@@ -1,0 +1,1015 @@
+/* src/store_fs.c — filesystem-backed object store.
+ *
+ * On-disk layout under ROOT:
+ *
+ *   buckets/<name>/                   -- bucket existence marker dir
+ *   data/<bucket>/<xx>/<yy>/<hex>     -- one file per object
+ *   tmp/                              -- staging files for atomic writes
+ *
+ * <hex> is the SHA-256 of "bucket\0key" rendered as 64 hex chars; <xx>
+ * and <yy> are the first two bytes of <hex>. The two-level prefix keeps
+ * fan-out under any directory below a few thousand at homelab scale.
+ *
+ * Each object file is self-contained:
+ *
+ *   [obj_header_t (52 bytes)][content_type (var)][key (var)][data (var)]
+ *
+ * Header has magic, schema version, sizes, mtime, raw MD5 etag, plus
+ * lengths for content_type and key. Reading the file means reading the
+ * header, skipping past header bytes, then streaming data. Writing means
+ * reserving header space, appending data while accumulating MD5 + size,
+ * then pwrite-ing the finalized header back at offset 0 before the
+ * atomic rename.
+ *
+ * Crash safety: every write goes through a temp file, fsync, rename,
+ * fsync(parent_dir). Concurrent writers to the same key serialize at
+ * the rename — last writer wins. Readers see one consistent version.
+ */
+
+/* The on-disk header is intentionally packed for a deterministic layout.
+ * GCC -O2 with -Wstringop-overread incorrectly treats the address of a
+ * packed struct whose first field is a small array as a pointer to that
+ * array only, generating false-positive warnings on full-struct
+ * read/write/pread calls. We silence that single diagnostic locally. */
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic ignored "-Wstringop-overread"
+#endif
+
+#include "store.h"
+#include "log.h"
+
+#include <dirent.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <inttypes.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/file.h>
+#include <sys/sendfile.h>
+#include <sys/stat.h>
+#include <sys/time.h>
+#include <sys/types.h>
+#include <time.h>
+#include <unistd.h>
+
+#include <openssl/evp.h>
+#include <openssl/sha.h>
+
+/* ===================================================================== */
+/* On-disk format                                                        */
+/* ===================================================================== */
+
+#define OBJ_MAGIC    "YS3OBJ\0"
+#define OBJ_MAGIC_LEN 8         /* "YS3OBJ\0\0" — 6 chars + 2 NUL */
+#define OBJ_SCHEMA   1u
+
+typedef struct __attribute__((packed)) {
+    char     magic[OBJ_MAGIC_LEN];   /* "YS3OBJ\0\0" */
+    uint32_t schema;                 /* OBJ_SCHEMA */
+    uint32_t header_size;            /* sizeof(this) + ct_len + key_len */
+    uint64_t data_size;
+    uint64_t mtime_ms;
+    uint8_t  etag[16];
+    uint16_t ct_len;
+    uint16_t key_len;
+} obj_header_t;
+
+_Static_assert(sizeof(obj_header_t) == 52, "obj_header_t layout");
+
+/* ===================================================================== */
+/* Path computation and small helpers                                    */
+/* ===================================================================== */
+
+struct s3_store {
+    char *root;       /* absolute path, no trailing slash */
+    char *data_dir;   /* ROOT/data */
+    char *tmp_dir;    /* ROOT/tmp */
+    char *buckets_dir;/* ROOT/buckets */
+};
+
+static char *xstrdup_join(const char *a, const char *b) {
+    size_t la = strlen(a), lb = strlen(b);
+    char *r = malloc(la + 1 + lb + 1);
+    if (!r) return NULL;
+    memcpy(r, a, la);
+    r[la] = '/';
+    memcpy(r + la + 1, b, lb);
+    r[la + 1 + lb] = '\0';
+    return r;
+}
+
+/* mkdir(path), but tolerate EEXIST. Returns 0 ok, -1 errno. */
+static int mkdir_idempotent(const char *p, mode_t mode) {
+    if (mkdir(p, mode) == 0) return 0;
+    if (errno == EEXIST) return 0;
+    return -1;
+}
+
+/* mkdir -p semantics. Walks the path, creating components. */
+static int mkdir_p(const char *path, mode_t mode) {
+    char buf[4096];
+    size_t n = strlen(path);
+    if (n + 1 > sizeof(buf)) { errno = ENAMETOOLONG; return -1; }
+    memcpy(buf, path, n + 1);
+
+    /* Skip leading '/' if absolute */
+    char *p = buf[0] == '/' ? buf + 1 : buf;
+    for (;;) {
+        char *slash = strchr(p, '/');
+        if (slash) *slash = '\0';
+        if (mkdir_idempotent(buf, mode) < 0) return -1;
+        if (!slash) break;
+        *slash = '/';
+        p = slash + 1;
+    }
+    return 0;
+}
+
+/* Open `dir` and fsync it. Used after rename to durably commit the dirent. */
+static int fsync_dir(const char *dir) {
+    int fd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fd < 0) return -1;
+    int rc = fsync(fd);
+    int e = errno;
+    close(fd);
+    if (rc < 0) { errno = e; return -1; }
+    return 0;
+}
+
+/* SHA-256 over "bucket\0key" → hex. out must hold 65 bytes. */
+static void hash_bucket_key(s3_str_t bucket, s3_str_t key, char out[65]) {
+    EVP_MD_CTX *c = EVP_MD_CTX_new();
+    EVP_DigestInit_ex(c, EVP_sha256(), NULL);
+    EVP_DigestUpdate(c, bucket.p, bucket.n);
+    static const uint8_t z = 0;
+    EVP_DigestUpdate(c, &z, 1);
+    EVP_DigestUpdate(c, key.p, key.n);
+    uint8_t raw[32];
+    unsigned int rl = 32;
+    EVP_DigestFinal_ex(c, raw, &rl);
+    EVP_MD_CTX_free(c);
+
+    static const char hex[] = "0123456789abcdef";
+    for (int i = 0; i < 32; i++) {
+        out[i*2 + 0] = hex[raw[i] >> 4];
+        out[i*2 + 1] = hex[raw[i] & 0xF];
+    }
+    out[64] = '\0';
+}
+
+/* Build object directory path: ROOT/data/<bucket>/<xx>/<yy>
+ * Returns 0 ok. out must hold at least 4096 bytes. */
+static int obj_dir(const s3_store_t *s, s3_str_t bucket, const char hex[65],
+                   char *out, size_t cap) {
+    int n = snprintf(out, cap, "%s/" S3_STR_FMT "/%c%c/%c%c",
+                     s->data_dir, S3_STR_ARG(bucket),
+                     hex[0], hex[1], hex[2], hex[3]);
+    return (n > 0 && (size_t)n < cap) ? 0 : -1;
+}
+
+static int obj_path(const s3_store_t *s, s3_str_t bucket, const char hex[65],
+                    char *out, size_t cap) {
+    int n = snprintf(out, cap, "%s/" S3_STR_FMT "/%c%c/%c%c/%s",
+                     s->data_dir, S3_STR_ARG(bucket),
+                     hex[0], hex[1], hex[2], hex[3], hex);
+    return (n > 0 && (size_t)n < cap) ? 0 : -1;
+}
+
+/* Validate bucket name per S3 rules (subset).
+ * - 3..63 chars
+ * - lowercase letters, digits, hyphen, dot
+ * - must begin/end with letter or digit
+ * - no consecutive dots
+ * - no '..' (already caught by no consecutive dots)
+ * - no IP-address form (we skip this check; cheap to add later)
+ */
+static int valid_bucket_name(s3_str_t n) {
+    if (n.n < 3 || n.n > 63) return 0;
+    char prev = 0;
+    for (size_t i = 0; i < n.n; i++) {
+        char c = n.p[i];
+        int is_lower = (c >= 'a' && c <= 'z');
+        int is_digit = (c >= '0' && c <= '9');
+        int is_dash  = (c == '-');
+        int is_dot   = (c == '.');
+        if (!(is_lower || is_digit || is_dash || is_dot)) return 0;
+        if (i == 0 && !(is_lower || is_digit)) return 0;
+        if (i == n.n - 1 && !(is_lower || is_digit)) return 0;
+        if (is_dot && prev == '.') return 0;
+        prev = c;
+    }
+    return 1;
+}
+
+/* Validate key per S3 rules (very permissive).
+ * - 1..1024 bytes (we cap at 1024)
+ * - any UTF-8 byte except NUL
+ * - reject "" and reject keys containing NUL
+ */
+static int valid_key(s3_str_t k) {
+    if (k.n == 0 || k.n > 1024) return 0;
+    if (memchr(k.p, '\0', k.n)) return 0;
+    return 1;
+}
+
+/* Build path ROOT/buckets/<name>. */
+static int bucket_path(const s3_store_t *s, s3_str_t name,
+                       char *out, size_t cap) {
+    int n = snprintf(out, cap, "%s/" S3_STR_FMT, s->buckets_dir,
+                     S3_STR_ARG(name));
+    return (n > 0 && (size_t)n < cap) ? 0 : -1;
+}
+
+/* Generate a temp file path under ROOT/tmp using mkstemp.
+ * Returns fd on success (with the path written to out_path), -1 on error. */
+static int tmp_open(const s3_store_t *s, char *out_path, size_t cap) {
+    int n = snprintf(out_path, cap, "%s/fs3.XXXXXX", s->tmp_dir);
+    if (n <= 0 || (size_t)n >= cap) { errno = ENAMETOOLONG; return -1; }
+    int fd = mkstemp(out_path);
+    if (fd < 0) return -1;
+    /* mkstemp creates with 0600 by default; that's fine. */
+    return fd;
+}
+
+/* ===================================================================== */
+/* Lifecycle                                                              */
+/* ===================================================================== */
+
+s3_err_t store_open(s3_store_t **out, const char *root) {
+    if (!out || !root) return S3_ERR_INVALID_ARGUMENT;
+
+    s3_store_t *s = calloc(1, sizeof(*s));
+    if (!s) return S3_ERR_INTERNAL;
+
+    s->root        = strdup(root);
+    s->data_dir    = xstrdup_join(root, "data");
+    s->tmp_dir     = xstrdup_join(root, "tmp");
+    s->buckets_dir = xstrdup_join(root, "buckets");
+    if (!s->root || !s->data_dir || !s->tmp_dir || !s->buckets_dir) {
+        store_close(s);
+        return S3_ERR_INTERNAL;
+    }
+
+    if (mkdir_p(s->root, 0700) < 0
+        || mkdir_p(s->data_dir, 0700) < 0
+        || mkdir_p(s->tmp_dir, 0700) < 0
+        || mkdir_p(s->buckets_dir, 0700) < 0) {
+        LOG_E("store_open: mkdir failed under %s: %s", root, strerror(errno));
+        store_close(s);
+        return S3_ERR_INTERNAL;
+    }
+
+    *out = s;
+    return S3_OK;
+}
+
+void store_close(s3_store_t *s) {
+    if (!s) return;
+    free(s->root);
+    free(s->data_dir);
+    free(s->tmp_dir);
+    free(s->buckets_dir);
+    free(s);
+}
+
+/* ===================================================================== */
+/* Bucket ops                                                             */
+/* ===================================================================== */
+
+s3_err_t store_bucket_create(s3_store_t *s, s3_str_t name) {
+    if (!s) return S3_ERR_INVALID_ARGUMENT;
+    if (!valid_bucket_name(name)) return S3_ERR_INVALID_BUCKET_NAME;
+
+    char bp[4096];
+    if (bucket_path(s, name, bp, sizeof(bp)) < 0) return S3_ERR_INTERNAL;
+
+    if (mkdir(bp, 0700) == 0) {
+        /* Pre-create the per-bucket data subtree to avoid races later. */
+        char dp[4096];
+        snprintf(dp, sizeof(dp), "%s/" S3_STR_FMT, s->data_dir, S3_STR_ARG(name));
+        (void)mkdir(dp, 0700);
+        return S3_OK;
+    }
+    if (errno == EEXIST) return S3_ERR_BUCKET_ALREADY_EXISTS;
+    LOG_W("bucket_create %s: %s", bp, strerror(errno));
+    return S3_ERR_INTERNAL;
+}
+
+int store_bucket_exists(s3_store_t *s, s3_str_t name) {
+    char bp[4096];
+    if (bucket_path(s, name, bp, sizeof(bp)) < 0) return 0;
+    struct stat st;
+    return stat(bp, &st) == 0 && S_ISDIR(st.st_mode);
+}
+
+/* Recursively check whether a directory tree contains any regular files. */
+static int dir_has_files(const char *path) {
+    DIR *d = opendir(path);
+    if (!d) return 0;
+    struct dirent *e;
+    int found = 0;
+    while ((e = readdir(d)) != NULL) {
+        if (e->d_name[0] == '.' &&
+            (e->d_name[1] == '\0' || (e->d_name[1] == '.' && e->d_name[2] == '\0')))
+            continue;
+        char child[4096];
+        snprintf(child, sizeof(child), "%s/%s", path, e->d_name);
+        struct stat st;
+        if (lstat(child, &st) < 0) continue;
+        if (S_ISREG(st.st_mode)) { found = 1; break; }
+        if (S_ISDIR(st.st_mode)) {
+            if (dir_has_files(child)) { found = 1; break; }
+        }
+    }
+    closedir(d);
+    return found;
+}
+
+/* Recursively rmdir a tree of empty directories. */
+static int rmdir_tree(const char *path) {
+    DIR *d = opendir(path);
+    if (!d) return -1;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        if (e->d_name[0] == '.' &&
+            (e->d_name[1] == '\0' || (e->d_name[1] == '.' && e->d_name[2] == '\0')))
+            continue;
+        char child[4096];
+        snprintf(child, sizeof(child), "%s/%s", path, e->d_name);
+        struct stat st;
+        if (lstat(child, &st) < 0) continue;
+        if (S_ISDIR(st.st_mode)) rmdir_tree(child);
+        /* We never delete files here; caller has ensured none exist. */
+    }
+    closedir(d);
+    return rmdir(path);
+}
+
+s3_err_t store_bucket_delete(s3_store_t *s, s3_str_t name) {
+    if (!s) return S3_ERR_INVALID_ARGUMENT;
+    if (!store_bucket_exists(s, name)) return S3_ERR_NO_SUCH_BUCKET;
+
+    char dp[4096];
+    snprintf(dp, sizeof(dp), "%s/" S3_STR_FMT, s->data_dir, S3_STR_ARG(name));
+    if (dir_has_files(dp)) return S3_ERR_BUCKET_NOT_EMPTY;
+
+    /* Remove empty subtree under data/<bucket>/, then bucket marker dir. */
+    rmdir_tree(dp);
+
+    char bp[4096];
+    if (bucket_path(s, name, bp, sizeof(bp)) < 0) return S3_ERR_INTERNAL;
+    if (rmdir(bp) < 0) {
+        LOG_W("bucket_delete rmdir %s: %s", bp, strerror(errno));
+        return S3_ERR_INTERNAL;
+    }
+    return S3_OK;
+}
+
+/* ===================================================================== */
+/* Streaming PUT                                                          */
+/* ===================================================================== */
+
+struct s3_writer {
+    s3_store_t *store;
+    int         fd;                  /* tmp file fd */
+    char        tmp_path[4096];      /* tmp file path */
+    uint64_t    data_written;        /* bytes written to data region so far */
+    EVP_MD_CTX *md5_ctx;             /* running MD5 */
+    obj_header_t hdr;                /* accumulated header (filled in begin) */
+    char       *bucket_dup;
+    char       *key_dup;             /* NOT NUL-terminated; key_len in hdr.key_len */
+    char       *content_type_dup;    /* NUL-terminated */
+    int         finalized;           /* 1 once commit/abort run */
+};
+
+static void writer_free(s3_writer_t *w) {
+    if (!w) return;
+    if (w->fd >= 0) close(w->fd);
+    if (w->tmp_path[0]) unlink(w->tmp_path);
+    if (w->md5_ctx) EVP_MD_CTX_free(w->md5_ctx);
+    free(w->bucket_dup);
+    free(w->key_dup);
+    free(w->content_type_dup);
+    free(w);
+}
+
+s3_err_t store_put_begin(s3_store_t *s, s3_str_t bucket, s3_str_t key,
+                         const char *content_type, s3_writer_t **out) {
+    if (!s || !out) return S3_ERR_INVALID_ARGUMENT;
+    if (!valid_bucket_name(bucket)) return S3_ERR_INVALID_BUCKET_NAME;
+    if (!valid_key(key))            return S3_ERR_INVALID_ARGUMENT;
+    if (!store_bucket_exists(s, bucket)) return S3_ERR_NO_SUCH_BUCKET;
+
+    s3_writer_t *w = calloc(1, sizeof(*w));
+    if (!w) return S3_ERR_INTERNAL;
+    w->store = s;
+    w->fd = -1;
+
+    w->md5_ctx = EVP_MD_CTX_new();
+    if (!w->md5_ctx
+        || EVP_DigestInit_ex(w->md5_ctx, EVP_md5(), NULL) != 1) {
+        writer_free(w);
+        return S3_ERR_INTERNAL;
+    }
+
+    /* Stash bucket/key/content-type for commit-time path computation. */
+    w->bucket_dup = malloc(bucket.n + 1);
+    w->key_dup    = malloc(key.n);
+    if (!w->bucket_dup || !w->key_dup) { writer_free(w); return S3_ERR_INTERNAL; }
+    memcpy(w->bucket_dup, bucket.p, bucket.n);
+    w->bucket_dup[bucket.n] = '\0';
+    memcpy(w->key_dup, key.p, key.n);
+
+    const char *ct = content_type ? content_type : "";
+    size_t ct_n = strlen(ct);
+    if (ct_n > sizeof(((s3_obj_meta_t*)0)->content_type) - 1) {
+        ct_n = sizeof(((s3_obj_meta_t*)0)->content_type) - 1;
+    }
+    w->content_type_dup = malloc(ct_n + 1);
+    if (!w->content_type_dup) { writer_free(w); return S3_ERR_INTERNAL; }
+    memcpy(w->content_type_dup, ct, ct_n);
+    w->content_type_dup[ct_n] = '\0';
+
+    /* Header lengths are known now; data size + etag come at commit time. */
+    if (key.n > UINT16_MAX) { writer_free(w); return S3_ERR_INVALID_ARGUMENT; }
+    if (ct_n > UINT16_MAX)  { writer_free(w); return S3_ERR_INVALID_ARGUMENT; }
+    memcpy(w->hdr.magic, OBJ_MAGIC, OBJ_MAGIC_LEN);
+    w->hdr.schema      = OBJ_SCHEMA;
+    w->hdr.header_size = (uint32_t)(sizeof(obj_header_t) + ct_n + key.n);
+    w->hdr.ct_len      = (uint16_t)ct_n;
+    w->hdr.key_len     = (uint16_t)key.n;
+    /* data_size, mtime_ms, etag filled at commit */
+
+    /* Open temp file. */
+    w->fd = tmp_open(s, w->tmp_path, sizeof(w->tmp_path));
+    if (w->fd < 0) {
+        LOG_E("tmp_open: %s", strerror(errno));
+        writer_free(w);
+        return S3_ERR_INTERNAL;
+    }
+
+    /* Reserve header space by writing the (incomplete) header, then the
+     * variable-length content_type and key bytes. We'll pwrite the final
+     * header back at offset 0 in commit. */
+    if (write(w->fd, &w->hdr, sizeof(w->hdr)) != (ssize_t)sizeof(w->hdr)
+        || (ct_n  && write(w->fd, w->content_type_dup, ct_n) != (ssize_t)ct_n)
+        || (key.n && write(w->fd, w->key_dup, key.n)         != (ssize_t)key.n)) {
+        LOG_E("write header: %s", strerror(errno));
+        writer_free(w);
+        return S3_ERR_INTERNAL;
+    }
+
+    *out = w;
+    return S3_OK;
+}
+
+s3_err_t store_put_write(s3_writer_t *w, const void *buf, size_t n) {
+    if (!w || w->finalized) return S3_ERR_INVALID_ARGUMENT;
+    if (n == 0) return S3_OK;
+
+    if (EVP_DigestUpdate(w->md5_ctx, buf, n) != 1) return S3_ERR_INTERNAL;
+
+    const char *p = buf;
+    size_t left = n;
+    while (left > 0) {
+        ssize_t r = write(w->fd, p, left);
+        if (r > 0) { p += r; left -= (size_t)r; w->data_written += (uint64_t)r; continue; }
+        if (r < 0 && errno == EINTR) continue;
+        LOG_W("put_write: %s", strerror(errno));
+        return S3_ERR_INTERNAL;
+    }
+    return S3_OK;
+}
+
+s3_err_t store_put_commit(s3_writer_t *w, s3_obj_meta_t *meta_out) {
+    if (!w || w->finalized) return S3_ERR_INVALID_ARGUMENT;
+    w->finalized = 1;
+
+    /* Finalize MD5 and timestamp. */
+    unsigned int mlen = 16;
+    if (EVP_DigestFinal_ex(w->md5_ctx, w->hdr.etag, &mlen) != 1) {
+        writer_free(w); return S3_ERR_INTERNAL;
+    }
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    w->hdr.mtime_ms = (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)(ts.tv_nsec / 1000000);
+    w->hdr.data_size = w->data_written;
+
+    /* Pwrite the finalized header back at offset 0. */
+    if (pwrite(w->fd, &w->hdr, sizeof(w->hdr), 0) != (ssize_t)sizeof(w->hdr)) {
+        LOG_E("pwrite header: %s", strerror(errno));
+        writer_free(w); return S3_ERR_INTERNAL;
+    }
+    /* Durability: data and metadata both. */
+    if (fsync(w->fd) < 0) {
+        LOG_E("fsync tmp: %s", strerror(errno));
+        writer_free(w); return S3_ERR_INTERNAL;
+    }
+
+    /* Compute final path. */
+    s3_str_t bucket = { w->bucket_dup, strlen(w->bucket_dup) };
+    s3_str_t key    = { w->key_dup,    w->hdr.key_len };
+    char hex[65];
+    hash_bucket_key(bucket, key, hex);
+
+    char dir[4096], path[4096];
+    if (obj_dir(w->store, bucket, hex, dir, sizeof(dir)) < 0
+        || obj_path(w->store, bucket, hex, path, sizeof(path)) < 0) {
+        writer_free(w); return S3_ERR_INTERNAL;
+    }
+    if (mkdir_p(dir, 0700) < 0) {
+        LOG_E("mkdir_p %s: %s", dir, strerror(errno));
+        writer_free(w); return S3_ERR_INTERNAL;
+    }
+
+    /* Atomic rename. */
+    if (rename(w->tmp_path, path) < 0) {
+        LOG_E("rename %s -> %s: %s", w->tmp_path, path, strerror(errno));
+        writer_free(w); return S3_ERR_INTERNAL;
+    }
+    /* tmp_path is gone; clear so writer_free doesn't unlink the live file. */
+    w->tmp_path[0] = '\0';
+
+    /* Make the dirent durable. */
+    if (fsync_dir(dir) < 0) {
+        LOG_W("fsync_dir %s: %s", dir, strerror(errno));
+        /* Not fatal — data is on disk; on crash the dirent might be lost. */
+    }
+
+    if (meta_out) {
+        memset(meta_out, 0, sizeof(*meta_out));
+        meta_out->size     = w->hdr.data_size;
+        meta_out->mtime_ms = w->hdr.mtime_ms;
+        memcpy(meta_out->etag, w->hdr.etag, 16);
+        size_t ctn = w->hdr.ct_len;
+        if (ctn >= sizeof(meta_out->content_type)) ctn = sizeof(meta_out->content_type) - 1;
+        memcpy(meta_out->content_type, w->content_type_dup, ctn);
+        meta_out->content_type[ctn] = '\0';
+    }
+
+    writer_free(w);
+    return S3_OK;
+}
+
+void store_put_abort(s3_writer_t *w) {
+    if (!w) return;
+    /* writer_free unlinks tmp_path if non-empty. */
+    writer_free(w);
+}
+
+/* ===================================================================== */
+/* Streaming GET                                                          */
+/* ===================================================================== */
+
+struct s3_reader {
+    int      fd;
+    uint64_t data_off;       /* file offset where data begins */
+    uint64_t data_size;      /* total data length */
+    uint64_t pos;            /* bytes already returned to caller */
+};
+
+/* Read header from fd at offset 0; verify magic/schema; populate meta. */
+static s3_err_t read_header(int fd, obj_header_t *hdr_out, s3_obj_meta_t *meta_out) {
+    obj_header_t h;
+    ssize_t r = pread(fd, &h, sizeof(h), 0);
+    if (r != (ssize_t)sizeof(h)) return S3_ERR_INTERNAL;
+    if (memcmp(h.magic, OBJ_MAGIC, OBJ_MAGIC_LEN) != 0) return S3_ERR_INTERNAL;
+    if (h.schema != OBJ_SCHEMA) return S3_ERR_INTERNAL;
+
+    if (hdr_out) *hdr_out = h;
+
+    if (meta_out) {
+        memset(meta_out, 0, sizeof(*meta_out));
+        meta_out->size     = h.data_size;
+        meta_out->mtime_ms = h.mtime_ms;
+        memcpy(meta_out->etag, h.etag, 16);
+
+        if (h.ct_len > 0) {
+            size_t ctn = h.ct_len;
+            if (ctn >= sizeof(meta_out->content_type)) {
+                ctn = sizeof(meta_out->content_type) - 1;
+            }
+            ssize_t cr = pread(fd, meta_out->content_type, ctn, sizeof(h));
+            if (cr != (ssize_t)ctn) return S3_ERR_INTERNAL;
+            meta_out->content_type[ctn] = '\0';
+        }
+    }
+    return S3_OK;
+}
+
+s3_err_t store_get_open(s3_store_t *s, s3_str_t bucket, s3_str_t key,
+                        s3_reader_t **out, s3_obj_meta_t *meta_out) {
+    if (!s || !out) return S3_ERR_INVALID_ARGUMENT;
+    if (!valid_bucket_name(bucket)) return S3_ERR_INVALID_BUCKET_NAME;
+    if (!valid_key(key))            return S3_ERR_INVALID_ARGUMENT;
+    if (!store_bucket_exists(s, bucket)) return S3_ERR_NO_SUCH_BUCKET;
+
+    char hex[65];
+    hash_bucket_key(bucket, key, hex);
+    char path[4096];
+    if (obj_path(s, bucket, hex, path, sizeof(path)) < 0) return S3_ERR_INTERNAL;
+
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        if (errno == ENOENT) return S3_ERR_NO_SUCH_KEY;
+        return S3_ERR_INTERNAL;
+    }
+
+    obj_header_t h;
+    s3_err_t e = read_header(fd, &h, meta_out);
+    if (e != S3_OK) { close(fd); return e; }
+
+    s3_reader_t *r = calloc(1, sizeof(*r));
+    if (!r) { close(fd); return S3_ERR_INTERNAL; }
+    r->fd        = fd;
+    r->data_off  = h.header_size;
+    r->data_size = h.data_size;
+    r->pos       = 0;
+    *out = r;
+    return S3_OK;
+}
+
+ssize_t store_get_read(s3_reader_t *r, void *buf, size_t n) {
+    if (!r) { errno = EINVAL; return -1; }
+    if (r->pos >= r->data_size) return 0;
+    uint64_t avail = r->data_size - r->pos;
+    if ((uint64_t)n > avail) n = (size_t)avail;
+    ssize_t got = pread(r->fd, buf, n, (off_t)(r->data_off + r->pos));
+    if (got > 0) r->pos += (uint64_t)got;
+    return got;
+}
+
+ssize_t store_get_sendfile(s3_reader_t *r, int out_fd, size_t max) {
+    if (!r) { errno = EINVAL; return -1; }
+    if (r->pos >= r->data_size) return 0;
+    uint64_t avail = r->data_size - r->pos;
+    size_t want = max ? (max < avail ? max : (size_t)avail) : (size_t)avail;
+    off_t off = (off_t)(r->data_off + r->pos);
+    ssize_t sent = sendfile(out_fd, r->fd, &off, want);
+    if (sent > 0) r->pos += (uint64_t)sent;
+    return sent;
+}
+
+void store_get_close(s3_reader_t *r) {
+    if (!r) return;
+    if (r->fd >= 0) close(r->fd);
+    free(r);
+}
+
+/* ===================================================================== */
+/* HEAD / DELETE                                                          */
+/* ===================================================================== */
+
+s3_err_t store_head(s3_store_t *s, s3_str_t bucket, s3_str_t key,
+                    s3_obj_meta_t *meta_out) {
+    s3_reader_t *r;
+    s3_err_t e = store_get_open(s, bucket, key, &r, meta_out);
+    if (e == S3_OK) store_get_close(r);
+    return e;
+}
+
+s3_err_t store_delete(s3_store_t *s, s3_str_t bucket, s3_str_t key) {
+    if (!s) return S3_ERR_INVALID_ARGUMENT;
+    if (!valid_bucket_name(bucket)) return S3_ERR_INVALID_BUCKET_NAME;
+    if (!valid_key(key))            return S3_ERR_INVALID_ARGUMENT;
+    if (!store_bucket_exists(s, bucket)) return S3_ERR_NO_SUCH_BUCKET;
+
+    char hex[65];
+    hash_bucket_key(bucket, key, hex);
+    char path[4096];
+    if (obj_path(s, bucket, hex, path, sizeof(path)) < 0) return S3_ERR_INTERNAL;
+    if (unlink(path) < 0) {
+        if (errno == ENOENT) {
+            /* S3 DELETE is idempotent: deleting a missing key is success. */
+            return S3_OK;
+        }
+        LOG_W("unlink %s: %s", path, strerror(errno));
+        return S3_ERR_INTERNAL;
+    }
+    /* fsync the leaf dir for durability. */
+    char *slash = strrchr(path, '/');
+    if (slash) {
+        *slash = '\0';
+        (void)fsync_dir(path);
+    }
+    return S3_OK;
+}
+
+/* ===================================================================== */
+/* List (FS-walk implementation; replaced by LMDB in Phase 2.2)          */
+/* ===================================================================== */
+
+/* The lister loads ALL keys for the bucket into memory at begin time,
+ * sorts them lexicographically, then iterates with marker / prefix /
+ * delimiter applied. For homelab scale this is fine; at >1M keys it
+ * becomes painful, which is exactly why Phase 2.2 swaps in LMDB.
+ *
+ * "Common prefix" handling: when delimiter is set, keys sharing a
+ * prefix up to the next delimiter character are rolled up into a
+ * single "prefix" entry. Distinct prefixes are emitted at most once. */
+
+typedef struct {
+    char        *key;        /* malloc'd, NUL-terminated */
+    size_t       key_len;
+    s3_obj_meta_t meta;
+} list_entry_t;
+
+struct s3_lister {
+    list_entry_t *items;
+    size_t        n_items;
+    size_t        cursor;       /* next item index to consider */
+
+    s3_str_t      prefix;       /* points into opts_storage */
+    s3_str_t      marker;
+    s3_str_t      delimiter;
+    int           max_keys;
+    int           emitted;
+    int           truncated;    /* 1 if we stopped at max_keys */
+
+    /* Heap copies of the option strings so they outlive the caller's
+     * stack frame. */
+    char         *opts_storage;
+    size_t        opts_storage_used;
+
+    /* Last-emitted common prefix, to dedupe subsequent matches. */
+    char         *last_prefix;
+    size_t        last_prefix_len;
+
+    /* Single-call return scratch. */
+    char         *ret_buf;
+    size_t        ret_cap;
+};
+
+static int cmp_entries(const void *a, const void *b) {
+    const list_entry_t *ea = a, *eb = b;
+    size_t n = ea->key_len < eb->key_len ? ea->key_len : eb->key_len;
+    int c = memcmp(ea->key, eb->key, n);
+    if (c) return c;
+    if (ea->key_len < eb->key_len) return -1;
+    if (ea->key_len > eb->key_len) return 1;
+    return 0;
+}
+
+static int starts_with(const char *p, size_t n, s3_str_t pref) {
+    if (pref.n == 0) return 1;
+    if (n < pref.n) return 0;
+    return memcmp(p, pref.p, pref.n) == 0;
+}
+
+/* Read one object file's header into entry. Sets entry->key (malloc'd). */
+static int load_entry(const char *path, list_entry_t *out) {
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return -1;
+
+    obj_header_t h;
+    ssize_t r = pread(fd, &h, sizeof(h), 0);
+    if (r != (ssize_t)sizeof(h) || memcmp(h.magic, OBJ_MAGIC, OBJ_MAGIC_LEN) != 0) {
+        close(fd); return -1;
+    }
+    char *kbuf = malloc((size_t)h.key_len + 1);
+    if (!kbuf) { close(fd); return -1; }
+    if (h.key_len > 0) {
+        if (pread(fd, kbuf, h.key_len, sizeof(h) + h.ct_len) != (ssize_t)h.key_len) {
+            free(kbuf); close(fd); return -1;
+        }
+    }
+    kbuf[h.key_len] = '\0';
+
+    out->key = kbuf;
+    out->key_len = h.key_len;
+    memset(&out->meta, 0, sizeof(out->meta));
+    out->meta.size = h.data_size;
+    out->meta.mtime_ms = h.mtime_ms;
+    memcpy(out->meta.etag, h.etag, 16);
+    if (h.ct_len > 0) {
+        size_t ctn = h.ct_len;
+        if (ctn >= sizeof(out->meta.content_type)) ctn = sizeof(out->meta.content_type) - 1;
+        if (pread(fd, out->meta.content_type, ctn, sizeof(h)) != (ssize_t)ctn) {
+            free(kbuf); close(fd); return -1;
+        }
+        out->meta.content_type[ctn] = '\0';
+    }
+    close(fd);
+    return 0;
+}
+
+/* Walk the per-bucket data dir collecting object files. */
+static int walk_bucket(const char *bucket_data_dir, list_entry_t **items_out,
+                       size_t *n_out) {
+    list_entry_t *items = NULL;
+    size_t n = 0, cap = 0;
+
+    DIR *d1 = opendir(bucket_data_dir);
+    if (!d1) {
+        if (errno == ENOENT) { *items_out = NULL; *n_out = 0; return 0; }
+        return -1;
+    }
+    struct dirent *e1;
+    while ((e1 = readdir(d1)) != NULL) {
+        if (e1->d_name[0] == '.') continue;
+        char p2[4096];
+        int n2 = snprintf(p2, sizeof(p2), "%s/%s", bucket_data_dir, e1->d_name);
+        if (n2 < 0 || (size_t)n2 >= sizeof(p2)) continue;
+        DIR *d2 = opendir(p2);
+        if (!d2) continue;
+        struct dirent *e2;
+        while ((e2 = readdir(d2)) != NULL) {
+            if (e2->d_name[0] == '.') continue;
+            char p3[4096];
+            int n3 = snprintf(p3, sizeof(p3), "%s/%s", p2, e2->d_name);
+            if (n3 < 0 || (size_t)n3 >= sizeof(p3)) continue;
+            DIR *d3 = opendir(p3);
+            if (!d3) continue;
+            struct dirent *e3;
+            while ((e3 = readdir(d3)) != NULL) {
+                if (e3->d_name[0] == '.') continue;
+                char path[4096];
+                int np = snprintf(path, sizeof(path), "%s/%s", p3, e3->d_name);
+                if (np < 0 || (size_t)np >= sizeof(path)) continue;
+                if (n == cap) {
+                    size_t nc = cap ? cap * 2 : 64;
+                    list_entry_t *ni = realloc(items, nc * sizeof(*items));
+                    if (!ni) { closedir(d3); closedir(d2); closedir(d1); goto oom; }
+                    items = ni; cap = nc;
+                }
+                if (load_entry(path, &items[n]) == 0) n++;
+            }
+            closedir(d3);
+        }
+        closedir(d2);
+    }
+    closedir(d1);
+    *items_out = items;
+    *n_out = n;
+    return 0;
+
+oom:
+    for (size_t i = 0; i < n; i++) free(items[i].key);
+    free(items);
+    return -1;
+}
+
+s3_err_t store_list_begin(s3_store_t *s, s3_str_t bucket,
+                          const s3_list_opts_t *opts, s3_lister_t **out) {
+    if (!s || !out) return S3_ERR_INVALID_ARGUMENT;
+    if (!valid_bucket_name(bucket)) return S3_ERR_INVALID_BUCKET_NAME;
+    if (!store_bucket_exists(s, bucket)) return S3_ERR_NO_SUCH_BUCKET;
+
+    s3_lister_t *l = calloc(1, sizeof(*l));
+    if (!l) return S3_ERR_INTERNAL;
+    l->max_keys = (opts && opts->max_keys > 0) ? opts->max_keys : 1000;
+
+    /* Copy opts strings into a single arena. */
+    size_t need = 0;
+    if (opts) {
+        need += opts->prefix.n + opts->marker.n + opts->delimiter.n;
+    }
+    if (need > 0) {
+        l->opts_storage = malloc(need);
+        if (!l->opts_storage) { store_list_close(l); return S3_ERR_INTERNAL; }
+    }
+    if (opts) {
+        char *o = l->opts_storage;
+        if (opts->prefix.n)    memcpy(o, opts->prefix.p, opts->prefix.n);
+        l->prefix = (s3_str_t){ o, opts->prefix.n };
+        o += opts->prefix.n;
+        if (opts->marker.n)    memcpy(o, opts->marker.p, opts->marker.n);
+        l->marker = (s3_str_t){ o, opts->marker.n };
+        o += opts->marker.n;
+        if (opts->delimiter.n) memcpy(o, opts->delimiter.p, opts->delimiter.n);
+        l->delimiter = (s3_str_t){ o, opts->delimiter.n };
+    }
+
+    char dp[4096];
+    snprintf(dp, sizeof(dp), "%s/" S3_STR_FMT, s->data_dir, S3_STR_ARG(bucket));
+    if (walk_bucket(dp, &l->items, &l->n_items) < 0) {
+        store_list_close(l);
+        return S3_ERR_INTERNAL;
+    }
+    qsort(l->items, l->n_items, sizeof(list_entry_t), cmp_entries);
+    *out = l;
+    return S3_OK;
+}
+
+s3_err_t store_list_next(s3_lister_t *l, s3_str_t *key_out,
+                         s3_obj_meta_t *meta_out, int *is_prefix_out) {
+    if (!l || !key_out) return S3_ERR_INVALID_ARGUMENT;
+
+    while (l->cursor < l->n_items) {
+        if (l->emitted >= l->max_keys) {
+            /* We hit max_keys. Are there any more matching items still
+             * available? If so, mark truncated. We need to scan ahead
+             * once to find out — at most one matching item is enough. */
+            for (size_t i = l->cursor; i < l->n_items; i++) {
+                list_entry_t *e2 = &l->items[i];
+                /* Apply same filters used in the main loop. */
+                if (l->marker.n > 0) {
+                    size_t mn = l->marker.n < e2->key_len ? l->marker.n : e2->key_len;
+                    int c = memcmp(e2->key, l->marker.p, mn);
+                    if (c < 0) continue;
+                    if (c == 0 && e2->key_len <= l->marker.n) continue;
+                }
+                if (!starts_with(e2->key, e2->key_len, l->prefix)) continue;
+                /* For delimiter, we also need to ensure the rolled-up
+                 * prefix would be different from last_prefix. Simplification:
+                 * any further matching key counts as "more available". This
+                 * may overestimate truncation in rare delimiter-rollup
+                 * cases but never under-reports. */
+                l->truncated = 1;
+                break;
+            }
+            return S3_ERR_NO_SUCH_KEY;
+        }
+
+        list_entry_t *e = &l->items[l->cursor++];
+
+        /* Marker: skip keys lexicographically <= marker. */
+        if (l->marker.n > 0) {
+            size_t mn = l->marker.n < e->key_len ? l->marker.n : e->key_len;
+            int c = memcmp(e->key, l->marker.p, mn);
+            if (c < 0) continue;
+            if (c == 0 && e->key_len <= l->marker.n) continue;
+        }
+
+        /* Prefix filter. */
+        if (!starts_with(e->key, e->key_len, l->prefix)) continue;
+
+        /* Delimiter handling: roll up keys sharing a prefix up to next
+         * occurrence of delimiter (after l->prefix). */
+        if (l->delimiter.n > 0) {
+            const char *after = e->key + l->prefix.n;
+            size_t after_n = e->key_len - l->prefix.n;
+            const char *hit = NULL;
+            if (l->delimiter.n == 1) {
+                hit = memchr(after, l->delimiter.p[0], after_n);
+            } else {
+                /* Multi-char delimiter; rare. Naive scan. */
+                for (size_t i = 0; i + l->delimiter.n <= after_n; i++) {
+                    if (memcmp(after + i, l->delimiter.p, l->delimiter.n) == 0) {
+                        hit = after + i; break;
+                    }
+                }
+            }
+            if (hit) {
+                size_t prefix_total = (size_t)(hit - e->key) + l->delimiter.n;
+                if (l->last_prefix && l->last_prefix_len == prefix_total
+                    && memcmp(l->last_prefix, e->key, prefix_total) == 0) {
+                    continue;  /* already emitted this rollup */
+                }
+                /* Save the rollup as the value to return. */
+                if (prefix_total + 1 > l->ret_cap) {
+                    char *nb = realloc(l->ret_buf, prefix_total + 1);
+                    if (!nb) return S3_ERR_INTERNAL;
+                    l->ret_buf = nb; l->ret_cap = prefix_total + 1;
+                }
+                memcpy(l->ret_buf, e->key, prefix_total);
+                l->ret_buf[prefix_total] = '\0';
+
+                /* Update last-prefix dedupe tracker. */
+                char *np = realloc(l->last_prefix, prefix_total);
+                if (!np) return S3_ERR_INTERNAL;
+                l->last_prefix = np;
+                memcpy(l->last_prefix, e->key, prefix_total);
+                l->last_prefix_len = prefix_total;
+
+                key_out->p = l->ret_buf;
+                key_out->n = prefix_total;
+                if (is_prefix_out) *is_prefix_out = 1;
+                l->emitted++;
+                return S3_OK;
+            }
+        }
+
+        /* Plain key. Copy into ret_buf. */
+        if (e->key_len + 1 > l->ret_cap) {
+            char *nb = realloc(l->ret_buf, e->key_len + 1);
+            if (!nb) return S3_ERR_INTERNAL;
+            l->ret_buf = nb; l->ret_cap = e->key_len + 1;
+        }
+        memcpy(l->ret_buf, e->key, e->key_len);
+        l->ret_buf[e->key_len] = '\0';
+        key_out->p = l->ret_buf;
+        key_out->n = e->key_len;
+        if (meta_out) *meta_out = e->meta;
+        if (is_prefix_out) *is_prefix_out = 0;
+        l->emitted++;
+        return S3_OK;
+    }
+    return S3_ERR_NO_SUCH_KEY;
+}
+
+int store_list_truncated(const s3_lister_t *l) {
+    return l ? l->truncated : 0;
+}
+
+void store_list_close(s3_lister_t *l) {
+    if (!l) return;
+    for (size_t i = 0; i < l->n_items; i++) free(l->items[i].key);
+    free(l->items);
+    free(l->opts_storage);
+    free(l->last_prefix);
+    free(l->ret_buf);
+    free(l);
+}
