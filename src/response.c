@@ -78,6 +78,7 @@ static const err_entry_t ERR_TABLE[] = {
     { S3_ERR_INVALID_REQUEST,           400, "InvalidRequest",           "Invalid request."                                  },
     { S3_ERR_SIGNATURE_DOES_NOT_MATCH,  403, "SignatureDoesNotMatch",    "The request signature does not match."             },
     { S3_ERR_ACCESS_DENIED,             403, "AccessDenied",             "Access denied."                                    },
+    { S3_ERR_INVALID_AUTH_HEADER,       400, "InvalidArgument",          "The Authorization header is malformed."            },
     { S3_ERR_REQUEST_TIME_TOO_SKEWED,   403, "RequestTimeTooSkewed",     "The difference between request time and server time is too large." },
     { S3_ERR_ENTITY_TOO_LARGE,          413, "EntityTooLarge",           "Your proposed upload exceeds the maximum allowed." },
     { S3_ERR_MISSING_CONTENT_LENGTH,    411, "MissingContentLength",     "Content-Length header is required."                },
