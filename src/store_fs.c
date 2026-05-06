@@ -712,6 +712,253 @@ s3_err_t store_delete(s3_store_t *s, s3_str_t bucket, s3_str_t key) {
     return S3_OK;
 }
 
+s3_err_t store_get_set_range(s3_reader_t *r, uint64_t offset, uint64_t length) {
+    if (!r) return S3_ERR_INVALID_ARGUMENT;
+    if (offset >= r->data_size) return S3_ERR_INVALID_RANGE;
+    uint64_t avail = r->data_size - offset;
+    if (length > avail) length = avail;
+    r->pos = offset;
+    /* Clip the readable window: sendfile checks (data_size - pos). */
+    r->data_size = offset + length;
+    return S3_OK;
+}
+
+/* ===================================================================== */
+/* Bucket listing                                                         */
+/* ===================================================================== */
+
+struct s3_bucket_lister {
+    char    **names;     /* malloc'd array of malloc'd NUL-terminated names */
+    uint64_t *ctimes;    /* ctime_ms for each name (parallel array) */
+    size_t    n;
+    size_t    cursor;
+};
+
+s3_err_t store_list_buckets_begin(s3_store_t *s, s3_bucket_lister_t **out) {
+    if (!s || !out) return S3_ERR_INVALID_ARGUMENT;
+
+    s3_bucket_lister_t *l = calloc(1, sizeof(*l));
+    if (!l) return S3_ERR_INTERNAL;
+
+    DIR *d = opendir(s->buckets_dir);
+    if (!d) {
+        /* buckets_dir always exists after store_open; ENOENT is weird. */
+        free(l);
+        return S3_ERR_INTERNAL;
+    }
+
+    size_t cap = 0;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        if (e->d_name[0] == '.') continue;
+        /* Only consider valid bucket names (extra safety check). */
+        s3_str_t nm = { e->d_name, strlen(e->d_name) };
+        if (!valid_bucket_name(nm)) continue;
+
+        if (l->n == cap) {
+            size_t nc = cap ? cap * 2 : 16;
+            char    **nn = realloc(l->names,  nc * sizeof(*l->names));
+            uint64_t *nc2 = realloc(l->ctimes, nc * sizeof(*l->ctimes));
+            if (!nn || !nc2) {
+                free(nn ? nn : l->names);
+                free(nc2 ? nc2 : l->ctimes);
+                closedir(d);
+                store_list_buckets_close(l);
+                return S3_ERR_INTERNAL;
+            }
+            l->names  = nn;
+            l->ctimes = nc2;
+            cap = nc;
+        }
+
+        l->names[l->n] = strdup(e->d_name);
+        if (!l->names[l->n]) {
+            closedir(d);
+            store_list_buckets_close(l);
+            return S3_ERR_INTERNAL;
+        }
+
+        /* Use the bucket directory mtime as creation date. */
+        char bp[4096];
+        struct stat st;
+        if (snprintf(bp, sizeof(bp), "%s/%s", s->buckets_dir, e->d_name)
+                < (int)sizeof(bp)
+            && stat(bp, &st) == 0) {
+            l->ctimes[l->n] = (uint64_t)st.st_mtime * 1000;
+        } else {
+            l->ctimes[l->n] = 0;
+        }
+        l->n++;
+    }
+    closedir(d);
+
+    /* Sort names alphabetically. Also sort ctimes in tandem. */
+    /* Simple insertion sort to keep parallel array in sync. */
+    for (size_t i = 1; i < l->n; i++) {
+        char    *kn = l->names[i];
+        uint64_t kt = l->ctimes[i];
+        size_t j = i;
+        while (j > 0 && strcmp(l->names[j-1], kn) > 0) {
+            l->names[j]  = l->names[j-1];
+            l->ctimes[j] = l->ctimes[j-1];
+            j--;
+        }
+        l->names[j]  = kn;
+        l->ctimes[j] = kt;
+    }
+
+    *out = l;
+    return S3_OK;
+}
+
+s3_err_t store_list_buckets_next(s3_bucket_lister_t *l, s3_str_t *name_out,
+                                  uint64_t *ctime_ms_out) {
+    if (!l || !name_out) return S3_ERR_INVALID_ARGUMENT;
+    if (l->cursor >= l->n) return S3_ERR_NO_SUCH_KEY;
+    name_out->p = l->names[l->cursor];
+    name_out->n = strlen(l->names[l->cursor]);
+    if (ctime_ms_out) *ctime_ms_out = l->ctimes[l->cursor];
+    l->cursor++;
+    return S3_OK;
+}
+
+void store_list_buckets_close(s3_bucket_lister_t *l) {
+    if (!l) return;
+    for (size_t i = 0; i < l->n; i++) free(l->names[i]);
+    free(l->names);
+    free(l->ctimes);
+    free(l);
+}
+
+/* ===================================================================== */
+/* Multipart upload listing                                               */
+/* ===================================================================== */
+
+struct s3_mpu_lister {
+    struct mpu_lister_entry {
+        char     upload_id[S3_MULTIPART_UPLOAD_ID_LEN + 1];
+        char    *key;
+        size_t   key_n;
+        uint64_t ctime_ms;
+    }      *entries;
+    size_t  n;
+    size_t  cursor;
+};
+
+s3_err_t store_mpu_list_begin(s3_store_t *s, s3_str_t bucket,
+                               s3_mpu_lister_t **out) {
+    if (!s || !out) return S3_ERR_INVALID_ARGUMENT;
+    if (!valid_bucket_name(bucket)) return S3_ERR_INVALID_BUCKET_NAME;
+    if (!store_bucket_exists(s, bucket)) return S3_ERR_NO_SUCH_BUCKET;
+
+    s3_mpu_lister_t *l = calloc(1, sizeof(*l));
+    if (!l) return S3_ERR_INTERNAL;
+
+    char mpu_bucket_dir[4096];
+    if (snprintf(mpu_bucket_dir, sizeof(mpu_bucket_dir),
+                 "%s/" S3_STR_FMT, s->mpu_dir, S3_STR_ARG(bucket))
+            >= (int)sizeof(mpu_bucket_dir)) {
+        free(l);
+        return S3_ERR_INTERNAL;
+    }
+
+    DIR *d = opendir(mpu_bucket_dir);
+    if (!d) {
+        /* No uploads yet — return empty lister. */
+        *out = l;
+        return S3_OK;
+    }
+
+    size_t cap = 0;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        if (e->d_name[0] == '.') continue;
+        /* Each subdir name should be a 32-char hex upload_id. */
+        size_t id_len = strlen(e->d_name);
+        if (id_len != S3_MULTIPART_UPLOAD_ID_LEN) continue;
+
+        char meta_path[4096];
+        if (snprintf(meta_path, sizeof(meta_path), "%s/%s/meta",
+                     mpu_bucket_dir, e->d_name) >= (int)sizeof(meta_path))
+            continue;
+
+        /* Parse the meta file. */
+        FILE *fp = fopen(meta_path, "r");
+        if (!fp) continue;
+
+        char *key = NULL;
+        size_t key_n = 0;
+        uint64_t ctime_ms = 0;
+        char *line = NULL;
+        size_t line_cap = 0;
+        ssize_t r;
+        while ((r = getline(&line, &line_cap, fp)) > 0) {
+            if (line[r-1] == '\n') { line[r-1] = '\0'; r--; }
+            if (strncmp(line, "key=", 4) == 0) {
+                free(key);
+                key = strdup(line + 4);
+                key_n = (size_t)r - 4;
+            } else if (strncmp(line, "ctime_ms=", 9) == 0) {
+                ctime_ms = (uint64_t)strtoull(line + 9, NULL, 10);
+            }
+        }
+        free(line);
+        fclose(fp);
+
+        if (!key) continue;  /* malformed meta, skip */
+
+        if (l->n == cap) {
+            size_t nc = cap ? cap * 2 : 8;
+            struct mpu_lister_entry *ne = realloc(l->entries,
+                                                   nc * sizeof(*ne));
+            if (!ne) { free(key); continue; }
+            l->entries = ne;
+            cap = nc;
+        }
+
+        struct mpu_lister_entry *ent = &l->entries[l->n];
+        memcpy(ent->upload_id, e->d_name, S3_MULTIPART_UPLOAD_ID_LEN + 1);
+        ent->key = key;
+        ent->key_n = key_n;
+        ent->ctime_ms = ctime_ms;
+        l->n++;
+    }
+    closedir(d);
+
+    /* Sort by upload_id (simple insertion sort, n is small). */
+    for (size_t i = 1; i < l->n; i++) {
+        struct mpu_lister_entry tmp = l->entries[i];
+        size_t j = i;
+        while (j > 0 && strcmp(l->entries[j-1].upload_id,
+                                tmp.upload_id) > 0) {
+            l->entries[j] = l->entries[j-1];
+            j--;
+        }
+        l->entries[j] = tmp;
+    }
+
+    *out = l;
+    return S3_OK;
+}
+
+s3_err_t store_mpu_list_next(s3_mpu_lister_t *l, s3_mpu_entry_t *entry_out) {
+    if (!l || !entry_out) return S3_ERR_INVALID_ARGUMENT;
+    if (l->cursor >= l->n) return S3_ERR_NO_SUCH_KEY;
+    struct mpu_lister_entry *ent = &l->entries[l->cursor++];
+    entry_out->upload_id = ent->upload_id;
+    entry_out->key       = ent->key;
+    entry_out->key_n     = ent->key_n;
+    entry_out->ctime_ms  = ent->ctime_ms;
+    return S3_OK;
+}
+
+void store_mpu_list_close(s3_mpu_lister_t *l) {
+    if (!l) return;
+    for (size_t i = 0; i < l->n; i++) free(l->entries[i].key);
+    free(l->entries);
+    free(l);
+}
+
 /* ===================================================================== */
 /* List (FS-walk implementation; replaced by LMDB in Phase 2.2)          */
 /* ===================================================================== */
@@ -1343,6 +1590,79 @@ s3_err_t store_mpu_abort(s3_store_t *s, s3_str_t bucket, s3_str_t key,
 
     if (rm_rf(dir) < 0) return S3_ERR_INTERNAL;
     return S3_OK;
+}
+
+int store_mpu_gc(s3_store_t *s, uint64_t max_age_secs) {
+    if (!s || max_age_secs == 0) return 0;
+
+    struct timespec now_ts;
+    clock_gettime(CLOCK_REALTIME, &now_ts);
+    uint64_t now_ms = (uint64_t)now_ts.tv_sec * 1000
+                    + (uint64_t)now_ts.tv_nsec / 1000000;
+    uint64_t threshold_ms = max_age_secs * 1000;
+
+    int removed = 0;
+
+    /* Scan ROOT/mpu/<bucket>/<upload_id>/ */
+    DIR *d_top = opendir(s->mpu_dir);
+    if (!d_top) return 0;   /* no uploads at all */
+
+    struct dirent *e_bucket;
+    while ((e_bucket = readdir(d_top)) != NULL) {
+        if (e_bucket->d_name[0] == '.') continue;
+
+        char bucket_dir[4096];
+        if (snprintf(bucket_dir, sizeof(bucket_dir), "%s/%s",
+                     s->mpu_dir, e_bucket->d_name) >= (int)sizeof(bucket_dir))
+            continue;
+
+        DIR *d_bucket = opendir(bucket_dir);
+        if (!d_bucket) continue;
+
+        struct dirent *e_upload;
+        while ((e_upload = readdir(d_bucket)) != NULL) {
+            if (e_upload->d_name[0] == '.') continue;
+            /* Only consider 32-char hex upload IDs. */
+            if (strlen(e_upload->d_name) != S3_MULTIPART_UPLOAD_ID_LEN)
+                continue;
+
+            char meta_path[4096];
+            if (snprintf(meta_path, sizeof(meta_path), "%s/%s/meta",
+                         bucket_dir, e_upload->d_name)
+                    >= (int)sizeof(meta_path))
+                continue;
+
+            /* Use the meta file's mtime as initiation time (set on atomic
+             * rename in store_mpu_create; reliable regardless of clock skew
+             * in the meta content). Fall back to parsing ctime_ms if stat
+             * is unavailable. */
+            struct stat st;
+            uint64_t init_ms = 0;
+            if (stat(meta_path, &st) == 0) {
+                init_ms = (uint64_t)st.st_mtime * 1000;
+            } else {
+                continue;   /* meta doesn't exist: not a real upload dir */
+            }
+
+            if (now_ms < init_ms) continue;   /* clock went backwards? skip */
+            if (now_ms - init_ms < threshold_ms) continue;
+
+            /* Stale — remove the whole upload dir. */
+            char upload_dir[4096];
+            if (snprintf(upload_dir, sizeof(upload_dir), "%s/%s",
+                         bucket_dir, e_upload->d_name)
+                    >= (int)sizeof(upload_dir))
+                continue;
+
+            LOG_I("mpu gc: removing stale upload %s/%s (age %llus)",
+                  e_bucket->d_name, e_upload->d_name,
+                  (unsigned long long)((now_ms - init_ms) / 1000));
+            if (rm_rf(upload_dir) == 0) removed++;
+        }
+        closedir(d_bucket);
+    }
+    closedir(d_top);
+    return removed;
 }
 
 /* Concatenate the part files into a single object file under data/.

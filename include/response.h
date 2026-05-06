@@ -74,6 +74,29 @@ int rsp_build_s3_error(conn_t *c, s3_err_t err,
 int rsp_build_list_bucket(conn_t *c, s3_str_t bucket,
                           const s3_list_opts_t *opts, s3_lister_t *l);
 
+/* Build a ListAllMyBucketsResult XML body, 200 OK.
+ * The lister is consumed (closed by this function). */
+int rsp_build_list_all_buckets(conn_t *c, s3_bucket_lister_t *l);
+
+/* Build a ListMultipartUploadsResult XML body, 200 OK.
+ * The lister is consumed (closed by this function). */
+int rsp_build_list_mpu(conn_t *c, s3_str_t bucket, s3_mpu_lister_t *l);
+
+/* Build a 206 Partial Content response head for a range GET.
+ * range_start and range_end are inclusive byte offsets (0-based).
+ * total_size is the full object size. The caller streams the body
+ * via the reader path, same as rsp_build_object_head. */
+int rsp_build_object_range(conn_t *c, const s3_obj_meta_t *m,
+                           uint64_t range_start, uint64_t range_end);
+
+/* Build a 416 Range Not Satisfiable response with a Content-Range
+ * header indicating the total object size. */
+int rsp_build_range_not_satisfiable(conn_t *c, uint64_t total_size);
+
+/* Build a 200 OK application/xml response from a NUL-terminated literal.
+ * Used for bucket subresource GET responses whose bodies are static. */
+int rsp_build_xml_200(conn_t *c, const char *body_lit);
+
 /* Build an InitiateMultipartUploadResult XML body, 200 OK. */
 int rsp_build_initiate_mpu(conn_t *c, s3_str_t bucket, s3_str_t key,
                            const char *upload_id);

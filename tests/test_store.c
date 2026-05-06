@@ -783,6 +783,77 @@ static void t_mpu_unknown_upload(void) {
     teardown_root();
 }
 
+static void t_mpu_gc(void) {
+    setup_root();
+    s3_store_t *s;
+    CHECK_EQ(store_open(&s, g_root), S3_OK, "gc: open");
+    store_bucket_create(s, S3_STR_LIT("gbuk"));
+
+    /* Initiate two uploads. */
+    char id1[33], id2[33];
+    CHECK_EQ(store_mpu_create(s, S3_STR_LIT("gbuk"), S3_STR_LIT("k1"),
+                               NULL, id1), S3_OK, "gc: create upload 1");
+    CHECK_EQ(store_mpu_create(s, S3_STR_LIT("gbuk"), S3_STR_LIT("k2"),
+                               NULL, id2), S3_OK, "gc: create upload 2");
+
+    /* GC with age=0 should be disabled — nothing removed. */
+    CHECK_EQ(store_mpu_gc(s, 0), 0, "gc: age=0 removes nothing");
+
+    /* GC with very large age — too young to remove. */
+    CHECK_EQ(store_mpu_gc(s, 999999), 0, "gc: not yet stale");
+
+    /* Wait 2 seconds, then GC with age=1 — both should be removed. */
+    sleep(2);
+    int removed = store_mpu_gc(s, 1);
+    CHECK_EQ(removed, 2, "gc: removes 2 stale uploads after 2s");
+
+    /* Verify they're gone from the lister. */
+    s3_mpu_lister_t *l;
+    CHECK_EQ(store_mpu_list_begin(s, S3_STR_LIT("gbuk"), &l),
+             S3_OK, "gc: list after gc ok");
+    s3_mpu_entry_t ent;
+    CHECK(store_mpu_list_next(l, &ent) == S3_ERR_NO_SUCH_KEY,
+          "gc: no uploads remain");
+    store_mpu_list_close(l);
+
+    store_close(s);
+    teardown_root();
+}
+
+static void t_list_all_buckets(void) {
+    setup_root();
+    s3_store_t *s;
+    CHECK_EQ(store_open(&s, g_root), S3_OK, "lab: open");
+
+    /* Empty store — lister should return immediately. */
+    s3_bucket_lister_t *l;
+    CHECK_EQ(store_list_buckets_begin(s, &l), S3_OK, "lab: begin empty");
+    s3_str_t name; uint64_t ct = 0;
+    CHECK(store_list_buckets_next(l, &name, &ct) == S3_ERR_NO_SUCH_KEY,
+          "lab: empty lister exhausted");
+    store_list_buckets_close(l);
+
+    /* Create three buckets in non-alphabetical order. */
+    store_bucket_create(s, S3_STR_LIT("zeta"));
+    store_bucket_create(s, S3_STR_LIT("alpha"));
+    store_bucket_create(s, S3_STR_LIT("beta"));
+
+    CHECK_EQ(store_list_buckets_begin(s, &l), S3_OK, "lab: begin 3");
+    /* Should come back in alphabetical order. */
+    CHECK_EQ(store_list_buckets_next(l, &name, &ct), S3_OK, "lab: next 1");
+    CHECK(name.n == 5 && memcmp(name.p, "alpha", 5) == 0, "lab: first=alpha");
+    CHECK_EQ(store_list_buckets_next(l, &name, &ct), S3_OK, "lab: next 2");
+    CHECK(name.n == 4 && memcmp(name.p, "beta", 4) == 0, "lab: second=beta");
+    CHECK_EQ(store_list_buckets_next(l, &name, &ct), S3_OK, "lab: next 3");
+    CHECK(name.n == 4 && memcmp(name.p, "zeta", 4) == 0, "lab: third=zeta");
+    CHECK(store_list_buckets_next(l, &name, &ct) == S3_ERR_NO_SUCH_KEY,
+          "lab: exhausted after 3");
+    store_list_buckets_close(l);
+
+    store_close(s);
+    teardown_root();
+}
+
 /* ---- Main --------------------------------------------------------- */
 
 int main(void) {
@@ -809,6 +880,8 @@ int main(void) {
     t_mpu_abort();
     t_mpu_invalid_part_list();
     t_mpu_unknown_upload();
+    t_mpu_gc();
+    t_list_all_buckets();
 
     if (failures == 0) { printf("ALL TESTS PASSED\n"); return 0; }
     printf("%d FAILURES\n", failures);

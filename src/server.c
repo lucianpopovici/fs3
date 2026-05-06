@@ -14,6 +14,8 @@
 #include "log.h"
 #include "store.h"
 
+#include <time.h>
+
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -98,6 +100,12 @@ server_t *server_create(const server_cfg_t *cfg) {
         goto fail;
     }
     LOG_I("store opened at %s", cfg->data_root);
+
+    /* Initial GC sweep on startup to clean up leftovers from previous runs. */
+    if (cfg->mpu_gc_age_secs > 0) {
+        int n = store_mpu_gc(s->store, cfg->mpu_gc_age_secs);
+        if (n > 0) LOG_I("mpu gc: removed %d stale upload(s) at startup", n);
+    }
 
     s->listen_fd = listen_socket(cfg->bind_addr, cfg->port, cfg->backlog);
     if (s->listen_fd < 0) goto fail;
@@ -221,8 +229,11 @@ static void accept_new(server_t *s) {
     }
 }
 
+#define GC_INTERVAL_SECS 60
+
 int server_run(server_t *s) {
     struct epoll_event events[MAX_EVENTS];
+    time_t last_gc = time(NULL);
 
     while (!s->stop) {
         int n = epoll_wait(s->epoll_fd, events, MAX_EVENTS, 1000);
@@ -230,6 +241,17 @@ int server_run(server_t *s) {
             if (errno == EINTR) continue;
             LOG_E("epoll_wait: %s", strerror(errno));
             return -1;
+        }
+
+        /* Periodic GC sweep (runs at most once per GC_INTERVAL_SECS). */
+        if (s->cfg.mpu_gc_age_secs > 0) {
+            time_t now = time(NULL);
+            if (now - last_gc >= GC_INTERVAL_SECS) {
+                last_gc = now;
+                int nr = store_mpu_gc(s->store, s->cfg.mpu_gc_age_secs);
+                if (nr > 0)
+                    LOG_I("mpu gc: removed %d stale upload(s)", nr);
+            }
         }
 
         for (int i = 0; i < n; i++) {

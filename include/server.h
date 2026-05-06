@@ -18,6 +18,10 @@ typedef struct {
      * without an Authorization header are accepted (0) or rejected (1). */
     struct sigv4_verifier *auth;
     int                    auth_required;
+
+    /* Multipart upload GC. Uploads older than this many seconds are
+     * removed by a periodic sweep. 0 = disabled (default). */
+    uint64_t mpu_gc_age_secs;
 } server_cfg_t;
 
 server_t *server_create(const server_cfg_t *cfg);

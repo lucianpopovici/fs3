@@ -6,6 +6,7 @@
 
 #include <getopt.h>
 #include <signal.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -25,6 +26,9 @@ static void usage(const char *argv0) {
         "  -d, --data <dir>         object store root (default /tmp/fs3-data)\n"
         "      --auth <ak:sk>       add a SigV4 credential (repeatable)\n"
         "      --require-auth       reject requests without an Authorization header\n"
+        "      --mpu-gc-age <secs>  remove abandoned multipart uploads older than\n"
+        "                           this many seconds (0 = disabled, default 0;\n"
+        "                           604800 = 7 days is a reasonable production value)\n"
         "  -v, --verbose            debug logging\n"
         "  -h, --help               this help\n",
         argv0);
@@ -54,6 +58,7 @@ static int parse_and_add_cred(sigv4_verifier_t *v, const char *spec) {
 enum {
     OPT_AUTH = 256,
     OPT_REQUIRE_AUTH,
+    OPT_MPU_GC_AGE,
 };
 
 int main(int argc, char **argv) {
@@ -62,6 +67,7 @@ int main(int argc, char **argv) {
     int port = 9000;
     int verbose = 0;
     int require_auth = 0;
+    uint64_t mpu_gc_age_secs = 0;
     sigv4_verifier_t *auth = NULL;
 
     static struct option opts[] = {
@@ -70,6 +76,7 @@ int main(int argc, char **argv) {
         { "data",         required_argument, NULL, 'd' },
         { "auth",         required_argument, NULL, OPT_AUTH },
         { "require-auth", no_argument,       NULL, OPT_REQUIRE_AUTH },
+        { "mpu-gc-age",   required_argument, NULL, OPT_MPU_GC_AGE },
         { "verbose",      no_argument,       NULL, 'v' },
         { "help",         no_argument,       NULL, 'h' },
         { 0 },
@@ -99,6 +106,9 @@ int main(int argc, char **argv) {
             case OPT_REQUIRE_AUTH:
                 require_auth = 1;
                 break;
+            case OPT_MPU_GC_AGE:
+                mpu_gc_age_secs = (uint64_t)strtoull(optarg, NULL, 10);
+                break;
             default:  usage(argv[0]); return 2;
         }
     }
@@ -119,13 +129,14 @@ int main(int argc, char **argv) {
     sigaction(SIGTERM, &sa, NULL);
 
     server_cfg_t cfg = {
-        .bind_addr = addr,
-        .port      = (uint16_t)port,
-        .backlog   = 1024,
-        .max_conns = 4096,
-        .data_root = data_root,
-        .auth      = auth,
-        .auth_required = require_auth,
+        .bind_addr        = addr,
+        .port             = (uint16_t)port,
+        .backlog          = 1024,
+        .max_conns        = 4096,
+        .data_root        = data_root,
+        .auth             = auth,
+        .auth_required    = require_auth,
+        .mpu_gc_age_secs  = mpu_gc_age_secs,
     };
 
     g_server = server_create(&cfg);

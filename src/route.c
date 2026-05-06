@@ -1,17 +1,18 @@
 /* src/route.c — request dispatcher and per-method handlers
  *
  * Path shape determines handler family:
- *   /                                 → service ops (list buckets — TODO)
+ *   /                                 → service ops (ListAllMyBuckets)
  *   /<bucket>                         → bucket ops (create/delete/list)
  *   /<bucket>/<key...>                → object ops (PUT/GET/HEAD/DELETE)
  *
  * Query string matters for some bucket ops:
- *   GET /<bucket>?location            → location subresource (TODO)
  *   GET /<bucket>?list-type=2&...     → ListObjectsV2 (treated as list)
  *   GET /<bucket>?prefix=&delimiter=  → ListObjectsV1
+ *   GET /<bucket>?uploads             → ListMultipartUploads
  *
- * For simplicity right now we treat any GET on /<bucket> (with or
- * without query) as a list. Full subresource handling lands in 3.1.
+ * Subresources like ?location, ?versioning, ?lifecycle, ?cors are not
+ * yet implemented; a GET on /<bucket> with an unrecognized query is
+ * treated as a list.
  */
 
 #include "route.h"
@@ -166,6 +167,14 @@ static char *scratch_alloc(conn_t *c, size_t n) {
 
 static void scratch_reset(conn_t *c) { c->req_scratch_used = 0; }
 
+/* Returns 1 if the query string contains a key matching `name` exactly
+ * (with or without a value). Used for subresource detection. */
+static int query_has_key(s3_str_t query, const char *name) {
+    char buf[2];
+    s3_str_t dummy;
+    return query_param(query, name, buf, sizeof(buf), &dummy);
+}
+
 /* ===================================================================== */
 /* Service-level (PATH = "/")                                            */
 /* ===================================================================== */
@@ -176,8 +185,176 @@ static int handle_service(conn_t *c) {
         return rsp_build_s3_error(c, S3_ERR_METHOD_NOT_ALLOWED,
                                   S3_STR_LIT("/"), NULL);
     }
-    /* TODO: ListAllMyBuckets. For now: 501. */
-    return rsp_build_s3_error(c, S3_ERR_NOT_IMPLEMENTED, S3_STR_LIT("/"), NULL);
+    /* ListAllMyBuckets */
+    s3_bucket_lister_t *l;
+    s3_err_t e = store_list_buckets_begin(c->store, &l);
+    if (e != S3_OK) return rsp_build_s3_error(c, e, S3_STR_LIT("/"), NULL);
+    return rsp_build_list_all_buckets(c, l);
+}
+
+/* ===================================================================== */
+/* Bucket subresource handlers                                            */
+/* ===================================================================== */
+
+/* Subresource key names recognised at the bucket level.
+ * "uploads" is intentionally absent — it is handled separately in
+ * handle_bucket as a GET-only operation. */
+static const char * const BUCKET_SUBRESOURCES[] = {
+    "location", "versioning", "acl", "logging", "notification",
+    "requestPayment", "tagging",
+    "lifecycle", "cors", "policy", "encryption", "website",
+    "object-lock", "replication",
+    NULL
+};
+
+/* Return the first recognised subresource key present in the query string,
+ * or NULL if none found. */
+static const char *detect_bucket_subresource(s3_str_t query) {
+    if (query.n == 0) return NULL;
+    for (int i = 0; BUCKET_SUBRESOURCES[i]; i++) {
+        if (query_has_key(query, BUCKET_SUBRESOURCES[i]))
+            return BUCKET_SUBRESOURCES[i];
+    }
+    return NULL;
+}
+
+static int handle_bucket_subresource(conn_t *c, s3_str_t bucket,
+                                      const char *sub) {
+    /* All subresource operations require the bucket to exist. */
+    if (!store_bucket_exists(c->store, bucket)) {
+        return rsp_build_s3_error(c, S3_ERR_NO_SUCH_BUCKET,
+                                  c->req.path, NULL);
+    }
+
+    /* HEAD — just confirm reachability; no body. */
+    if (method_is(c, "HEAD")) {
+        return rsp_build_status(c, 200, "OK");
+    }
+
+    /* PUT — accept and silently discard the body for all subresources.
+     * The body bytes will be drained by route_dispatch_body and ignored
+     * (no put_writer, no req_body_buf). */
+    if (method_is(c, "PUT")) {
+        return rsp_build_status(c, 200, "OK");
+    }
+
+    /* DELETE — succeed for the subset that S3 allows deletion on. */
+    if (method_is(c, "DELETE")) {
+        if (strcmp(sub, "lifecycle")  == 0 ||
+            strcmp(sub, "cors")       == 0 ||
+            strcmp(sub, "policy")     == 0 ||
+            strcmp(sub, "tagging")    == 0) {
+            return rsp_build_status(c, 204, "No Content");
+        }
+        return rsp_build_s3_error(c, S3_ERR_METHOD_NOT_ALLOWED,
+                                  c->req.path, NULL);
+    }
+
+    if (method_is(c, "GET")) {
+        /* ---- subresources that return a static 200 XML body ---- */
+        if (strcmp(sub, "location") == 0) {
+            /* Empty LocationConstraint means us-east-1 per S3 spec. */
+            return rsp_build_xml_200(c,
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+                "<LocationConstraint"
+                " xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"/>");
+        }
+        if (strcmp(sub, "versioning") == 0) {
+            return rsp_build_xml_200(c,
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+                "<VersioningConfiguration"
+                " xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"/>");
+        }
+        if (strcmp(sub, "acl") == 0) {
+            return rsp_build_xml_200(c,
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+                "<AccessControlPolicy"
+                " xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">"
+                "<Owner>"
+                "<ID>fs3owner</ID>"
+                "<DisplayName>fs3</DisplayName>"
+                "</Owner>"
+                "<AccessControlList>"
+                "<Grant>"
+                "<Grantee"
+                " xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\""
+                " xsi:type=\"CanonicalUser\">"
+                "<ID>fs3owner</ID>"
+                "<DisplayName>fs3</DisplayName>"
+                "</Grantee>"
+                "<Permission>FULL_CONTROL</Permission>"
+                "</Grant>"
+                "</AccessControlList>"
+                "</AccessControlPolicy>");
+        }
+        if (strcmp(sub, "logging") == 0) {
+            return rsp_build_xml_200(c,
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+                "<BucketLoggingStatus"
+                " xmlns=\"http://doc.s3.amazonaws.com/2006-03-01\"/>");
+        }
+        if (strcmp(sub, "notification") == 0) {
+            return rsp_build_xml_200(c,
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+                "<NotificationConfiguration"
+                " xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"/>");
+        }
+        if (strcmp(sub, "requestPayment") == 0) {
+            return rsp_build_xml_200(c,
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+                "<RequestPaymentConfiguration"
+                " xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">"
+                "<Payer>BucketOwner</Payer>"
+                "</RequestPaymentConfiguration>");
+        }
+        if (strcmp(sub, "tagging") == 0) {
+            return rsp_build_xml_200(c,
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+                "<Tagging"
+                " xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">"
+                "<TagSet/>"
+                "</Tagging>");
+        }
+        /* ---- subresources that return 404 ---- */
+        if (strcmp(sub, "lifecycle") == 0) {
+            return rsp_build_s3_error(c,
+                S3_ERR_NO_SUCH_LIFECYCLE_CONFIGURATION,
+                c->req.path, NULL);
+        }
+        if (strcmp(sub, "cors") == 0) {
+            return rsp_build_s3_error(c,
+                S3_ERR_NO_SUCH_CORS_CONFIGURATION,
+                c->req.path, NULL);
+        }
+        if (strcmp(sub, "policy") == 0) {
+            return rsp_build_s3_error(c,
+                S3_ERR_NO_SUCH_BUCKET_POLICY,
+                c->req.path, NULL);
+        }
+        if (strcmp(sub, "encryption") == 0) {
+            return rsp_build_s3_error(c,
+                S3_ERR_SSE_CONFIGURATION_NOT_FOUND,
+                c->req.path, NULL);
+        }
+        if (strcmp(sub, "website") == 0) {
+            return rsp_build_s3_error(c,
+                S3_ERR_NO_SUCH_WEBSITE_CONFIGURATION,
+                c->req.path, NULL);
+        }
+        if (strcmp(sub, "object-lock") == 0) {
+            return rsp_build_s3_error(c,
+                S3_ERR_OBJECT_LOCK_CONFIGURATION_NOT_FOUND,
+                c->req.path, NULL);
+        }
+        if (strcmp(sub, "replication") == 0) {
+            return rsp_build_s3_error(c,
+                S3_ERR_REPLICATION_CONFIGURATION_NOT_FOUND,
+                c->req.path, NULL);
+        }
+    }
+
+    return rsp_build_s3_error(c, S3_ERR_METHOD_NOT_ALLOWED,
+                               c->req.path, NULL);
 }
 
 /* ===================================================================== */
@@ -185,6 +362,11 @@ static int handle_service(conn_t *c) {
 /* ===================================================================== */
 
 static int handle_bucket(conn_t *c, s3_str_t bucket) {
+    /* Subresource dispatch — must come before normal method handling so
+     * that e.g. PUT /bucket?acl doesn't accidentally create a bucket. */
+    const char *sub = detect_bucket_subresource(c->req.query);
+    if (sub) return handle_bucket_subresource(c, bucket, sub);
+
     if (method_is(c, "PUT")) {
         s3_err_t e = store_bucket_create(c->store, bucket);
         if (e == S3_OK) {
@@ -212,6 +394,19 @@ static int handle_bucket(conn_t *c, s3_str_t bucket) {
     }
 
     if (method_is(c, "GET")) {
+        /* GET /bucket?uploads — ListMultipartUploads */
+        if (c->req.query.n > 0) {
+            s3_str_t v_uploads = S3_STR_NULL;
+            char qb[8];
+            if (query_param(c->req.query, "uploads", qb, sizeof(qb), &v_uploads)) {
+                s3_mpu_lister_t *ml;
+                s3_err_t e = store_mpu_list_begin(c->store, bucket, &ml);
+                if (e != S3_OK)
+                    return rsp_build_s3_error(c, e, c->req.path, NULL);
+                return rsp_build_list_mpu(c, bucket, ml);
+            }
+        }
+
         /* List objects. Parse query parameters. */
         s3_list_opts_t opts = { 0 };
         char *qb = scratch_alloc(c, c->req.query.n + 1);
@@ -291,6 +486,69 @@ static int handle_object_put_complete(conn_t *c) {
     return rsp_build_status_with_headers(c, 200, "OK", extra);
 }
 
+/* Parse a simple "bytes=start-end" or "bytes=start-" or "bytes=-suffix"
+ * Range header. Returns 1 and fills start_out and end_out (inclusive, 0-based)
+ * relative to obj_size. Returns 0 if absent or multi-range (caller serves 200).
+ * Returns -1 if the range is syntactically valid but not satisfiable (→ 416). */
+static int parse_range(const conn_t *c, uint64_t obj_size,
+                       uint64_t *start_out, uint64_t *end_out) {
+    const s3_str_t *rv = hdr_get(c, "range");
+    if (!rv) return 0;
+
+    /* Must start with "bytes=" */
+    if (rv->n < 6 || memcmp(rv->p, "bytes=", 6) != 0) return 0;
+    const char *s = rv->p + 6;
+    size_t n = rv->n - 6;
+
+    /* Reject multi-range (contains comma). */
+    if (memchr(s, ',', n)) return 0;
+
+    /* Find the '-'. */
+    const char *dash = memchr(s, '-', n);
+    if (!dash) return 0;
+
+    size_t prefix_n = (size_t)(dash - s);
+    size_t suffix_n = n - prefix_n - 1;
+
+    uint64_t start, end;
+    if (prefix_n == 0) {
+        /* bytes=-N: last N bytes */
+        if (suffix_n == 0) return 0;
+        uint64_t last = 0;
+        for (size_t i = 0; i < suffix_n; i++) {
+            if (s[prefix_n + 1 + i] < '0' || s[prefix_n + 1 + i] > '9') return 0;
+            last = last * 10 + (uint64_t)(s[prefix_n + 1 + i] - '0');
+        }
+        if (last == 0) return -1;
+        start = (last >= obj_size) ? 0 : obj_size - last;
+        end   = obj_size - 1;
+    } else {
+        /* bytes=start-[end] */
+        start = 0;
+        for (size_t i = 0; i < prefix_n; i++) {
+            if (s[i] < '0' || s[i] > '9') return 0;
+            start = start * 10 + (uint64_t)(s[i] - '0');
+        }
+        if (suffix_n == 0) {
+            end = obj_size > 0 ? obj_size - 1 : 0;
+        } else {
+            end = 0;
+            for (size_t i = 0; i < suffix_n; i++) {
+                if (dash[1 + i] < '0' || dash[1 + i] > '9') return 0;
+                end = end * 10 + (uint64_t)(dash[1 + i] - '0');
+            }
+        }
+    }
+
+    if (obj_size == 0 || start >= obj_size) return -1;
+    if (end >= obj_size) end = obj_size - 1;
+    if (start > end) return -1;
+
+    *start_out = start;
+    *end_out   = end;
+    return 1;
+}
+
 static int handle_object_get(conn_t *c, s3_str_t bucket, s3_str_t key,
                              int head_only) {
     s3_reader_t *r;
@@ -299,6 +557,32 @@ static int handle_object_get(conn_t *c, s3_str_t bucket, s3_str_t key,
     if (e != S3_OK) {
         return rsp_build_s3_error(c, e, c->req.path, NULL);
     }
+
+    /* Range request handling (ignored for HEAD — HEAD always returns full meta). */
+    if (!head_only) {
+        uint64_t rs = 0, re = 0;
+        int rc = parse_range(c, m.size, &rs, &re);
+        if (rc == -1) {
+            /* Not satisfiable. */
+            store_get_close(r);
+            return rsp_build_range_not_satisfiable(c, m.size);
+        }
+        if (rc == 1) {
+            /* Valid range. */
+            s3_err_t re2 = store_get_set_range(r, rs, re - rs + 1);
+            if (re2 != S3_OK) {
+                store_get_close(r);
+                return rsp_build_range_not_satisfiable(c, m.size);
+            }
+            if (rsp_build_object_range(c, &m, rs, re) < 0) {
+                store_get_close(r);
+                return -1;
+            }
+            c->get_reader = r;
+            return 0;
+        }
+    }
+
     if (rsp_build_object_head(c, &m, head_only) < 0) {
         store_get_close(r);
         return -1;

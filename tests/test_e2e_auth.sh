@@ -320,6 +320,56 @@ out=$(FS3_AK="$AK" FS3_SK="$SK" python3 "$ROOT/tests/sign_chunked.py" \
 status=$(echo "$out" | head -1)
 check_eq "chunked wrong decoded-len → 403" "$status" "STATUS=403"
 
+# --- trailer-form chunked SigV4 ---
+
+# happy path: trailer-form PUT with x-amz-checksum-sha256 trailer
+out=$(FS3_AK="$AK" FS3_SK="$SK" python3 "$ROOT/tests/sign_chunked.py" \
+        --url "$URL/authbucket/trailer-ok" \
+        --body "Hello, trailer-form streaming SigV4!" \
+        --chunk-size 8 --trailer 2>&1)
+status=$(echo "$out" | head -1)
+check_eq "trailer-form PUT happy path" "$status" "STATUS=200"
+
+# Verify body landed correctly via signed GET
+out=$(sign --method GET --url "$URL/authbucket/trailer-ok" 2>&1)
+if echo "$out" | grep -q "Hello, trailer-form streaming SigV4"; then
+    PASS=$((PASS+1)); printf '.'
+else
+    FAIL=$((FAIL+1)); printf '\nFAIL: trailer-form GET body mismatch\n'
+    echo "$out"
+fi
+
+# tampered x-amz-trailer-signature
+out=$(FS3_AK="$AK" FS3_SK="$SK" python3 "$ROOT/tests/sign_chunked.py" \
+        --url "$URL/authbucket/trailer-bad-sig" \
+        --body "tampered" --chunk-size 4 --trailer --malform trailer-sig 2>&1)
+status=$(echo "$out" | head -1)
+check_eq "trailer-form bad trailer-sig → 403" "$status" "STATUS=403"
+if echo "$out" | grep -q "SignatureDoesNotMatch"; then
+    PASS=$((PASS+1)); printf '.'
+else
+    FAIL=$((FAIL+1)); printf '\nFAIL: trailer-form bad sig body\n'
+fi
+
+# Object must not exist after a failed trailer signature
+out=$(sign --method GET --url "$URL/authbucket/trailer-bad-sig" 2>&1)
+status=$(echo "$out" | head -1)
+check_eq "trailer-form bad sig left no object" "$status" "STATUS=404"
+
+# missing x-amz-trailer-signature line
+out=$(FS3_AK="$AK" FS3_SK="$SK" python3 "$ROOT/tests/sign_chunked.py" \
+        --url "$URL/authbucket/trailer-no-sig" \
+        --body "no sig here" --chunk-size 4 --trailer --malform no-trailer-sig 2>&1)
+status=$(echo "$out" | head -1)
+check_eq "trailer-form missing trailer-sig → 403" "$status" "STATUS=403"
+
+# tampered trailer header value (sig was computed over original)
+out=$(FS3_AK="$AK" FS3_SK="$SK" python3 "$ROOT/tests/sign_chunked.py" \
+        --url "$URL/authbucket/trailer-bad-line" \
+        --body "tampered line" --chunk-size 4 --trailer --malform trailer-line 2>&1)
+status=$(echo "$out" | head -1)
+check_eq "trailer-form tampered trailer value → 403" "$status" "STATUS=403"
+
 echo
 echo "===== auth e2e: $PASS passed, $FAIL failed ====="
 [ "$FAIL" -eq 0 ]

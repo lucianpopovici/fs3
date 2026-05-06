@@ -1,6 +1,6 @@
 # fs3
 
-A single-node S3-compatible object store in C. Phase 3 snapshot.
+A single-node S3-compatible object store in C. Phase 4 snapshot.
 
 ## Status
 
@@ -45,16 +45,20 @@ What's working end-to-end:
   HTTP 400 `XAmzContentSHA256Mismatch`. Closes the gap that would
   otherwise let a malicious client lie about its body bytes.
 
-- **Streaming chunked SigV4** (`STREAMING-AWS4-HMAC-SHA256-PAYLOAD`) —
-  the framing the AWS CLI uses by default for any PUT. Per-chunk
-  signatures are verified against the chained signing key (each
-  chunk's signature feeds into the next chunk's string-to-sign).
-  Bytes are streamed into the store writer only after their chunk
-  signature has been verified, and any chunk-level failure aborts
-  the in-flight PUT before commit. The decoder is a small state
-  machine that handles arbitrarily-split feeds (a CRLF can land
-  across two `on_body` callbacks). Trailer variants
-  (`STREAMING-...-TRAILER`) remain unimplemented.
+- **Streaming chunked SigV4** (`STREAMING-AWS4-HMAC-SHA256-PAYLOAD`
+  and `STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER`) — the framing the
+  AWS CLI uses by default for any PUT. Per-chunk signatures are
+  verified against the chained signing key (each chunk's signature
+  feeds into the next chunk's string-to-sign). Bytes are streamed
+  into the store writer only after their chunk signature has been
+  verified, and any chunk-level failure aborts the in-flight PUT
+  before commit. The decoder is a small state machine that handles
+  arbitrarily-split feeds (a CRLF can land across two `on_body`
+  callbacks). For the trailer form, post-body trailer headers
+  (e.g. `x-amz-checksum-sha256`) are parsed and the
+  `x-amz-trailer-signature` is verified against the canonical-trailer
+  hash chained to the terminator chunk's signature; if the trailer
+  signature fails, the PUT is aborted before commit.
 
 - **Multipart upload** — `POST ?uploads`, `PUT ?partNumber=N&uploadId=ID`,
   `POST ?uploadId=ID` (Complete), `DELETE ?uploadId=ID` (Abort).
@@ -70,18 +74,24 @@ What's working end-to-end:
   and listings return the suffixed ETag. The real AWS CLI
   (`aws s3 cp` of files >8 MB) round-trips byte-for-byte.
 
+- **Service-level `ListAllMyBuckets`** — `GET /` returns a `<ListAllMyBucketsResult>`
+  with all buckets sorted alphabetically, including their creation dates.
+- **`ListMultipartUploads`** — `GET /bucket?uploads` lists all in-progress
+  multipart uploads for a bucket, with key, upload ID, and initiation time.
+- **Multipart upload GC** — `--mpu-gc-age <secs>` enables a periodic sweep
+  (every 60 s) that removes abandoned uploads older than the configured age.
+  Also runs once at startup to clean up leftovers from previous server runs.
+  `604800` (7 days) is a reasonable production value; `0` disables (default).
+- **HTTP `Range:` requests on GET** — `206 Partial Content` responses with
+  `Content-Range:` header. Supports `bytes=start-end`, `bytes=start-`, and
+  `bytes=-suffix` forms. Out-of-range requests return 416 with
+  `Content-Range: bytes */total`.
+
 What's *not* yet wired:
 
-- HTTP `Range:` requests on GET (the AWS CLI doesn't issue ranged
-  GETs by default — verified via `aws s3 cp` of a 16 MB file
-  round-tripping correctly — but explicit `--range` invocations
-  and other clients do need it).
-- Streaming chunked SigV4 with trailers (`STREAMING-...-TRAILER`,
-  used when SDKs send `x-amz-checksum-sha256` after the body).
-- `ListMultipartUploads` (`GET /bucket?uploads`) — listing in-flight
-  multipart uploads. Not needed for the upload→complete happy path.
-- GC sweep for stale multipart uploads.
-- Service-level `ListAllMyBuckets` (`GET /`).
+- The `STREAMING-UNSIGNED-PAYLOAD-TRAILER` variant (standard HTTP
+  chunked + signed trailers, used by some clients when the body itself
+  is unsigned but a checksum trailer is signed).
 - Bucket subresources: location, versioning, lifecycle, CORS, etc.
 
 ## Layout
@@ -110,8 +120,8 @@ fs3/
 │   ├── sigv4.c           SigV4 canonical-request, signing-key, verify
 │   └── store_fs.c        filesystem-backed object store
 ├── tests/
-│   ├── test_e2e.sh       21 HTTP integration tests (no auth)
-│   ├── test_e2e_auth.sh  28 SigV4 e2e tests (with auth, including chunked)
+│   ├── test_e2e.sh       30 HTTP integration tests (no auth)
+│   ├── test_e2e_auth.sh  35 SigV4 e2e tests (with auth, including chunked + trailer)
 │   ├── test_e2e_mpu.sh   19 multipart upload e2e tests
 │   ├── test_sigv4.c      34 SigV4 unit tests + AWS test vectors
 │   ├── test_store.c      21 store-layer tests (incl. multipart)
@@ -127,7 +137,7 @@ fs3/
 ```
 make                # release (-O2)
 make DEBUG=1        # ASan + UBSan
-make test           # build and run all tests (~70 tests + 50k fuzz iters)
+make test           # build and run all tests (~115 tests + 50k fuzz iters)
 make smoketest      # start server briefly, probe with curl
 make clean
 ```
@@ -176,13 +186,13 @@ multipart upload (default >8 MB) round-trips byte-for-byte against fs3.
 
 | target                   | what it covers                                                |
 |--------------------------|---------------------------------------------------------------|
-| `tests/test_store`       | bucket CRUD, streaming PUT/GET, sendfile, listing, persistence, multipart lifecycle |
+| `tests/test_store`       | bucket CRUD, streaming PUT/GET, sendfile, listing, persistence, multipart lifecycle, GC sweep, ListAllMyBuckets |
 | `tests/test_xml`         | XML library: escaping, parsing, security limits, round-trips  |
 | `tests/test_xml_legacy`  | original calling style still works                            |
 | `tests/test_xml_fuzz`    | 50,000 random byte inputs into `parse_xml`, must not crash    |
 | `tests/test_sigv4`       | 34 SigV4 tests: primitives, full verifier against botocore-generated test vectors, body-hash streaming verification |
-| `tests/test_e2e.sh`      | 21 HTTP integration tests (auth disabled)                     |
-| `tests/test_e2e_auth.sh` | 28 SigV4 integration tests (botocore-signed requests, body-hash mismatch detection, streaming chunked SigV4 with happy path + 4 failure modes) |
+| `tests/test_e2e.sh`      | 30 HTTP integration tests (auth disabled, incl. Range, ListBuckets, ListMPU) |
+| `tests/test_e2e_auth.sh` | 35 SigV4 integration tests (botocore-signed requests, body-hash mismatch detection, streaming chunked SigV4 with happy path + failure modes, plus trailer-form happy path + 4 failure modes) |
 | `tests/test_e2e_mpu.sh`  | 19 multipart upload e2e tests (full lifecycle, abort, missing parts, malformed XML, large multipart) |
 
 The HTTP e2e suite covers: bucket create / duplicate / invalid name,
@@ -205,18 +215,8 @@ UBSan) builds with zero warnings, leaks, or sanitizer findings.
 
 The natural next pieces, in rough order:
 
-1. **Service-level operations**: `ListAllMyBuckets` on `GET /`. The
-   AWS CLI's `aws s3 ls` (no bucket) currently fails with
-   `NotImplemented` from this server.
-2. **`ListMultipartUploads`** (`GET /bucket?uploads`) — list active
-   multipart uploads. Plus a GC sweep for stale uploads — abandoned
-   uploads currently leak their staging dirs under `<root>/mpu/`
-   until manually cleaned.
-3. **HTTP `Range:` requests on GET** — `206 Partial Content` with
-   `Content-Range:`. The AWS CLI doesn't use ranged GETs by default
-   (verified empirically with 16 MB downloads), but explicit
-   `--range` invocations and other clients (e.g. video players,
-   `dd skip=`) do.
-4. **Bucket subresources**: location, versioning, lifecycle, CORS, etc.
-5. **SigV4 trailer variants** (`STREAMING-...-TRAILER`, used when
-   AWS SDKs send checksums after the body).
+1. **Bucket subresources**: location, versioning, lifecycle, CORS, etc.
+2. **`STREAMING-UNSIGNED-PAYLOAD-TRAILER`** — closes the remaining
+   chunked-SigV4 gap (the variant where chunks are unsigned but the
+   trailer is, used by some clients with unsigned bodies and a signed
+   checksum trailer).

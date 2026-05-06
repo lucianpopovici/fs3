@@ -79,6 +79,11 @@ ssize_t  store_get_read(s3_reader_t *r, void *buf, size_t n);
 ssize_t  store_get_sendfile(s3_reader_t *r, int out_fd, size_t max);
 void     store_get_close(s3_reader_t *r);
 
+/* Restrict the reader to a byte range [offset, offset+length) within the
+ * object body. Must be called after store_get_open(), before the first
+ * read/sendfile. Returns S3_ERR_INVALID_RANGE if offset >= object size. */
+s3_err_t store_get_set_range(s3_reader_t *r, uint64_t offset, uint64_t length);
+
 /* ---- HEAD / DELETE ---- */
 
 s3_err_t store_head(s3_store_t *s, s3_str_t bucket, s3_str_t key,
@@ -145,6 +150,48 @@ s3_err_t store_mpu_complete(s3_store_t *s, s3_str_t bucket, s3_str_t key,
 /* Abort: remove the staging dir and all part files. */
 s3_err_t store_mpu_abort(s3_store_t *s, s3_str_t bucket, s3_str_t key,
                          const char *upload_id);
+
+/* GC sweep: scan all uploads across all buckets. Remove any whose
+ * initiation time is older than `max_age_secs` seconds ago.
+ * max_age_secs == 0 disables the sweep (returns 0 immediately).
+ * Returns the number of uploads removed, or -1 on a fatal error. */
+int store_mpu_gc(s3_store_t *s, uint64_t max_age_secs);
+
+/* ---- Bucket listing ----
+ *
+ * Lists all buckets, sorted alphabetically. Each call to
+ * store_list_buckets_next() returns the next bucket name and its
+ * creation time (derived from the bucket directory mtime). Returns
+ * S3_ERR_NO_SUCH_KEY when exhausted. The returned name span points
+ * into lister-owned storage, valid until the next call or close. */
+
+typedef struct s3_bucket_lister s3_bucket_lister_t;
+
+s3_err_t store_list_buckets_begin(s3_store_t *s, s3_bucket_lister_t **out);
+s3_err_t store_list_buckets_next(s3_bucket_lister_t *l, s3_str_t *name_out,
+                                  uint64_t *ctime_ms_out);
+void     store_list_buckets_close(s3_bucket_lister_t *l);
+
+/* ---- Multipart upload listing ----
+ *
+ * Lists all in-progress multipart uploads for a bucket, sorted by
+ * upload_id. store_mpu_list_next() fills an s3_mpu_entry_t whose string
+ * fields point into lister-owned storage (valid until next call or close).
+ * Returns S3_ERR_NO_SUCH_KEY when exhausted. */
+
+typedef struct s3_mpu_lister s3_mpu_lister_t;
+
+typedef struct {
+    const char *upload_id; /* 32 hex chars + NUL, lister-owned */
+    const char *key;       /* NUL-terminated, lister-owned */
+    size_t      key_n;
+    uint64_t    ctime_ms;
+} s3_mpu_entry_t;
+
+s3_err_t store_mpu_list_begin(s3_store_t *s, s3_str_t bucket,
+                               s3_mpu_lister_t **out);
+s3_err_t store_mpu_list_next(s3_mpu_lister_t *l, s3_mpu_entry_t *entry_out);
+void     store_mpu_list_close(s3_mpu_lister_t *l);
 
 /* ---- List ----
  *

@@ -32,7 +32,15 @@ typedef enum {
     S3_ERR_BAD_DIGEST,                  /* x-amz-content-sha256 mismatch */
     S3_ERR_INVALID_PART,                /* multipart: bad part list */
     S3_ERR_MALFORMED_XML,               /* XML body could not be parsed */
-    S3_ERR_MAX
+    S3_ERR_INVALID_RANGE,               /* Range header not satisfiable → 416 */
+    /* Bucket subresource 404s */
+    S3_ERR_NO_SUCH_LIFECYCLE_CONFIGURATION,
+    S3_ERR_NO_SUCH_CORS_CONFIGURATION,
+    S3_ERR_NO_SUCH_BUCKET_POLICY,
+    S3_ERR_SSE_CONFIGURATION_NOT_FOUND,
+    S3_ERR_NO_SUCH_WEBSITE_CONFIGURATION,
+    S3_ERR_OBJECT_LOCK_CONFIGURATION_NOT_FOUND,
+    S3_ERR_REPLICATION_CONFIGURATION_NOT_FOUND,
 } s3_err_t;
 
 /* ---- Bounded string view (NOT null-terminated) -------------------------- */
