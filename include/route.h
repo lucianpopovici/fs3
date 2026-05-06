@@ -32,4 +32,8 @@ int route_dispatch_complete(conn_t *c);
  *         -1 on error. */
 int route_dispatch_send_body(conn_t *c);
 
+/* Build an S3 error response for the current request (used by the auth
+ * hook to short-circuit dispatch). Returns 0 on success, -1 on error. */
+int route_build_error(conn_t *c, s3_err_t err);
+
 #endif

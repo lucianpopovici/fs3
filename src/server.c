@@ -196,7 +196,8 @@ static void accept_new(server_t *s) {
         size_t pl = strlen(peer);
         snprintf(peer + pl, sizeof(peer) - pl, ":%u", ntohs(sa.sin_port));
 
-        conn_t *c = conn_create(fd, peer, s->store);
+        conn_t *c = conn_create(fd, peer, s->store,
+                                s->cfg.auth, s->cfg.auth_required);
         if (!c) {
             LOG_E("conn_create OOM");
             close(fd);

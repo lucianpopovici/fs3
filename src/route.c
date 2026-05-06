@@ -321,6 +321,238 @@ static int handle_object_delete(conn_t *c, s3_str_t bucket, s3_str_t key) {
 }
 
 /* ===================================================================== */
+/* Multipart upload handlers                                              */
+/* ===================================================================== */
+
+/* POST /bucket/key?uploads — generate an upload ID and return
+ * <InitiateMultipartUploadResult>. */
+static int handle_mpu_initiate(conn_t *c, s3_str_t bucket, s3_str_t key) {
+    const s3_str_t *ct_hdr = hdr_get(c, "content-type");
+    char ct_buf[128] = {0};
+    if (ct_hdr) {
+        size_t n = ct_hdr->n;
+        if (n >= sizeof(ct_buf)) n = sizeof(ct_buf) - 1;
+        memcpy(ct_buf, ct_hdr->p, n);
+    }
+
+    char upload_id[33];
+    s3_err_t e = store_mpu_create(c->store, bucket, key,
+                                   ct_hdr ? ct_buf : NULL, upload_id);
+    if (e != S3_OK) {
+        return rsp_build_s3_error(c, e, c->req.path, NULL);
+    }
+    return rsp_build_initiate_mpu(c, bucket, key, upload_id);
+}
+
+/* PUT /bucket/key?partNumber=N&uploadId=ID — open a part writer.
+ * Body streams via cb_on_body. The matching commit happens in
+ * handle_mpu_part_complete from route_dispatch_complete. */
+static int handle_mpu_upload_part_begin(conn_t *c, s3_str_t bucket, s3_str_t key,
+                                         int part_number, const char *upload_id) {
+    s3_writer_t *w;
+    s3_err_t e = store_mpu_part_begin(c->store, bucket, key,
+                                       upload_id, part_number, &w);
+    if (e != S3_OK) {
+        return rsp_build_s3_error(c, e, c->req.path, NULL);
+    }
+    c->put_writer = w;
+    c->mpu_is_part_upload = 1;
+    return 0;
+}
+
+/* Commit the in-flight part; build a 200 with ETag header. Called from
+ * route_dispatch_complete for an active part-upload writer. */
+static int handle_mpu_part_complete(conn_t *c) {
+    if (!c->put_writer) return -1;
+    char etag_hex[33];
+    s3_err_t e = store_mpu_part_commit(c->put_writer, etag_hex);
+    c->put_writer = NULL;
+    if (e != S3_OK) {
+        return rsp_build_s3_error(c, e, c->req.path, NULL);
+    }
+    char extra[80];
+    snprintf(extra, sizeof(extra), "ETag: \"%s\"\r\n", etag_hex);
+    return rsp_build_status_with_headers(c, 200, "OK", extra);
+}
+
+/* POST /bucket/key?uploadId=ID — complete. The XML body lists the parts.
+ * We allocate a 1 MiB body buffer; cb_on_body fills it; the actual
+ * completion happens in handle_mpu_complete_finish. */
+#define MPU_COMPLETE_BODY_CAP (1024 * 1024)
+
+static int handle_mpu_complete_begin(conn_t *c) {
+    /* Allocate buffer to receive the XML body. */
+    free(c->req_body_buf);
+    c->req_body_buf = malloc(MPU_COMPLETE_BODY_CAP);
+    if (!c->req_body_buf) {
+        return rsp_build_s3_error(c, S3_ERR_INTERNAL, c->req.path, NULL);
+    }
+    c->req_body_len = 0;
+    c->req_body_cap = MPU_COMPLETE_BODY_CAP;
+    return 0;
+}
+
+/* Parse one <Part>...<PartNumber>N</PartNumber><ETag>"hex"</ETag>...</Part>
+ * out of the body. Returns the byte offset just after the closing </Part>,
+ * or -1 if no further <Part> found, or -2 on malformed input. Fills `out`
+ * with the parsed values when found. */
+static long parse_one_part(const char *body, size_t n, size_t start,
+                            s3_part_ref_t *out) {
+    /* Find next "<Part>" — but not "<Parts>" (used in some clients) or
+     * any other tag starting with "Part". Easiest: scan for "<Part>". */
+    static const char open_tag[] = "<Part>";
+    static const char close_tag[] = "</Part>";
+    const char *p = memmem(body + start, n - start, open_tag, sizeof(open_tag) - 1);
+    if (!p) return -1;
+    size_t inner_start = (size_t)(p - body) + sizeof(open_tag) - 1;
+    const char *q = memmem(body + inner_start, n - inner_start,
+                           close_tag, sizeof(close_tag) - 1);
+    if (!q) return -2;
+    size_t inner_end = (size_t)(q - body);
+    /* Now within [inner_start, inner_end), find PartNumber and ETag. */
+    /* Look for <PartNumber>...</PartNumber> */
+    static const char pn_open[] = "<PartNumber>";
+    static const char pn_close[] = "</PartNumber>";
+    const char *pn_p = memmem(body + inner_start, inner_end - inner_start,
+                              pn_open, sizeof(pn_open) - 1);
+    if (!pn_p) return -2;
+    size_t pn_v0 = (size_t)(pn_p - body) + sizeof(pn_open) - 1;
+    const char *pn_q = memmem(body + pn_v0, inner_end - pn_v0,
+                              pn_close, sizeof(pn_close) - 1);
+    if (!pn_q) return -2;
+    size_t pn_vn = (size_t)(pn_q - body) - pn_v0;
+    /* Parse decimal */
+    int part_number = 0;
+    for (size_t i = 0; i < pn_vn; i++) {
+        char ch = body[pn_v0 + i];
+        if (ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r') continue;
+        if (ch < '0' || ch > '9') return -2;
+        part_number = part_number * 10 + (ch - '0');
+        if (part_number > 10000) return -2;
+    }
+    if (part_number < 1) return -2;
+
+    /* ETag — value is wrapped in quotes by S3 convention, but be tolerant. */
+    static const char et_open[] = "<ETag>";
+    static const char et_close[] = "</ETag>";
+    const char *et_p = memmem(body + inner_start, inner_end - inner_start,
+                              et_open, sizeof(et_open) - 1);
+    if (!et_p) return -2;
+    size_t et_v0 = (size_t)(et_p - body) + sizeof(et_open) - 1;
+    const char *et_q = memmem(body + et_v0, inner_end - et_v0,
+                              et_close, sizeof(et_close) - 1);
+    if (!et_q) return -2;
+    size_t et_vn = (size_t)(et_q - body) - et_v0;
+    /* Strip surrounding quotes/whitespace */
+    while (et_vn > 0 && (body[et_v0] == '"' || body[et_v0] == ' '
+                         || body[et_v0] == '\t' || body[et_v0] == '\n'
+                         || body[et_v0] == '\r' || body[et_v0] == '&')) {
+        /* '&' would be the start of "&quot;" — skip the whole entity. */
+        if (body[et_v0] == '&') {
+            const char *amp_end = memchr(body + et_v0, ';', et_vn);
+            if (!amp_end) return -2;
+            size_t adv = (size_t)(amp_end - (body + et_v0)) + 1;
+            if (adv > et_vn) return -2;
+            et_v0 += adv; et_vn -= adv;
+            continue;
+        }
+        et_v0++; et_vn--;
+    }
+    while (et_vn > 0 && (body[et_v0 + et_vn - 1] == '"'
+                         || body[et_v0 + et_vn - 1] == ' '
+                         || body[et_v0 + et_vn - 1] == '\t'
+                         || body[et_v0 + et_vn - 1] == '\n'
+                         || body[et_v0 + et_vn - 1] == '\r'
+                         || body[et_v0 + et_vn - 1] == ';')) {
+        /* Trailing ";" might come from "&quot;" — strip the whole entity. */
+        if (body[et_v0 + et_vn - 1] == ';') {
+            const char *semi = body + et_v0 + et_vn - 1;
+            const char *amp = memrchr(body + et_v0, '&', et_vn);
+            if (!amp || amp > semi) return -2;
+            et_vn = (size_t)(amp - (body + et_v0));
+            continue;
+        }
+        et_vn--;
+    }
+    if (et_vn != 32) return -2;
+    for (size_t i = 0; i < 32; i++) {
+        char ch = body[et_v0 + i];
+        if (!((ch >= '0' && ch <= '9')
+              || (ch >= 'a' && ch <= 'f')
+              || (ch >= 'A' && ch <= 'F'))) return -2;
+    }
+    out->part_number = part_number;
+    memcpy(out->etag_hex, body + et_v0, 32);
+    out->etag_hex[32] = '\0';
+    return (long)((size_t)(q - body) + sizeof(close_tag) - 1);
+}
+
+static int handle_mpu_complete_finish(conn_t *c, s3_str_t bucket, s3_str_t key,
+                                       const char *upload_id) {
+    /* Reject if body overflowed the cap. */
+    if (c->req_body_len > c->req_body_cap) {
+        return rsp_build_s3_error(c, S3_ERR_INVALID_REQUEST, c->req.path, NULL);
+    }
+
+    /* Parse <Part> entries. We allocate up to 10000 part refs; in practice
+     * the body cap of 1 MiB will limit this well below that. */
+    s3_part_ref_t *parts = NULL;
+    size_t parts_n = 0, parts_cap = 0;
+    size_t pos = 0;
+    while (pos < c->req_body_len) {
+        if (parts_n == parts_cap) {
+            size_t nc = parts_cap ? parts_cap * 2 : 16;
+            if (nc > 10000) nc = 10000;
+            s3_part_ref_t *np = realloc(parts, nc * sizeof(*np));
+            if (!np) {
+                free(parts);
+                return rsp_build_s3_error(c, S3_ERR_INTERNAL,
+                                          c->req.path, NULL);
+            }
+            parts = np;
+            parts_cap = nc;
+        }
+        long r = parse_one_part(c->req_body_buf, c->req_body_len, pos,
+                                &parts[parts_n]);
+        if (r == -1) break;       /* no more parts */
+        if (r == -2) {
+            free(parts);
+            return rsp_build_s3_error(c, S3_ERR_MALFORMED_XML,
+                                      c->req.path, NULL);
+        }
+        parts_n++;
+        if (parts_n >= 10000) break;
+        pos = (size_t)r;
+    }
+    if (parts_n == 0) {
+        free(parts);
+        return rsp_build_s3_error(c, S3_ERR_INVALID_REQUEST,
+                                  c->req.path, NULL);
+    }
+
+    char etag[40];
+    s3_obj_meta_t meta;
+    s3_err_t e = store_mpu_complete(c->store, bucket, key,
+                                     upload_id, parts, parts_n,
+                                     etag, &meta);
+    free(parts);
+    if (e != S3_OK) {
+        return rsp_build_s3_error(c, e, c->req.path, NULL);
+    }
+    return rsp_build_complete_mpu(c, bucket, key, etag);
+}
+
+/* DELETE /bucket/key?uploadId=ID */
+static int handle_mpu_abort(conn_t *c, s3_str_t bucket, s3_str_t key,
+                             const char *upload_id) {
+    s3_err_t e = store_mpu_abort(c->store, bucket, key, upload_id);
+    if (e != S3_OK) {
+        return rsp_build_s3_error(c, e, c->req.path, NULL);
+    }
+    return rsp_build_status(c, 204, "No Content");
+}
+
+/* ===================================================================== */
 /* Top-level dispatch                                                     */
 /* ===================================================================== */
 
@@ -348,6 +580,83 @@ int route_dispatch_headers(conn_t *c) {
     }
 
     /* Object-level: "/bucket/key" */
+
+    /* Multipart upload subresources are signalled by query parameters.
+     * Decode them once into a scratch buffer; query_param mutates in place
+     * during pct_decode, so each call needs a fresh buffer. */
+    s3_str_t v_uploads = S3_STR_NULL;
+    s3_str_t v_upload_id = S3_STR_NULL;
+    s3_str_t v_part_number = S3_STR_NULL;
+    int has_uploads = 0;       /* "?uploads" (no value) */
+    int has_upload_id = 0;
+    int has_part_number = 0;
+    if (c->req.query.n > 0) {
+        char *qb1 = scratch_alloc(c, c->req.query.n + 1);
+        char *qb2 = scratch_alloc(c, c->req.query.n + 1);
+        char *qb3 = scratch_alloc(c, c->req.query.n + 1);
+        if (qb1 && query_param(c->req.query, "uploads",
+                               qb1, c->req.query.n, &v_uploads)) {
+            has_uploads = 1;
+        }
+        if (qb2 && query_param(c->req.query, "uploadId",
+                               qb2, c->req.query.n, &v_upload_id)) {
+            has_upload_id = 1;
+        }
+        if (qb3 && query_param(c->req.query, "partNumber",
+                               qb3, c->req.query.n, &v_part_number)) {
+            has_part_number = 1;
+        }
+    }
+
+    /* Validate uploadId looks like 32 hex chars (matches what we generate). */
+    char upload_id_buf[33] = {0};
+    if (has_upload_id) {
+        if (v_upload_id.n != 32) {
+            return rsp_build_s3_error(c, S3_ERR_NO_SUCH_UPLOAD,
+                                      c->req.path, NULL);
+        }
+        for (size_t i = 0; i < 32; i++) {
+            char ch = v_upload_id.p[i];
+            if (!((ch >= '0' && ch <= '9')
+                  || (ch >= 'a' && ch <= 'f')
+                  || (ch >= 'A' && ch <= 'F'))) {
+                return rsp_build_s3_error(c, S3_ERR_NO_SUCH_UPLOAD,
+                                          c->req.path, NULL);
+            }
+        }
+        memcpy(upload_id_buf, v_upload_id.p, 32);
+    }
+
+    if (method_is(c, "POST") && has_uploads) {
+        return handle_mpu_initiate(c, bucket, key);
+    }
+    if (method_is(c, "POST") && has_upload_id) {
+        c->mpu_complete_pending = 1;
+        c->mpu_bucket = bucket;          /* points into req_scratch */
+        c->mpu_key    = key;
+        memcpy(c->mpu_upload_id, upload_id_buf, 33);
+        return handle_mpu_complete_begin(c);
+    }
+    if (method_is(c, "PUT") && has_upload_id && has_part_number) {
+        /* Parse partNumber — must be a small positive integer. */
+        int pn = 0;
+        for (size_t i = 0; i < v_part_number.n; i++) {
+            char ch = v_part_number.p[i];
+            if (ch < '0' || ch > '9') { pn = 0; break; }
+            pn = pn * 10 + (ch - '0');
+            if (pn > 10000) { pn = 0; break; }
+        }
+        if (pn < 1) {
+            return rsp_build_s3_error(c, S3_ERR_INVALID_ARGUMENT,
+                                      c->req.path, NULL);
+        }
+        return handle_mpu_upload_part_begin(c, bucket, key,
+                                             pn, upload_id_buf);
+    }
+    if (method_is(c, "DELETE") && has_upload_id) {
+        return handle_mpu_abort(c, bucket, key, upload_id_buf);
+    }
+
     if (method_is(c, "PUT")) {
         /* Streaming PUT: open writer, then accept body via on_body. */
         return handle_object_put_begin(c, bucket, key);
@@ -368,15 +677,46 @@ int route_dispatch_body(conn_t *c, const char *data, size_t len) {
              * absorbed by llhttp but ignored. */
             return rsp_build_s3_error(c, e, c->req.path, NULL);
         }
+        return 0;
     }
-    /* If no writer, body bytes are simply discarded (e.g. on a method
-     * we'd already errored on; or a body sent on GET, which we ignore). */
+    /* If a handler asked us to buffer the body (e.g. CompleteMultipartUpload
+     * needs the XML body parsed before commit), accumulate into req_body_buf
+     * up to req_body_cap. Anything beyond the cap is rejected as
+     * EntityTooLarge — but we only check after the body is complete to keep
+     * this path simple; cap should be set generously. */
+    if (c->req_body_buf && c->req_body_cap > 0) {
+        if (c->req_body_len + len > c->req_body_cap) {
+            /* Truncate to cap and remember we overflowed. */
+            size_t take = c->req_body_cap - c->req_body_len;
+            if (take > 0) {
+                memcpy(c->req_body_buf + c->req_body_len, data, take);
+                c->req_body_len += take;
+            }
+            /* Mark overflow by setting len > cap (we'll detect at complete). */
+            c->req_body_len = c->req_body_cap + 1;
+            return 0;
+        }
+        memcpy(c->req_body_buf + c->req_body_len, data, len);
+        c->req_body_len += len;
+        return 0;
+    }
+    /* If no writer and no buffer, body bytes are simply discarded
+     * (e.g. on a method we'd already errored on; or a body sent on GET,
+     * which we ignore). */
     return 0;
 }
 
 int route_dispatch_complete(conn_t *c) {
     if (c->put_writer) {
+        if (c->mpu_is_part_upload) {
+            return handle_mpu_part_complete(c);
+        }
         return handle_object_put_complete(c);
+    }
+    if (c->mpu_complete_pending) {
+        c->mpu_complete_pending = 0;
+        return handle_mpu_complete_finish(c, c->mpu_bucket, c->mpu_key,
+                                          c->mpu_upload_id);
     }
     /* Non-streaming requests already built their response in
      * route_dispatch_headers. Nothing more to do here. */
@@ -401,4 +741,20 @@ int route_dispatch_send_body(conn_t *c) {
         return 0;
     }
     return 1;  /* more bytes remaining */
+}
+
+/* ===================================================================== */
+/* Auth-hook helper                                                       */
+/* ===================================================================== */
+
+/* Build an S3 error response immediately. Used from the SigV4 hookpoint
+ * in cb_on_headers_complete to short-circuit dispatch. The caller has
+ * NOT set up any handler-owned state (no writer, no reader), so this
+ * is essentially a wrapper around rsp_build_s3_error that also resets
+ * the per-request scratch arena. */
+int route_build_error(conn_t *c, s3_err_t err) {
+    /* Make sure scratch is fresh (in case the auth hook fires before
+     * the route layer would normally call scratch_reset). */
+    c->req_scratch_used = 0;
+    return rsp_build_s3_error(c, err, c->req.path, NULL);
 }

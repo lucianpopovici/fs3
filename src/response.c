@@ -55,6 +55,28 @@ void rsp_format_etag(const uint8_t etag[16], char out[35]) {
     out[34] = '\0';
 }
 
+void rsp_format_etag_with_parts(const uint8_t etag[16], uint16_t part_count,
+                                char out[41]) {
+    static const char hex[] = "0123456789abcdef";
+    out[0] = '"';
+    for (int i = 0; i < 16; i++) {
+        out[1 + i*2 + 0] = hex[etag[i] >> 4];
+        out[1 + i*2 + 1] = hex[etag[i] & 0xF];
+    }
+    if (part_count == 0) {
+        out[33] = '"';
+        out[34] = '\0';
+        return;
+    }
+    /* "<hex>-<count>" — count fits in 5 chars (0..65535). */
+    int n = snprintf(out + 33, 41 - 33, "-%u\"", (unsigned)part_count);
+    if (n < 0 || n >= 41 - 33) {
+        /* Defensive fallback. */
+        out[33] = '"';
+        out[34] = '\0';
+    }
+}
+
 /* ===================================================================== */
 /* S3 error code mapping                                                  */
 /* ===================================================================== */
@@ -78,13 +100,15 @@ static const err_entry_t ERR_TABLE[] = {
     { S3_ERR_INVALID_REQUEST,           400, "InvalidRequest",           "Invalid request."                                  },
     { S3_ERR_SIGNATURE_DOES_NOT_MATCH,  403, "SignatureDoesNotMatch",    "The request signature does not match."             },
     { S3_ERR_ACCESS_DENIED,             403, "AccessDenied",             "Access denied."                                    },
-    { S3_ERR_INVALID_AUTH_HEADER,       400, "InvalidArgument",          "The Authorization header is malformed."            },
     { S3_ERR_REQUEST_TIME_TOO_SKEWED,   403, "RequestTimeTooSkewed",     "The difference between request time and server time is too large." },
     { S3_ERR_ENTITY_TOO_LARGE,          413, "EntityTooLarge",           "Your proposed upload exceeds the maximum allowed." },
     { S3_ERR_MISSING_CONTENT_LENGTH,    411, "MissingContentLength",     "Content-Length header is required."                },
     { S3_ERR_METHOD_NOT_ALLOWED,        405, "MethodNotAllowed",         "The specified method is not allowed."              },
     { S3_ERR_INTERNAL,                  500, "InternalError",            "We encountered an internal error."                 },
     { S3_ERR_NOT_IMPLEMENTED,           501, "NotImplemented",           "The requested functionality is not implemented."   },
+    { S3_ERR_BAD_DIGEST,                 400, "XAmzContentSHA256Mismatch","The provided x-amz-content-sha256 header does not match the body." },
+    { S3_ERR_INVALID_PART,               400, "InvalidPart",              "One or more of the specified parts could not be found." },
+    { S3_ERR_MALFORMED_XML,              400, "MalformedXML",             "The XML you provided was not well-formed."         },
 };
 
 static const err_entry_t *err_lookup(s3_err_t e) {
@@ -129,7 +153,7 @@ int rsp_build_status_with_headers(conn_t *c, int status, const char *reason,
 /* ===================================================================== */
 
 int rsp_build_object_head(conn_t *c, const s3_obj_meta_t *m, int head_only) {
-    char etag[35]; rsp_format_etag(m->etag, etag);
+    char etag[41]; rsp_format_etag_with_parts(m->etag, m->part_count, etag);
     char lm[32];   rsp_format_rfc1123(m->mtime_ms, lm);
 
     const char *ct = m->content_type[0] ? m->content_type : "application/octet-stream";
@@ -340,7 +364,8 @@ int rsp_build_list_bucket(conn_t *c, s3_str_t bucket,
             char ts[32]; rsp_format_iso8601(m.mtime_ms, ts);
             xml_text_child(contents, "LastModified", ts);
 
-            char etag[35]; rsp_format_etag(m.etag, etag);
+            char etag[41];
+            rsp_format_etag_with_parts(m.etag, m.part_count, etag);
             xml_text_child(contents, "ETag", etag);
 
             char szbuf[24]; snprintf(szbuf, sizeof(szbuf),
@@ -399,4 +424,80 @@ int rsp_build_list_bucket(conn_t *c, s3_str_t bucket,
     c->wpos = 0;
     c->state = CST_WRITE_RESPONSE;
     return 0;
+}
+
+/* ===================================================================== */
+/* Multipart upload responses                                             */
+/* ===================================================================== */
+
+/* Internal helper: ship a finished body as a 200 OK XML response,
+ * spilling into ext_body if it doesn't fit in wbuf. Takes ownership of
+ * `body` (frees on success or failure). */
+static int ship_xml_200(conn_t *c, char *body, size_t blen) {
+    int n = snprintf(c->wbuf, CONN_WBUF_SZ,
+        "HTTP/1.1 200 OK\r\n"
+        "Server: fs3/0.2\r\n"
+        "Content-Type: application/xml\r\n"
+        "Content-Length: %zu\r\n"
+        "Connection: %s\r\n"
+        "\r\n",
+        blen,
+        c->req.keep_alive ? "keep-alive" : "close");
+    if (n < 0 || n >= CONN_WBUF_SZ) { free(body); return -1; }
+
+    if ((size_t)n + blen <= CONN_WBUF_SZ) {
+        memcpy(c->wbuf + n, body, blen);
+        free(body);
+        c->wlen = (size_t)n + blen;
+    } else {
+        c->wlen = (size_t)n;
+        free(c->ext_body);
+        c->ext_body = body;
+        c->ext_body_len = blen;
+        c->ext_body_pos = 0;
+    }
+    c->wpos = 0;
+    c->state = CST_WRITE_RESPONSE;
+    return 0;
+}
+
+int rsp_build_initiate_mpu(conn_t *c, s3_str_t bucket, s3_str_t key,
+                           const char *upload_id) {
+    XMLNode *root = create_node("InitiateMultipartUploadResult");
+    if (!root) return -1;
+    if (add_attr(root, "xmlns", "http://s3.amazonaws.com/doc/2006-03-01/") < 0) {
+        free_tree(root); return -1;
+    }
+    xml_text_child_n(root, "Bucket",   bucket.p, bucket.n);
+    xml_text_child_n(root, "Key",      key.p,    key.n);
+    xml_text_child  (root, "UploadId", upload_id);
+
+    size_t blen = 0;
+    char *body = xml_render_with_decl(root, &blen);
+    free_tree(root);
+    if (!body) return -1;
+    return ship_xml_200(c, body, blen);
+}
+
+int rsp_build_complete_mpu(conn_t *c, s3_str_t bucket, s3_str_t key,
+                           const char *etag) {
+    XMLNode *root = create_node("CompleteMultipartUploadResult");
+    if (!root) return -1;
+    if (add_attr(root, "xmlns", "http://s3.amazonaws.com/doc/2006-03-01/") < 0) {
+        free_tree(root); return -1;
+    }
+    /* AWS S3 also returns Location, but it's optional and most clients
+     * just consume the ETag — keep it minimal for now. */
+    xml_text_child_n(root, "Bucket", bucket.p, bucket.n);
+    xml_text_child_n(root, "Key",    key.p,    key.n);
+    /* ETag wrapped in quotes per convention. */
+    char etag_q[64];
+    snprintf(etag_q, sizeof(etag_q), "\"%s\"", etag);
+    xml_text_child(root, "ETag", etag_q);
+
+    size_t blen = 0;
+    char *body = xml_render_with_decl(root, &blen);
+    free_tree(root);
+    if (!body) return -1;
+    return ship_xml_200(c, body, blen);
 }

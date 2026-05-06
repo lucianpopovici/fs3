@@ -12,6 +12,12 @@ typedef struct {
     int         backlog;     /* listen() backlog */
     int         max_conns;   /* hard cap on concurrent connections */
     const char *data_root;   /* path for the object store; required */
+
+    /* Authentication. Both fields may be NULL/0 to disable auth.
+     * When `auth` is set, `auth_required` controls whether requests
+     * without an Authorization header are accepted (0) or rejected (1). */
+    struct sigv4_verifier *auth;
+    int                    auth_required;
 } server_cfg_t;
 
 server_t *server_create(const server_cfg_t *cfg);

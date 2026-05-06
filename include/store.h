@@ -35,7 +35,10 @@ typedef struct s3_lister s3_lister_t;
 typedef struct {
     uint64_t size;             /* body size in bytes */
     uint64_t mtime_ms;         /* ms since Unix epoch */
-    uint8_t  etag[16];         /* raw MD5 of body (single-PUT) */
+    uint8_t  etag[16];         /* raw MD5 of body (single-PUT) or
+                                  multipart-of-MD5s (multipart upload) */
+    uint16_t part_count;       /* 0 for single-PUT, >0 for multipart;
+                                  formatters render as "hex-N" if >0 */
     char     content_type[128];/* NUL-terminated; "" if not set */
 } s3_obj_meta_t;
 
@@ -81,6 +84,67 @@ void     store_get_close(s3_reader_t *r);
 s3_err_t store_head(s3_store_t *s, s3_str_t bucket, s3_str_t key,
                     s3_obj_meta_t *meta_out);
 s3_err_t store_delete(s3_store_t *s, s3_str_t bucket, s3_str_t key);
+
+/* ---- Multipart upload ----
+ *
+ * Lifecycle:
+ *   create() — generate a unique upload_id, allocate a staging dir
+ *              (data/<bucket>/_uploads/<upload_id>/) plus a small meta
+ *              file describing the target key + content-type.
+ *   part_begin/write/commit — exactly like single-PUT but lands the part
+ *              file under the staging dir as part-NNNNN with the part's
+ *              MD5 as the part's ETag.
+ *   complete() — given a list of (part_number, etag) pairs in lex order,
+ *              verifies all the parts are on disk and their etags match,
+ *              then concatenates them into a single object file in the
+ *              live tree, computes the multipart ETag (MD5 over the
+ *              concatenation of part-MD5s, suffixed with "-N"), and
+ *              cleans up the staging dir.
+ *   abort()  — wipes the staging dir and forgets the upload.
+ *
+ * Concurrent part uploads to the same upload_id are allowed (each part
+ * lands as its own file). The staging dir is per-upload, so different
+ * uploads to the same key don't collide.
+ *
+ * Part numbering: 1..10000 (S3 limit; we enforce). Part size is
+ * unrestricted from the store's POV; clients should respect S3's 5 MiB
+ * minimum (except for the last part). */
+
+#define S3_MULTIPART_UPLOAD_ID_LEN 32   /* hex chars, NUL-terminated → 33 */
+
+typedef struct {
+    int      part_number;         /* 1..10000 */
+    char     etag_hex[33];        /* 32 hex chars + NUL — MD5 of the part body */
+} s3_part_ref_t;
+
+/* Generate a fresh upload_id and stage it. Writes the upload_id (NUL-
+ * terminated, S3_MULTIPART_UPLOAD_ID_LEN+1 bytes including NUL) into
+ * `upload_id_out`. */
+s3_err_t store_mpu_create(s3_store_t *s, s3_str_t bucket, s3_str_t key,
+                          const char *content_type,
+                          char upload_id_out[S3_MULTIPART_UPLOAD_ID_LEN + 1]);
+
+/* Streaming part upload — same shape as the single-PUT writer. */
+s3_err_t store_mpu_part_begin(s3_store_t *s, s3_str_t bucket, s3_str_t key,
+                              const char *upload_id, int part_number,
+                              s3_writer_t **out);
+s3_err_t store_mpu_part_write(s3_writer_t *w, const void *buf, size_t n);
+/* On success, fills *etag_hex_out with 32 hex chars (NUL-terminated). */
+s3_err_t store_mpu_part_commit(s3_writer_t *w, char etag_hex_out[33]);
+void     store_mpu_part_abort(s3_writer_t *w);
+
+/* Complete the upload by assembling the listed parts (in part-number
+ * order). Verifies each etag matches what we have on disk. On success,
+ * writes the multipart-style ETag ("hex-N") into etag_out and the
+ * final object metadata into meta_out. */
+s3_err_t store_mpu_complete(s3_store_t *s, s3_str_t bucket, s3_str_t key,
+                            const char *upload_id,
+                            const s3_part_ref_t *parts, size_t n_parts,
+                            char etag_out[40], s3_obj_meta_t *meta_out);
+
+/* Abort: remove the staging dir and all part files. */
+s3_err_t store_mpu_abort(s3_store_t *s, s3_str_t bucket, s3_str_t key,
+                         const char *upload_id);
 
 /* ---- List ----
  *

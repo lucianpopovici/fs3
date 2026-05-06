@@ -29,7 +29,7 @@ INCLUDES   := -Iinclude -I$(LLHTTP_DIR)/include -I$(XML_DIR)
 
 # Server objects
 SRV_SRCS := src/main.c src/server.c src/conn.c src/log.c src/store_fs.c \
-            src/route.c src/response.c
+            src/route.c src/response.c src/sigv4.c
 SRV_OBJS := $(SRV_SRCS:.c=.o)
 
 LLHTTP_OBJS := $(LLHTTP_DIR)/src/api.o $(LLHTTP_DIR)/src/http.o \
@@ -65,7 +65,7 @@ $(XML_DIR)/%.o: $(XML_DIR)/%.c
 
 # ----- Tests --------------------------------------------------------
 
-TEST_BINS := tests/test_store tests/test_xml tests/test_xml_legacy tests/test_xml_fuzz
+TEST_BINS := tests/test_store tests/test_xml tests/test_xml_legacy tests/test_xml_fuzz tests/test_sigv4
 
 test: $(TEST_BINS) fs3
 	@echo "=== test_store ==="
@@ -76,8 +76,14 @@ test: $(TEST_BINS) fs3
 	@./tests/test_xml_legacy
 	@echo "=== test_xml_fuzz (50000 iterations) ==="
 	@./tests/test_xml_fuzz 50000
+	@echo "=== test_sigv4 ==="
+	@./tests/test_sigv4
 	@echo "=== test_e2e (HTTP integration) ==="
 	@./tests/test_e2e.sh
+	@echo "=== test_e2e_auth (SigV4 integration) ==="
+	@./tests/test_e2e_auth.sh
+	@echo "=== test_e2e_mpu (multipart integration) ==="
+	@./tests/test_e2e_mpu.sh
 
 tests/test_store: tests/test_store.c src/store_fs.o src/log.o
 	$(CC) $(CFLAGS) $(INCLUDES) tests/test_store.c \
@@ -94,6 +100,13 @@ tests/test_xml_legacy: $(XML_DIR)/tests/test_legacy.c $(XML_DIR)/xml_parser.o
 tests/test_xml_fuzz: $(XML_DIR)/tests/test_fuzz.c $(XML_DIR)/xml_parser.o
 	$(CC) $(CFLAGS) $(INCLUDES) $(XML_DIR)/tests/test_fuzz.c \
 	    $(XML_DIR)/xml_parser.o $(LDFLAGS) -o $@
+
+# test_sigv4 needs the SIGV4_TESTING macro to expose internal helpers,
+# so we recompile sigv4.c instead of using the cached .o from the
+# server build.
+tests/test_sigv4: tests/test_sigv4.c src/sigv4.c
+	$(CC) $(CFLAGS) $(INCLUDES) -DSIGV4_TESTING tests/test_sigv4.c src/sigv4.c \
+	    $(LDFLAGS) -o $@
 
 clean:
 	rm -f fs3 $(OBJS) $(OBJS:.o=.d) $(TEST_BINS) tests/*.d

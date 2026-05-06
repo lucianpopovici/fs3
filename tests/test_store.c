@@ -618,6 +618,171 @@ static void t_persistence(void) {
     teardown_root();
 }
 
+/* ---- Multipart upload --------------------------------------------- */
+
+static void t_mpu_basic(void) {
+    setup_root();
+    s3_store_t *s;
+    CHECK_EQ(store_open(&s, g_root), S3_OK, "mpu: store_open");
+    CHECK(store_bucket_create(s, S3_STR_LIT("buk")) == S3_OK,
+          "mpu: bucket create");
+
+    char upload_id[33];
+    CHECK(store_mpu_create(s, S3_STR_LIT("buk"), S3_STR_LIT("big.bin"),
+                            "application/octet-stream", upload_id) == S3_OK,
+          "mpu: create");
+    CHECK(strlen(upload_id) == 32, "mpu: upload_id is 32 hex chars");
+
+    /* Upload three parts: 5MB, 5MB, 1MB. */
+    s3_part_ref_t parts[3];
+    const size_t sizes[3] = { 5 * 1024 * 1024, 5 * 1024 * 1024, 1 * 1024 * 1024 };
+    for (int i = 0; i < 3; i++) {
+        s3_writer_t *w = NULL;
+        CHECK(store_mpu_part_begin(s, S3_STR_LIT("buk"), S3_STR_LIT("big.bin"),
+                                    upload_id, i + 1, &w) == S3_OK,
+              "mpu: part begin");
+        char *buf = malloc(sizes[i]);
+        memset(buf, 'a' + i, sizes[i]);
+        CHECK(store_mpu_part_write(w, buf, sizes[i]) == S3_OK,
+              "mpu: part write");
+        free(buf);
+        parts[i].part_number = i + 1;
+        CHECK(store_mpu_part_commit(w, parts[i].etag_hex) == S3_OK,
+              "mpu: part commit");
+    }
+
+    char etag[40];
+    s3_obj_meta_t meta;
+    CHECK(store_mpu_complete(s, S3_STR_LIT("buk"), S3_STR_LIT("big.bin"),
+                              upload_id, parts, 3, etag, &meta) == S3_OK,
+          "mpu: complete");
+    CHECK(meta.size == sizes[0] + sizes[1] + sizes[2],
+          "mpu: total size correct");
+    /* ETag should be "<32hex>-3" */
+    CHECK(strlen(etag) == 32 + 2,    "mpu: etag len = 32 + '-' + '3'");
+    CHECK(etag[32] == '-',           "mpu: etag has dash");
+    CHECK(etag[33] == '3',           "mpu: etag part count = 3");
+
+    /* Read back and verify content */
+    s3_reader_t *r = NULL;
+    s3_obj_meta_t m2;
+    CHECK(store_get_open(s, S3_STR_LIT("buk"), S3_STR_LIT("big.bin"),
+                          &r, &m2) == S3_OK, "mpu: get_open");
+    CHECK(m2.size == sizes[0] + sizes[1] + sizes[2], "mpu: read size matches");
+    /* Read all bytes; spot-check region pattern. */
+    size_t total = 0;
+    int region_ok = 1;
+    char buf[4096];
+    for (size_t i = 0; i < m2.size && region_ok; ) {
+        ssize_t got = store_get_read(r, buf, sizeof(buf));
+        if (got <= 0) { region_ok = 0; break; }
+        for (ssize_t j = 0; j < got; j++) {
+            char check;
+            size_t idx = i + (size_t)j;
+            if      (idx < sizes[0])                    check = 'a';
+            else if (idx < sizes[0] + sizes[1])         check = 'b';
+            else                                         check = 'c';
+            if (buf[j] != check) { region_ok = 0; break; }
+        }
+        i += (size_t)got;
+        total += (size_t)got;
+    }
+    CHECK(region_ok && total == m2.size,
+          "mpu: all bytes match expected region pattern");
+    store_get_close(r);
+
+    store_close(s);
+    teardown_root();
+}
+
+static void t_mpu_abort(void) {
+    setup_root();
+    s3_store_t *s;
+    CHECK_EQ(store_open(&s, g_root), S3_OK, "mpu_abort: open");
+    store_bucket_create(s, S3_STR_LIT("buk"));
+
+    char upload_id[33];
+    CHECK(store_mpu_create(s, S3_STR_LIT("buk"), S3_STR_LIT("k1"),
+                            NULL, upload_id) == S3_OK, "mpu_abort: create");
+    /* Upload one part */
+    s3_writer_t *w;
+    store_mpu_part_begin(s, S3_STR_LIT("buk"), S3_STR_LIT("k1"),
+                          upload_id, 1, &w);
+    store_mpu_part_write(w, "hi", 2);
+    char etag[33];
+    store_mpu_part_commit(w, etag);
+
+    /* Abort */
+    CHECK(store_mpu_abort(s, S3_STR_LIT("buk"), S3_STR_LIT("k1"),
+                           upload_id) == S3_OK, "mpu_abort: abort ok");
+    /* Subsequent abort should return NoSuchUpload */
+    CHECK(store_mpu_abort(s, S3_STR_LIT("buk"), S3_STR_LIT("k1"),
+                           upload_id) == S3_ERR_NO_SUCH_UPLOAD,
+          "mpu_abort: idempotent NoSuchUpload");
+    /* Object should not exist */
+    s3_obj_meta_t m;
+    CHECK(store_head(s, S3_STR_LIT("buk"), S3_STR_LIT("k1"), &m)
+          == S3_ERR_NO_SUCH_KEY, "mpu_abort: no object created");
+
+    store_close(s);
+    teardown_root();
+}
+
+static void t_mpu_invalid_part_list(void) {
+    setup_root();
+    s3_store_t *s;
+    CHECK_EQ(store_open(&s, g_root), S3_OK, "mpu_inv: open");
+    store_bucket_create(s, S3_STR_LIT("buk"));
+    char upload_id[33];
+    store_mpu_create(s, S3_STR_LIT("buk"), S3_STR_LIT("k1"), NULL, upload_id);
+
+    /* Upload part 1 only */
+    s3_writer_t *w;
+    store_mpu_part_begin(s, S3_STR_LIT("buk"), S3_STR_LIT("k1"),
+                          upload_id, 1, &w);
+    store_mpu_part_write(w, "x", 1);
+    s3_part_ref_t parts[2];
+    parts[0].part_number = 1;
+    store_mpu_part_commit(w, parts[0].etag_hex);
+
+    /* Try to complete with a non-existent part 2 */
+    parts[1].part_number = 2;
+    memset(parts[1].etag_hex, '0', 32); parts[1].etag_hex[32] = 0;
+    char etag[40];
+    s3_obj_meta_t meta;
+    CHECK(store_mpu_complete(s, S3_STR_LIT("buk"), S3_STR_LIT("k1"),
+                              upload_id, parts, 2, etag, &meta)
+          == S3_ERR_INVALID_PART, "mpu: missing part rejected");
+
+    /* Out-of-order part numbers also rejected */
+    parts[0].part_number = 2;
+    parts[1].part_number = 1;
+    CHECK(store_mpu_complete(s, S3_STR_LIT("buk"), S3_STR_LIT("k1"),
+                              upload_id, parts, 2, etag, &meta)
+          == S3_ERR_INVALID_ARGUMENT, "mpu: out-of-order parts rejected");
+
+    /* Cleanup */
+    store_mpu_abort(s, S3_STR_LIT("buk"), S3_STR_LIT("k1"), upload_id);
+    store_close(s);
+    teardown_root();
+}
+
+static void t_mpu_unknown_upload(void) {
+    setup_root();
+    s3_store_t *s;
+    CHECK_EQ(store_open(&s, g_root), S3_OK, "mpu_unk: open");
+    store_bucket_create(s, S3_STR_LIT("buk"));
+
+    /* Try to upload a part to a non-existent upload */
+    s3_writer_t *w;
+    CHECK(store_mpu_part_begin(s, S3_STR_LIT("buk"), S3_STR_LIT("k1"),
+                                "0123456789abcdef0123456789abcdef", 1, &w)
+          == S3_ERR_NO_SUCH_UPLOAD, "mpu: part to unknown upload rejected");
+
+    store_close(s);
+    teardown_root();
+}
+
 /* ---- Main --------------------------------------------------------- */
 
 int main(void) {
@@ -640,6 +805,10 @@ int main(void) {
     t_list_max_keys();
     t_abort_does_not_create();
     t_persistence();
+    t_mpu_basic();
+    t_mpu_abort();
+    t_mpu_invalid_part_list();
+    t_mpu_unknown_upload();
 
     if (failures == 0) { printf("ALL TESTS PASSED\n"); return 0; }
     printf("%d FAILURES\n", failures);

@@ -63,7 +63,7 @@
 
 #define OBJ_MAGIC    "YS3OBJ\0"
 #define OBJ_MAGIC_LEN 8         /* "YS3OBJ\0\0" — 6 chars + 2 NUL */
-#define OBJ_SCHEMA   1u
+#define OBJ_SCHEMA   2u         /* v2 added part_count */
 
 typedef struct __attribute__((packed)) {
     char     magic[OBJ_MAGIC_LEN];   /* "YS3OBJ\0\0" */
@@ -74,9 +74,11 @@ typedef struct __attribute__((packed)) {
     uint8_t  etag[16];
     uint16_t ct_len;
     uint16_t key_len;
+    uint16_t part_count;             /* 0 = single PUT; >0 = multipart, ETag is "hex-N" */
+    uint8_t  reserved[6];            /* keep struct 8-byte aligned, room to grow */
 } obj_header_t;
 
-_Static_assert(sizeof(obj_header_t) == 52, "obj_header_t layout");
+_Static_assert(sizeof(obj_header_t) == 60, "obj_header_t layout");
 
 /* ===================================================================== */
 /* Path computation and small helpers                                    */
@@ -87,6 +89,7 @@ struct s3_store {
     char *data_dir;   /* ROOT/data */
     char *tmp_dir;    /* ROOT/tmp */
     char *buckets_dir;/* ROOT/buckets */
+    char *mpu_dir;    /* ROOT/mpu — multipart upload staging */
 };
 
 static char *xstrdup_join(const char *a, const char *b) {
@@ -247,7 +250,8 @@ s3_err_t store_open(s3_store_t **out, const char *root) {
     s->data_dir    = xstrdup_join(root, "data");
     s->tmp_dir     = xstrdup_join(root, "tmp");
     s->buckets_dir = xstrdup_join(root, "buckets");
-    if (!s->root || !s->data_dir || !s->tmp_dir || !s->buckets_dir) {
+    s->mpu_dir     = xstrdup_join(root, "mpu");
+    if (!s->root || !s->data_dir || !s->tmp_dir || !s->buckets_dir || !s->mpu_dir) {
         store_close(s);
         return S3_ERR_INTERNAL;
     }
@@ -255,7 +259,8 @@ s3_err_t store_open(s3_store_t **out, const char *root) {
     if (mkdir_p(s->root, 0700) < 0
         || mkdir_p(s->data_dir, 0700) < 0
         || mkdir_p(s->tmp_dir, 0700) < 0
-        || mkdir_p(s->buckets_dir, 0700) < 0) {
+        || mkdir_p(s->buckets_dir, 0700) < 0
+        || mkdir_p(s->mpu_dir, 0700) < 0) {
         LOG_E("store_open: mkdir failed under %s: %s", root, strerror(errno));
         store_close(s);
         return S3_ERR_INTERNAL;
@@ -271,6 +276,7 @@ void store_close(s3_store_t *s) {
     free(s->data_dir);
     free(s->tmp_dir);
     free(s->buckets_dir);
+    free(s->mpu_dir);
     free(s);
 }
 
@@ -382,6 +388,14 @@ struct s3_writer {
     char       *key_dup;             /* NOT NUL-terminated; key_len in hdr.key_len */
     char       *content_type_dup;    /* NUL-terminated */
     int         finalized;           /* 1 once commit/abort run */
+
+    /* Multipart part mode. When non-empty, this writer is uploading a
+     * single part of a multipart upload. We skip the obj_header_t prefix
+     * and write only data; the part's MD5 ETag is what callers care
+     * about. The part lands at `final_path` (under the staging dir).
+     * The content_type/key fields above are NOT used in this mode. */
+    int         is_part;
+    char        final_path[4096];    /* destination for atomic rename */
 };
 
 static void writer_free(s3_writer_t *w) {
@@ -584,6 +598,7 @@ static s3_err_t read_header(int fd, obj_header_t *hdr_out, s3_obj_meta_t *meta_o
         memset(meta_out, 0, sizeof(*meta_out));
         meta_out->size     = h.data_size;
         meta_out->mtime_ms = h.mtime_ms;
+        meta_out->part_count = h.part_count;
         memcpy(meta_out->etag, h.etag, 16);
 
         if (h.ct_len > 0) {
@@ -782,6 +797,7 @@ static int load_entry(const char *path, list_entry_t *out) {
     memset(&out->meta, 0, sizeof(out->meta));
     out->meta.size = h.data_size;
     out->meta.mtime_ms = h.mtime_ms;
+    out->meta.part_count = h.part_count;
     memcpy(out->meta.etag, h.etag, 16);
     if (h.ct_len > 0) {
         size_t ctn = h.ct_len;
@@ -1012,4 +1028,562 @@ void store_list_close(s3_lister_t *l) {
     free(l->last_prefix);
     free(l->ret_buf);
     free(l);
+}
+
+/* ===================================================================== */
+/* Multipart upload                                                       */
+/* ===================================================================== */
+
+/* Layout under <root>/mpu/:
+ *
+ *   mpu/<bucket>/<upload_id>/meta            — metadata (key, content-type)
+ *   mpu/<bucket>/<upload_id>/part-NNNNN      — one file per part, raw bytes
+ *
+ * `meta` format (line-oriented, easy to read/write):
+ *   key=<key bytes>
+ *   ct=<content-type or empty>
+ *   ctime_ms=<unix epoch ms>
+ *
+ * The key is one line; we don't expect newlines in keys (S3 keys are
+ * arbitrary bytes per spec, but every real client uses URL-safe forms;
+ * if a newline ever shows up we'd fail to parse, which is fine — that
+ * client's request would have failed many other places first).
+ */
+
+static int random_hex_id(char *out, size_t out_n) {
+    /* /dev/urandom for unpredictability. */
+    int fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return -1;
+    static const char H[] = "0123456789abcdef";
+    size_t need = out_n / 2;
+    uint8_t buf[64];
+    if (need > sizeof(buf)) need = sizeof(buf);
+    ssize_t r = read(fd, buf, need);
+    close(fd);
+    if (r < (ssize_t)need) return -1;
+    for (size_t i = 0; i < need; i++) {
+        out[2*i + 0] = H[(buf[i] >> 4) & 0xF];
+        out[2*i + 1] = H[ buf[i]       & 0xF];
+    }
+    out[out_n - 1] = '\0';
+    return 0;
+}
+
+/* Build path: <mpu_dir>/<bucket>/<upload_id> */
+static int mpu_dir_path(const s3_store_t *s, s3_str_t bucket,
+                        const char *upload_id, char *out, size_t cap) {
+    int n = snprintf(out, cap, "%s/" S3_STR_FMT "/%s",
+                     s->mpu_dir, S3_STR_ARG(bucket), upload_id);
+    return (n < 0 || (size_t)n >= cap) ? -1 : n;
+}
+
+/* Build path: <mpu_dir>/<bucket>/<upload_id>/part-NNNNN */
+static int mpu_part_path(const s3_store_t *s, s3_str_t bucket,
+                         const char *upload_id, int part_number,
+                         char *out, size_t cap) {
+    int n = snprintf(out, cap, "%s/" S3_STR_FMT "/%s/part-%05d",
+                     s->mpu_dir, S3_STR_ARG(bucket), upload_id, part_number);
+    return (n < 0 || (size_t)n >= cap) ? -1 : n;
+}
+
+/* Recursively remove a directory tree. Used for mpu_abort/complete cleanup. */
+static int rm_rf(const char *path) {
+    DIR *d = opendir(path);
+    if (!d) {
+        if (errno == ENOENT) return 0;
+        return -1;
+    }
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) continue;
+        char child[4096];
+        if (snprintf(child, sizeof(child), "%s/%s", path, e->d_name)
+            >= (int)sizeof(child)) {
+            closedir(d); return -1;
+        }
+        struct stat st;
+        if (lstat(child, &st) == 0 && S_ISDIR(st.st_mode)) {
+            if (rm_rf(child) < 0) { closedir(d); return -1; }
+        } else {
+            if (unlink(child) < 0 && errno != ENOENT) {
+                closedir(d); return -1;
+            }
+        }
+    }
+    closedir(d);
+    return rmdir(path) < 0 && errno != ENOENT ? -1 : 0;
+}
+
+s3_err_t store_mpu_create(s3_store_t *s, s3_str_t bucket, s3_str_t key,
+                          const char *content_type,
+                          char upload_id_out[S3_MULTIPART_UPLOAD_ID_LEN + 1]) {
+    if (!s || !upload_id_out) return S3_ERR_INVALID_ARGUMENT;
+    if (!valid_bucket_name(bucket)) return S3_ERR_INVALID_BUCKET_NAME;
+    if (!valid_key(key))            return S3_ERR_INVALID_ARGUMENT;
+    if (!store_bucket_exists(s, bucket)) return S3_ERR_NO_SUCH_BUCKET;
+
+    /* Generate a random upload ID (32 hex chars = 128 bits) until we
+     * find one that doesn't exist. Collision probability is negligible
+     * but we check anyway. */
+    char id[S3_MULTIPART_UPLOAD_ID_LEN + 1];
+    char dir[4096];
+    for (int attempt = 0; attempt < 8; attempt++) {
+        if (random_hex_id(id, sizeof(id)) < 0) return S3_ERR_INTERNAL;
+        if (mpu_dir_path(s, bucket, id, dir, sizeof(dir)) < 0)
+            return S3_ERR_INTERNAL;
+        if (mkdir_p(dir, 0700) < 0) {
+            /* Possible reasons: bucket subdir under mpu/ doesn't exist
+             * yet, or filesystem error. mkdir_p creates parents. */
+            return S3_ERR_INTERNAL;
+        }
+        /* mkdir_p succeeds even if dir already exists (it uses
+         * EEXIST tolerantly). To detect collision, check if meta exists. */
+        char meta[4096];
+        if (snprintf(meta, sizeof(meta), "%s/meta", dir) >= (int)sizeof(meta))
+            return S3_ERR_INTERNAL;
+        if (access(meta, F_OK) == 0) {
+            /* Real collision — vanishingly unlikely; loop. */
+            continue;
+        }
+        /* Write meta atomically. */
+        char meta_tmp[4096];
+        if (snprintf(meta_tmp, sizeof(meta_tmp), "%s/meta.tmp", dir)
+            >= (int)sizeof(meta_tmp)) return S3_ERR_INTERNAL;
+        int fd = open(meta_tmp, O_WRONLY | O_CREAT | O_EXCL, 0600);
+        if (fd < 0) return S3_ERR_INTERNAL;
+        FILE *fp = fdopen(fd, "w");
+        if (!fp) { close(fd); unlink(meta_tmp); return S3_ERR_INTERNAL; }
+
+        /* ctime_ms */
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        uint64_t ctime_ms = (uint64_t)ts.tv_sec * 1000
+                          + (uint64_t)ts.tv_nsec / 1000000;
+
+        fprintf(fp, "key=" S3_STR_FMT "\n", S3_STR_ARG(key));
+        fprintf(fp, "ct=%s\n", content_type ? content_type : "");
+        fprintf(fp, "ctime_ms=%" PRIu64 "\n", ctime_ms);
+        if (fflush(fp) < 0 || fsync(fileno(fp)) < 0) {
+            fclose(fp); unlink(meta_tmp); return S3_ERR_INTERNAL;
+        }
+        fclose(fp);
+        if (rename(meta_tmp, meta) < 0) {
+            unlink(meta_tmp); return S3_ERR_INTERNAL;
+        }
+        fsync_dir(dir);
+
+        memcpy(upload_id_out, id, sizeof(id));
+        return S3_OK;
+    }
+    return S3_ERR_INTERNAL;
+}
+
+/* Read the meta file for an upload. Fills out_key and out_ct (each may
+ * be NULL to skip). out_key/out_ct are malloc'd; caller frees. Returns
+ * S3_OK or S3_ERR_NO_SUCH_UPLOAD if the meta file doesn't exist. */
+static s3_err_t mpu_read_meta(const s3_store_t *s, s3_str_t bucket,
+                              const char *upload_id,
+                              char **out_key, size_t *out_key_n,
+                              char **out_ct) {
+    char dir[4096], meta[4096];
+    if (mpu_dir_path(s, bucket, upload_id, dir, sizeof(dir)) < 0)
+        return S3_ERR_INTERNAL;
+    if (snprintf(meta, sizeof(meta), "%s/meta", dir) >= (int)sizeof(meta))
+        return S3_ERR_INTERNAL;
+    FILE *fp = fopen(meta, "r");
+    if (!fp) {
+        if (errno == ENOENT) return S3_ERR_NO_SUCH_UPLOAD;
+        return S3_ERR_INTERNAL;
+    }
+    char *line = NULL;
+    size_t line_cap = 0;
+    if (out_key) *out_key = NULL;
+    if (out_ct)  *out_ct  = NULL;
+    if (out_key_n) *out_key_n = 0;
+    ssize_t r;
+    while ((r = getline(&line, &line_cap, fp)) > 0) {
+        if (r > 0 && line[r-1] == '\n') { line[r-1] = '\0'; r--; }
+        if (strncmp(line, "key=", 4) == 0 && out_key) {
+            *out_key = strdup(line + 4);
+            if (out_key_n) *out_key_n = (size_t)r - 4;
+        } else if (strncmp(line, "ct=", 3) == 0 && out_ct) {
+            *out_ct = strdup(line + 3);
+        }
+    }
+    free(line);
+    fclose(fp);
+    return S3_OK;
+}
+
+s3_err_t store_mpu_part_begin(s3_store_t *s, s3_str_t bucket, s3_str_t key,
+                              const char *upload_id, int part_number,
+                              s3_writer_t **out) {
+    if (!s || !upload_id || !out) return S3_ERR_INVALID_ARGUMENT;
+    if (part_number < 1 || part_number > 10000) return S3_ERR_INVALID_ARGUMENT;
+    if (!valid_bucket_name(bucket)) return S3_ERR_INVALID_BUCKET_NAME;
+    if (!valid_key(key))            return S3_ERR_INVALID_ARGUMENT;
+
+    /* Verify the upload exists and the key matches. */
+    char *stored_key = NULL;
+    size_t stored_key_n = 0;
+    s3_err_t err = mpu_read_meta(s, bucket, upload_id,
+                                  &stored_key, &stored_key_n, NULL);
+    if (err != S3_OK) return err;
+    if (stored_key_n != key.n
+        || memcmp(stored_key, key.p, key.n) != 0) {
+        free(stored_key);
+        return S3_ERR_NO_SUCH_UPLOAD;
+    }
+    free(stored_key);
+
+    s3_writer_t *w = calloc(1, sizeof(*w));
+    if (!w) return S3_ERR_INTERNAL;
+    w->store = s;
+    w->fd = -1;
+    w->is_part = 1;
+
+    /* Final destination: <mpu>/<bucket>/<upload_id>/part-NNNNN */
+    if (mpu_part_path(s, bucket, upload_id, part_number,
+                      w->final_path, sizeof(w->final_path)) < 0) {
+        writer_free(w);
+        return S3_ERR_INTERNAL;
+    }
+    /* Tmp file in tmp_dir. */
+    if (snprintf(w->tmp_path, sizeof(w->tmp_path),
+                 "%s/part.XXXXXX", s->tmp_dir) >= (int)sizeof(w->tmp_path)) {
+        writer_free(w);
+        return S3_ERR_INTERNAL;
+    }
+    w->fd = mkstemp(w->tmp_path);
+    if (w->fd < 0) { writer_free(w); return S3_ERR_INTERNAL; }
+
+    w->md5_ctx = EVP_MD_CTX_new();
+    if (!w->md5_ctx
+        || EVP_DigestInit_ex(w->md5_ctx, EVP_md5(), NULL) != 1) {
+        writer_free(w);
+        return S3_ERR_INTERNAL;
+    }
+
+    *out = w;
+    return S3_OK;
+}
+
+s3_err_t store_mpu_part_write(s3_writer_t *w, const void *buf, size_t n) {
+    if (!w || w->finalized || !w->is_part) return S3_ERR_INVALID_ARGUMENT;
+    if (n == 0) return S3_OK;
+    ssize_t off = 0;
+    while ((size_t)off < n) {
+        ssize_t r = write(w->fd, (const char *)buf + off, n - (size_t)off);
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            return S3_ERR_INTERNAL;
+        }
+        off += r;
+    }
+    EVP_DigestUpdate(w->md5_ctx, buf, n);
+    w->data_written += n;
+    return S3_OK;
+}
+
+s3_err_t store_mpu_part_commit(s3_writer_t *w, char etag_hex_out[33]) {
+    if (!w || w->finalized || !w->is_part) return S3_ERR_INVALID_ARGUMENT;
+    w->finalized = 1;
+
+    uint8_t mac[16];
+    unsigned int mac_n = 16;
+    if (EVP_DigestFinal_ex(w->md5_ctx, mac, &mac_n) != 1) {
+        writer_free(w); return S3_ERR_INTERNAL;
+    }
+    if (etag_hex_out) {
+        static const char H[] = "0123456789abcdef";
+        for (int i = 0; i < 16; i++) {
+            etag_hex_out[2*i + 0] = H[(mac[i] >> 4) & 0xF];
+            etag_hex_out[2*i + 1] = H[ mac[i]       & 0xF];
+        }
+        etag_hex_out[32] = '\0';
+    }
+
+    if (fsync(w->fd) < 0) { writer_free(w); return S3_ERR_INTERNAL; }
+    close(w->fd); w->fd = -1;
+    if (rename(w->tmp_path, w->final_path) < 0) {
+        writer_free(w); return S3_ERR_INTERNAL;
+    }
+    w->tmp_path[0] = '\0';  /* don't unlink the live file in writer_free */
+
+    /* fsync the upload dir so the part is durable. */
+    char dir[4096];
+    snprintf(dir, sizeof(dir), "%.*s",
+             (int)(strrchr(w->final_path, '/') - w->final_path),
+             w->final_path);
+    fsync_dir(dir);
+
+    writer_free(w);
+    return S3_OK;
+}
+
+void store_mpu_part_abort(s3_writer_t *w) {
+    /* Same as store_put_abort: writer_free removes the tmp file. */
+    if (w) writer_free(w);
+}
+
+s3_err_t store_mpu_abort(s3_store_t *s, s3_str_t bucket, s3_str_t key,
+                         const char *upload_id) {
+    if (!s || !upload_id) return S3_ERR_INVALID_ARGUMENT;
+    (void)key;  /* not strictly needed for abort, but accept it for symmetry */
+    if (!valid_bucket_name(bucket)) return S3_ERR_INVALID_BUCKET_NAME;
+
+    char dir[4096];
+    if (mpu_dir_path(s, bucket, upload_id, dir, sizeof(dir)) < 0)
+        return S3_ERR_INTERNAL;
+    /* Verify the upload existed (return NoSuchUpload if not). */
+    char meta[4200];
+    if (snprintf(meta, sizeof(meta), "%s/meta", dir) >= (int)sizeof(meta))
+        return S3_ERR_INTERNAL;
+    if (access(meta, F_OK) < 0) return S3_ERR_NO_SUCH_UPLOAD;
+
+    if (rm_rf(dir) < 0) return S3_ERR_INTERNAL;
+    return S3_OK;
+}
+
+/* Concatenate the part files into a single object file under data/.
+ * On success, the new object replaces any existing object at <bucket>/<key>.
+ *
+ * Returns S3_OK and writes the multipart-style ETag ("hex-N") to
+ * etag_out, plus standard meta to meta_out.
+ */
+s3_err_t store_mpu_complete(s3_store_t *s, s3_str_t bucket, s3_str_t key,
+                            const char *upload_id,
+                            const s3_part_ref_t *parts, size_t n_parts,
+                            char etag_out[40], s3_obj_meta_t *meta_out) {
+    if (!s || !upload_id || !parts || n_parts == 0) return S3_ERR_INVALID_ARGUMENT;
+    if (n_parts > 10000) return S3_ERR_INVALID_ARGUMENT;
+    if (!valid_bucket_name(bucket)) return S3_ERR_INVALID_BUCKET_NAME;
+    if (!valid_key(key))            return S3_ERR_INVALID_ARGUMENT;
+    if (!store_bucket_exists(s, bucket)) return S3_ERR_NO_SUCH_BUCKET;
+
+    /* Verify the upload exists and the key matches. */
+    char *stored_key = NULL;
+    size_t stored_key_n = 0;
+    char *stored_ct = NULL;
+    s3_err_t err = mpu_read_meta(s, bucket, upload_id,
+                                  &stored_key, &stored_key_n, &stored_ct);
+    if (err != S3_OK) {
+        free(stored_key); free(stored_ct);
+        return err;
+    }
+    if (stored_key_n != key.n
+        || memcmp(stored_key, key.p, key.n) != 0) {
+        free(stored_key); free(stored_ct);
+        return S3_ERR_NO_SUCH_UPLOAD;
+    }
+    free(stored_key);
+    /* stored_ct may be NULL/empty; we'll use it for the new object. */
+
+    /* Validate the parts list:
+     *   - part_numbers strictly increasing, each in [1,10000]
+     *   - each part file exists and has the right size
+     *   - each part's MD5 (recomputed via stat? — no, we trust the
+     *     filename and the etag in the request body. Real S3 verifies
+     *     against the server-side ETag stored when the part was committed.
+     *     We don't persist that today; the part file's MD5 is the etag.
+     *     For now, accept whatever etag the client sent — and trust
+     *     that if a wrong part file is on disk somehow, the resulting
+     *     object will be wrong but we haven't actively misbehaved.)
+     *
+     * Compute total size and the multipart-style ETag:
+     *   ETag = MD5(concat of raw 16-byte MD5s of each part) + "-N"
+     */
+    EVP_MD_CTX *etag_md = EVP_MD_CTX_new();
+    if (!etag_md || EVP_DigestInit_ex(etag_md, EVP_md5(), NULL) != 1) {
+        if (etag_md) EVP_MD_CTX_free(etag_md);
+        free(stored_ct);
+        return S3_ERR_INTERNAL;
+    }
+
+    int prev_pn = 0;
+    /* First pass: validate ordering and ranges (cheap, no disk access). */
+    for (size_t i = 0; i < n_parts; i++) {
+        if (parts[i].part_number <= prev_pn
+            || parts[i].part_number < 1
+            || parts[i].part_number > 10000) {
+            EVP_MD_CTX_free(etag_md);
+            free(stored_ct);
+            return S3_ERR_INVALID_ARGUMENT;
+        }
+        prev_pn = parts[i].part_number;
+    }
+
+    /* Second pass: stat each part, accumulate sizes + multipart-MD5. */
+    uint64_t total_size = 0;
+    for (size_t i = 0; i < n_parts; i++) {
+        char pp[4096];
+        if (mpu_part_path(s, bucket, upload_id, parts[i].part_number,
+                          pp, sizeof(pp)) < 0) {
+            EVP_MD_CTX_free(etag_md);
+            free(stored_ct);
+            return S3_ERR_INTERNAL;
+        }
+        struct stat st;
+        if (stat(pp, &st) < 0) {
+            EVP_MD_CTX_free(etag_md);
+            free(stored_ct);
+            return S3_ERR_INVALID_PART;
+        }
+        total_size += (uint64_t)st.st_size;
+
+        /* Decode the etag hex into 16 raw bytes and feed into multipart-MD5. */
+        uint8_t raw[16];
+        for (int j = 0; j < 16; j++) {
+            char hi = parts[i].etag_hex[2*j];
+            char lo = parts[i].etag_hex[2*j + 1];
+            int hv = (hi >= '0' && hi <= '9') ? hi - '0'
+                   : (hi >= 'a' && hi <= 'f') ? hi - 'a' + 10
+                   : (hi >= 'A' && hi <= 'F') ? hi - 'A' + 10 : -1;
+            int lv = (lo >= '0' && lo <= '9') ? lo - '0'
+                   : (lo >= 'a' && lo <= 'f') ? lo - 'a' + 10
+                   : (lo >= 'A' && lo <= 'F') ? lo - 'A' + 10 : -1;
+            if (hv < 0 || lv < 0) {
+                EVP_MD_CTX_free(etag_md);
+                free(stored_ct);
+                return S3_ERR_INVALID_PART;
+            }
+            raw[j] = (uint8_t)((hv << 4) | lv);
+        }
+        EVP_DigestUpdate(etag_md, raw, 16);
+    }
+
+    uint8_t mp_md5[16];
+    unsigned int mp_md5_n = 16;
+    EVP_DigestFinal_ex(etag_md, mp_md5, &mp_md5_n);
+    EVP_MD_CTX_free(etag_md);
+    static const char H[] = "0123456789abcdef";
+    char mp_hex[33];
+    for (int i = 0; i < 16; i++) {
+        mp_hex[2*i + 0] = H[(mp_md5[i] >> 4) & 0xF];
+        mp_hex[2*i + 1] = H[ mp_md5[i]       & 0xF];
+    }
+    mp_hex[32] = '\0';
+
+    /* Now assemble the object file. We mirror the single-PUT layout:
+     * obj_header_t + content_type + key + concatenated part data.
+     * The header.etag is the raw 16 bytes of mp_md5.
+     */
+
+    /* Build target dir + path using the same hash + obj_dir/obj_path
+     * helpers as single-PUT. */
+    char hex[65];
+    hash_bucket_key(bucket, key, hex);
+    char target_dir[4096];
+    if (obj_dir(s, bucket, hex, target_dir, sizeof(target_dir)) < 0
+        || mkdir_p(target_dir, 0700) < 0) {
+        free(stored_ct);
+        return S3_ERR_INTERNAL;
+    }
+    char target_path[4096];
+    if (obj_path(s, bucket, hex, target_path, sizeof(target_path)) < 0) {
+        free(stored_ct);
+        return S3_ERR_INTERNAL;
+    }
+
+    /* Open temp file in tmp/ */
+    char tmp_path[4096];
+    snprintf(tmp_path, sizeof(tmp_path), "%s/mpu.XXXXXX", s->tmp_dir);
+    int tfd = mkstemp(tmp_path);
+    if (tfd < 0) { free(stored_ct); return S3_ERR_INTERNAL; }
+
+    /* Build header — native byte order, like single-PUT. */
+    obj_header_t hdr = {0};
+    memcpy(hdr.magic, OBJ_MAGIC, OBJ_MAGIC_LEN);
+    hdr.schema = OBJ_SCHEMA;
+    size_t ct_n = stored_ct ? strlen(stored_ct) : 0;
+    if (ct_n > UINT16_MAX || key.n > UINT16_MAX) {
+        close(tfd); unlink(tmp_path); free(stored_ct);
+        return S3_ERR_INVALID_ARGUMENT;
+    }
+    hdr.ct_len = (uint16_t)ct_n;
+    hdr.key_len = (uint16_t)key.n;
+    hdr.part_count = (uint16_t)n_parts;
+    hdr.header_size = (uint32_t)(sizeof(hdr) + ct_n + key.n);
+    hdr.data_size = total_size;
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    uint64_t mtime_ms = (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
+    hdr.mtime_ms = mtime_ms;
+    memcpy(hdr.etag, mp_md5, 16);
+
+    if (write(tfd, &hdr, sizeof(hdr)) != (ssize_t)sizeof(hdr)
+        || (ct_n && write(tfd, stored_ct, ct_n) != (ssize_t)ct_n)
+        || (key.n && write(tfd, key.p, key.n) != (ssize_t)key.n)) {
+        close(tfd); unlink(tmp_path); free(stored_ct);
+        return S3_ERR_INTERNAL;
+    }
+
+    /* Concatenate part files. */
+    for (size_t i = 0; i < n_parts; i++) {
+        char pp[4096];
+        mpu_part_path(s, bucket, upload_id, parts[i].part_number,
+                      pp, sizeof(pp));
+        int pfd = open(pp, O_RDONLY | O_CLOEXEC);
+        if (pfd < 0) {
+            close(tfd); unlink(tmp_path); free(stored_ct);
+            return S3_ERR_INVALID_PART;
+        }
+        char buf[64 * 1024];
+        for (;;) {
+            ssize_t r = read(pfd, buf, sizeof(buf));
+            if (r == 0) break;
+            if (r < 0) {
+                if (errno == EINTR) continue;
+                close(pfd); close(tfd); unlink(tmp_path); free(stored_ct);
+                return S3_ERR_INTERNAL;
+            }
+            ssize_t off = 0;
+            while (off < r) {
+                ssize_t wr = write(tfd, buf + off, (size_t)(r - off));
+                if (wr < 0) {
+                    if (errno == EINTR) continue;
+                    close(pfd); close(tfd); unlink(tmp_path); free(stored_ct);
+                    return S3_ERR_INTERNAL;
+                }
+                off += wr;
+            }
+        }
+        close(pfd);
+    }
+
+    if (fsync(tfd) < 0) {
+        close(tfd); unlink(tmp_path); free(stored_ct);
+        return S3_ERR_INTERNAL;
+    }
+    close(tfd);
+
+    /* Atomic rename and dirfsync. */
+    if (rename(tmp_path, target_path) < 0) {
+        unlink(tmp_path); free(stored_ct);
+        return S3_ERR_INTERNAL;
+    }
+    fsync_dir(target_dir);
+
+    /* Clean up the staging dir. */
+    char up_dir[4096];
+    mpu_dir_path(s, bucket, upload_id, up_dir, sizeof(up_dir));
+    rm_rf(up_dir);
+
+    /* Fill outputs. */
+    if (etag_out) {
+        snprintf(etag_out, 40, "%s-%zu", mp_hex, n_parts);
+    }
+    if (meta_out) {
+        memset(meta_out, 0, sizeof(*meta_out));
+        meta_out->size = total_size;
+        meta_out->mtime_ms = mtime_ms;
+        meta_out->part_count = (uint16_t)n_parts;
+        memcpy(meta_out->etag, mp_md5, 16);
+        if (stored_ct) {
+            strncpy(meta_out->content_type, stored_ct,
+                    sizeof(meta_out->content_type) - 1);
+        }
+    }
+    free(stored_ct);
+    return S3_OK;
 }

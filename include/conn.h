@@ -72,6 +72,16 @@ typedef struct conn {
     /* Reference to the global object store (lifetime == server). */
     struct s3_store   *store;
 
+    /* Reference to the global SigV4 verifier (lifetime == server).
+     * NULL means auth is disabled — every request is accepted. */
+    struct sigv4_verifier *auth;
+
+    /* Set to 1 in server config to require a valid signature. When
+     * verifier is NULL, this is moot (no auth at all). When verifier
+     * is set, auth_required=0 means "verify if Authorization is
+     * present, else allow" — useful for compatibility transitions. */
+    int                auth_required;
+
     /* Read buffer: bytes are fed to llhttp via llhttp_execute() */
     char               rbuf[CONN_RBUF_SZ];
     size_t             rlen;
@@ -88,6 +98,16 @@ typedef struct conn {
     char              *ext_body;
     size_t             ext_body_len;
     size_t             ext_body_pos;
+
+    /* Optional REQUEST body buffer. Used by handlers that need to parse
+     * the entire request body (e.g. CompleteMultipartUpload XML) rather
+     * than streaming it to a writer. Set by handlers in
+     * route_dispatch_headers; populated by route_dispatch_body across
+     * chunks; consumed by route_dispatch_complete. Capped at
+     * req_body_cap; bytes beyond that cause a 400. */
+    char              *req_body_buf;
+    size_t             req_body_len;
+    size_t             req_body_cap;
 
     /* HTTP parser */
     llhttp_t           parser;
@@ -117,6 +137,39 @@ typedef struct conn {
     struct s3_reader  *get_reader;          /* GET body still to send via sendfile */
     int                get_head_only;       /* HEAD: don't stream body */
 
+    /* Body-hash verification state. Set up at cb_on_headers_complete
+     * after a successful SigV4 verify, when the client declared a real
+     * SHA-256 (not UNSIGNED-PAYLOAD). The on_body callback feeds bytes
+     * into body_hash_ctx; on_message_complete finalizes and compares
+     * with body_hash_expected. body_hash_ctx is a malloc'd EVP_MD_CTX*
+     * (typed as void* here so this header doesn't pull in OpenSSL). */
+    void              *body_hash_ctx;       /* EVP_MD_CTX* — NULL if not verifying */
+    char               body_hash_expected[64];  /* hex, no NUL */
+
+    /* Streaming chunked SigV4 decoder. Set up at cb_on_headers_complete
+     * when x-amz-content-sha256 = STREAMING-AWS4-HMAC-SHA256-PAYLOAD.
+     * Mutually exclusive with body_hash_ctx. The on_body callback
+     * routes bytes through it; the decoder calls route_dispatch_body
+     * with verified data. */
+    struct sigv4_chunk_decoder *chunk_decoder;
+
+    /* Multipart upload context.
+     *  mpu_is_part_upload — when true, c->put_writer was created via
+     *      store_mpu_part_begin and route_dispatch_complete should call
+     *      store_mpu_part_commit instead of store_put_commit.
+     *  mpu_complete_pending — when true, route_dispatch_complete should
+     *      parse req_body_buf and call store_mpu_complete with bucket,
+     *      key, and upload_id below.
+     *  mpu_bucket / mpu_key — saved from headers-complete time so we
+     *      have them available at message-complete. They live in
+     *      req_scratch (same lifetime as the request).
+     *  mpu_upload_id — 32 hex chars + NUL. */
+    int                mpu_is_part_upload;
+    int                mpu_complete_pending;
+    s3_str_t           mpu_bucket;
+    s3_str_t           mpu_key;
+    char               mpu_upload_id[33];
+
     /* Server-side bookkeeping (server.c uses these; opaque to other code). */
     struct conn       *list_prev;
     struct conn       *list_next;
@@ -125,7 +178,8 @@ typedef struct conn {
 } conn_t;
 
 /* Lifecycle */
-conn_t *conn_create(int fd, const char *peer, struct s3_store *store);
+conn_t *conn_create(int fd, const char *peer, struct s3_store *store,
+                    struct sigv4_verifier *auth, int auth_required);
 void    conn_destroy(conn_t *c);
 
 /* I/O readiness callbacks. Return 0 to keep alive, -1 to close. */

@@ -27,6 +27,7 @@
 #include "conn.h"
 #include "log.h"
 #include "route.h"
+#include "sigv4.h"
 #include "store.h"
 
 #include <ctype.h>
@@ -69,12 +70,15 @@ static void parser_init(conn_t *c) {
     c->parser.data = c;
 }
 
-conn_t *conn_create(int fd, const char *peer, struct s3_store *store) {
+conn_t *conn_create(int fd, const char *peer, struct s3_store *store,
+                    struct sigv4_verifier *auth, int auth_required) {
     conn_t *c = calloc(1, sizeof(*c));
     if (!c) return NULL;
     c->fd = fd;
     c->state = CST_READ_HEADERS;
     c->store = store;
+    c->auth = auth;
+    c->auth_required = auth_required;
     snprintf(c->peer, sizeof(c->peer), "%s", peer ? peer : "?");
     parser_init(c);
     return c;
@@ -85,7 +89,10 @@ void conn_destroy(conn_t *c) {
     /* Release any handler-owned state (request was abandoned mid-flight). */
     if (c->put_writer) store_put_abort(c->put_writer);
     if (c->get_reader) store_get_close(c->get_reader);
+    if (c->body_hash_ctx) sigv4_body_hash_free(c->body_hash_ctx);
+    if (c->chunk_decoder) sigv4_chunk_free(c->chunk_decoder);
     free(c->ext_body);
+    free(c->req_body_buf);
     free(c);
 }
 
@@ -151,12 +158,29 @@ static void request_reset(conn_t *c) {
     c->ext_body_len = 0;
     c->ext_body_pos = 0;
     c->req_scratch_used = 0;
+    free(c->req_body_buf);
+    c->req_body_buf = NULL;
+    c->req_body_len = 0;
+    c->req_body_cap = 0;
+    c->mpu_is_part_upload = 0;
+    c->mpu_complete_pending = 0;
+    c->mpu_bucket = (s3_str_t){0};
+    c->mpu_key = (s3_str_t){0};
+    c->mpu_upload_id[0] = '\0';
 
     /* Belt-and-suspenders: by the time we reset, route_dispatch_complete
      * (PUT path) or route_dispatch_send_body (GET path) should have
      * cleared these. If anything slipped through, release it now. */
     if (c->put_writer) { store_put_abort(c->put_writer); c->put_writer = NULL; }
     if (c->get_reader) { store_get_close(c->get_reader); c->get_reader = NULL; }
+    if (c->body_hash_ctx) {
+        sigv4_body_hash_free(c->body_hash_ctx);
+        c->body_hash_ctx = NULL;
+    }
+    if (c->chunk_decoder) {
+        sigv4_chunk_free(c->chunk_decoder);
+        c->chunk_decoder = NULL;
+    }
     c->get_head_only = 0;
 }
 
@@ -171,6 +195,13 @@ static int cb_on_message_begin(llhttp_t *p) {
      * fully written, so this is a no-op in normal flow. */
     (void)c;
     return 0;
+}
+
+/* Callback for the chunk decoder: forwards verified chunk-data bytes
+ * to the route layer (which streams them into the PUT writer). */
+static int chunk_data_to_route(void *user, const char *data, size_t len) {
+    conn_t *c = user;
+    return route_dispatch_body(c, data, len);
 }
 
 static int cb_on_url(llhttp_t *p, const char *at, size_t len) {
@@ -265,9 +296,54 @@ static int cb_on_headers_complete(llhttp_t *p) {
     int http11 = (p->http_major == 1 && p->http_minor == 1);
     c->req.keep_alive = http11 && !conn_close;
 
-    /* Phase 2 hook: SigV4 verification slots in here, before route
-     * dispatch. Return HPE_PAUSED to give the verifier a chance, then
-     * llhttp_resume() (or build a 403 and skip the body) below. */
+    /* Phase 2 hook: SigV4 verification.
+     *
+     * If a verifier is configured, check the signature now. On failure,
+     * build the appropriate S3 error response and skip the route
+     * dispatch — but return 0 (not -1) so llhttp continues to
+     * on_body/on_message_complete, which lets us write the response
+     * cleanly and either keep the connection alive or close it. */
+    if (c->auth) {
+        /* Look up authorization header. If missing and auth not strictly
+         * required, fall through. */
+        const s3_str_t *auth_h = NULL;
+        for (size_t i = 0; i < c->req.n_headers; i++) {
+            if (s3_str_eq_lit(c->req.headers[i].k, "authorization")) {
+                auth_h = &c->req.headers[i].v;
+                break;
+            }
+        }
+        if (auth_h || c->auth_required) {
+            s3_err_t e = sigv4_verify(c->auth, c);
+            if (e != S3_OK) {
+                LOG_D("sigv4 verify failed (err=%d) on %s",
+                      (int)e, c->peer);
+                if (route_build_error(c, e) < 0) return -1;
+                return 0;
+            }
+            /* Verified. If the client declared a real body hash (not
+             * UNSIGNED-PAYLOAD and not the streaming literal), set up
+             * streaming verification so we catch the case where the
+             * client lied about its body. */
+            const s3_str_t *bh = NULL;
+            for (size_t i = 0; i < c->req.n_headers; i++) {
+                if (s3_str_eq_lit(c->req.headers[i].k, "x-amz-content-sha256")) {
+                    bh = &c->req.headers[i].v;
+                    break;
+                }
+            }
+            if (bh && bh->n == 64
+                && !s3_str_eq_lit(*bh, "UNSIGNED-PAYLOAD")) {
+                c->body_hash_ctx = sigv4_body_hash_begin();
+                if (c->body_hash_ctx) {
+                    memcpy(c->body_hash_expected, bh->p, 64);
+                }
+                /* If begin failed (OOM), we'd silently skip body
+                 * verification rather than fail the request. The
+                 * signature itself is still verified. */
+            }
+        }
+    }
 
     c->state = CST_READ_BODY;
 
@@ -277,12 +353,69 @@ static int cb_on_headers_complete(llhttp_t *p) {
     if (route_dispatch_headers(c) < 0) {
         return -1;
     }
+
+    /* If this is a chunked-SigV4 request, set up the chunk decoder
+     * AFTER route_dispatch_headers has set up a writer (if any).
+     * The decoder's on_data callback forwards verified data bytes to
+     * route_dispatch_body, which requires the writer to exist. */
+    if (c->auth && sigv4_is_chunked(c)) {
+        /* Find x-amz-decoded-content-length for end-of-stream check. */
+        uint64_t expected = 0;
+        for (size_t i = 0; i < c->req.n_headers; i++) {
+            if (s3_str_eq_lit(c->req.headers[i].k, "x-amz-decoded-content-length")) {
+                const s3_str_t *v = &c->req.headers[i].v;
+                /* Bounded parse — value should be plain decimal. */
+                for (size_t j = 0; j < v->n; j++) {
+                    if (v->p[j] < '0' || v->p[j] > '9') { expected = 0; break; }
+                    expected = expected * 10 + (uint64_t)(v->p[j] - '0');
+                }
+                break;
+            }
+        }
+        c->chunk_decoder = sigv4_chunk_begin(c->auth, c, expected,
+                                             chunk_data_to_route, c);
+        if (!c->chunk_decoder) {
+            /* OOM or some other failure setting up the decoder. */
+            if (route_build_error(c, S3_ERR_INTERNAL) < 0) return -1;
+            return 0;
+        }
+    }
     return 0;
 }
 
 static int cb_on_body(llhttp_t *p, const char *at, size_t len) {
     conn_t *c = p->data;
     c->req.body_consumed += len;
+
+    /* Chunked SigV4: feed bytes to the decoder, which calls back via
+     * chunk_data_to_route for each verified data segment. The decoder
+     * also handles the framing and per-chunk signature verification. */
+    if (c->chunk_decoder) {
+        if (sigv4_chunk_feed(c->chunk_decoder, at, len) < 0) {
+            LOG_D("chunk feed failed on %s", c->peer);
+            /* Abort any in-flight PUT so nothing reaches the store. */
+            if (c->put_writer) {
+                store_put_abort(c->put_writer);
+                c->put_writer = NULL;
+            }
+            sigv4_chunk_free(c->chunk_decoder);
+            c->chunk_decoder = NULL;
+            if (route_build_error(c, S3_ERR_SIGNATURE_DOES_NOT_MATCH) < 0) {
+                return -1;
+            }
+            /* Drain remaining body bytes silently — but llhttp will keep
+             * delivering them via on_body. We've already built the
+             * response. Returning 0 keeps the parser running so we
+             * still hit on_message_complete and can flush the response. */
+            return 0;
+        }
+        return 0;
+    }
+
+    /* If body-hash verification is active, feed the bytes through. */
+    if (c->body_hash_ctx) {
+        sigv4_body_hash_update(c->body_hash_ctx, at, len);
+    }
     /* Stream body bytes into a writer if route established one for PUT. */
     if (route_dispatch_body(c, at, len) < 0) return -1;
     return 0;
@@ -290,6 +423,49 @@ static int cb_on_body(llhttp_t *p, const char *at, size_t len) {
 
 static int cb_on_message_complete(llhttp_t *p) {
     conn_t *c = p->data;
+
+    /* If a chunk decoder was active and is still alive (no mid-stream
+     * failure already produced a response), verify the terminator
+     * chunk arrived and the total decoded length matched. */
+    if (c->chunk_decoder) {
+        int ok = (sigv4_chunk_finish(c->chunk_decoder) == 0);
+        sigv4_chunk_free(c->chunk_decoder);
+        c->chunk_decoder = NULL;
+        if (!ok) {
+            LOG_D("chunk finish failed on %s", c->peer);
+            if (c->put_writer) {
+                store_put_abort(c->put_writer);
+                c->put_writer = NULL;
+            }
+            if (route_build_error(c, S3_ERR_SIGNATURE_DOES_NOT_MATCH) < 0) {
+                return -1;
+            }
+            c->request_dispatched = 1;
+            return HPE_PAUSED;
+        }
+    }
+
+    /* If body-hash verification is active, finalize and compare BEFORE
+     * the route layer commits. A mismatch means the client lied about
+     * its body — we abort the PUT writer (no object on disk) and
+     * return XAmzContentSHA256Mismatch. */
+    if (c->body_hash_ctx) {
+        int matched = sigv4_body_hash_verify(c->body_hash_ctx,
+                                             c->body_hash_expected);
+        sigv4_body_hash_free(c->body_hash_ctx);
+        c->body_hash_ctx = NULL;
+        if (!matched) {
+            LOG_D("body sha256 mismatch on %s", c->peer);
+            /* Abort any in-flight PUT so nothing reaches the store. */
+            if (c->put_writer) {
+                store_put_abort(c->put_writer);
+                c->put_writer = NULL;
+            }
+            if (route_build_error(c, S3_ERR_BAD_DIGEST) < 0) return -1;
+            c->request_dispatched = 1;
+            return HPE_PAUSED;
+        }
+    }
 
     /* For streaming PUT, finalize: store_put_commit + build response.
      * For non-streaming requests the response was already built at

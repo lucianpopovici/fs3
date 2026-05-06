@@ -23,13 +23,15 @@ typedef enum {
     S3_ERR_INVALID_REQUEST,
     S3_ERR_SIGNATURE_DOES_NOT_MATCH,
     S3_ERR_ACCESS_DENIED,
-    S3_ERR_INVALID_AUTH_HEADER,
     S3_ERR_REQUEST_TIME_TOO_SKEWED,
     S3_ERR_ENTITY_TOO_LARGE,
     S3_ERR_MISSING_CONTENT_LENGTH,
     S3_ERR_METHOD_NOT_ALLOWED,
     S3_ERR_INTERNAL,
     S3_ERR_NOT_IMPLEMENTED,
+    S3_ERR_BAD_DIGEST,                  /* x-amz-content-sha256 mismatch */
+    S3_ERR_INVALID_PART,                /* multipart: bad part list */
+    S3_ERR_MALFORMED_XML,               /* XML body could not be parsed */
     S3_ERR_MAX
 } s3_err_t;
 
