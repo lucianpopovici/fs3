@@ -167,6 +167,8 @@ static void request_reset(conn_t *c) {
     c->mpu_bucket = (s3_str_t){0};
     c->mpu_key = (s3_str_t){0};
     c->mpu_upload_id[0] = '\0';
+    c->delete_pending = 0;
+    c->delete_bucket = (s3_str_t){0};
 
     /* Belt-and-suspenders: by the time we reset, route_dispatch_complete
      * (PUT path) or route_dispatch_send_body (GET path) should have

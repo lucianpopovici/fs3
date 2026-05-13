@@ -84,6 +84,10 @@ test: $(TEST_BINS) fs3
 	@./tests/test_e2e_auth.sh
 	@echo "=== test_e2e_mpu (multipart integration) ==="
 	@./tests/test_e2e_mpu.sh
+	@echo "=== test_e2e_phase9 (range / bulk-delete / bucket-subresources) ==="
+	@./tests/test_e2e_phase9.sh
+	@echo "=== test_e2e_phase10 (object copy / ?acl stub) ==="
+	@./tests/test_e2e_phase10.sh
 
 tests/test_store: tests/test_store.c src/store_fs.o src/log.o
 	$(CC) $(CFLAGS) $(INCLUDES) tests/test_store.c \

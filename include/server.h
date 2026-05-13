@@ -19,9 +19,11 @@ typedef struct {
     struct sigv4_verifier *auth;
     int                    auth_required;
 
-    /* Multipart upload GC. Uploads older than this many seconds are
-     * removed by a periodic sweep. 0 = disabled (default). */
-    uint64_t mpu_gc_age_secs;
+    /* Multipart upload GC. Defaults (when fields are 0) are 60 s
+     * sweep cadence and 24 h TTL. Override mainly for tests that want
+     * to force quick reaping; production has no reason to retune. */
+    int                    gc_interval_s;     /* sweep cadence in seconds */
+    uint64_t               gc_max_age_ms;     /* TTL for staging dirs */
 } server_cfg_t;
 
 server_t *server_create(const server_cfg_t *cfg);

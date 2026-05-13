@@ -14,8 +14,6 @@
 #include "log.h"
 #include "store.h"
 
-#include <time.h>
-
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -26,6 +24,7 @@
 #include <string.h>
 #include <sys/epoll.h>
 #include <sys/socket.h>
+#include <time.h>
 #include <unistd.h>
 
 #define MAX_EVENTS 64
@@ -38,6 +37,12 @@ struct server {
     int           n_conns;
     conn_t       *conns_head;   /* intrusive doubly-linked list */
     s3_store_t   *store;        /* shared object store */
+    /* Periodic multipart-upload GC. We piggyback on the epoll_wait
+     * timeout — once every gc_interval_ms of wall clock, sweep the MPU
+     * staging area and reap any upload older than gc_max_age_ms. */
+    time_t        gc_last_run;       /* monotonic seconds */
+    int           gc_interval_s;     /* sweep cadence */
+    uint64_t      gc_max_age_ms;     /* TTL */
 };
 
 static void list_push(conn_t **head, conn_t *c) {
@@ -101,12 +106,6 @@ server_t *server_create(const server_cfg_t *cfg) {
     }
     LOG_I("store opened at %s", cfg->data_root);
 
-    /* Initial GC sweep on startup to clean up leftovers from previous runs. */
-    if (cfg->mpu_gc_age_secs > 0) {
-        int n = store_mpu_gc(s->store, cfg->mpu_gc_age_secs);
-        if (n > 0) LOG_I("mpu gc: removed %d stale upload(s) at startup", n);
-    }
-
     s->listen_fd = listen_socket(cfg->bind_addr, cfg->port, cfg->backlog);
     if (s->listen_fd < 0) goto fail;
 
@@ -126,6 +125,14 @@ server_t *server_create(const server_cfg_t *cfg) {
     }
 
     LOG_I("listening on %s:%u", cfg->bind_addr, cfg->port);
+
+    /* GC defaults: sweep every 60s, reap uploads older than 24h.
+     * Config may override either for testing or admin policy. */
+    s->gc_interval_s = cfg->gc_interval_s > 0 ? cfg->gc_interval_s : 60;
+    s->gc_max_age_ms = cfg->gc_max_age_ms > 0
+                       ? cfg->gc_max_age_ms
+                       : (24ULL * 3600 * 1000);
+    s->gc_last_run = time(NULL);
     return s;
 
 fail:
@@ -229,11 +236,8 @@ static void accept_new(server_t *s) {
     }
 }
 
-#define GC_INTERVAL_SECS 60
-
 int server_run(server_t *s) {
     struct epoll_event events[MAX_EVENTS];
-    time_t last_gc = time(NULL);
 
     while (!s->stop) {
         int n = epoll_wait(s->epoll_fd, events, MAX_EVENTS, 1000);
@@ -243,15 +247,17 @@ int server_run(server_t *s) {
             return -1;
         }
 
-        /* Periodic GC sweep (runs at most once per GC_INTERVAL_SECS). */
-        if (s->cfg.mpu_gc_age_secs > 0) {
-            time_t now = time(NULL);
-            if (now - last_gc >= GC_INTERVAL_SECS) {
-                last_gc = now;
-                int nr = store_mpu_gc(s->store, s->cfg.mpu_gc_age_secs);
-                if (nr > 0)
-                    LOG_I("mpu gc: removed %d stale upload(s)", nr);
-            }
+        /* Periodic MPU GC. We piggyback on the 1s epoll timeout: every
+         * gc_interval_s seconds (wall clock), sweep the staging area
+         * and reap any abandoned upload older than gc_max_age_ms. */
+        time_t now = time(NULL);
+        if (s->gc_interval_s > 0
+            && now - s->gc_last_run >= s->gc_interval_s) {
+            int reaped = store_mpu_gc(s->store,
+                                      (uint64_t)now * 1000,
+                                      s->gc_max_age_ms);
+            if (reaped > 0) LOG_I("mpu_gc: reaped %d stale upload(s)", reaped);
+            s->gc_last_run = now;
         }
 
         for (int i = 0; i < n; i++) {

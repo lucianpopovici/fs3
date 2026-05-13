@@ -77,12 +77,11 @@ ssize_t  store_get_read(s3_reader_t *r, void *buf, size_t n);
 /* Send up to `max` body bytes from the object file directly to out_fd
  * via sendfile(2). Returns bytes sent (0 = EOF), or -1 on error. */
 ssize_t  store_get_sendfile(s3_reader_t *r, int out_fd, size_t max);
+/* Restrict the reader to a byte range [first, last] (0-based, inclusive).
+ * Must be called before the first read/sendfile. Returns S3_ERR_INVALID_ARGUMENT
+ * if the range falls outside the object body. */
+s3_err_t store_get_seek(s3_reader_t *r, uint64_t first, uint64_t last);
 void     store_get_close(s3_reader_t *r);
-
-/* Restrict the reader to a byte range [offset, offset+length) within the
- * object body. Must be called after store_get_open(), before the first
- * read/sendfile. Returns S3_ERR_INVALID_RANGE if offset >= object size. */
-s3_err_t store_get_set_range(s3_reader_t *r, uint64_t offset, uint64_t length);
 
 /* ---- HEAD / DELETE ---- */
 
@@ -151,48 +150,6 @@ s3_err_t store_mpu_complete(s3_store_t *s, s3_str_t bucket, s3_str_t key,
 s3_err_t store_mpu_abort(s3_store_t *s, s3_str_t bucket, s3_str_t key,
                          const char *upload_id);
 
-/* GC sweep: scan all uploads across all buckets. Remove any whose
- * initiation time is older than `max_age_secs` seconds ago.
- * max_age_secs == 0 disables the sweep (returns 0 immediately).
- * Returns the number of uploads removed, or -1 on a fatal error. */
-int store_mpu_gc(s3_store_t *s, uint64_t max_age_secs);
-
-/* ---- Bucket listing ----
- *
- * Lists all buckets, sorted alphabetically. Each call to
- * store_list_buckets_next() returns the next bucket name and its
- * creation time (derived from the bucket directory mtime). Returns
- * S3_ERR_NO_SUCH_KEY when exhausted. The returned name span points
- * into lister-owned storage, valid until the next call or close. */
-
-typedef struct s3_bucket_lister s3_bucket_lister_t;
-
-s3_err_t store_list_buckets_begin(s3_store_t *s, s3_bucket_lister_t **out);
-s3_err_t store_list_buckets_next(s3_bucket_lister_t *l, s3_str_t *name_out,
-                                  uint64_t *ctime_ms_out);
-void     store_list_buckets_close(s3_bucket_lister_t *l);
-
-/* ---- Multipart upload listing ----
- *
- * Lists all in-progress multipart uploads for a bucket, sorted by
- * upload_id. store_mpu_list_next() fills an s3_mpu_entry_t whose string
- * fields point into lister-owned storage (valid until next call or close).
- * Returns S3_ERR_NO_SUCH_KEY when exhausted. */
-
-typedef struct s3_mpu_lister s3_mpu_lister_t;
-
-typedef struct {
-    const char *upload_id; /* 32 hex chars + NUL, lister-owned */
-    const char *key;       /* NUL-terminated, lister-owned */
-    size_t      key_n;
-    uint64_t    ctime_ms;
-} s3_mpu_entry_t;
-
-s3_err_t store_mpu_list_begin(s3_store_t *s, s3_str_t bucket,
-                               s3_mpu_lister_t **out);
-s3_err_t store_mpu_list_next(s3_mpu_lister_t *l, s3_mpu_entry_t *entry_out);
-void     store_mpu_list_close(s3_mpu_lister_t *l);
-
 /* ---- List ----
  *
  * Phase 2.1 implementation walks the filesystem; OK for homelab scale
@@ -222,4 +179,50 @@ s3_err_t store_list_next(s3_lister_t *l, s3_str_t *key_out,
 int      store_list_truncated(const s3_lister_t *l);
 void     store_list_close(s3_lister_t *l);
 
+/* ---- Service-level listing ----
+ *
+ * store_list_buckets enumerates all buckets under <root>/buckets/.
+ * Result is a heap-allocated array of s3_bucket_info_t records; caller
+ * frees with store_buckets_free. Order is filesystem-readdir order,
+ * which is fine — S3 itself doesn't guarantee ordering for
+ * ListAllMyBuckets. */
+typedef struct {
+    char    *name;          /* NUL-terminated, owned */
+    uint64_t ctime_ms;      /* bucket creation time */
+} s3_bucket_info_t;
+
+s3_err_t store_list_buckets(s3_store_t *s,
+                            s3_bucket_info_t **out, size_t *n_out);
+void     store_buckets_free(s3_bucket_info_t *list, size_t n);
+
+/* ---- In-flight multipart uploads ----
+ *
+ * Enumerate active multipart uploads in a bucket. Reads each
+ * <root>/mpu/<bucket>/<upload_id>/meta to extract key + ctime.
+ * Filters by key_prefix (may be S3_STR_NULL to list all).
+ * Caller frees with store_mpu_uploads_free. */
+typedef struct {
+    char    *key;                                       /* owned */
+    char     upload_id[S3_MULTIPART_UPLOAD_ID_LEN + 1]; /* fixed */
+    uint64_t ctime_ms;
+} s3_mpu_info_t;
+
+s3_err_t store_list_mpu_uploads(s3_store_t *s, s3_str_t bucket,
+                                s3_str_t key_prefix,
+                                s3_mpu_info_t **out, size_t *n_out);
+void     store_mpu_uploads_free(s3_mpu_info_t *list, size_t n);
+
+/* ---- Multipart GC ----
+ *
+ * Sweep the MPU staging area and remove any upload whose ctime_ms is
+ * older than (now_ms - max_age_ms). Returns the number of uploads
+ * removed (0 if none, -errno on internal error). Safe to call on a
+ * live system; uses the same rm_rf machinery as store_mpu_abort.
+ *
+ * Suggested cadence: call once every few minutes from the event loop,
+ * with max_age_ms = 86_400_000 (24 hours). Real S3 defaults to 7
+ * days but it's an admin policy, not a protocol requirement. */
+int      store_mpu_gc(s3_store_t *s, uint64_t now_ms, uint64_t max_age_ms);
+
 #endif
+

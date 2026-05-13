@@ -170,6 +170,10 @@ typedef struct conn {
     s3_str_t           mpu_key;
     char               mpu_upload_id[33];
 
+    /* Bulk-delete context (POST /<bucket>?delete) */
+    int                delete_pending;
+    s3_str_t           delete_bucket;   /* points into req_scratch */
+
     /* Server-side bookkeeping (server.c uses these; opaque to other code). */
     struct conn       *list_prev;
     struct conn       *list_next;

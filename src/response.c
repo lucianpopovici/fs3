@@ -109,14 +109,6 @@ static const err_entry_t ERR_TABLE[] = {
     { S3_ERR_BAD_DIGEST,                 400, "XAmzContentSHA256Mismatch","The provided x-amz-content-sha256 header does not match the body." },
     { S3_ERR_INVALID_PART,               400, "InvalidPart",              "One or more of the specified parts could not be found." },
     { S3_ERR_MALFORMED_XML,              400, "MalformedXML",             "The XML you provided was not well-formed."         },
-    { S3_ERR_INVALID_RANGE,             416, "InvalidRange",             "The requested range is not satisfiable."            },
-    { S3_ERR_NO_SUCH_LIFECYCLE_CONFIGURATION,      404, "NoSuchLifecycleConfiguration",          "The lifecycle configuration does not exist."        },
-    { S3_ERR_NO_SUCH_CORS_CONFIGURATION,           404, "NoSuchCORSConfiguration",               "The CORS configuration does not exist."             },
-    { S3_ERR_NO_SUCH_BUCKET_POLICY,                404, "NoSuchBucketPolicy",                    "The bucket policy does not exist."                  },
-    { S3_ERR_SSE_CONFIGURATION_NOT_FOUND,          404, "ServerSideEncryptionConfigurationNotFoundError", "The server side encryption configuration was not found." },
-    { S3_ERR_NO_SUCH_WEBSITE_CONFIGURATION,        404, "NoSuchWebsiteConfiguration",            "The specified bucket does not have a website configuration." },
-    { S3_ERR_OBJECT_LOCK_CONFIGURATION_NOT_FOUND,  404, "ObjectLockConfigurationNotFoundError",  "Object Lock configuration does not exist for this bucket." },
-    { S3_ERR_REPLICATION_CONFIGURATION_NOT_FOUND,  404, "ReplicationConfigurationNotFoundError", "The replication configuration was not found."       },
 };
 
 static const err_entry_t *err_lookup(s3_err_t e) {
@@ -434,148 +426,6 @@ int rsp_build_list_bucket(conn_t *c, s3_str_t bucket,
     return 0;
 }
 
-/* Forward declaration — defined in the MPU section below. */
-static int ship_xml_200(conn_t *c, char *body, size_t blen);
-
-/* ===================================================================== */
-/* ListAllMyBucketsResult                                                 */
-/* ===================================================================== */
-
-int rsp_build_list_all_buckets(conn_t *c, s3_bucket_lister_t *l) {
-    XMLNode *root = create_node("ListAllMyBucketsResult");
-    if (!root) { store_list_buckets_close(l); return -1; }
-    if (add_attr(root, "xmlns", "http://s3.amazonaws.com/doc/2006-03-01/") < 0) {
-        free_tree(root); store_list_buckets_close(l); return -1;
-    }
-
-    XMLNode *owner = create_node("Owner");
-    if (!owner || add_child(root, owner) < 0) {
-        if (owner) free_tree(owner);
-        free_tree(root); store_list_buckets_close(l); return -1;
-    }
-    xml_text_child(owner, "ID", "fs3");
-    xml_text_child(owner, "DisplayName", "fs3");
-
-    XMLNode *buckets = create_node("Buckets");
-    if (!buckets || add_child(root, buckets) < 0) {
-        if (buckets) free_tree(buckets);
-        free_tree(root); store_list_buckets_close(l); return -1;
-    }
-
-    for (;;) {
-        s3_str_t name; uint64_t ctime_ms = 0;
-        s3_err_t e = store_list_buckets_next(l, &name, &ctime_ms);
-        if (e != S3_OK) break;
-
-        XMLNode *b = create_node("Bucket");
-        if (!b || add_child(buckets, b) < 0) {
-            if (b) free_tree(b);
-            free_tree(root); store_list_buckets_close(l); return -1;
-        }
-        xml_text_child_n(b, "Name", name.p, name.n);
-        char ts[32]; rsp_format_iso8601(ctime_ms, ts);
-        xml_text_child(b, "CreationDate", ts);
-    }
-    store_list_buckets_close(l);
-
-    size_t blen = 0;
-    char *body = xml_render_with_decl(root, &blen);
-    free_tree(root);
-    if (!body) return -1;
-    return ship_xml_200(c, body, blen);
-}
-
-/* ===================================================================== */
-/* ListMultipartUploadsResult                                             */
-/* ===================================================================== */
-
-int rsp_build_list_mpu(conn_t *c, s3_str_t bucket, s3_mpu_lister_t *l) {
-    XMLNode *root = create_node("ListMultipartUploadsResult");
-    if (!root) { store_mpu_list_close(l); return -1; }
-    if (add_attr(root, "xmlns", "http://s3.amazonaws.com/doc/2006-03-01/") < 0) {
-        free_tree(root); store_mpu_list_close(l); return -1;
-    }
-    xml_text_child_n(root, "Bucket", bucket.p, bucket.n);
-
-    for (;;) {
-        s3_mpu_entry_t ent;
-        s3_err_t e = store_mpu_list_next(l, &ent);
-        if (e != S3_OK) break;
-
-        XMLNode *up = create_node("Upload");
-        if (!up || add_child(root, up) < 0) {
-            if (up) free_tree(up);
-            free_tree(root); store_mpu_list_close(l); return -1;
-        }
-        xml_text_child_n(up, "Key", ent.key, ent.key_n);
-        xml_text_child(up, "UploadId", ent.upload_id);
-        char ts[32]; rsp_format_iso8601(ent.ctime_ms, ts);
-        xml_text_child(up, "Initiated", ts);
-    }
-    store_mpu_list_close(l);
-
-    size_t blen = 0;
-    char *body = xml_render_with_decl(root, &blen);
-    free_tree(root);
-    if (!body) return -1;
-    return ship_xml_200(c, body, blen);
-}
-
-/* ===================================================================== */
-/* Range response (206 Partial Content / 416 Range Not Satisfiable)      */
-/* ===================================================================== */
-
-int rsp_build_object_range(conn_t *c, const s3_obj_meta_t *m,
-                           uint64_t range_start, uint64_t range_end) {
-    char etag[41]; rsp_format_etag_with_parts(m->etag, m->part_count, etag);
-    char lm[32];   rsp_format_rfc1123(m->mtime_ms, lm);
-    const char *ct = m->content_type[0] ? m->content_type
-                                        : "application/octet-stream";
-    uint64_t length = range_end - range_start + 1;
-
-    int n = snprintf(c->wbuf, CONN_WBUF_SZ,
-        "HTTP/1.1 206 Partial Content\r\n"
-        "Server: fs3/0.2\r\n"
-        "Content-Type: %s\r\n"
-        "Content-Length: %llu\r\n"
-        "Content-Range: bytes %llu-%llu/%llu\r\n"
-        "ETag: %s\r\n"
-        "Last-Modified: %s\r\n"
-        "Accept-Ranges: bytes\r\n"
-        "Connection: %s\r\n"
-        "\r\n",
-        ct,
-        (unsigned long long)length,
-        (unsigned long long)range_start,
-        (unsigned long long)range_end,
-        (unsigned long long)m->size,
-        etag,
-        lm,
-        c->req.keep_alive ? "keep-alive" : "close");
-    if (n < 0 || n >= CONN_WBUF_SZ) return -1;
-    c->wlen = (size_t)n;
-    c->wpos = 0;
-    c->state = CST_WRITE_RESPONSE;
-    return 0;
-}
-
-int rsp_build_range_not_satisfiable(conn_t *c, uint64_t total_size) {
-    int n = snprintf(c->wbuf, CONN_WBUF_SZ,
-        "HTTP/1.1 416 Range Not Satisfiable\r\n"
-        "Server: fs3/0.2\r\n"
-        "Content-Length: 0\r\n"
-        "Content-Range: bytes */%llu\r\n"
-        "Connection: %s\r\n"
-        "\r\n",
-        (unsigned long long)total_size,
-        c->req.keep_alive ? "keep-alive" : "close");
-    if (n < 0 || n >= CONN_WBUF_SZ) return -1;
-    c->wlen = (size_t)n;
-    c->wpos = 0;
-    c->state = CST_WRITE_RESPONSE;
-    return 0;
-}
-
 /* ===================================================================== */
 /* Multipart upload responses                                             */
 /* ===================================================================== */
@@ -611,16 +461,6 @@ static int ship_xml_200(conn_t *c, char *body, size_t blen) {
     return 0;
 }
 
-/* Build a 200 OK application/xml response from a NUL-terminated literal.
- * Used by bucket subresource handlers whose responses are static strings. */
-int rsp_build_xml_200(conn_t *c, const char *body_lit) {
-    size_t blen = strlen(body_lit);
-    char *body = malloc(blen);
-    if (!body) return -1;
-    memcpy(body, body_lit, blen);
-    return ship_xml_200(c, body, blen);
-}
-
 int rsp_build_initiate_mpu(conn_t *c, s3_str_t bucket, s3_str_t key,
                            const char *upload_id) {
     XMLNode *root = create_node("InitiateMultipartUploadResult");
@@ -654,6 +494,267 @@ int rsp_build_complete_mpu(conn_t *c, s3_str_t bucket, s3_str_t key,
     char etag_q[64];
     snprintf(etag_q, sizeof(etag_q), "\"%s\"", etag);
     xml_text_child(root, "ETag", etag_q);
+
+    size_t blen = 0;
+    char *body = xml_render_with_decl(root, &blen);
+    free_tree(root);
+    if (!body) return -1;
+    return ship_xml_200(c, body, blen);
+}
+
+/* ===================================================================== */
+/* Service-level: ListAllMyBuckets                                        */
+/* ===================================================================== */
+
+int rsp_build_list_all_my_buckets(conn_t *c,
+                                   const s3_bucket_info_t *buckets,
+                                   size_t n_buckets) {
+    XMLNode *root = create_node("ListAllMyBucketsResult");
+    if (!root) return -1;
+    if (add_attr(root, "xmlns", "http://s3.amazonaws.com/doc/2006-03-01/") < 0) {
+        free_tree(root); return -1;
+    }
+
+    /* AWS requires <Owner> with ID + DisplayName. fs3 has no identity
+     * model, so we emit placeholder values that look plausible enough
+     * for clients that parse the response. */
+    XMLNode *owner = create_node("Owner");
+    if (!owner || add_child(root, owner) < 0) {
+        if (owner) free_tree(owner);
+        free_tree(root); return -1;
+    }
+    xml_text_child(owner, "ID",          "fs3");
+    xml_text_child(owner, "DisplayName", "fs3");
+
+    XMLNode *list = create_node("Buckets");
+    if (!list || add_child(root, list) < 0) {
+        if (list) free_tree(list);
+        free_tree(root); return -1;
+    }
+    for (size_t i = 0; i < n_buckets; i++) {
+        XMLNode *b = create_node("Bucket");
+        if (!b || add_child(list, b) < 0) {
+            if (b) free_tree(b);
+            free_tree(root); return -1;
+        }
+        xml_text_child(b, "Name", buckets[i].name);
+        char ts[32];
+        rsp_format_iso8601(buckets[i].ctime_ms, ts);
+        xml_text_child(b, "CreationDate", ts);
+    }
+
+    size_t blen = 0;
+    char *body = xml_render_with_decl(root, &blen);
+    free_tree(root);
+    if (!body) return -1;
+    return ship_xml_200(c, body, blen);
+}
+
+/* ===================================================================== */
+/* Object copy: CopyObjectResult                                          */
+/* ===================================================================== */
+
+int rsp_build_copy_object(conn_t *c, const s3_obj_meta_t *m) {
+    char etag[41]; rsp_format_etag_with_parts(m->etag, m->part_count, etag);
+    char ts[32];   rsp_format_iso8601(m->mtime_ms, ts);
+
+    XMLNode *root = create_node("CopyObjectResult");
+    if (!root) return -1;
+    if (!xml_text_child(root, "LastModified", ts)
+        || !xml_text_child(root, "ETag", etag)) {
+        free_tree(root); return -1;
+    }
+    size_t blen = 0;
+    char *body = xml_render_with_decl(root, &blen);
+    free_tree(root);
+    if (!body) return -1;
+    return ship_xml_200(c, body, blen);
+}
+
+/* ===================================================================== */
+/* ACL stub: AccessControlPolicy                                          */
+/* ===================================================================== */
+
+int rsp_build_acl(conn_t *c) {
+    /* fs3 has no real ACL model — always return a single FULL_CONTROL
+     * grant to the "fs3" canonical user. The xsi: namespace on Grantee
+     * is required by AWS clients. We build it as a literal string to
+     * sidestep XML library concerns about colon-containing attribute names. */
+    static const char acl_xml[] =
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+        "<AccessControlPolicy xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">"
+        "<Owner><ID>fs3</ID><DisplayName>fs3</DisplayName></Owner>"
+        "<AccessControlList><Grant>"
+        "<Grantee xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\""
+        " xsi:type=\"CanonicalUser\">"
+        "<ID>fs3</ID><DisplayName>fs3</DisplayName></Grantee>"
+        "<Permission>FULL_CONTROL</Permission>"
+        "</Grant></AccessControlList>"
+        "</AccessControlPolicy>";
+    size_t blen = sizeof(acl_xml) - 1;
+    char *body = malloc(blen);
+    if (!body) return -1;
+    memcpy(body, acl_xml, blen);
+    return ship_xml_200(c, body, blen);
+}
+
+/* ===================================================================== */
+/* Range responses (206 / 416)                                            */
+/* ===================================================================== */
+
+int rsp_build_object_range(conn_t *c, const s3_obj_meta_t *m,
+                           uint64_t first, uint64_t last, int head_only) {
+    char etag[41]; rsp_format_etag_with_parts(m->etag, m->part_count, etag);
+    char lm[32];   rsp_format_rfc1123(m->mtime_ms, lm);
+    const char *ct = m->content_type[0] ? m->content_type
+                                        : "application/octet-stream";
+    uint64_t range_len = last - first + 1;
+
+    int n = snprintf(c->wbuf, CONN_WBUF_SZ,
+        "HTTP/1.1 206 Partial Content\r\n"
+        "Server: fs3/0.2\r\n"
+        "Content-Type: %s\r\n"
+        "Content-Length: %llu\r\n"
+        "Content-Range: bytes %llu-%llu/%llu\r\n"
+        "ETag: %s\r\n"
+        "Last-Modified: %s\r\n"
+        "Accept-Ranges: bytes\r\n"
+        "Connection: %s\r\n"
+        "\r\n",
+        ct,
+        (unsigned long long)range_len,
+        (unsigned long long)first,
+        (unsigned long long)last,
+        (unsigned long long)m->size,
+        etag, lm,
+        c->req.keep_alive ? "keep-alive" : "close");
+    (void)head_only;
+    if (n < 0 || n >= CONN_WBUF_SZ) return -1;
+    c->wlen = (size_t)n;
+    c->wpos = 0;
+    c->state = CST_WRITE_RESPONSE;
+    return 0;
+}
+
+int rsp_build_range_not_satisfiable(conn_t *c, uint64_t obj_size) {
+    char cr[64];
+    snprintf(cr, sizeof(cr), "Content-Range: bytes */%llu\r\n",
+             (unsigned long long)obj_size);
+    return rsp_build_status_with_headers(c, 416, "Range Not Satisfiable", cr);
+}
+
+/* ===================================================================== */
+/* Bulk delete: DeleteResult                                              */
+/* ===================================================================== */
+
+int rsp_build_delete_objects(conn_t *c,
+                              const char **deleted_keys, size_t n_deleted,
+                              const char **error_keys,   size_t n_errors) {
+    XMLNode *root = create_node("DeleteResult");
+    if (!root) return -1;
+    if (add_attr(root, "xmlns", "http://s3.amazonaws.com/doc/2006-03-01/") < 0) {
+        free_tree(root); return -1;
+    }
+    for (size_t i = 0; i < n_deleted; i++) {
+        XMLNode *d = create_node("Deleted");
+        if (!d || add_child(root, d) < 0) {
+            if (d) free_tree(d);
+            free_tree(root); return -1;
+        }
+        if (!xml_text_child(d, "Key", deleted_keys[i])) {
+            free_tree(root); return -1;
+        }
+    }
+    for (size_t i = 0; i < n_errors; i++) {
+        XMLNode *e = create_node("Error");
+        if (!e || add_child(root, e) < 0) {
+            if (e) free_tree(e);
+            free_tree(root); return -1;
+        }
+        if (!xml_text_child(e, "Key", error_keys[i])
+            || !xml_text_child(e, "Code", "InternalError")
+            || !xml_text_child(e, "Message", "An internal error occurred.")) {
+            free_tree(root); return -1;
+        }
+    }
+    size_t blen = 0;
+    char *body = xml_render_with_decl(root, &blen);
+    free_tree(root);
+    if (!body) return -1;
+    return ship_xml_200(c, body, blen);
+}
+
+/* ===================================================================== */
+/* Bucket subresources: location + versioning                             */
+/* ===================================================================== */
+
+int rsp_build_bucket_location(conn_t *c) {
+    XMLNode *root = create_node("LocationConstraint");
+    if (!root) return -1;
+    if (add_attr(root, "xmlns", "http://s3.amazonaws.com/doc/2006-03-01/") < 0) {
+        free_tree(root); return -1;
+    }
+    /* Empty content = us-east-1 (the S3 classic region). */
+    size_t blen = 0;
+    char *body = xml_render_with_decl(root, &blen);
+    free_tree(root);
+    if (!body) return -1;
+    return ship_xml_200(c, body, blen);
+}
+
+int rsp_build_bucket_versioning(conn_t *c) {
+    XMLNode *root = create_node("VersioningConfiguration");
+    if (!root) return -1;
+    if (add_attr(root, "xmlns", "http://s3.amazonaws.com/doc/2006-03-01/") < 0) {
+        free_tree(root); return -1;
+    }
+    /* No Status child = versioning never configured. */
+    size_t blen = 0;
+    char *body = xml_render_with_decl(root, &blen);
+    free_tree(root);
+    if (!body) return -1;
+    return ship_xml_200(c, body, blen);
+}
+
+/* ===================================================================== */
+/* Bucket-level: ListMultipartUploads                                     */
+/* ===================================================================== */
+
+int rsp_build_list_mpu_uploads(conn_t *c, s3_str_t bucket, s3_str_t prefix,
+                                const s3_mpu_info_t *uploads,
+                                size_t n_uploads) {
+    XMLNode *root = create_node("ListMultipartUploadsResult");
+    if (!root) return -1;
+    if (add_attr(root, "xmlns", "http://s3.amazonaws.com/doc/2006-03-01/") < 0) {
+        free_tree(root); return -1;
+    }
+    xml_text_child_n(root, "Bucket", bucket.p, bucket.n);
+    if (prefix.n > 0) {
+        xml_text_child_n(root, "Prefix", prefix.p, prefix.n);
+    } else {
+        /* AWS always emits <Prefix/> even when empty. */
+        XMLNode *p = create_node("Prefix");
+        if (p) add_child(root, p);
+    }
+    /* fs3 doesn't paginate this listing yet — IsTruncated is always
+     * false. If you have >1000 in-flight uploads that's a separate
+     * problem. */
+    xml_text_child(root, "IsTruncated", "false");
+
+    for (size_t i = 0; i < n_uploads; i++) {
+        XMLNode *u = create_node("Upload");
+        if (!u || add_child(root, u) < 0) {
+            if (u) free_tree(u);
+            free_tree(root); return -1;
+        }
+        xml_text_child(u, "Key",      uploads[i].key);
+        xml_text_child(u, "UploadId", uploads[i].upload_id);
+        char ts[32];
+        rsp_format_iso8601(uploads[i].ctime_ms, ts);
+        xml_text_child(u, "Initiated", ts);
+        /* Real S3 also emits <Owner>, <Initiator>, <StorageClass>;
+         * AWS clients tolerate their absence. */
+    }
 
     size_t blen = 0;
     char *body = xml_render_with_decl(root, &blen);

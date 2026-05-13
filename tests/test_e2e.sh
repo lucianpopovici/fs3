@@ -404,171 +404,26 @@ t_list_ext_body_spillover() {
     check_contains "spillover well-closed"   "$body" "</ListBucketResult>"
 }
 
-# ---- ListAllMyBuckets ---------------------------------------------------
+t_list_all_my_buckets() {
+    # Create three uniquely-named buckets so this test doesn't depend
+    # on whether prior tests left buckets in the data dir.
+    http_put_empty /lamb-x >/dev/null
+    http_put_empty /lamb-y >/dev/null
+    http_put_empty /lamb-z >/dev/null
 
-t_list_all_buckets() {
-    # Create two buckets, then list at service level
-    http_put_empty /lab-bucket-a >/dev/null
-    http_put_empty /lab-bucket-b >/dev/null
-
-    code=$(http_get /)
-    check_eq "GET / status" "$code" "200"
-    body=$(read_body)
-    check_contains "ListAllMyBuckets root element" "$body" "ListAllMyBucketsResult"
-    check_contains "ListAllMyBuckets bucket-a"     "$body" "<Name>lab-bucket-a</Name>"
-    check_contains "ListAllMyBuckets bucket-b"     "$body" "<Name>lab-bucket-b</Name>"
-    check_contains "ListAllMyBuckets CreationDate" "$body" "<CreationDate>"
-    check_contains "ListAllMyBuckets Owner"        "$body" "<Owner>"
+    body=$(curl -sS "$URL/")
+    check_contains "ListAllMyBucketsResult root" "$body" "<ListAllMyBucketsResult"
+    check_contains "owner stub"                  "$body" "<Owner>"
+    check_contains "lists lamb-x" "$body" "<Name>lamb-x</Name>"
+    check_contains "lists lamb-y" "$body" "<Name>lamb-y</Name>"
+    check_contains "lists lamb-z" "$body" "<Name>lamb-z</Name>"
+    check_contains "CreationDate present" "$body" "<CreationDate>"
 }
 
-t_list_all_buckets_empty() {
-    # Fresh server already has zero buckets; / should return empty Buckets list
-    # (other tests create buckets so we just check the XML is well-formed)
-    code=$(http_get /)
-    check_eq "GET / always 200" "$code" "200"
-    check_contains "ListAllMyBuckets xml decl" "$(read_body)" "<?xml"
-}
-
-# ---- ListMultipartUploads -----------------------------------------------
-
-t_list_multipart_uploads() {
-    http_put_empty /lmu-bucket >/dev/null
-
-    # Initiate two uploads
-    body1=$(curl -sS -m 5 -X POST "$URL/lmu-bucket/key-one?uploads" -o - 2>/dev/null)
-    body2=$(curl -sS -m 5 -X POST "$URL/lmu-bucket/key-two?uploads" -o - 2>/dev/null)
-
-    code=$(http_get "/lmu-bucket?uploads")
-    check_eq "GET bucket?uploads status" "$code" "200"
-    body=$(read_body)
-    check_contains "ListMPU root element"  "$body" "ListMultipartUploadsResult"
-    check_contains "ListMPU bucket"        "$body" "<Bucket>lmu-bucket</Bucket>"
-    check_contains "ListMPU key-one"       "$body" "<Key>key-one</Key>"
-    check_contains "ListMPU key-two"       "$body" "<Key>key-two</Key>"
-    check_contains "ListMPU UploadId"      "$body" "<UploadId>"
-    check_contains "ListMPU Initiated"     "$body" "<Initiated>"
-}
-
-t_list_multipart_uploads_empty() {
-    http_put_empty /lmu-empty-bucket >/dev/null
-    code=$(http_get "/lmu-empty-bucket?uploads")
-    check_eq "GET empty bucket?uploads status" "$code" "200"
-    check_contains "ListMPU empty xml" "$(read_body)" "ListMultipartUploadsResult"
-}
-
-# ---- Range requests -----------------------------------------------------
-
-t_range_basic() {
-    http_put_empty /rng-bucket >/dev/null
-    # Body: "Hello, world!" (13 bytes); bytes 0-4 = "Hello"
-    http_put /rng-bucket/obj "Hello, world!" >/dev/null
-
-    # bytes=0-4
-    code=$(curl -sS -m 5 -o "$BODY_FILE" -w "%{http_code}" \
-           -H "Range: bytes=0-4" "$URL/rng-bucket/obj")
-    check_eq "Range 0-4 status" "$code" "206"
-    check_eq "Range 0-4 body"   "$(read_body)" "Hello"
-}
-
-t_range_suffix() {
-    http_put_empty /rng2-bucket >/dev/null
-    http_put /rng2-bucket/obj "Hello, world!" >/dev/null
-
-    # bytes=-6 → last 6 bytes = "world!"
-    code=$(curl -sS -m 5 -o "$BODY_FILE" -w "%{http_code}" \
-           -H "Range: bytes=-6" "$URL/rng2-bucket/obj")
-    check_eq "Range -6 status" "$code" "206"
-    check_eq "Range -6 body"   "$(read_body)" "world!"
-}
-
-t_range_open_end() {
-    http_put_empty /rng3-bucket >/dev/null
-    http_put /rng3-bucket/obj "Hello, world!" >/dev/null
-
-    # bytes=7- → from byte 7 to end = "world!"
-    code=$(curl -sS -m 5 -o "$BODY_FILE" -w "%{http_code}" \
-           -H "Range: bytes=7-" "$URL/rng3-bucket/obj")
-    check_eq "Range 7- status" "$code" "206"
-    check_eq "Range 7- body"   "$(read_body)" "world!"
-}
-
-t_range_not_satisfiable() {
-    http_put_empty /rng4-bucket >/dev/null
-    http_put /rng4-bucket/obj "Hello" >/dev/null
-
-    # bytes=100-200 → beyond end of 5-byte object
-    code=$(curl -sS -m 5 -o "$BODY_FILE" -w "%{http_code}" \
-           -H "Range: bytes=100-200" "$URL/rng4-bucket/obj")
-    check_eq "Range beyond end status" "$code" "416"
-}
-
-t_range_headers() {
-    http_put_empty /rng5-bucket >/dev/null
-    http_put /rng5-bucket/obj "Hello, world!" >/dev/null
-
-    # Check that 206 includes the right headers
-    headers=$(curl -sS -m 5 -i -H "Range: bytes=0-4" "$URL/rng5-bucket/obj")
-    check_contains "Range response Content-Range" "$headers" "Content-Range: bytes 0-4/13"
-    check_contains "Range response Content-Length" "$headers" "Content-Length: 5"
-    check_contains "Range response Accept-Ranges"  "$headers" "Accept-Ranges: bytes"
-}
-
-t_bucket_subresource_location() {
-    http_put_empty /sub-bkt >/dev/null
-    body=$(curl -sS -m 5 "$URL/sub-bkt?location")
-    check_contains "location body has LocationConstraint" "$body" "LocationConstraint"
-    status=$(curl -sS -m 5 -o /dev/null -w "%{http_code}" "$URL/sub-bkt?location")
-    check_eq "location 200" "$status" "200"
-}
-
-t_bucket_subresource_versioning() {
-    http_put_empty /vsn-bkt >/dev/null
-    body=$(curl -sS -m 5 "$URL/vsn-bkt?versioning")
-    check_contains "versioning body" "$body" "VersioningConfiguration"
-    status=$(curl -sS -m 5 -o /dev/null -w "%{http_code}" "$URL/vsn-bkt?versioning")
-    check_eq "versioning 200" "$status" "200"
-}
-
-t_bucket_subresource_acl() {
-    http_put_empty /acl-bkt >/dev/null
-    body=$(curl -sS -m 5 "$URL/acl-bkt?acl")
-    check_contains "acl body has AccessControlPolicy" "$body" "AccessControlPolicy"
-    check_contains "acl body has FULL_CONTROL"        "$body" "FULL_CONTROL"
-    status=$(curl -sS -m 5 -o /dev/null -w "%{http_code}" "$URL/acl-bkt?acl")
-    check_eq "acl 200" "$status" "200"
-}
-
-t_bucket_subresource_404s() {
-    http_put_empty /s404-bkt >/dev/null
-    for sub in lifecycle cors policy encryption website object-lock replication; do
-        status=$(curl -sS -m 5 -o /dev/null -w "%{http_code}" "$URL/s404-bkt?${sub}")
-        check_eq "GET ?${sub} → 404" "$status" "404"
-    done
-}
-
-t_bucket_subresource_put_ignore() {
-    http_put_empty /put-sub-bkt >/dev/null
-    for sub in acl versioning lifecycle cors policy tagging; do
-        status=$(curl -sS -m 5 -X PUT -o /dev/null -w "%{http_code}" \
-                      -d "<Config/>" "$URL/put-sub-bkt?${sub}")
-        check_eq "PUT ?${sub} → 200" "$status" "200"
-    done
-}
-
-t_bucket_subresource_delete() {
-    http_put_empty /del-sub-bkt >/dev/null
-    for sub in lifecycle cors policy tagging; do
-        status=$(curl -sS -m 5 -X DELETE -o /dev/null -w "%{http_code}" \
-                      "$URL/del-sub-bkt?${sub}")
-        check_eq "DELETE ?${sub} → 204" "$status" "204"
-    done
-}
-
-t_bucket_subresource_no_bucket() {
-    status=$(curl -sS -m 5 -o /dev/null -w "%{http_code}" "$URL/nosuchbucket?location")
-    check_eq "subresource on missing bucket → 404" "$status" "404"
-    body=$(curl -sS -m 5 "$URL/nosuchbucket?location")
-    check_contains "subresource missing bucket error code" "$body" "NoSuchBucket"
+t_list_all_my_buckets_method_not_allowed() {
+    # PUT/POST/DELETE on / should still 405 (not creating "/" as bucket)
+    code=$(http_put_empty /)
+    check_eq "PUT / status" "$code" "405"
 }
 
 # ---- Run ----------------------------------------------------------------
@@ -594,15 +449,8 @@ run_test t_large_object
 run_test t_content_type_roundtrip
 run_test t_path_traversal_safe
 run_test t_list_ext_body_spillover
-run_test t_list_all_buckets
-run_test t_list_all_buckets_empty
-run_test t_list_multipart_uploads
-run_test t_list_multipart_uploads_empty
-run_test t_range_basic
-run_test t_range_suffix
-run_test t_range_open_end
-run_test t_range_not_satisfiable
-run_test t_range_headers
+run_test t_list_all_my_buckets
+run_test t_list_all_my_buckets_method_not_allowed
 
 echo
 echo "===== $PASS passed, $FAIL failed ====="

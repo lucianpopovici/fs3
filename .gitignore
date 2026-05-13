@@ -53,3 +53,12 @@ dkms.conf
 
 # debug information files
 *.dwo
+
+fs3
+
+# Compiled test binaries (rebuilt by make test)
+tests/test_store
+tests/test_xml
+tests/test_xml_legacy
+tests/test_xml_fuzz
+tests/test_sigv4

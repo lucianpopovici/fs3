@@ -71,14 +71,9 @@ def main():
     p.add_argument("--service", default="s3")
     p.add_argument("--malform",
                    choices=("none", "chunk-sig", "data-mismatch", "no-terminator",
-                            "wrong-decoded-len", "trailer-sig", "no-trailer-sig",
-                            "trailer-line"),
+                            "wrong-decoded-len"),
                    default="none",
                    help="Inject a fault for negative testing")
-    p.add_argument("--trailer", action="store_true",
-                   help="Use STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER form "
-                        "(adds an x-amz-checksum-sha256 trailer with the "
-                        "body's SHA-256 in base64).")
     args = p.parse_args()
 
     ak = os.environ["FS3_AK"]
@@ -110,39 +105,23 @@ def main():
         decoded_len = len(body) + 1
 
     # ----- Seed signature (header-mode SigV4) -----
-    # Canonical request includes the literal streaming body-hash sentinel,
-    # and signs host;x-amz-content-sha256;x-amz-date;x-amz-decoded-content-length
-    # plus x-amz-trailer when in trailer mode.
-    if args.trailer:
-        body_hash_sentinel = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER"
-        trailer_names = "x-amz-checksum-sha256"
-        signed_headers = ("host;x-amz-content-sha256;x-amz-date;"
-                          "x-amz-decoded-content-length;x-amz-trailer")
-        canonical_headers = (
-            f"host:{host}\n"
-            f"x-amz-content-sha256:{body_hash_sentinel}\n"
-            f"x-amz-date:{amz_date}\n"
-            f"x-amz-decoded-content-length:{decoded_len}\n"
-            f"x-amz-trailer:{trailer_names}\n"
-        )
-    else:
-        body_hash_sentinel = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD"
-        trailer_names = None
-        signed_headers = ("host;x-amz-content-sha256;x-amz-date;"
-                          "x-amz-decoded-content-length")
-        canonical_headers = (
-            f"host:{host}\n"
-            f"x-amz-content-sha256:{body_hash_sentinel}\n"
-            f"x-amz-date:{amz_date}\n"
-            f"x-amz-decoded-content-length:{decoded_len}\n"
-        )
+    # Canonical request includes the literal STREAMING-AWS4-HMAC-SHA256-PAYLOAD
+    # as the body hash, and signs host;x-amz-content-sha256;x-amz-date;
+    # x-amz-decoded-content-length.
+    signed_headers = "host;x-amz-content-sha256;x-amz-date;x-amz-decoded-content-length"
+    canonical_headers = (
+        f"host:{host}\n"
+        f"x-amz-content-sha256:STREAMING-AWS4-HMAC-SHA256-PAYLOAD\n"
+        f"x-amz-date:{amz_date}\n"
+        f"x-amz-decoded-content-length:{decoded_len}\n"
+    )
     canonical_request = (
         f"PUT\n"
         f"{path}\n"
         f"\n"
         f"{canonical_headers}\n"
         f"{signed_headers}\n"
-        f"{body_hash_sentinel}"
+        f"STREAMING-AWS4-HMAC-SHA256-PAYLOAD"
     )
     cr_hash = hashlib.sha256(canonical_request.encode()).hexdigest()
     sts = (f"AWS4-HMAC-SHA256\n"
@@ -206,64 +185,19 @@ def main():
         body_pieces.append(
             f"0;chunk-signature={chunk_sig}\r\n".encode()
         )
-
-        if args.trailer:
-            # Emit trailer headers, then x-amz-trailer-signature, then \r\n.
-            import base64
-            checksum_b64 = base64.b64encode(
-                hashlib.sha256(body).digest()
-            ).decode()
-            trailer_pairs = [("x-amz-checksum-sha256", checksum_b64)]
-
-            # canonical_trailer: "<lc-name>:<trimmed-value>\n" per trailer,
-            # sorted by name. Value-trim mirrors canonical-headers.
-            canon_trailer = "".join(
-                f"{n}:{v}\n" for n, v in sorted(trailer_pairs)
-            )
-            canon_trailer_hash = hashlib.sha256(canon_trailer.encode()).hexdigest()
-
-            # The trailer signature's "previous signature" is the
-            # terminator chunk's signature (chunk_sig above).
-            trailer_sts = (
-                f"AWS4-HMAC-SHA256-TRAILER\n"
-                f"{amz_date}\n"
-                f"{scope}\n"
-                f"{chunk_sig}\n"
-                f"{canon_trailer_hash}"
-            )
-            trailer_sig = hexd(sign(signing_key, trailer_sts))
-            if args.malform == "trailer-sig":
-                trailer_sig = trailer_sig[:-1] + (
-                    "0" if trailer_sig[-1] != "0" else "1")
-
-            for n, v in trailer_pairs:
-                if args.malform == "trailer-line" and n == "x-amz-checksum-sha256":
-                    # Send a different value than what was signed.
-                    body_pieces.append(f"{n}:tampered=\r\n".encode())
-                else:
-                    body_pieces.append(f"{n}:{v}\r\n".encode())
-            if args.malform != "no-trailer-sig":
-                body_pieces.append(
-                    f"x-amz-trailer-signature:{trailer_sig}\r\n".encode()
-                )
-
         body_pieces.append(b"\r\n")
 
     wire_body = b"".join(body_pieces)
     content_length = len(wire_body)
 
     # ----- Build and send HTTP request -----
-    extra_headers = ""
-    if args.trailer:
-        extra_headers = f"x-amz-trailer: {trailer_names}\r\n"
     http_request = (
         f"PUT {path} HTTP/1.1\r\n"
         f"Host: {host}\r\n"
         f"Authorization: {auth_header}\r\n"
-        f"x-amz-content-sha256: {body_hash_sentinel}\r\n"
+        f"x-amz-content-sha256: STREAMING-AWS4-HMAC-SHA256-PAYLOAD\r\n"
         f"x-amz-date: {amz_date}\r\n"
         f"x-amz-decoded-content-length: {decoded_len}\r\n"
-        f"{extra_headers}"
         f"Content-Length: {content_length}\r\n"
         f"\r\n"
     ).encode() + wire_body

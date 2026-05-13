@@ -74,29 +74,6 @@ int rsp_build_s3_error(conn_t *c, s3_err_t err,
 int rsp_build_list_bucket(conn_t *c, s3_str_t bucket,
                           const s3_list_opts_t *opts, s3_lister_t *l);
 
-/* Build a ListAllMyBucketsResult XML body, 200 OK.
- * The lister is consumed (closed by this function). */
-int rsp_build_list_all_buckets(conn_t *c, s3_bucket_lister_t *l);
-
-/* Build a ListMultipartUploadsResult XML body, 200 OK.
- * The lister is consumed (closed by this function). */
-int rsp_build_list_mpu(conn_t *c, s3_str_t bucket, s3_mpu_lister_t *l);
-
-/* Build a 206 Partial Content response head for a range GET.
- * range_start and range_end are inclusive byte offsets (0-based).
- * total_size is the full object size. The caller streams the body
- * via the reader path, same as rsp_build_object_head. */
-int rsp_build_object_range(conn_t *c, const s3_obj_meta_t *m,
-                           uint64_t range_start, uint64_t range_end);
-
-/* Build a 416 Range Not Satisfiable response with a Content-Range
- * header indicating the total object size. */
-int rsp_build_range_not_satisfiable(conn_t *c, uint64_t total_size);
-
-/* Build a 200 OK application/xml response from a NUL-terminated literal.
- * Used for bucket subresource GET responses whose bodies are static. */
-int rsp_build_xml_200(conn_t *c, const char *body_lit);
-
 /* Build an InitiateMultipartUploadResult XML body, 200 OK. */
 int rsp_build_initiate_mpu(conn_t *c, s3_str_t bucket, s3_str_t key,
                            const char *upload_id);
@@ -106,6 +83,50 @@ int rsp_build_initiate_mpu(conn_t *c, s3_str_t bucket, s3_str_t key,
  * (e.g. "abc...-3"); we wrap it in quotes per S3 convention. */
 int rsp_build_complete_mpu(conn_t *c, s3_str_t bucket, s3_str_t key,
                            const char *etag);
+
+/* Build a ListAllMyBucketsResult XML body, 200 OK. */
+int rsp_build_list_all_my_buckets(conn_t *c,
+                                   const s3_bucket_info_t *buckets,
+                                   size_t n_buckets);
+
+/* Build a ListMultipartUploadsResult XML body, 200 OK. */
+int rsp_build_list_mpu_uploads(conn_t *c, s3_str_t bucket, s3_str_t prefix,
+                                const s3_mpu_info_t *uploads,
+                                size_t n_uploads);
+
+/* Build a CopyObjectResult XML body (200 OK) for server-side object copy.
+ * `m` is the metadata of the newly written destination object. */
+int rsp_build_copy_object(conn_t *c, const s3_obj_meta_t *m);
+
+/* Build an AccessControlPolicy XML body (200 OK). fs3 has no real ACL
+ * model; always returns a single FULL_CONTROL grant to the "fs3" owner. */
+int rsp_build_acl(conn_t *c);
+
+/* Build a 206 Partial Content response for a byte-range GET.
+ * `first` and `last` are 0-based, inclusive indices into the object body.
+ * The caller is responsible for seeking the reader to `first` before the
+ * writable callback starts streaming. */
+int rsp_build_object_range(conn_t *c, const s3_obj_meta_t *m,
+                           uint64_t first, uint64_t last, int head_only);
+
+/* Build a 416 Range Not Satisfiable response with a Content-Range: bytes
+ * "star/total" header and no body. */
+int rsp_build_range_not_satisfiable(conn_t *c, uint64_t obj_size);
+
+/* Build a DeleteResult XML body, 200 OK.
+ * `deleted_keys` / `n_deleted` — keys that were successfully deleted (or
+ *   already absent — S3 DELETE is idempotent).
+ * `error_keys`   / `n_errors`  — keys for which an internal error occurred.
+ * In Quiet mode the caller passes n_deleted == 0; only errors are emitted. */
+int rsp_build_delete_objects(conn_t *c,
+                              const char **deleted_keys, size_t n_deleted,
+                              const char **error_keys,   size_t n_errors);
+
+/* Build a GetBucketLocation XML response. Empty LocationConstraint = us-east-1. */
+int rsp_build_bucket_location(conn_t *c);
+
+/* Build a GetBucketVersioning XML response (versioning never enabled). */
+int rsp_build_bucket_versioning(conn_t *c);
 
 /* Map an s3_err_t to an HTTP status code. */
 int rsp_status_for_err(s3_err_t err);

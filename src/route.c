@@ -1,18 +1,17 @@
 /* src/route.c — request dispatcher and per-method handlers
  *
  * Path shape determines handler family:
- *   /                                 → service ops (ListAllMyBuckets)
+ *   /                                 → service ops (list buckets — TODO)
  *   /<bucket>                         → bucket ops (create/delete/list)
  *   /<bucket>/<key...>                → object ops (PUT/GET/HEAD/DELETE)
  *
  * Query string matters for some bucket ops:
+ *   GET /<bucket>?location            → location subresource (TODO)
  *   GET /<bucket>?list-type=2&...     → ListObjectsV2 (treated as list)
  *   GET /<bucket>?prefix=&delimiter=  → ListObjectsV1
- *   GET /<bucket>?uploads             → ListMultipartUploads
  *
- * Subresources like ?location, ?versioning, ?lifecycle, ?cors are not
- * yet implemented; a GET on /<bucket> with an unrecognized query is
- * treated as a list.
+ * For simplicity right now we treat any GET on /<bucket> (with or
+ * without query) as a list. Full subresource handling lands in 3.1.
  */
 
 #include "route.h"
@@ -167,14 +166,6 @@ static char *scratch_alloc(conn_t *c, size_t n) {
 
 static void scratch_reset(conn_t *c) { c->req_scratch_used = 0; }
 
-/* Returns 1 if the query string contains a key matching `name` exactly
- * (with or without a value). Used for subresource detection. */
-static int query_has_key(s3_str_t query, const char *name) {
-    char buf[2];
-    s3_str_t dummy;
-    return query_param(query, name, buf, sizeof(buf), &dummy);
-}
-
 /* ===================================================================== */
 /* Service-level (PATH = "/")                                            */
 /* ===================================================================== */
@@ -185,176 +176,148 @@ static int handle_service(conn_t *c) {
         return rsp_build_s3_error(c, S3_ERR_METHOD_NOT_ALLOWED,
                                   S3_STR_LIT("/"), NULL);
     }
-    /* ListAllMyBuckets */
-    s3_bucket_lister_t *l;
-    s3_err_t e = store_list_buckets_begin(c->store, &l);
-    if (e != S3_OK) return rsp_build_s3_error(c, e, S3_STR_LIT("/"), NULL);
-    return rsp_build_list_all_buckets(c, l);
-}
-
-/* ===================================================================== */
-/* Bucket subresource handlers                                            */
-/* ===================================================================== */
-
-/* Subresource key names recognised at the bucket level.
- * "uploads" is intentionally absent — it is handled separately in
- * handle_bucket as a GET-only operation. */
-static const char * const BUCKET_SUBRESOURCES[] = {
-    "location", "versioning", "acl", "logging", "notification",
-    "requestPayment", "tagging",
-    "lifecycle", "cors", "policy", "encryption", "website",
-    "object-lock", "replication",
-    NULL
-};
-
-/* Return the first recognised subresource key present in the query string,
- * or NULL if none found. */
-static const char *detect_bucket_subresource(s3_str_t query) {
-    if (query.n == 0) return NULL;
-    for (int i = 0; BUCKET_SUBRESOURCES[i]; i++) {
-        if (query_has_key(query, BUCKET_SUBRESOURCES[i]))
-            return BUCKET_SUBRESOURCES[i];
+    /* GET / → ListAllMyBuckets */
+    s3_bucket_info_t *buckets = NULL;
+    size_t n_buckets = 0;
+    s3_err_t e = store_list_buckets(c->store, &buckets, &n_buckets);
+    if (e != S3_OK) {
+        return rsp_build_s3_error(c, e, S3_STR_LIT("/"), NULL);
     }
-    return NULL;
+    int rc = rsp_build_list_all_my_buckets(c, buckets, n_buckets);
+    store_buckets_free(buckets, n_buckets);
+    return rc;
 }
 
-static int handle_bucket_subresource(conn_t *c, s3_str_t bucket,
-                                      const char *sub) {
-    /* All subresource operations require the bucket to exist. */
+/* ===================================================================== */
+/* Bulk-delete handler (POST /<bucket>?delete)                            */
+/* ===================================================================== */
+
+#define BULK_DELETE_BODY_CAP (1024 * 1024)
+
+static int handle_bulk_delete_begin(conn_t *c, s3_str_t bucket) {
     if (!store_bucket_exists(c->store, bucket)) {
-        return rsp_build_s3_error(c, S3_ERR_NO_SUCH_BUCKET,
-                                  c->req.path, NULL);
+        return rsp_build_s3_error(c, S3_ERR_NO_SUCH_BUCKET, c->req.path, NULL);
     }
-
-    /* HEAD — just confirm reachability; no body. */
-    if (method_is(c, "HEAD")) {
-        return rsp_build_status(c, 200, "OK");
+    free(c->req_body_buf);
+    c->req_body_buf = malloc(BULK_DELETE_BODY_CAP);
+    if (!c->req_body_buf) {
+        return rsp_build_s3_error(c, S3_ERR_INTERNAL, c->req.path, NULL);
     }
+    c->req_body_len = 0;
+    c->req_body_cap = BULK_DELETE_BODY_CAP;
+    c->delete_pending = 1;
+    c->delete_bucket  = bucket;
+    return 0;
+}
 
-    /* PUT — accept and silently discard the body for all subresources.
-     * The body bytes will be drained by route_dispatch_body and ignored
-     * (no put_writer, no req_body_buf). */
-    if (method_is(c, "PUT")) {
-        return rsp_build_status(c, 200, "OK");
-    }
-
-    /* DELETE — succeed for the subset that S3 allows deletion on. */
-    if (method_is(c, "DELETE")) {
-        if (strcmp(sub, "lifecycle")  == 0 ||
-            strcmp(sub, "cors")       == 0 ||
-            strcmp(sub, "policy")     == 0 ||
-            strcmp(sub, "tagging")    == 0) {
-            return rsp_build_status(c, 204, "No Content");
-        }
-        return rsp_build_s3_error(c, S3_ERR_METHOD_NOT_ALLOWED,
-                                  c->req.path, NULL);
-    }
-
-    if (method_is(c, "GET")) {
-        /* ---- subresources that return a static 200 XML body ---- */
-        if (strcmp(sub, "location") == 0) {
-            /* Empty LocationConstraint means us-east-1 per S3 spec. */
-            return rsp_build_xml_200(c,
-                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
-                "<LocationConstraint"
-                " xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"/>");
-        }
-        if (strcmp(sub, "versioning") == 0) {
-            return rsp_build_xml_200(c,
-                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
-                "<VersioningConfiguration"
-                " xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"/>");
-        }
-        if (strcmp(sub, "acl") == 0) {
-            return rsp_build_xml_200(c,
-                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
-                "<AccessControlPolicy"
-                " xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">"
-                "<Owner>"
-                "<ID>fs3owner</ID>"
-                "<DisplayName>fs3</DisplayName>"
-                "</Owner>"
-                "<AccessControlList>"
-                "<Grant>"
-                "<Grantee"
-                " xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\""
-                " xsi:type=\"CanonicalUser\">"
-                "<ID>fs3owner</ID>"
-                "<DisplayName>fs3</DisplayName>"
-                "</Grantee>"
-                "<Permission>FULL_CONTROL</Permission>"
-                "</Grant>"
-                "</AccessControlList>"
-                "</AccessControlPolicy>");
-        }
-        if (strcmp(sub, "logging") == 0) {
-            return rsp_build_xml_200(c,
-                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
-                "<BucketLoggingStatus"
-                " xmlns=\"http://doc.s3.amazonaws.com/2006-03-01\"/>");
-        }
-        if (strcmp(sub, "notification") == 0) {
-            return rsp_build_xml_200(c,
-                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
-                "<NotificationConfiguration"
-                " xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"/>");
-        }
-        if (strcmp(sub, "requestPayment") == 0) {
-            return rsp_build_xml_200(c,
-                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
-                "<RequestPaymentConfiguration"
-                " xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">"
-                "<Payer>BucketOwner</Payer>"
-                "</RequestPaymentConfiguration>");
-        }
-        if (strcmp(sub, "tagging") == 0) {
-            return rsp_build_xml_200(c,
-                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
-                "<Tagging"
-                " xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">"
-                "<TagSet/>"
-                "</Tagging>");
-        }
-        /* ---- subresources that return 404 ---- */
-        if (strcmp(sub, "lifecycle") == 0) {
-            return rsp_build_s3_error(c,
-                S3_ERR_NO_SUCH_LIFECYCLE_CONFIGURATION,
-                c->req.path, NULL);
-        }
-        if (strcmp(sub, "cors") == 0) {
-            return rsp_build_s3_error(c,
-                S3_ERR_NO_SUCH_CORS_CONFIGURATION,
-                c->req.path, NULL);
-        }
-        if (strcmp(sub, "policy") == 0) {
-            return rsp_build_s3_error(c,
-                S3_ERR_NO_SUCH_BUCKET_POLICY,
-                c->req.path, NULL);
-        }
-        if (strcmp(sub, "encryption") == 0) {
-            return rsp_build_s3_error(c,
-                S3_ERR_SSE_CONFIGURATION_NOT_FOUND,
-                c->req.path, NULL);
-        }
-        if (strcmp(sub, "website") == 0) {
-            return rsp_build_s3_error(c,
-                S3_ERR_NO_SUCH_WEBSITE_CONFIGURATION,
-                c->req.path, NULL);
-        }
-        if (strcmp(sub, "object-lock") == 0) {
-            return rsp_build_s3_error(c,
-                S3_ERR_OBJECT_LOCK_CONFIGURATION_NOT_FOUND,
-                c->req.path, NULL);
-        }
-        if (strcmp(sub, "replication") == 0) {
-            return rsp_build_s3_error(c,
-                S3_ERR_REPLICATION_CONFIGURATION_NOT_FOUND,
-                c->req.path, NULL);
+/* Parse <Delete>...<Object><Key>k</Key></Object>...</Delete>.
+ * Fills keys_out with a heap-allocated array of NUL-terminated strings.
+ * Sets quiet_out to 1 if <Quiet>true</Quiet> is present. Returns 0 ok,
+ * -1 on OOM. Caller frees each key and the array. */
+static int parse_delete_body(const char *body, size_t body_len,
+                              char ***keys_out, size_t *n_out, int *quiet_out) {
+    *quiet_out = 0;
+    static const char qt_open[]  = "<Quiet>";
+    static const char qt_close[] = "</Quiet>";
+    const char *qp = memmem(body, body_len, qt_open, sizeof(qt_open) - 1);
+    if (qp) {
+        size_t qv0 = (size_t)(qp - body) + sizeof(qt_open) - 1;
+        const char *qq = memmem(body + qv0, body_len - qv0,
+                                qt_close, sizeof(qt_close) - 1);
+        if (qq && (size_t)(qq - body) - qv0 == 4
+            && memcmp(body + qv0, "true", 4) == 0) {
+            *quiet_out = 1;
         }
     }
 
-    return rsp_build_s3_error(c, S3_ERR_METHOD_NOT_ALLOWED,
-                               c->req.path, NULL);
+    static const char obj_open[]  = "<Object>";
+    static const char obj_close[] = "</Object>";
+    static const char key_open[]  = "<Key>";
+    static const char key_close[] = "</Key>";
+
+    char **keys = NULL;
+    size_t n_keys = 0, cap = 0;
+    size_t pos = 0;
+
+    while (pos < body_len) {
+        const char *op = memmem(body + pos, body_len - pos,
+                                obj_open, sizeof(obj_open) - 1);
+        if (!op) break;
+        size_t obj_start = (size_t)(op - body) + sizeof(obj_open) - 1;
+        const char *oq = memmem(body + obj_start, body_len - obj_start,
+                                obj_close, sizeof(obj_close) - 1);
+        if (!oq) break;
+        size_t obj_end = (size_t)(oq - body);
+
+        const char *kp = memmem(body + obj_start, obj_end - obj_start,
+                                key_open, sizeof(key_open) - 1);
+        if (kp) {
+            size_t kv0 = (size_t)(kp - body) + sizeof(key_open) - 1;
+            const char *kq = memmem(body + kv0, obj_end - kv0,
+                                    key_close, sizeof(key_close) - 1);
+            if (kq) {
+                size_t klen = (size_t)(kq - body) - kv0;
+                char *k = malloc(klen + 1);
+                if (!k) goto oom;
+                memcpy(k, body + kv0, klen);
+                k[klen] = '\0';
+                if (n_keys == cap) {
+                    size_t nc = cap ? cap * 2 : 16;
+                    char **nk = realloc(keys, nc * sizeof(*nk));
+                    if (!nk) { free(k); goto oom; }
+                    keys = nk; cap = nc;
+                }
+                keys[n_keys++] = k;
+            }
+        }
+        pos = obj_end + sizeof(obj_close) - 1;
+    }
+
+    *keys_out = keys;
+    *n_out    = n_keys;
+    return 0;
+oom:
+    for (size_t i = 0; i < n_keys; i++) free(keys[i]);
+    free(keys);
+    return -1;
+}
+
+static int handle_bulk_delete_finish(conn_t *c, s3_str_t bucket) {
+    if (c->req_body_len > c->req_body_cap) {
+        return rsp_build_s3_error(c, S3_ERR_ENTITY_TOO_LARGE, c->req.path, NULL);
+    }
+    char **keys = NULL;
+    size_t n_keys = 0;
+    int quiet = 0;
+    if (parse_delete_body(c->req_body_buf, c->req_body_len,
+                          &keys, &n_keys, &quiet) < 0) {
+        return rsp_build_s3_error(c, S3_ERR_INTERNAL, c->req.path, NULL);
+    }
+    if (n_keys == 0) {
+        return rsp_build_s3_error(c, S3_ERR_MALFORMED_XML, c->req.path, NULL);
+    }
+    const char **deleted_keys = malloc(n_keys * sizeof(*deleted_keys));
+    const char **error_keys   = malloc(n_keys * sizeof(*error_keys));
+    size_t n_deleted = 0, n_errors = 0;
+    if (!deleted_keys || !error_keys) {
+        for (size_t i = 0; i < n_keys; i++) free(keys[i]);
+        free(keys); free(deleted_keys); free(error_keys);
+        return rsp_build_s3_error(c, S3_ERR_INTERNAL, c->req.path, NULL);
+    }
+    for (size_t i = 0; i < n_keys; i++) {
+        s3_str_t k = { keys[i], strlen(keys[i]) };
+        s3_err_t e = store_delete(c->store, bucket, k);
+        if (e == S3_OK) {
+            if (!quiet) deleted_keys[n_deleted++] = keys[i];
+        } else {
+            error_keys[n_errors++] = keys[i];
+        }
+    }
+    int rc = rsp_build_delete_objects(c, deleted_keys, n_deleted,
+                                       error_keys, n_errors);
+    for (size_t i = 0; i < n_keys; i++) free(keys[i]);
+    free(keys); free(deleted_keys); free(error_keys);
+    return rc;
 }
 
 /* ===================================================================== */
@@ -362,10 +325,21 @@ static int handle_bucket_subresource(conn_t *c, s3_str_t bucket,
 /* ===================================================================== */
 
 static int handle_bucket(conn_t *c, s3_str_t bucket) {
-    /* Subresource dispatch — must come before normal method handling so
-     * that e.g. PUT /bucket?acl doesn't accidentally create a bucket. */
-    const char *sub = detect_bucket_subresource(c->req.query);
-    if (sub) return handle_bucket_subresource(c, bucket, sub);
+    /* ?acl — GET returns ACL XML; PUT accepts and discards the body. */
+    if (c->req.query.n > 0) {
+        char *qb = scratch_alloc(c, c->req.query.n + 1);
+        s3_str_t v;
+        if (qb && query_param(c->req.query, "acl", qb, c->req.query.n, &v)) {
+            if (!store_bucket_exists(c->store, bucket)) {
+                return rsp_build_s3_error(c, S3_ERR_NO_SUCH_BUCKET,
+                                          c->req.path, NULL);
+            }
+            if (method_is(c, "GET"))  return rsp_build_acl(c);
+            if (method_is(c, "PUT"))  return rsp_build_status(c, 200, "OK");
+            return rsp_build_s3_error(c, S3_ERR_METHOD_NOT_ALLOWED,
+                                      c->req.path, NULL);
+        }
+    }
 
     if (method_is(c, "PUT")) {
         s3_err_t e = store_bucket_create(c->store, bucket);
@@ -393,17 +367,72 @@ static int handle_bucket(conn_t *c, s3_str_t bucket) {
         return rsp_build_status(c, 200, "OK");
     }
 
-    if (method_is(c, "GET")) {
-        /* GET /bucket?uploads — ListMultipartUploads */
+    if (method_is(c, "POST")) {
         if (c->req.query.n > 0) {
-            s3_str_t v_uploads = S3_STR_NULL;
-            char qb[8];
-            if (query_param(c->req.query, "uploads", qb, sizeof(qb), &v_uploads)) {
-                s3_mpu_lister_t *ml;
-                s3_err_t e = store_mpu_list_begin(c->store, bucket, &ml);
-                if (e != S3_OK)
+            char *qb = scratch_alloc(c, c->req.query.n + 1);
+            s3_str_t v;
+            if (qb && query_param(c->req.query, "delete",
+                                  qb, c->req.query.n, &v)) {
+                return handle_bulk_delete_begin(c, bucket);
+            }
+        }
+        return rsp_build_s3_error(c, S3_ERR_METHOD_NOT_ALLOWED,
+                                  c->req.path, NULL);
+    }
+
+    if (method_is(c, "GET")) {
+        /* Check for bucket subresources before falling through to listing. */
+        if (c->req.query.n > 0) {
+            char *qb_loc = scratch_alloc(c, c->req.query.n + 1);
+            s3_str_t v_loc;
+            if (qb_loc && query_param(c->req.query, "location",
+                                      qb_loc, c->req.query.n, &v_loc)) {
+                if (!store_bucket_exists(c->store, bucket)) {
+                    return rsp_build_s3_error(c, S3_ERR_NO_SUCH_BUCKET,
+                                              c->req.path, NULL);
+                }
+                return rsp_build_bucket_location(c);
+            }
+            char *qb_ver = scratch_alloc(c, c->req.query.n + 1);
+            s3_str_t v_ver;
+            if (qb_ver && query_param(c->req.query, "versioning",
+                                      qb_ver, c->req.query.n, &v_ver)) {
+                if (!store_bucket_exists(c->store, bucket)) {
+                    return rsp_build_s3_error(c, S3_ERR_NO_SUCH_BUCKET,
+                                              c->req.path, NULL);
+                }
+                return rsp_build_bucket_versioning(c);
+            }
+        }
+
+        /* Detect "?uploads" — bucket-level subresource for
+         * ListMultipartUploads. */
+        if (c->req.query.n > 0) {
+            char *qb_u = scratch_alloc(c, c->req.query.n + 1);
+            s3_str_t v_u;
+            if (qb_u && query_param(c->req.query, "uploads",
+                                    qb_u, c->req.query.n, &v_u)) {
+                /* Optional prefix filter. */
+                s3_str_t prefix = S3_STR_NULL;
+                char *qb_p = scratch_alloc(c, c->req.query.n + 1);
+                if (qb_p) {
+                    s3_str_t pv;
+                    if (query_param(c->req.query, "prefix",
+                                    qb_p, c->req.query.n, &pv)) {
+                        prefix = pv;
+                    }
+                }
+                s3_mpu_info_t *ups = NULL;
+                size_t n_ups = 0;
+                s3_err_t e = store_list_mpu_uploads(c->store, bucket,
+                                                    prefix, &ups, &n_ups);
+                if (e != S3_OK) {
                     return rsp_build_s3_error(c, e, c->req.path, NULL);
-                return rsp_build_list_mpu(c, bucket, ml);
+                }
+                int rc = rsp_build_list_mpu_uploads(c, bucket, prefix,
+                                                    ups, n_ups);
+                store_mpu_uploads_free(ups, n_ups);
+                return rc;
             }
         }
 
@@ -486,66 +515,73 @@ static int handle_object_put_complete(conn_t *c) {
     return rsp_build_status_with_headers(c, 200, "OK", extra);
 }
 
-/* Parse a simple "bytes=start-end" or "bytes=start-" or "bytes=-suffix"
- * Range header. Returns 1 and fills start_out and end_out (inclusive, 0-based)
- * relative to obj_size. Returns 0 if absent or multi-range (caller serves 200).
- * Returns -1 if the range is syntactically valid but not satisfiable (→ 416). */
-static int parse_range(const conn_t *c, uint64_t obj_size,
-                       uint64_t *start_out, uint64_t *end_out) {
-    const s3_str_t *rv = hdr_get(c, "range");
-    if (!rv) return 0;
+/* Parse an HTTP Range header value of the form "bytes=A-B", "bytes=A-",
+ * or "bytes=-N". Returns 1 if a satisfiable range was decoded and written
+ * to first_out/last_out, 0 if the header is absent or uses an
+ * unrecognized unit (treat as full GET), or -1 if the range is syntactically
+ * invalid or outside the object (send 416). */
+static int parse_byte_range(const s3_str_t *hdr, uint64_t obj_size,
+                             uint64_t *first_out, uint64_t *last_out) {
+    if (!hdr || hdr->n == 0) return 0;
+    static const char prefix[] = "bytes=";
+    const size_t prefix_n = sizeof(prefix) - 1;
+    if (hdr->n < prefix_n || memcmp(hdr->p, prefix, prefix_n) != 0) return 0;
 
-    /* Must start with "bytes=" */
-    if (rv->n < 6 || memcmp(rv->p, "bytes=", 6) != 0) return 0;
-    const char *s = rv->p + 6;
-    size_t n = rv->n - 6;
+    const char *spec  = hdr->p + prefix_n;
+    size_t      spec_n = hdr->n - prefix_n;
 
-    /* Reject multi-range (contains comma). */
-    if (memchr(s, ',', n)) return 0;
+    const char *dash = memchr(spec, '-', spec_n);
+    if (!dash) return 0;  /* no '-' → unrecognized form */
 
-    /* Find the '-'. */
-    const char *dash = memchr(s, '-', n);
-    if (!dash) return 0;
+    size_t before_n = (size_t)(dash - spec);
+    size_t after_n  = spec_n - before_n - 1;
 
-    size_t prefix_n = (size_t)(dash - s);
-    size_t suffix_n = n - prefix_n - 1;
+    if (before_n == 0 && after_n == 0) return -1;  /* "bytes=-" is invalid */
 
-    uint64_t start, end;
-    if (prefix_n == 0) {
-        /* bytes=-N: last N bytes */
-        if (suffix_n == 0) return 0;
-        uint64_t last = 0;
-        for (size_t i = 0; i < suffix_n; i++) {
-            if (s[prefix_n + 1 + i] < '0' || s[prefix_n + 1 + i] > '9') return 0;
-            last = last * 10 + (uint64_t)(s[prefix_n + 1 + i] - '0');
+    if (obj_size == 0) return -1;  /* no valid range on empty object */
+
+    uint64_t first, last;
+    if (before_n == 0) {
+        /* "bytes=-N" — last N bytes */
+        uint64_t suffix = 0;
+        for (size_t i = 0; i < after_n; i++) {
+            char ch = dash[1 + i];
+            if (ch < '0' || ch > '9') return -1;
+            suffix = suffix * 10 + (uint64_t)(ch - '0');
         }
-        if (last == 0) return -1;
-        start = (last >= obj_size) ? 0 : obj_size - last;
-        end   = obj_size - 1;
+        if (suffix == 0) return -1;
+        first = (suffix >= obj_size) ? 0 : obj_size - suffix;
+        last  = obj_size - 1;
+    } else if (after_n == 0) {
+        /* "bytes=A-" — from A to end */
+        first = 0;
+        for (size_t i = 0; i < before_n; i++) {
+            char ch = spec[i];
+            if (ch < '0' || ch > '9') return -1;
+            first = first * 10 + (uint64_t)(ch - '0');
+        }
+        if (first >= obj_size) return -1;
+        last = obj_size - 1;
     } else {
-        /* bytes=start-[end] */
-        start = 0;
-        for (size_t i = 0; i < prefix_n; i++) {
-            if (s[i] < '0' || s[i] > '9') return 0;
-            start = start * 10 + (uint64_t)(s[i] - '0');
+        /* "bytes=A-B" */
+        first = 0;
+        for (size_t i = 0; i < before_n; i++) {
+            char ch = spec[i];
+            if (ch < '0' || ch > '9') return -1;
+            first = first * 10 + (uint64_t)(ch - '0');
         }
-        if (suffix_n == 0) {
-            end = obj_size > 0 ? obj_size - 1 : 0;
-        } else {
-            end = 0;
-            for (size_t i = 0; i < suffix_n; i++) {
-                if (dash[1 + i] < '0' || dash[1 + i] > '9') return 0;
-                end = end * 10 + (uint64_t)(dash[1 + i] - '0');
-            }
+        last = 0;
+        for (size_t i = 0; i < after_n; i++) {
+            char ch = dash[1 + i];
+            if (ch < '0' || ch > '9') return -1;
+            last = last * 10 + (uint64_t)(ch - '0');
         }
+        if (first > last) return -1;
+        if (first >= obj_size) return -1;
+        if (last >= obj_size) last = obj_size - 1;  /* clamp per RFC 9110 */
     }
-
-    if (obj_size == 0 || start >= obj_size) return -1;
-    if (end >= obj_size) end = obj_size - 1;
-    if (start > end) return -1;
-
-    *start_out = start;
-    *end_out   = end;
+    *first_out = first;
+    *last_out  = last;
     return 1;
 }
 
@@ -558,31 +594,31 @@ static int handle_object_get(conn_t *c, s3_str_t bucket, s3_str_t key,
         return rsp_build_s3_error(c, e, c->req.path, NULL);
     }
 
-    /* Range request handling (ignored for HEAD — HEAD always returns full meta). */
-    if (!head_only) {
-        uint64_t rs = 0, re = 0;
-        int rc = parse_range(c, m.size, &rs, &re);
-        if (rc == -1) {
-            /* Not satisfiable. */
-            store_get_close(r);
-            return rsp_build_range_not_satisfiable(c, m.size);
-        }
-        if (rc == 1) {
-            /* Valid range. */
-            s3_err_t re2 = store_get_set_range(r, rs, re - rs + 1);
-            if (re2 != S3_OK) {
-                store_get_close(r);
-                return rsp_build_range_not_satisfiable(c, m.size);
-            }
-            if (rsp_build_object_range(c, &m, rs, re) < 0) {
-                store_get_close(r);
-                return -1;
-            }
-            c->get_reader = r;
-            return 0;
-        }
+    /* Parse optional Range header. */
+    const s3_str_t *range_hdr = hdr_get(c, "range");
+    uint64_t rfirst = 0, rlast = 0;
+    int range_rc = parse_byte_range(range_hdr, m.size, &rfirst, &rlast);
+    if (range_rc < 0) {
+        store_get_close(r);
+        return rsp_build_range_not_satisfiable(c, m.size);
     }
 
+    if (range_rc > 0) {
+        /* Satisfy range: seek the reader, build 206 head. */
+        store_get_seek(r, rfirst, rlast);
+        if (rsp_build_object_range(c, &m, rfirst, rlast, head_only) < 0) {
+            store_get_close(r);
+            return -1;
+        }
+        if (head_only) {
+            store_get_close(r);
+            return 0;
+        }
+        c->get_reader = r;
+        return 0;
+    }
+
+    /* Full GET / HEAD */
     if (rsp_build_object_head(c, &m, head_only) < 0) {
         store_get_close(r);
         return -1;
@@ -602,6 +638,88 @@ static int handle_object_delete(conn_t *c, s3_str_t bucket, s3_str_t key) {
         return rsp_build_s3_error(c, e, c->req.path, NULL);
     }
     return rsp_build_status(c, 204, "No Content");
+}
+
+/* ===================================================================== */
+/* Object copy (PUT with x-amz-copy-source header)                       */
+/* ===================================================================== */
+
+static int handle_object_copy(conn_t *c, s3_str_t dst_bucket, s3_str_t dst_key) {
+    const s3_str_t *src_hdr = hdr_get(c, "x-amz-copy-source");
+
+    /* Decode the source path. Use malloc — it may be up to ~1100 bytes and
+     * we don't want to exhaust the per-request scratch arena. */
+    char *src_buf = malloc(src_hdr->n + 1);
+    if (!src_buf) return rsp_build_s3_error(c, S3_ERR_INTERNAL, c->req.path, NULL);
+    memcpy(src_buf, src_hdr->p, src_hdr->n);
+    size_t src_n = pct_decode(src_buf, src_hdr->n);
+
+    /* Strip optional versionId query string (we ignore versions). */
+    char *qmark = memchr(src_buf, '?', src_n);
+    if (qmark) src_n = (size_t)(qmark - src_buf);
+
+    /* Skip optional leading '/'. */
+    char *p = src_buf;
+    if (src_n > 0 && p[0] == '/') { p++; src_n--; }
+
+    /* Split at first '/' → src_bucket / src_key. */
+    char *slash = memchr(p, '/', src_n);
+    if (!slash || slash == p) {
+        free(src_buf);
+        return rsp_build_s3_error(c, S3_ERR_INVALID_ARGUMENT, c->req.path, NULL);
+    }
+    size_t src_bucket_n = (size_t)(slash - p);
+    size_t src_key_n    = src_n - src_bucket_n - 1;
+    if (src_key_n == 0) {
+        free(src_buf);
+        return rsp_build_s3_error(c, S3_ERR_INVALID_ARGUMENT, c->req.path, NULL);
+    }
+    s3_str_t src_bucket = { p,         src_bucket_n };
+    s3_str_t src_key    = { slash + 1, src_key_n    };
+
+    /* Open source. */
+    s3_reader_t *reader = NULL;
+    s3_obj_meta_t src_meta;
+    s3_err_t e = store_get_open(c->store, src_bucket, src_key, &reader, &src_meta);
+    if (e != S3_OK) {
+        free(src_buf);
+        return rsp_build_s3_error(c, e, c->req.path, NULL);
+    }
+
+    /* Open dest writer with source content-type. */
+    s3_writer_t *writer = NULL;
+    e = store_put_begin(c->store, dst_bucket, dst_key, src_meta.content_type, &writer);
+    if (e != S3_OK) {
+        store_get_close(reader);
+        free(src_buf);
+        return rsp_build_s3_error(c, e, c->req.path, NULL);
+    }
+    free(src_buf);  /* src_buf no longer needed; src_bucket/src_key no longer safe */
+
+    /* Stream. */
+    char xbuf[8192];
+    int stream_ok = 1;
+    for (;;) {
+        ssize_t n = store_get_read(reader, xbuf, sizeof(xbuf));
+        if (n == 0) break;
+        if (n < 0 || store_put_write(writer, xbuf, (size_t)n) != S3_OK) {
+            stream_ok = 0;
+            break;
+        }
+    }
+    store_get_close(reader);
+
+    if (!stream_ok) {
+        store_put_abort(writer);
+        return rsp_build_s3_error(c, S3_ERR_INTERNAL, c->req.path, NULL);
+    }
+
+    s3_obj_meta_t dst_meta;
+    e = store_put_commit(writer, &dst_meta);
+    if (e != S3_OK) {
+        return rsp_build_s3_error(c, e, c->req.path, NULL);
+    }
+    return rsp_build_copy_object(c, &dst_meta);
 }
 
 /* ===================================================================== */
@@ -865,6 +983,28 @@ int route_dispatch_headers(conn_t *c) {
 
     /* Object-level: "/bucket/key" */
 
+    /* Object-level ?acl: GET returns ACL XML; PUT accepts and ignores body.
+     * Both require the object to exist for GET. PUT is a no-op for fs3
+     * (no real ACL model). Must be checked before MPU params to short-circuit
+     * ambiguous query strings like "?acl&uploadId=...". */
+    if (c->req.query.n > 0) {
+        char *qb_acl = scratch_alloc(c, c->req.query.n + 1);
+        s3_str_t v_acl;
+        if (qb_acl && query_param(c->req.query, "acl",
+                                  qb_acl, c->req.query.n, &v_acl)) {
+            if (method_is(c, "GET")) {
+                s3_obj_meta_t m;
+                s3_err_t e = store_head(c->store, bucket, key, &m);
+                if (e != S3_OK)
+                    return rsp_build_s3_error(c, e, c->req.path, NULL);
+                return rsp_build_acl(c);
+            }
+            if (method_is(c, "PUT")) return rsp_build_status(c, 200, "OK");
+            return rsp_build_s3_error(c, S3_ERR_METHOD_NOT_ALLOWED,
+                                      c->req.path, NULL);
+        }
+    }
+
     /* Multipart upload subresources are signalled by query parameters.
      * Decode them once into a scratch buffer; query_param mutates in place
      * during pct_decode, so each call needs a fresh buffer. */
@@ -942,6 +1082,10 @@ int route_dispatch_headers(conn_t *c) {
     }
 
     if (method_is(c, "PUT")) {
+        /* Server-side copy: PUT with x-amz-copy-source header. */
+        if (hdr_get(c, "x-amz-copy-source")) {
+            return handle_object_copy(c, bucket, key);
+        }
         /* Streaming PUT: open writer, then accept body via on_body. */
         return handle_object_put_begin(c, bucket, key);
     }
@@ -1001,6 +1145,10 @@ int route_dispatch_complete(conn_t *c) {
         c->mpu_complete_pending = 0;
         return handle_mpu_complete_finish(c, c->mpu_bucket, c->mpu_key,
                                           c->mpu_upload_id);
+    }
+    if (c->delete_pending) {
+        c->delete_pending = 0;
+        return handle_bulk_delete_finish(c, c->delete_bucket);
     }
     /* Non-streaming requests already built their response in
      * route_dispatch_headers. Nothing more to do here. */

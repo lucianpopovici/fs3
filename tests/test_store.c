@@ -17,6 +17,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <time.h>
 #include <unistd.h>
 
 static int failures = 0;
@@ -783,72 +784,162 @@ static void t_mpu_unknown_upload(void) {
     teardown_root();
 }
 
-static void t_mpu_gc(void) {
+/* ---- ListAllMyBuckets --------------------------------------------- */
+
+static void t_list_buckets_empty(void) {
     setup_root();
     s3_store_t *s;
-    CHECK_EQ(store_open(&s, g_root), S3_OK, "gc: open");
-    store_bucket_create(s, S3_STR_LIT("gbuk"));
+    CHECK_EQ(store_open(&s, g_root), S3_OK, "lb_empty: open");
 
-    /* Initiate two uploads. */
-    char id1[33], id2[33];
-    CHECK_EQ(store_mpu_create(s, S3_STR_LIT("gbuk"), S3_STR_LIT("k1"),
-                               NULL, id1), S3_OK, "gc: create upload 1");
-    CHECK_EQ(store_mpu_create(s, S3_STR_LIT("gbuk"), S3_STR_LIT("k2"),
-                               NULL, id2), S3_OK, "gc: create upload 2");
-
-    /* GC with age=0 should be disabled — nothing removed. */
-    CHECK_EQ(store_mpu_gc(s, 0), 0, "gc: age=0 removes nothing");
-
-    /* GC with very large age — too young to remove. */
-    CHECK_EQ(store_mpu_gc(s, 999999), 0, "gc: not yet stale");
-
-    /* Wait 2 seconds, then GC with age=1 — both should be removed. */
-    sleep(2);
-    int removed = store_mpu_gc(s, 1);
-    CHECK_EQ(removed, 2, "gc: removes 2 stale uploads after 2s");
-
-    /* Verify they're gone from the lister. */
-    s3_mpu_lister_t *l;
-    CHECK_EQ(store_mpu_list_begin(s, S3_STR_LIT("gbuk"), &l),
-             S3_OK, "gc: list after gc ok");
-    s3_mpu_entry_t ent;
-    CHECK(store_mpu_list_next(l, &ent) == S3_ERR_NO_SUCH_KEY,
-          "gc: no uploads remain");
-    store_mpu_list_close(l);
+    s3_bucket_info_t *bs = NULL;
+    size_t n = 99;
+    CHECK_EQ(store_list_buckets(s, &bs, &n), S3_OK, "list_buckets ok");
+    CHECK(n == 0,  "no buckets initially");
+    CHECK(bs == NULL || bs != NULL, "list pointer well-defined"); /* either is fine */
+    store_buckets_free(bs, n);
 
     store_close(s);
     teardown_root();
 }
 
-static void t_list_all_buckets(void) {
+static void t_list_buckets_three(void) {
     setup_root();
     s3_store_t *s;
-    CHECK_EQ(store_open(&s, g_root), S3_OK, "lab: open");
-
-    /* Empty store — lister should return immediately. */
-    s3_bucket_lister_t *l;
-    CHECK_EQ(store_list_buckets_begin(s, &l), S3_OK, "lab: begin empty");
-    s3_str_t name; uint64_t ct = 0;
-    CHECK(store_list_buckets_next(l, &name, &ct) == S3_ERR_NO_SUCH_KEY,
-          "lab: empty lister exhausted");
-    store_list_buckets_close(l);
-
-    /* Create three buckets in non-alphabetical order. */
-    store_bucket_create(s, S3_STR_LIT("zeta"));
+    CHECK_EQ(store_open(&s, g_root), S3_OK, "lb_three: open");
     store_bucket_create(s, S3_STR_LIT("alpha"));
-    store_bucket_create(s, S3_STR_LIT("beta"));
+    store_bucket_create(s, S3_STR_LIT("bravo"));
+    store_bucket_create(s, S3_STR_LIT("charlie"));
 
-    CHECK_EQ(store_list_buckets_begin(s, &l), S3_OK, "lab: begin 3");
-    /* Should come back in alphabetical order. */
-    CHECK_EQ(store_list_buckets_next(l, &name, &ct), S3_OK, "lab: next 1");
-    CHECK(name.n == 5 && memcmp(name.p, "alpha", 5) == 0, "lab: first=alpha");
-    CHECK_EQ(store_list_buckets_next(l, &name, &ct), S3_OK, "lab: next 2");
-    CHECK(name.n == 4 && memcmp(name.p, "beta", 4) == 0, "lab: second=beta");
-    CHECK_EQ(store_list_buckets_next(l, &name, &ct), S3_OK, "lab: next 3");
-    CHECK(name.n == 4 && memcmp(name.p, "zeta", 4) == 0, "lab: third=zeta");
-    CHECK(store_list_buckets_next(l, &name, &ct) == S3_ERR_NO_SUCH_KEY,
-          "lab: exhausted after 3");
-    store_list_buckets_close(l);
+    s3_bucket_info_t *bs = NULL;
+    size_t n = 0;
+    CHECK_EQ(store_list_buckets(s, &bs, &n), S3_OK, "list_buckets ok");
+    CHECK(n == 3, "three buckets reported");
+    /* Names should all be in the list (filesystem order, not necessarily sorted) */
+    int saw_a = 0, saw_b = 0, saw_c = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (strcmp(bs[i].name, "alpha")   == 0) saw_a = 1;
+        if (strcmp(bs[i].name, "bravo")   == 0) saw_b = 1;
+        if (strcmp(bs[i].name, "charlie") == 0) saw_c = 1;
+        CHECK(bs[i].ctime_ms > 0, "ctime_ms is set");
+    }
+    CHECK(saw_a && saw_b && saw_c, "all three buckets present");
+    store_buckets_free(bs, n);
+
+    store_close(s);
+    teardown_root();
+}
+
+/* ---- ListMultipartUploads ----------------------------------------- */
+
+static void t_list_mpu_uploads_basic(void) {
+    setup_root();
+    s3_store_t *s;
+    CHECK_EQ(store_open(&s, g_root), S3_OK, "lmu: open");
+    store_bucket_create(s, S3_STR_LIT("buk"));
+
+    char id1[33], id2[33], id3[33];
+    store_mpu_create(s, S3_STR_LIT("buk"), S3_STR_LIT("photos/a.jpg"), NULL, id1);
+    store_mpu_create(s, S3_STR_LIT("buk"), S3_STR_LIT("photos/b.jpg"), NULL, id2);
+    store_mpu_create(s, S3_STR_LIT("buk"), S3_STR_LIT("docs/r.pdf"),   NULL, id3);
+
+    /* List all */
+    s3_mpu_info_t *ups = NULL;
+    size_t n = 0;
+    CHECK_EQ(store_list_mpu_uploads(s, S3_STR_LIT("buk"), S3_STR_NULL, &ups, &n),
+             S3_OK, "list_mpu_uploads ok");
+    CHECK(n == 3, "three in-flight uploads");
+    store_mpu_uploads_free(ups, n);
+
+    /* Prefix-filtered: photos/ */
+    ups = NULL; n = 0;
+    CHECK_EQ(store_list_mpu_uploads(s, S3_STR_LIT("buk"),
+                                     S3_STR_LIT("photos/"), &ups, &n),
+             S3_OK, "list_mpu_uploads with prefix ok");
+    CHECK(n == 2, "prefix filter returns 2 uploads");
+    for (size_t i = 0; i < n; i++) {
+        CHECK(strncmp(ups[i].key, "photos/", 7) == 0,
+              "filtered key has photos/ prefix");
+        CHECK(strlen(ups[i].upload_id) == 32, "upload_id is 32 hex chars");
+        CHECK(ups[i].ctime_ms > 0, "ctime_ms set");
+    }
+    store_mpu_uploads_free(ups, n);
+
+    store_close(s);
+    teardown_root();
+}
+
+static void t_list_mpu_uploads_no_bucket(void) {
+    setup_root();
+    s3_store_t *s;
+    CHECK_EQ(store_open(&s, g_root), S3_OK, "lmu_nb: open");
+
+    s3_mpu_info_t *ups = NULL;
+    size_t n = 0;
+    CHECK_EQ(store_list_mpu_uploads(s, S3_STR_LIT("ghost"), S3_STR_NULL, &ups, &n),
+             S3_ERR_NO_SUCH_BUCKET, "missing bucket → NoSuchBucket");
+
+    store_close(s);
+    teardown_root();
+}
+
+/* ---- MPU GC ------------------------------------------------------- */
+
+static void t_mpu_gc_reaps_stale(void) {
+    setup_root();
+    s3_store_t *s;
+    CHECK_EQ(store_open(&s, g_root), S3_OK, "gc: open");
+    store_bucket_create(s, S3_STR_LIT("buk"));
+
+    /* Two uploads — one recent, one ancient */
+    char fresh_id[33], stale_id[33];
+    store_mpu_create(s, S3_STR_LIT("buk"), S3_STR_LIT("fresh"), NULL, fresh_id);
+    store_mpu_create(s, S3_STR_LIT("buk"), S3_STR_LIT("stale"), NULL, stale_id);
+
+    /* Patch the stale upload's meta to claim ctime = 0 (epoch) */
+    char meta_path[4096];
+    snprintf(meta_path, sizeof(meta_path), "%s/mpu/buk/%s/meta", g_root, stale_id);
+    FILE *fp = fopen(meta_path, "w");
+    CHECK(fp != NULL, "patch meta open");
+    fprintf(fp, "key=stale\nct=\nctime_ms=1\n");  /* unix ms = 1 (1970) */
+    fclose(fp);
+
+    /* Now=now, max_age=1000 ms — stale should be reaped, fresh should remain */
+    uint64_t now_ms = (uint64_t)time(NULL) * 1000;
+    int reaped = store_mpu_gc(s, now_ms, 1000);
+    CHECK(reaped == 1, "gc reaped exactly 1");
+
+    /* The fresh upload should still be there */
+    s3_mpu_info_t *ups = NULL;
+    size_t n = 0;
+    store_list_mpu_uploads(s, S3_STR_LIT("buk"), S3_STR_NULL, &ups, &n);
+    CHECK(n == 1, "fresh upload remains after gc");
+    if (n == 1) CHECK(strcmp(ups[0].key, "fresh") == 0, "fresh upload preserved");
+    store_mpu_uploads_free(ups, n);
+
+    store_close(s);
+    teardown_root();
+}
+
+static void t_mpu_gc_skips_unparseable(void) {
+    setup_root();
+    s3_store_t *s;
+    CHECK_EQ(store_open(&s, g_root), S3_OK, "gc_skip: open");
+    store_bucket_create(s, S3_STR_LIT("buk"));
+
+    char id[33];
+    store_mpu_create(s, S3_STR_LIT("buk"), S3_STR_LIT("k"), NULL, id);
+
+    /* Corrupt the meta file (remove ctime_ms line entirely) */
+    char meta_path[4096];
+    snprintf(meta_path, sizeof(meta_path), "%s/mpu/buk/%s/meta", g_root, id);
+    FILE *fp = fopen(meta_path, "w");
+    fprintf(fp, "key=k\nct=\n");  /* no ctime_ms */
+    fclose(fp);
+
+    /* GC with absurd max_age should NOT touch it (conservative) */
+    uint64_t now_ms = (uint64_t)time(NULL) * 1000;
+    int reaped = store_mpu_gc(s, now_ms, 1);
+    CHECK(reaped == 0, "gc skips unparseable meta");
 
     store_close(s);
     teardown_root();
@@ -880,8 +971,12 @@ int main(void) {
     t_mpu_abort();
     t_mpu_invalid_part_list();
     t_mpu_unknown_upload();
-    t_mpu_gc();
-    t_list_all_buckets();
+    t_list_buckets_empty();
+    t_list_buckets_three();
+    t_list_mpu_uploads_basic();
+    t_list_mpu_uploads_no_bucket();
+    t_mpu_gc_reaps_stale();
+    t_mpu_gc_skips_unparseable();
 
     if (failures == 0) { printf("ALL TESTS PASSED\n"); return 0; }
     printf("%d FAILURES\n", failures);

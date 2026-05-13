@@ -742,13 +742,13 @@ s3_err_t sigv4_verify(const sigv4_verifier_t *v, const conn_t *c) {
     const s3_str_t *bh_h = hdr_lookup(c, "x-amz-content-sha256");
     s3_str_t body_hash = bh_h ? *bh_h : empty_sha256;
 
-    /* STREAMING-UNSIGNED-PAYLOAD-TRAILER is a different framing
-     * (standard HTTP chunked + trailers, not aws-chunked) and is not
-     * yet implemented. STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER is
-     * supported: the seed signature is verified here using the literal
-     * as the body hash (per AWS spec), and the chunk decoder handles
-     * the per-chunk signatures plus the trailer signature. */
-    if (s3_str_eq_lit(body_hash, "STREAMING-UNSIGNED-PAYLOAD-TRAILER")) {
+    /* The trailer variants of chunked SigV4 are not implemented. The
+     * regular STREAMING-AWS4-HMAC-SHA256-PAYLOAD is supported via the
+     * sigv4_chunk_* API: we verify the seed signature here using the
+     * literal as the body hash (per AWS spec), and conn.c sets up a
+     * chunk decoder for the body bytes. */
+    if (s3_str_eq_lit(body_hash, "STREAMING-UNSIGNED-PAYLOAD-TRAILER")
+        || s3_str_eq_lit(body_hash, "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER")) {
         return S3_ERR_NOT_IMPLEMENTED;
     }
 
@@ -833,13 +833,12 @@ void sigv4_body_hash_free(void *ctx) {
 /* Streaming chunked SigV4                                                */
 /* ===================================================================== */
 
-/* Returns 1 if the request is using a streaming aws-chunked framing
- * (with or without trailers), 0 otherwise. */
+/* Returns 1 if the request is using STREAMING-AWS4-HMAC-SHA256-PAYLOAD,
+ * 0 otherwise. */
 int sigv4_is_chunked(const conn_t *c) {
     const s3_str_t *bh = hdr_lookup(c, "x-amz-content-sha256");
     if (!bh) return 0;
-    return s3_str_eq_lit(*bh, "STREAMING-AWS4-HMAC-SHA256-PAYLOAD")
-        || s3_str_eq_lit(*bh, "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER");
+    return s3_str_eq_lit(*bh, "STREAMING-AWS4-HMAC-SHA256-PAYLOAD");
 }
 
 /* Decoder state machine. Each chunk goes:
@@ -875,23 +874,9 @@ typedef enum {
     CST_DATA,
     CST_CRLF2,
     CST_CRLF2_HALF,        /* saw \r at end of buffer; expect \n next */
-    /* Trailer-mode states (only reachable when trailer_mode=1) */
-    CST_TRAILER_LINE,      /* accumulating bytes of a trailer header line */
-    CST_TRAILER_LF,        /* saw \r at end of trailer line, expect \n */
-    CST_TRAILER_FINAL_LF,  /* saw \r at start of blank line, expect \n */
     CST_DONE,
     CST_ERROR,
 } chunk_state_t;
-
-/* Maximum trailer headers we'll accept on a single request. AWS clients
- * in practice send at most one (e.g. x-amz-checksum-sha256) plus the
- * mandatory x-amz-trailer-signature. */
-#define SIGV4_MAX_TRAILERS 8
-
-typedef struct {
-    char   name[64];   size_t name_n;
-    char   value[256]; size_t value_n;
-} trailer_kv_t;
 
 struct sigv4_chunk_decoder {
     /* Crypto state (immutable after begin) */
@@ -914,15 +899,6 @@ struct sigv4_chunk_decoder {
     int      seen_terminator;
     uint64_t expected_decoded;      /* x-amz-decoded-content-length, 0 = unbounded */
     uint64_t total_decoded;         /* sum of chunk_size seen */
-
-    /* Trailer mode (STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER) */
-    int           trailer_mode;
-    char          trailer_line[1024];
-    size_t        trailer_line_n;
-    char          trailer_sig[64];        /* claimed x-amz-trailer-signature */
-    int           trailer_sig_seen;
-    trailer_kv_t  trailers[SIGV4_MAX_TRAILERS];
-    int           trailer_n;
 
     /* Forwarding callback */
     sigv4_chunk_data_cb on_data;
@@ -974,7 +950,7 @@ static int parse_chunk_header(const char *line, size_t n,
  * is finalized as a side effect; caller should re-init if needed. */
 static int verify_chunk_sig(sigv4_chunk_decoder_t *d) {
     /* Constants: SHA-256("") in hex */
-    static const char EMPTY_HASH[65] =
+    static const char EMPTY_HASH[64] =
         "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
     /* Finalize data hash. */
@@ -1020,133 +996,6 @@ static int verify_chunk_sig(sigv4_chunk_decoder_t *d) {
     return ok;
 }
 
-/* Process one trailer header line:
- *   - split on ':'
- *   - lowercase name; trim+collapse value
- *   - if name is "x-amz-trailer-signature", stash the value into
- *     d->trailer_sig (must be 64 hex chars)
- *   - otherwise, store as a trailer for canonical-trailer hashing
- * Returns 0 on success, -1 on malformed line or buffer overflow.
- */
-static int process_trailer_line(sigv4_chunk_decoder_t *d,
-                                const char *line, size_t n) {
-    /* Find ':' separator. */
-    size_t colon = 0;
-    while (colon < n && line[colon] != ':') colon++;
-    if (colon == 0 || colon == n) return -1;
-
-    /* Lowercase name into a small scratch. */
-    char name_lc[64];
-    if (colon > sizeof(name_lc)) return -1;
-    for (size_t j = 0; j < colon; j++) {
-        char ch = line[j];
-        name_lc[j] = (ch >= 'A' && ch <= 'Z') ? (char)(ch + 32) : ch;
-    }
-
-    /* Trim + collapse value. */
-    char value[256];
-    int v_n = trim_and_collapse_ws(line + colon + 1, n - colon - 1,
-                                   value, sizeof(value));
-    if (v_n < 0) return -1;
-
-    /* Special case: x-amz-trailer-signature is the trailer sig itself. */
-    static const char SIG_NAME[] = "x-amz-trailer-signature";
-    static const size_t SIG_NAME_N = sizeof(SIG_NAME) - 1;
-    if (colon == SIG_NAME_N && memcmp(name_lc, SIG_NAME, SIG_NAME_N) == 0) {
-        if (v_n != 64) return -1;
-        for (int j = 0; j < 64; j++) {
-            char ch = value[j];
-            if (!((ch >= '0' && ch <= '9')
-                  || (ch >= 'a' && ch <= 'f')
-                  || (ch >= 'A' && ch <= 'F'))) return -1;
-        }
-        if (d->trailer_sig_seen) return -1;     /* duplicate */
-        memcpy(d->trailer_sig, value, 64);
-        d->trailer_sig_seen = 1;
-        return 0;
-    }
-
-    if (d->trailer_n >= SIGV4_MAX_TRAILERS) return -1;
-    if ((size_t)v_n > sizeof(d->trailers[0].value)) return -1;
-
-    /* Reject duplicates by name. */
-    for (int t = 0; t < d->trailer_n; t++) {
-        if (d->trailers[t].name_n == colon
-            && memcmp(d->trailers[t].name, name_lc, colon) == 0) return -1;
-    }
-
-    trailer_kv_t *t = &d->trailers[d->trailer_n++];
-    memcpy(t->name, name_lc, colon);
-    t->name_n = colon;
-    memcpy(t->value, value, (size_t)v_n);
-    t->value_n = (size_t)v_n;
-    return 0;
-}
-
-static int trailer_cmp(const void *a, const void *b) {
-    const trailer_kv_t *x = a, *y = b;
-    size_t n = x->name_n < y->name_n ? x->name_n : y->name_n;
-    int r = memcmp(x->name, y->name, n);
-    if (r) return r;
-    if (x->name_n != y->name_n) return x->name_n < y->name_n ? -1 : 1;
-    return 0;
-}
-
-/* Verify the trailer signature using:
- *   string-to-sign:
- *     AWS4-HMAC-SHA256-TRAILER\n
- *     <amz_date>\n
- *     <scope>\n
- *     <prev_sig>\n               (signature of the terminator chunk)
- *     hex(SHA256(canonical_trailers))
- *
- * canonical_trailers is the trailers, sorted by lowercased name, each
- * formatted as "<lc-name>:<trimmed-value>\n".
- *
- * Returns 1 if signature matches, 0 otherwise. */
-static int verify_trailer_sig(sigv4_chunk_decoder_t *d) {
-    if (!d->trailer_sig_seen) return 0;
-
-    qsort(d->trailers, (size_t)d->trailer_n, sizeof(trailer_kv_t), trailer_cmp);
-
-    char canon[2048];
-    size_t o = 0;
-    for (int t = 0; t < d->trailer_n; t++) {
-        const trailer_kv_t *kv = &d->trailers[t];
-        if (o + kv->name_n + 1 + kv->value_n + 1 > sizeof(canon)) return 0;
-        memcpy(canon + o, kv->name, kv->name_n);
-        o += kv->name_n;
-        canon[o++] = ':';
-        memcpy(canon + o, kv->value, kv->value_n);
-        o += kv->value_n;
-        canon[o++] = '\n';
-    }
-
-    uint8_t canon_mac[32];
-    char    canon_hex[64];
-    sha256(canon, o, canon_mac);
-    hex_encode(canon_mac, 32, canon_hex);
-
-    char sts[512];
-    int p = 0;
-    static const char prefix[] = "AWS4-HMAC-SHA256-TRAILER\n";
-    memcpy(sts + p, prefix, sizeof(prefix) - 1); p += (int)sizeof(prefix) - 1;
-    memcpy(sts + p, d->amz_date, d->amz_date_n);  p += (int)d->amz_date_n;
-    sts[p++] = '\n';
-    memcpy(sts + p, d->scope, d->scope_n);        p += (int)d->scope_n;
-    sts[p++] = '\n';
-    memcpy(sts + p, d->prev_sig, 64);             p += 64;
-    sts[p++] = '\n';
-    memcpy(sts + p, canon_hex, 64);               p += 64;
-
-    uint8_t mac[32];
-    char    want[64];
-    hmac_sha256(d->signing_key, 32, sts, (size_t)p, mac);
-    hex_encode(mac, 32, want);
-
-    return CRYPTO_memcmp(want, d->trailer_sig, 64) == 0;
-}
-
 sigv4_chunk_decoder_t *sigv4_chunk_begin(const sigv4_verifier_t *v,
                                           const conn_t *c,
                                           uint64_t expected_decoded,
@@ -1179,11 +1028,6 @@ sigv4_chunk_decoder_t *sigv4_chunk_begin(const sigv4_verifier_t *v,
     memcpy(d->scope, ap.scope.p, ap.scope.n);
     d->scope_n = ap.scope.n;
     memcpy(d->prev_sig, ap.signature.p, 64);
-
-    /* Detect trailer mode from x-amz-content-sha256. */
-    const s3_str_t *bh = hdr_lookup(c, "x-amz-content-sha256");
-    d->trailer_mode = (bh && s3_str_eq_lit(*bh,
-        "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER")) ? 1 : 0;
 
     derive_signing_key(cr->secret_key, cr->secret_len,
                        ap.date, ap.region, ap.service, d->signing_key);
@@ -1231,14 +1075,12 @@ int sigv4_chunk_feed(sigv4_chunk_decoder_t *d, const char *data, size_t len) {
             /* Reset data hash for this chunk. */
             EVP_DigestInit_ex(d->data_hash_ctx, EVP_sha256(), NULL);
             if (d->chunk_size == 0) {
-                /* Terminator chunk: verify the chunk signature, then
-                 * either read trailer headers (trailer mode) or just
-                 * consume the empty trailer-part terminator (\r\n). */
+                /* Terminator chunk: no data, just verify sig and consume \r\n. */
                 if (!verify_chunk_sig(d)) {
                     d->state = CST_ERROR; return -1;
                 }
                 d->seen_terminator = 1;
-                d->state = d->trailer_mode ? CST_TRAILER_LINE : CST_CRLF2;
+                d->state = CST_CRLF2;
             } else {
                 d->state = CST_DATA;
             }
@@ -1283,43 +1125,6 @@ int sigv4_chunk_feed(sigv4_chunk_decoder_t *d, const char *data, size_t len) {
             d->state = d->seen_terminator ? CST_DONE : CST_SIZE;
             break;
 
-        case CST_TRAILER_LINE:
-            /* Accumulate bytes of the current trailer line until \r.
-             * An immediate \r at line position 0 means we just hit the
-             * blank-line terminator that ends the trailer-part. */
-            while (i < len && data[i] != '\r') {
-                if (d->trailer_line_n >= sizeof(d->trailer_line)) {
-                    d->state = CST_ERROR; return -1;
-                }
-                d->trailer_line[d->trailer_line_n++] = data[i++];
-            }
-            if (i < len && data[i] == '\r') {
-                i++;
-                if (d->trailer_line_n == 0) {
-                    d->state = CST_TRAILER_FINAL_LF;
-                } else {
-                    d->state = CST_TRAILER_LF;
-                }
-            }
-            break;
-
-        case CST_TRAILER_LF:
-            if (data[i] != '\n') { d->state = CST_ERROR; return -1; }
-            i++;
-            if (process_trailer_line(d, d->trailer_line, d->trailer_line_n) < 0) {
-                d->state = CST_ERROR; return -1;
-            }
-            d->trailer_line_n = 0;
-            d->state = CST_TRAILER_LINE;
-            break;
-
-        case CST_TRAILER_FINAL_LF:
-            if (data[i] != '\n') { d->state = CST_ERROR; return -1; }
-            i++;
-            if (!verify_trailer_sig(d)) { d->state = CST_ERROR; return -1; }
-            d->state = CST_DONE;
-            break;
-
         case CST_DONE:
             /* Extra bytes after terminator — ignore (some clients send
              * an extra \r\n). We could be strict but it costs nothing
@@ -1338,13 +1143,6 @@ int sigv4_chunk_finish(sigv4_chunk_decoder_t *d) {
     if (!d) return -1;
     if (d->state == CST_ERROR) return -1;
     if (!d->seen_terminator) return -1;
-    /* For trailer mode, the trailer-part must have been fully consumed
-     * (we reached CST_DONE) — otherwise the trailer signature was never
-     * verified. For non-trailer mode, CST_DONE is the only "good" end
-     * state too: the body may legitimately end at CRLF2_HALF for some
-     * clients, but in that case the state machine has already advanced
-     * to CST_DONE because the terminating CRLF was consumed. */
-    if (d->state != CST_DONE) return -1;
     if (d->expected_decoded != 0
         && d->total_decoded != d->expected_decoded) {
         return -1;

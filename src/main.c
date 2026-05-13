@@ -6,7 +6,6 @@
 
 #include <getopt.h>
 #include <signal.h>
-#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -21,16 +20,15 @@ static void on_signal(int sig) {
 static void usage(const char *argv0) {
     fprintf(stderr,
         "usage: %s [options]\n"
-        "  -a, --addr <ip>          bind address (default 127.0.0.1)\n"
-        "  -p, --port <num>         port (default 9000)\n"
-        "  -d, --data <dir>         object store root (default /tmp/fs3-data)\n"
-        "      --auth <ak:sk>       add a SigV4 credential (repeatable)\n"
-        "      --require-auth       reject requests without an Authorization header\n"
-        "      --mpu-gc-age <secs>  remove abandoned multipart uploads older than\n"
-        "                           this many seconds (0 = disabled, default 0;\n"
-        "                           604800 = 7 days is a reasonable production value)\n"
-        "  -v, --verbose            debug logging\n"
-        "  -h, --help               this help\n",
+        "  -a, --addr <ip>            bind address (default 127.0.0.1)\n"
+        "  -p, --port <num>           port (default 9000)\n"
+        "  -d, --data <dir>           object store root (default /tmp/fs3-data)\n"
+        "      --auth <ak:sk>         add a SigV4 credential (repeatable)\n"
+        "      --require-auth         reject requests without an Authorization header\n"
+        "      --mpu-gc-interval N    seconds between MPU GC sweeps (default 60)\n"
+        "      --mpu-gc-max-age N     seconds before a stale MPU is reaped (default 86400)\n"
+        "  -v, --verbose              debug logging\n"
+        "  -h, --help                 this help\n",
         argv0);
 }
 
@@ -58,7 +56,8 @@ static int parse_and_add_cred(sigv4_verifier_t *v, const char *spec) {
 enum {
     OPT_AUTH = 256,
     OPT_REQUIRE_AUTH,
-    OPT_MPU_GC_AGE,
+    OPT_MPU_GC_INTERVAL,
+    OPT_MPU_GC_MAX_AGE,
 };
 
 int main(int argc, char **argv) {
@@ -67,18 +66,20 @@ int main(int argc, char **argv) {
     int port = 9000;
     int verbose = 0;
     int require_auth = 0;
-    uint64_t mpu_gc_age_secs = 0;
+    int gc_interval_s = 0;        /* 0 → server defaults to 60 */
+    uint64_t gc_max_age_ms = 0;   /* 0 → server defaults to 24h */
     sigv4_verifier_t *auth = NULL;
 
     static struct option opts[] = {
-        { "addr",         required_argument, NULL, 'a' },
-        { "port",         required_argument, NULL, 'p' },
-        { "data",         required_argument, NULL, 'd' },
-        { "auth",         required_argument, NULL, OPT_AUTH },
-        { "require-auth", no_argument,       NULL, OPT_REQUIRE_AUTH },
-        { "mpu-gc-age",   required_argument, NULL, OPT_MPU_GC_AGE },
-        { "verbose",      no_argument,       NULL, 'v' },
-        { "help",         no_argument,       NULL, 'h' },
+        { "addr",            required_argument, NULL, 'a' },
+        { "port",            required_argument, NULL, 'p' },
+        { "data",            required_argument, NULL, 'd' },
+        { "auth",            required_argument, NULL, OPT_AUTH },
+        { "require-auth",    no_argument,       NULL, OPT_REQUIRE_AUTH },
+        { "mpu-gc-interval", required_argument, NULL, OPT_MPU_GC_INTERVAL },
+        { "mpu-gc-max-age",  required_argument, NULL, OPT_MPU_GC_MAX_AGE },
+        { "verbose",         no_argument,       NULL, 'v' },
+        { "help",            no_argument,       NULL, 'h' },
         { 0 },
     };
 
@@ -106,8 +107,19 @@ int main(int argc, char **argv) {
             case OPT_REQUIRE_AUTH:
                 require_auth = 1;
                 break;
-            case OPT_MPU_GC_AGE:
-                mpu_gc_age_secs = (uint64_t)strtoull(optarg, NULL, 10);
+            case OPT_MPU_GC_INTERVAL:
+                gc_interval_s = atoi(optarg);
+                if (gc_interval_s < 1) {
+                    fprintf(stderr, "--mpu-gc-interval must be >= 1\n");
+                    return 2;
+                }
+                break;
+            case OPT_MPU_GC_MAX_AGE:
+                gc_max_age_ms = (uint64_t)atoll(optarg) * 1000;
+                if (gc_max_age_ms == 0) {
+                    fprintf(stderr, "--mpu-gc-max-age must be >= 1\n");
+                    return 2;
+                }
                 break;
             default:  usage(argv[0]); return 2;
         }
@@ -129,14 +141,15 @@ int main(int argc, char **argv) {
     sigaction(SIGTERM, &sa, NULL);
 
     server_cfg_t cfg = {
-        .bind_addr        = addr,
-        .port             = (uint16_t)port,
-        .backlog          = 1024,
-        .max_conns        = 4096,
-        .data_root        = data_root,
-        .auth             = auth,
-        .auth_required    = require_auth,
-        .mpu_gc_age_secs  = mpu_gc_age_secs,
+        .bind_addr     = addr,
+        .port          = (uint16_t)port,
+        .backlog       = 1024,
+        .max_conns     = 4096,
+        .data_root     = data_root,
+        .auth          = auth,
+        .auth_required = require_auth,
+        .gc_interval_s = gc_interval_s,
+        .gc_max_age_ms = gc_max_age_ms,
     };
 
     g_server = server_create(&cfg);

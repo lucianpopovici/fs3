@@ -201,6 +201,52 @@ else
     FAIL=$((FAIL+1)); printf '\nFAIL: large multipart byte mismatch\n'
 fi
 
+# --- t8: ListMultipartUploads ---
+# Initiate three uploads, then list and verify the response.
+UP1=$(curl -sS -X POST "$URL/mpb/lmu/a.txt?uploads" | grep -oP '<UploadId>\K[^<]+')
+UP2=$(curl -sS -X POST "$URL/mpb/lmu/b.txt?uploads" | grep -oP '<UploadId>\K[^<]+')
+UP3=$(curl -sS -X POST "$URL/mpb/other/c.txt?uploads" | grep -oP '<UploadId>\K[^<]+')
+
+body=$(curl -sS "$URL/mpb?uploads")
+case "$body" in
+    *"<ListMultipartUploadsResult"*) PASS=$((PASS+1)); printf '.';;
+    *) FAIL=$((FAIL+1)); printf '\nFAIL: ListMultipartUploadsResult root\n%s\n' "$body";;
+esac
+
+# Should see all three uploads (we listed bucket mpb, all three are on mpb).
+count_uploads=$(echo "$body" | grep -c "<Upload>" || true)
+check_eq "three in-flight uploads listed" "$count_uploads" "3"
+
+# Filter by prefix
+body=$(curl -sS "$URL/mpb?uploads&prefix=lmu/")
+count_uploads=$(echo "$body" | grep -c "<Upload>" || true)
+check_eq "prefix filter narrows to 2" "$count_uploads" "2"
+
+if echo "$body" | grep -q "<Prefix>lmu/</Prefix>"; then
+    PASS=$((PASS+1)); printf '.'
+else
+    FAIL=$((FAIL+1)); printf '\nFAIL: <Prefix>lmu/</Prefix> echoed\n'
+fi
+
+# Cleanup uploads we just created
+curl -sS -X DELETE "$URL/mpb/lmu/a.txt?uploadId=$UP1" -o /dev/null
+curl -sS -X DELETE "$URL/mpb/lmu/b.txt?uploadId=$UP2" -o /dev/null
+curl -sS -X DELETE "$URL/mpb/other/c.txt?uploadId=$UP3" -o /dev/null
+
+# After abort, listing should be empty (well, no <Upload> entries)
+body=$(curl -sS "$URL/mpb?uploads")
+count_uploads=$(echo "$body" | grep -c "<Upload>" || true)
+check_eq "after abort, no uploads listed" "$count_uploads" "0"
+
+# --- t9: missing bucket → 404 ---
+out=$(curl -sS -w "%{http_code}" -o /tmp/fs3-mpu-err.$$ "$URL/nobucket?uploads")
+check_eq "list MPUs on missing bucket = 404" "$out" "404"
+if grep -q "NoSuchBucket" /tmp/fs3-mpu-err.$$; then
+    PASS=$((PASS+1)); printf '.'
+else
+    FAIL=$((FAIL+1)); printf '\nFAIL: NoSuchBucket in body\n'
+fi
+
 echo
 echo "===== mpu e2e: $PASS passed, $FAIL failed ====="
 [ "$FAIL" -eq 0 ]
