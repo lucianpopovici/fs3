@@ -49,6 +49,7 @@
 #include <sys/file.h>
 #include <sys/sendfile.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <sys/time.h>
 #include <sys/types.h>
 #include <time.h>
@@ -85,11 +86,12 @@ _Static_assert(sizeof(obj_header_t) == 60, "obj_header_t layout");
 /* ===================================================================== */
 
 struct s3_store {
-    char *root;       /* absolute path, no trailing slash */
-    char *data_dir;   /* ROOT/data */
-    char *tmp_dir;    /* ROOT/tmp */
-    char *buckets_dir;/* ROOT/buckets */
-    char *mpu_dir;    /* ROOT/mpu — multipart upload staging */
+    char    *root;           /* absolute path, no trailing slash */
+    char    *data_dir;       /* ROOT/data */
+    char    *tmp_dir;        /* ROOT/tmp */
+    char    *buckets_dir;    /* ROOT/buckets */
+    char    *mpu_dir;        /* ROOT/mpu — multipart upload staging */
+    uint64_t min_free_bytes; /* 0 = no quota check */
 };
 
 static char *xstrdup_join(const char *a, const char *b) {
@@ -280,6 +282,23 @@ void store_close(s3_store_t *s) {
     free(s);
 }
 
+void store_set_min_free_bytes(s3_store_t *s, uint64_t min_free_bytes) {
+    if (s) s->min_free_bytes = min_free_bytes;
+}
+
+/* Check disk quota. Returns S3_ERR_INSUFFICIENT_STORAGE if the filesystem
+ * hosting the store root has fewer than s->min_free_bytes available.
+ * Returns S3_OK if the quota is not set or if there is enough space.
+ * Fails open (returns S3_OK) if statvfs itself fails. */
+static s3_err_t quota_check(const s3_store_t *s) {
+    if (!s || s->min_free_bytes == 0) return S3_OK;
+    struct statvfs st;
+    if (statvfs(s->root, &st) < 0) return S3_OK;
+    uint64_t free_bytes = (uint64_t)st.f_bavail * (uint64_t)st.f_bsize;
+    if (free_bytes < s->min_free_bytes) return S3_ERR_INSUFFICIENT_STORAGE;
+    return S3_OK;
+}
+
 /* ===================================================================== */
 /* Bucket ops                                                             */
 /* ===================================================================== */
@@ -415,6 +434,8 @@ s3_err_t store_put_begin(s3_store_t *s, s3_str_t bucket, s3_str_t key,
     if (!valid_bucket_name(bucket)) return S3_ERR_INVALID_BUCKET_NAME;
     if (!valid_key(key))            return S3_ERR_INVALID_ARGUMENT;
     if (!store_bucket_exists(s, bucket)) return S3_ERR_NO_SUCH_BUCKET;
+    s3_err_t qe = quota_check(s);
+    if (qe != S3_OK) return qe;
 
     s3_writer_t *w = calloc(1, sizeof(*w));
     if (!w) return S3_ERR_INTERNAL;
@@ -1292,6 +1313,8 @@ s3_err_t store_mpu_part_begin(s3_store_t *s, s3_str_t bucket, s3_str_t key,
     if (part_number < 1 || part_number > 10000) return S3_ERR_INVALID_ARGUMENT;
     if (!valid_bucket_name(bucket)) return S3_ERR_INVALID_BUCKET_NAME;
     if (!valid_key(key))            return S3_ERR_INVALID_ARGUMENT;
+    s3_err_t qe = quota_check(s);
+    if (qe != S3_OK) return qe;
 
     /* Verify the upload exists and the key matches. */
     char *stored_key = NULL;

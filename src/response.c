@@ -109,6 +109,7 @@ static const err_entry_t ERR_TABLE[] = {
     { S3_ERR_BAD_DIGEST,                 400, "XAmzContentSHA256Mismatch","The provided x-amz-content-sha256 header does not match the body." },
     { S3_ERR_INVALID_PART,               400, "InvalidPart",              "One or more of the specified parts could not be found." },
     { S3_ERR_MALFORMED_XML,              400, "MalformedXML",             "The XML you provided was not well-formed."         },
+    { S3_ERR_INSUFFICIENT_STORAGE,       507, "QuotaExceeded",            "The server storage quota has been reached."        },
 };
 
 static const err_entry_t *err_lookup(s3_err_t e) {
@@ -548,6 +549,30 @@ int rsp_build_list_all_my_buckets(conn_t *c,
     free_tree(root);
     if (!body) return -1;
     return ship_xml_200(c, body, blen);
+}
+
+/* ===================================================================== */
+/* Health check: GET /_health                                             */
+/* ===================================================================== */
+
+int rsp_build_health(conn_t *c) {
+    static const char body[] = "{\"status\":\"ok\"}\n";
+    int n = snprintf(c->wbuf, CONN_WBUF_SZ,
+        "HTTP/1.1 200 OK\r\n"
+        "Server: fs3/0.2\r\n"
+        "Content-Type: application/json\r\n"
+        "Content-Length: %zu\r\n"
+        "Connection: %s\r\n"
+        "\r\n"
+        "%s",
+        sizeof(body) - 1,
+        c->req.keep_alive ? "keep-alive" : "close",
+        body);
+    if (n < 0 || n >= CONN_WBUF_SZ) return -1;
+    c->wlen = (size_t)n;
+    c->wpos = 0;
+    c->state = CST_WRITE_RESPONSE;
+    return 0;
 }
 
 /* ===================================================================== */

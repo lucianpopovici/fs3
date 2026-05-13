@@ -24,6 +24,11 @@ typedef struct {
      * to force quick reaping; production has no reason to retune. */
     int                    gc_interval_s;     /* sweep cadence in seconds */
     uint64_t               gc_max_age_ms;     /* TTL for staging dirs */
+
+    /* Disk quota. When non-zero, PUT and MPU-part requests are rejected
+     * with 507 if the underlying filesystem has fewer than this many
+     * bytes free at the time the upload starts. */
+    uint64_t               min_free_bytes;
 } server_cfg_t;
 
 server_t *server_create(const server_cfg_t *cfg);

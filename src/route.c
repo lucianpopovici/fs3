@@ -961,6 +961,14 @@ static int handle_mpu_abort(conn_t *c, s3_str_t bucket, s3_str_t key,
 int route_dispatch_headers(conn_t *c) {
     scratch_reset(c);
 
+    /* Health check — handled on the raw path before any bucket/key routing. */
+    if (c->req.path.n == 8 && memcmp(c->req.path.p, "/_health", 8) == 0) {
+        if (!method_is(c, "GET") && !method_is(c, "HEAD"))
+            return rsp_build_s3_error(c, S3_ERR_METHOD_NOT_ALLOWED,
+                                      c->req.path, NULL);
+        return rsp_build_health(c);
+    }
+
     /* Decode path into bucket + key spans. */
     char *path_scratch = scratch_alloc(c, c->req.path.n);
     if (!path_scratch) {

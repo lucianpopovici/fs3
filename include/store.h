@@ -47,6 +47,12 @@ typedef struct {
 s3_err_t store_open(s3_store_t **out, const char *root);
 void     store_close(s3_store_t *s);
 
+/* Set a minimum free-space threshold: store_put_begin and
+ * store_mpu_part_begin will return S3_ERR_INSUFFICIENT_STORAGE when
+ * the filesystem has fewer than `min_free_bytes` available. Pass 0 to
+ * disable the check (the default). */
+void     store_set_min_free_bytes(s3_store_t *s, uint64_t min_free_bytes);
+
 /* ---- Buckets ---- */
 
 s3_err_t store_bucket_create(s3_store_t *s, s3_str_t name);

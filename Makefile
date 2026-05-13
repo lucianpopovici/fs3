@@ -88,6 +88,8 @@ test: $(TEST_BINS) fs3
 	@./tests/test_e2e_phase9.sh
 	@echo "=== test_e2e_phase10 (object copy / ?acl stub) ==="
 	@./tests/test_e2e_phase10.sh
+	@echo "=== test_e2e_phase11 (health endpoint / credentials file / disk quota) ==="
+	@./tests/test_e2e_phase11.sh
 
 tests/test_store: tests/test_store.c src/store_fs.o src/log.o
 	$(CC) $(CFLAGS) $(INCLUDES) tests/test_store.c \

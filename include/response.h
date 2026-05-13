@@ -94,6 +94,10 @@ int rsp_build_list_mpu_uploads(conn_t *c, s3_str_t bucket, s3_str_t prefix,
                                 const s3_mpu_info_t *uploads,
                                 size_t n_uploads);
 
+/* Build a 200 OK health-check response for GET /_health.
+ * Returns {"status":"ok"} as application/json. */
+int rsp_build_health(conn_t *c);
+
 /* Build a CopyObjectResult XML body (200 OK) for server-side object copy.
  * `m` is the metadata of the newly written destination object. */
 int rsp_build_copy_object(conn_t *c, const s3_obj_meta_t *m);

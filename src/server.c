@@ -104,6 +104,11 @@ server_t *server_create(const server_cfg_t *cfg) {
         LOG_E("store_open(%s) failed", cfg->data_root);
         goto fail;
     }
+    if (cfg->min_free_bytes > 0) {
+        store_set_min_free_bytes(s->store, cfg->min_free_bytes);
+        LOG_I("disk quota: min %.1f MiB free required",
+              (double)cfg->min_free_bytes / (1024.0 * 1024.0));
+    }
     LOG_I("store opened at %s", cfg->data_root);
 
     s->listen_fd = listen_socket(cfg->bind_addr, cfg->port, cfg->backlog);

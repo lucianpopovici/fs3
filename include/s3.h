@@ -32,6 +32,7 @@ typedef enum {
     S3_ERR_BAD_DIGEST,                  /* x-amz-content-sha256 mismatch */
     S3_ERR_INVALID_PART,                /* multipart: bad part list */
     S3_ERR_MALFORMED_XML,               /* XML body could not be parsed */
+    S3_ERR_INSUFFICIENT_STORAGE,        /* disk free space below --min-free-bytes */
     S3_ERR_MAX
 } s3_err_t;
 
