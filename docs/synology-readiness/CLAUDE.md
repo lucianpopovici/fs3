@@ -68,28 +68,30 @@ done" but survivable on a trusted LAN in the meantime.
 
 ### Tier 2 — want before calling it production-grade
 
-4. **[06-startup-recovery](06-startup-recovery/CLAUDE.md)** — no startup
-   scan for orphaned temp files or interrupted multipart staging after
-   an ungraceful shutdown. The C2000 erratum makes these boxes prone to
-   sudden death, so this matters more here than usual.
+4. **[06-startup-recovery](06-startup-recovery/CLAUDE.md)** — **DONE
+   (2026-06-10).** `store_open` sweeps orphaned `tmp/` files before
+   accepting connections, logging count + bytes; `data/` untouched,
+   in-flight MPUs preserved. Unit + e2e tested.
 
-5. **[05-resource-bounds](05-resource-bounds/CLAUDE.md)** — connection
-   cap exists (`max_conns`) but there's no per-request body-size limit
-   and no bound on concurrent multipart memory. On a 2 GB-RAM box this
-   is a DoS-by-accident risk.
+5. **[05-resource-bounds](05-resource-bounds/CLAUDE.md)** — **DONE
+   (2026-06-10).** `--max-body-size` (413, enforced on declared length
+   AND streamed total), `--idle-timeout` sweep, `--max-conns` default
+   512. Buffered XML bodies were already capped.
 
 6. **[04-credential-management](04-credential-management/CLAUDE.md)** —
-   the verifier already supports multiple credentials; what's missing is
-   *management*: persistence beyond the install-time conf, rotation
-   without downtime, and any notion of per-bucket scoping.
+   **DONE (2026-06-10)** except per-bucket scoping (skipped on purpose).
+   SIGHUP rebuilds credentials from the file build-then-swap, so
+   rotation needs no restart and a bad file can't lock everyone out.
 
-7. **[08-service-supervision](08-service-supervision/CLAUDE.md)** — the
-   SPK backgrounds fs3 with a PID file; DSM won't restart it on crash.
-   Includes auto-restart / crash recovery.
+7. **[08-service-supervision](08-service-supervision/CLAUDE.md)** —
+   **fallback done (2026-06-10).** SPK watchdog respawns fs3 on crash
+   with exponential backoff; verified locally. DSM-native supervision
+   (preferred) still needs hardware investigation.
 
-8. **[07-metrics-health](07-metrics-health/CLAUDE.md)** — no `/healthz`,
-   no `/metrics`. You run Prometheus/Grafana on the Pi 4; fs3 gives it
-   nothing to scrape.
+8. **[07-metrics-health](07-metrics-health/CLAUDE.md)** — **DONE
+   (2026-06-10).** Localhost admin listener (`--metrics-port`, SPK
+   default 9101) serves `/healthz` + Prometheus `/metrics`; S3-port
+   `/_health` is now auth-exempt for liveness probes.
 
 ### Tier 3 — operational polish
 

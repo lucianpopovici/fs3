@@ -1,5 +1,14 @@
 # CLAUDE.md — resource bounds (body size, memory, concurrency)
 
+> **STATUS: DONE (2026-06-10).** `--max-body-size` (default 5 GiB,
+> 0 = off) returns 413, enforced both from the declared Content-Length
+> at headers-complete and from the running streamed total in `on_body`
+> (chunked/lying clients included); a mid-stream 413 aborts the writer
+> with no tmp orphan. `--max-conns` default dropped 4096 → 512.
+> `--idle-timeout` (default 60 s) sweeps stalled connections after each
+> event batch. The buffered MPU-complete and bulk-delete bodies were
+> already capped at 1 MB. e2e coverage in `tests/test_e2e_phase12.sh`.
+
 **Problem:** fs3 caps concurrent connections but has no per-request
 body-size limit and no bound on memory consumed by in-flight requests.
 On a 2 GB-RAM box, a few large concurrent uploads — or one malicious

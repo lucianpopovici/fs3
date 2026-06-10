@@ -1,5 +1,18 @@
 # CLAUDE.md — metrics + health endpoint
 
+> **STATUS: DONE (2026-06-10).** `--metrics-port` opens a localhost-only
+> admin listener serving `/healthz` and Prometheus `/metrics`
+> (`src/metrics.c`): requests by method × status class, bytes in/out,
+> duration summary, and per-scrape gauges (buckets, in-flight MPUs,
+> volume used/free). Counters are plain uint64 — single-thread
+> invariant documented in `include/metrics.h`. The S3-port `/_health`
+> (added in Phase 11; `_` can't collide with a bucket name) is now
+> auth-exempt for credential-less liveness probes. SPK enables the
+> listener on 127.0.0.1:9101 (`FS3_METRICS_PORT`). Not done:
+> `fs3_objects_total` (needs tree walk or overwrite-aware incremental
+> counting), duration histogram buckets (summary sum/count instead),
+> and the optional Grafana panel JSON.
+
 **Problem:** fs3 exposes no `/healthz` and no `/metrics`. There's no way
 to see request rates, error rates, latency, or storage growth without
 tailing and parsing `fs3.log`.

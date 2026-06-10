@@ -270,6 +270,23 @@ tick "Expose on the LAN" in the install wizard or set
 `FS3_BIND=0.0.0.0` in `fs3.conf` and restart the package. Only do this
 on a network where you trust every host.
 
+### Monitoring
+
+The SPK starts fs3 with an admin listener on `127.0.0.1:9101`
+(`FS3_METRICS_PORT` in `fs3.conf`; 0 disables) serving `/healthz` and
+Prometheus-format `/metrics` — request counts by method/status, bytes
+in/out, request durations, bucket and in-flight-multipart gauges, and
+volume used/free. It is localhost-only by design; to scrape it from a
+Prometheus host elsewhere on the LAN, add a DSM reverse-proxy entry for
+it (same pattern as above) or use an SSH tunnel. The S3 port itself
+answers `GET /_health` without credentials for simple liveness checks.
+
+The package runs fs3 under a watchdog: if the process crashes, it is
+restarted automatically with exponential backoff (1 s doubling to a
+60 s ceiling). Credentials can be rotated without a restart: edit
+`/var/packages/fs3/var/credentials` and `kill -HUP` the fs3 process —
+a malformed file is rejected and the previous credentials stay active.
+
 ### Data folder permissions
 
 By default objects are stored under `/var/packages/fs3/var/data`, which

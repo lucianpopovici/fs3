@@ -1,5 +1,15 @@
 # CLAUDE.md — startup recovery scan
 
+> **STATUS: DONE (2026-06-10).** `recover_tmp_dir()` in `src/store_fs.c`
+> runs from `store_open` (before accept) and unconditionally unlinks
+> everything under `ROOT/tmp/`, logging count + bytes. `data/` is not
+> scanned and MPU staging dirs are left to the TTL GC, per the brief.
+> Unit tests cover orphan cleanup, committed-object preservation, and
+> in-flight-MPU survival; the phase12 e2e suite verifies the sweep and
+> log line through a real server boot. The optional startup MPU-GC pass
+> was skipped — the periodic GC's first tick (≤60 s after boot) already
+> covers it.
+
 **Problem:** there's no integrity pass on startup. After an ungraceful
 shutdown mid-write, two kinds of debris can remain:
 1. Orphaned temp files under `ROOT/tmp/` (a PUT that wrote but never

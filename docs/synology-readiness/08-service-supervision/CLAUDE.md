@@ -1,5 +1,18 @@
 # CLAUDE.md — service supervision / auto-restart
 
+> **STATUS: fallback implemented (2026-06-10); DSM-native path still
+> open.** `start-stop-status` now runs fs3 under a watchdog that
+> respawns it on unexpected exit with 1s→60s exponential backoff (reset
+> after a 60s-healthy run); `stop` raises a stop flag first so
+> intentional stops don't respawn, and the DSM status contract (0/3) is
+> unchanged. Verified locally: kill -9 → respawn, port-conflict
+> crash-loop backs off and self-recovers, clean stop. Known limits, as
+> the brief warned: the watchdog itself is unsupervised, and DSM shows
+> "running" during backoff. The preferred DSM-native service model
+> still needs investigating against the DSM 7 developer guide + real
+> hardware (reboot autostart relies on `startable="yes"` — verify on
+> the DS1515+).
+
 **Problem:** the SPK launches fs3 as a backgrounded process and records
 its PID (`start-stop-status` in `packaging/synology/scripts/`). If fs3
 crashes, nothing restarts it — DSM just shows "stopped" until someone

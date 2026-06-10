@@ -1,5 +1,15 @@
 # CLAUDE.md — credential management
 
+> **STATUS: DONE (2026-06-10), except per-bucket scoping (deliberately
+> skipped, per the "don't build IAM" guidance).** The credentials file
+> (`--credentials-file`, multi-key, 0600, secrets out of argv) landed
+> with Phase 11 + the SPK hardening. SIGHUP now rebuilds the credential
+> set (CLI `--auth` specs + file) in a scratch verifier and swaps it in
+> via `sigv4_swap_creds` — build-then-swap, so a malformed file keeps
+> the old working set. Runs on the server's once-per-second tick, never
+> concurrently with a verify. e2e: add/revoke without restart, bad-file
+> reload keeps previous creds (`tests/test_e2e_phase12.sh`).
+
 **Problem:** authentication today is one-or-more static `access:secret`
 pairs passed on the command line (`--auth`), which the SPK bakes into
 `fs3.conf` in plaintext at install time. Changing a key means editing the

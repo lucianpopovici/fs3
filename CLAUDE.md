@@ -4,13 +4,15 @@ This file is the bridge from "I just unpacked the tarball" to "I know
 where the load-bearing parts are." Read the README first for what fs3
 is. This file is the working notes — the *don't relearn these* facts.
 
-The project has been built up across ten phases. Current state: a
-~10,200-line single-node S3-compatible server in C, with header-mode +
+The project has been built up across twelve phases. Current state: a
+~11,000-line single-node S3-compatible server in C, with header-mode +
 streaming-chunked SigV4, multipart upload, service-level listing,
 periodic GC of abandoned multipart uploads, HTTP Range requests,
 bulk-delete (`?delete`), bucket subresources (location/versioning
-stubs), server-side object copy, and ACL stubs. 233 explicit tests +
-50K fuzz iterations green under both `-O2` and ASan + UBSan.
+stubs), server-side object copy, ACL stubs, health + Prometheus
+metrics endpoints, disk-full/quota handling, startup crash recovery,
+request resource bounds, and SIGHUP credential rotation. ~290 explicit
+tests + 50K fuzz iterations green under both `-O2` and ASan + UBSan.
 
 ## First five minutes on a fresh box
 
@@ -139,6 +141,8 @@ read time — the read path already does this.
 | `tests/test_e2e_mpu.sh` | bash + curl | 26 integration tests of the full multipart lifecycle including ListMultipartUploads, prefix filter, abort, malformed XML, large parts |
 | `tests/test_e2e_phase9.sh` | bash + curl | 45 integration tests of Range GET (206/416), bulk delete (`?delete`), and bucket subresources (`?location`, `?versioning`) |
 | `tests/test_e2e_phase10.sh` | bash + curl | 27 integration tests of server-side object copy and `?acl` stub |
+| `tests/test_e2e_phase11.sh` | bash + curl + python | 16 integration tests of `/_health`, `--credentials-file`, `--min-free-bytes` quota |
+| `tests/test_e2e_phase12.sh` | bash + curl + python | 34 integration tests of startup recovery, `--max-body-size` (413), `--idle-timeout`, `--max-conns`, SIGHUP credential reload, and the `--metrics-port` admin listener |
 
 All eight targets pass under both `-O2` and DEBUG (ASan + UBSan).
 
@@ -286,10 +290,18 @@ For when "wait, what was I doing in phase 5?" is the question:
 - **Phase 10** — Server-side object copy (`PUT` with
   `x-amz-copy-source`), and `?acl` stub for both bucket and object
   level (GET returns static FULL_CONTROL ACL, PUT discards body).
-- **Phase 11** — `GET /healthz` health endpoint,
+- **Phase 11** — `GET /_health` health endpoint,
   `--credentials-file` (one `ak:sk` per line, `#` comments),
   and `--min-free-bytes` disk quota (reject uploads when the volume's
-  free space drops below the threshold). The current state.
+  free space drops below the threshold).
+- **Phase 12** — NAS-readiness Tier 1+2 (see
+  `docs/synology-readiness/`): ENOSPC/EDQUOT → 507 at every write
+  step; startup sweep of orphaned `tmp/` files; `--max-body-size`
+  (streamed-enforced 413), `--idle-timeout`, `--max-conns` default
+  512; SIGHUP credential reload (build-then-swap); `--metrics-port`
+  localhost admin listener with `/healthz` + Prometheus `/metrics`;
+  auth-exempt `/_health`; SPK watchdog with backoff. The current
+  state.
 
 ## Decisions for next phase
 
