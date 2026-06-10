@@ -165,5 +165,56 @@ check_eq "connection accepted after slots freed" "$code" "200"
 
 stop_server
 
+# ===================================================================
+# 5. SIGHUP credential reload (rotation without restart)
+# ===================================================================
+CRED_FILE=/tmp/fs3-p12-$$.creds
+ALICE_AK="ALICEKEYID12345678"
+ALICE_SK="alicesecretkey0000000000000000001"
+BOB_AK="BOBKEYIDABCDEF9876"
+BOB_SK="bobsecretkey000000000000000000001"
+
+sign() {
+    local ak="$1" sk="$2"; shift 2
+    FS3_AK="$ak" FS3_SK="$sk" python3 "$ROOT/tests/sign_request.py" "$@" 2>&1 | head -1
+}
+
+printf '%s:%s\n' "$ALICE_AK" "$ALICE_SK" > "$CRED_FILE"
+start_server --credentials-file "$CRED_FILE" --require-auth
+
+st=$(sign "$ALICE_AK" "$ALICE_SK" --method PUT --url "$URL/p12auth")
+check_eq "alice works before reload" "$st" "STATUS=200"
+st=$(sign "$BOB_AK" "$BOB_SK" --method GET --url "$URL/p12auth")
+check_eq "bob rejected before reload" "$st" "STATUS=403"
+
+# Add bob, HUP, both must work — no restart, same process.
+printf '%s:%s\n' "$BOB_AK" "$BOB_SK" >> "$CRED_FILE"
+kill -HUP "$SP"
+sleep 1.5
+kill -0 "$SP" || { echo "server died on SIGHUP" >&2; exit 1; }
+st=$(sign "$BOB_AK" "$BOB_SK" --method GET --url "$URL/p12auth")
+check_eq "bob works after reload" "$st" "STATUS=200"
+st=$(sign "$ALICE_AK" "$ALICE_SK" --method GET --url "$URL/p12auth")
+check_eq "alice still works after reload" "$st" "STATUS=200"
+
+# Revoke alice, HUP: alice out, bob stays.
+printf '%s:%s\n' "$BOB_AK" "$BOB_SK" > "$CRED_FILE"
+kill -HUP "$SP"
+sleep 1.5
+st=$(sign "$ALICE_AK" "$ALICE_SK" --method GET --url "$URL/p12auth")
+check_eq "revoked alice rejected after reload" "$st" "STATUS=403"
+st=$(sign "$BOB_AK" "$BOB_SK" --method GET --url "$URL/p12auth")
+check_eq "bob unaffected by alice's revocation" "$st" "STATUS=200"
+
+# Malformed file + HUP: keep the old (working) credentials.
+echo "not a credential line at all" > "$CRED_FILE"
+kill -HUP "$SP"
+sleep 1.5
+st=$(sign "$BOB_AK" "$BOB_SK" --method GET --url "$URL/p12auth")
+check_eq "bad reload keeps previous credentials" "$st" "STATUS=200"
+
+rm -f "$CRED_FILE"
+stop_server
+
 printf '\n===== phase12 e2e: %d passed, %d failed =====\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

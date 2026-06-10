@@ -47,6 +47,7 @@ struct server {
      * per second, after the event batch is processed — never before,
      * since the events array may hold pointers into conns we'd free. */
     time_t        idle_last_sweep;
+    time_t        tick_last;         /* cfg.tick_cb cadence limiter */
 };
 
 static void list_push(conn_t **head, conn_t *c) {
@@ -258,10 +259,18 @@ int server_run(server_t *s) {
             return -1;
         }
 
+        time_t now = time(NULL);
+
+        /* Owner's once-per-second tick (e.g. SIGHUP credential reload).
+         * Runs between batches, so never concurrently with a request. */
+        if (s->cfg.tick_cb && now != s->tick_last) {
+            s->tick_last = now;
+            s->cfg.tick_cb(s->cfg.tick_user);
+        }
+
         /* Periodic MPU GC. We piggyback on the 1s epoll timeout: every
          * gc_interval_s seconds (wall clock), sweep the staging area
          * and reap any abandoned upload older than gc_max_age_ms. */
-        time_t now = time(NULL);
         if (s->gc_interval_s > 0
             && now - s->gc_last_run >= s->gc_interval_s) {
             int reaped = store_mpu_gc(s->store,

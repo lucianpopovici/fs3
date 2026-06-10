@@ -41,6 +41,14 @@ int sigv4_add_cred(sigv4_verifier_t *v,
 /* Free the verifier and its credentials. */
 void sigv4_destroy(sigv4_verifier_t *v);
 
+/* Exchange the credential lists of two verifiers. Used for downtime-free
+ * rotation: build a replacement set in a scratch verifier, swap it into
+ * the live one, destroy the scratch (which now holds the old list).
+ * Build-then-swap means a malformed credentials file never leaves the
+ * live verifier with a partial or empty list. Safe only because the
+ * server is single-threaded — no verify can be in flight during a swap. */
+void sigv4_swap_creds(sigv4_verifier_t *a, sigv4_verifier_t *b);
+
 /* Override "now" for deterministic testing. fixed_now is Unix epoch
  * seconds; pass 0 to use the real wall clock. */
 void sigv4_set_clock(sigv4_verifier_t *v, int64_t fixed_now);

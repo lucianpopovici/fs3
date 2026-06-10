@@ -12,10 +12,16 @@
 #include <stdint.h>
 
 static server_t *g_server;
+static volatile sig_atomic_t g_reload;
 
 static void on_signal(int sig) {
     (void)sig;
     if (g_server) server_stop(g_server);
+}
+
+static void on_sighup(int sig) {
+    (void)sig;
+    g_reload = 1;
 }
 
 static void usage(const char *argv0) {
@@ -25,7 +31,8 @@ static void usage(const char *argv0) {
         "  -p, --port <num>           port (default 9000)\n"
         "  -d, --data <dir>           object store root (default /tmp/fs3-data)\n"
         "      --auth <ak:sk>         add a SigV4 credential (repeatable)\n"
-        "      --credentials-file <f> load credentials from file (one ak:sk per line)\n"
+        "      --credentials-file <f> load credentials from file (one ak:sk per line);\n"
+        "                             SIGHUP re-reads the file for downtime-free rotation\n"
         "      --require-auth         reject requests without an Authorization header\n"
         "      --min-free-bytes <N>   reject uploads when disk free < N (K/M/G suffix ok)\n"
         "      --max-body-size <N>    reject request bodies > N with 413 (default 5G; 0 = off)\n"
@@ -105,6 +112,51 @@ static int load_credentials_file(sigv4_verifier_t *v, const char *path) {
     return 0;
 }
 
+/* SIGHUP credential reload. Rebuilds the complete credential set — the
+ * CLI --auth specs plus the credentials file — in a scratch verifier,
+ * then swaps it into the live one (sigv4_swap_creds). Build-then-swap:
+ * a malformed or missing file leaves the live credentials untouched, so
+ * a botched rotation can't lock everyone out. Invoked from the server's
+ * once-per-second tick, never concurrently with a request. */
+typedef struct {
+    sigv4_verifier_t *live;            /* NULL if auth disabled */
+    const char       *cred_file;       /* NULL if not configured */
+    const char       *auth_specs[32];  /* argv pointers, stable for the
+                                          process lifetime */
+    int               n_auth_specs;
+} reload_ctx_t;
+
+static void reload_tick(void *user) {
+    if (!g_reload) return;
+    g_reload = 0;
+    reload_ctx_t *r = user;
+    if (!r->live || !r->cred_file) {
+        LOG_W("SIGHUP: credential reload needs --credentials-file; ignored");
+        return;
+    }
+    sigv4_verifier_t *scratch = sigv4_create();
+    if (!scratch) {
+        LOG_E("SIGHUP reload: out of memory; keeping old credentials");
+        return;
+    }
+    for (int i = 0; i < r->n_auth_specs; i++) {
+        if (parse_and_add_cred(scratch, r->auth_specs[i]) < 0) {
+            LOG_E("SIGHUP reload: bad --auth spec; keeping old credentials");
+            sigv4_destroy(scratch);
+            return;
+        }
+    }
+    if (load_credentials_file(scratch, r->cred_file) < 0) {
+        LOG_E("SIGHUP reload: cannot load %s; keeping old credentials",
+              r->cred_file);
+        sigv4_destroy(scratch);
+        return;
+    }
+    sigv4_swap_creds(r->live, scratch);
+    sigv4_destroy(scratch);  /* now holds (and zeroes) the old list */
+    LOG_I("SIGHUP: credentials reloaded from %s", r->cred_file);
+}
+
 enum {
     OPT_AUTH = 256,
     OPT_CREDENTIALS_FILE,
@@ -135,6 +187,7 @@ int main(int argc, char **argv) {
     int max_conns = 512;
     int idle_timeout_s = 60;
     sigv4_verifier_t *auth = NULL;
+    reload_ctx_t reload_ctx = {0};
 
     static struct option opts[] = {
         { "addr",             required_argument, NULL, 'a' },
@@ -174,6 +227,11 @@ int main(int argc, char **argv) {
                     sigv4_destroy(auth);
                     return 2;
                 }
+                if (reload_ctx.n_auth_specs
+                    < (int)(sizeof(reload_ctx.auth_specs)
+                            / sizeof(reload_ctx.auth_specs[0]))) {
+                    reload_ctx.auth_specs[reload_ctx.n_auth_specs++] = optarg;
+                }
                 break;
             case OPT_CREDENTIALS_FILE:
                 if (!auth) {
@@ -187,6 +245,7 @@ int main(int argc, char **argv) {
                     sigv4_destroy(auth);
                     return 2;
                 }
+                reload_ctx.cred_file = optarg;
                 break;
             case OPT_REQUIRE_AUTH:
                 require_auth = 1;
@@ -260,6 +319,12 @@ int main(int argc, char **argv) {
     sigaction(SIGINT,  &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
 
+    /* SIGHUP = reload credentials (handled on the event-loop tick). */
+    struct sigaction sa_hup = { .sa_handler = on_sighup, .sa_flags = SA_RESTART };
+    sigemptyset(&sa_hup.sa_mask);
+    sigaction(SIGHUP, &sa_hup, NULL);
+    reload_ctx.live = auth;
+
     server_cfg_t cfg = {
         .bind_addr     = addr,
         .port          = (uint16_t)port,
@@ -273,6 +338,8 @@ int main(int argc, char **argv) {
         .min_free_bytes = min_free_bytes,
         .max_body_bytes = max_body_bytes,
         .idle_timeout_s = idle_timeout_s,
+        .tick_cb        = reload_tick,
+        .tick_user      = &reload_ctx,
     };
 
     g_server = server_create(&cfg);

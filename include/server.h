@@ -39,6 +39,13 @@ typedef struct {
      * activity for this long are closed to reclaim slots from stuck or
      * dribbling clients. 0 disables the sweep. */
     int                    idle_timeout_s;
+
+    /* Optional tick callback, invoked from the event loop at most once
+     * per second, between event batches (so never concurrently with a
+     * request). main.c uses it to act on signal flags — e.g. the SIGHUP
+     * credential reload — without the server knowing about either. */
+    void                 (*tick_cb)(void *user);
+    void                  *tick_user;
 } server_cfg_t;
 
 server_t *server_create(const server_cfg_t *cfg);

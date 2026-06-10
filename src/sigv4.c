@@ -116,6 +116,13 @@ void sigv4_destroy(sigv4_verifier_t *v) {
     free(v);
 }
 
+void sigv4_swap_creds(sigv4_verifier_t *a, sigv4_verifier_t *b) {
+    if (!a || !b) return;
+    cred_t *tmp = a->creds;
+    a->creds = b->creds;
+    b->creds = tmp;
+}
+
 int sigv4_add_cred(sigv4_verifier_t *v,
                    const char *access_key,
                    const char *secret_key) {
