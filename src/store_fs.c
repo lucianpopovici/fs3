@@ -132,6 +132,29 @@ static int mkdir_p(const char *path, mode_t mode) {
     return 0;
 }
 
+/* Test seams: tests override these to inject I/O failures (e.g. ENOSPC)
+ * without needing a real full filesystem. NULL = use the real syscall. */
+ssize_t (*s3_store_write_hook)(int fd, const void *buf, size_t n) = NULL;
+int     (*s3_store_fsync_hook)(int fd) = NULL;
+
+static ssize_t xwrite(int fd, const void *buf, size_t n) {
+    return s3_store_write_hook ? s3_store_write_hook(fd, buf, n)
+                               : write(fd, buf, n);
+}
+
+static int xfsync(int fd) {
+    return s3_store_fsync_hook ? s3_store_fsync_hook(fd) : fsync(fd);
+}
+
+/* ENOSPC and EDQUOT both mean "the volume can't hold this" and must
+ * surface as the storage error, not a generic 500. Note ENOSPC from a
+ * buffered write may only appear at fsync/rename time (delayed
+ * allocation), so every step of the durable sequence maps through here. */
+static s3_err_t map_io_err(int err) {
+    return (err == ENOSPC || err == EDQUOT) ? S3_ERR_INSUFFICIENT_STORAGE
+                                            : S3_ERR_INTERNAL;
+}
+
 /* Open `dir` and fsync it. Used after rename to durably commit the dirent. */
 static int fsync_dir(const char *dir) {
     int fd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
@@ -481,19 +504,21 @@ s3_err_t store_put_begin(s3_store_t *s, s3_str_t bucket, s3_str_t key,
     w->fd = tmp_open(s, w->tmp_path, sizeof(w->tmp_path));
     if (w->fd < 0) {
         LOG_E("tmp_open: %s", strerror(errno));
+        s3_err_t e = map_io_err(errno);
         writer_free(w);
-        return S3_ERR_INTERNAL;
+        return e;
     }
 
     /* Reserve header space by writing the (incomplete) header, then the
      * variable-length content_type and key bytes. We'll pwrite the final
      * header back at offset 0 in commit. */
-    if (write(w->fd, &w->hdr, sizeof(w->hdr)) != (ssize_t)sizeof(w->hdr)
-        || (ct_n  && write(w->fd, w->content_type_dup, ct_n) != (ssize_t)ct_n)
-        || (key.n && write(w->fd, w->key_dup, key.n)         != (ssize_t)key.n)) {
+    if (xwrite(w->fd, &w->hdr, sizeof(w->hdr)) != (ssize_t)sizeof(w->hdr)
+        || (ct_n  && xwrite(w->fd, w->content_type_dup, ct_n) != (ssize_t)ct_n)
+        || (key.n && xwrite(w->fd, w->key_dup, key.n)         != (ssize_t)key.n)) {
         LOG_E("write header: %s", strerror(errno));
+        s3_err_t e = map_io_err(errno);
         writer_free(w);
-        return S3_ERR_INTERNAL;
+        return e;
     }
 
     *out = w;
@@ -509,11 +534,11 @@ s3_err_t store_put_write(s3_writer_t *w, const void *buf, size_t n) {
     const char *p = buf;
     size_t left = n;
     while (left > 0) {
-        ssize_t r = write(w->fd, p, left);
+        ssize_t r = xwrite(w->fd, p, left);
         if (r > 0) { p += r; left -= (size_t)r; w->data_written += (uint64_t)r; continue; }
         if (r < 0 && errno == EINTR) continue;
         LOG_W("put_write: %s", strerror(errno));
-        return S3_ERR_INTERNAL;
+        return map_io_err(errno);
     }
     return S3_OK;
 }
@@ -535,12 +560,15 @@ s3_err_t store_put_commit(s3_writer_t *w, s3_obj_meta_t *meta_out) {
     /* Pwrite the finalized header back at offset 0. */
     if (pwrite(w->fd, &w->hdr, sizeof(w->hdr), 0) != (ssize_t)sizeof(w->hdr)) {
         LOG_E("pwrite header: %s", strerror(errno));
-        writer_free(w); return S3_ERR_INTERNAL;
+        s3_err_t e = map_io_err(errno);
+        writer_free(w); return e;
     }
-    /* Durability: data and metadata both. */
-    if (fsync(w->fd) < 0) {
+    /* Durability: data and metadata both. A failed fsync here never
+     * reaches the live tree — the rename below hasn't happened yet. */
+    if (xfsync(w->fd) < 0) {
         LOG_E("fsync tmp: %s", strerror(errno));
-        writer_free(w); return S3_ERR_INTERNAL;
+        s3_err_t e = map_io_err(errno);
+        writer_free(w); return e;
     }
 
     /* Compute final path. */
@@ -556,13 +584,15 @@ s3_err_t store_put_commit(s3_writer_t *w, s3_obj_meta_t *meta_out) {
     }
     if (mkdir_p(dir, 0700) < 0) {
         LOG_E("mkdir_p %s: %s", dir, strerror(errno));
-        writer_free(w); return S3_ERR_INTERNAL;
+        s3_err_t e = map_io_err(errno);
+        writer_free(w); return e;
     }
 
-    /* Atomic rename. */
+    /* Atomic rename. Can also fail with ENOSPC (new dirent allocation). */
     if (rename(w->tmp_path, path) < 0) {
         LOG_E("rename %s -> %s: %s", w->tmp_path, path, strerror(errno));
-        writer_free(w); return S3_ERR_INTERNAL;
+        s3_err_t e = map_io_err(errno);
+        writer_free(w); return e;
     }
     /* tmp_path is gone; clear so writer_free doesn't unlink the live file. */
     w->tmp_path[0] = '\0';
@@ -1241,9 +1271,13 @@ s3_err_t store_mpu_create(s3_store_t *s, s3_str_t bucket, s3_str_t key,
         if (snprintf(meta_tmp, sizeof(meta_tmp), "%s/meta.tmp", dir)
             >= (int)sizeof(meta_tmp)) return S3_ERR_INTERNAL;
         int fd = open(meta_tmp, O_WRONLY | O_CREAT | O_EXCL, 0600);
-        if (fd < 0) return S3_ERR_INTERNAL;
+        if (fd < 0) {
+            s3_err_t e = map_io_err(errno);
+            rmdir(dir);  /* don't leave a meta-less staging dir behind */
+            return e;
+        }
         FILE *fp = fdopen(fd, "w");
-        if (!fp) { close(fd); unlink(meta_tmp); return S3_ERR_INTERNAL; }
+        if (!fp) { close(fd); unlink(meta_tmp); rmdir(dir); return S3_ERR_INTERNAL; }
 
         /* ctime_ms */
         struct timespec ts;
@@ -1254,12 +1288,16 @@ s3_err_t store_mpu_create(s3_store_t *s, s3_str_t bucket, s3_str_t key,
         fprintf(fp, "key=" S3_STR_FMT "\n", S3_STR_ARG(key));
         fprintf(fp, "ct=%s\n", content_type ? content_type : "");
         fprintf(fp, "ctime_ms=%" PRIu64 "\n", ctime_ms);
-        if (fflush(fp) < 0 || fsync(fileno(fp)) < 0) {
-            fclose(fp); unlink(meta_tmp); return S3_ERR_INTERNAL;
+        if (fflush(fp) < 0 || xfsync(fileno(fp)) < 0) {
+            s3_err_t e = map_io_err(errno);
+            fclose(fp); unlink(meta_tmp); rmdir(dir);
+            return e;
         }
         fclose(fp);
         if (rename(meta_tmp, meta) < 0) {
-            unlink(meta_tmp); return S3_ERR_INTERNAL;
+            s3_err_t e = map_io_err(errno);
+            unlink(meta_tmp); rmdir(dir);
+            return e;
         }
         fsync_dir(dir);
 
@@ -1348,7 +1386,11 @@ s3_err_t store_mpu_part_begin(s3_store_t *s, s3_str_t bucket, s3_str_t key,
         return S3_ERR_INTERNAL;
     }
     w->fd = mkstemp(w->tmp_path);
-    if (w->fd < 0) { writer_free(w); return S3_ERR_INTERNAL; }
+    if (w->fd < 0) {
+        s3_err_t e = map_io_err(errno);
+        writer_free(w);
+        return e;
+    }
 
     w->md5_ctx = EVP_MD_CTX_new();
     if (!w->md5_ctx
@@ -1366,10 +1408,10 @@ s3_err_t store_mpu_part_write(s3_writer_t *w, const void *buf, size_t n) {
     if (n == 0) return S3_OK;
     ssize_t off = 0;
     while ((size_t)off < n) {
-        ssize_t r = write(w->fd, (const char *)buf + off, n - (size_t)off);
+        ssize_t r = xwrite(w->fd, (const char *)buf + off, n - (size_t)off);
         if (r < 0) {
             if (errno == EINTR) continue;
-            return S3_ERR_INTERNAL;
+            return map_io_err(errno);
         }
         off += r;
     }
@@ -1396,10 +1438,14 @@ s3_err_t store_mpu_part_commit(s3_writer_t *w, char etag_hex_out[33]) {
         etag_hex_out[32] = '\0';
     }
 
-    if (fsync(w->fd) < 0) { writer_free(w); return S3_ERR_INTERNAL; }
+    if (xfsync(w->fd) < 0) {
+        s3_err_t e = map_io_err(errno);
+        writer_free(w); return e;
+    }
     close(w->fd); w->fd = -1;
     if (rename(w->tmp_path, w->final_path) < 0) {
-        writer_free(w); return S3_ERR_INTERNAL;
+        s3_err_t e = map_io_err(errno);
+        writer_free(w); return e;
     }
     w->tmp_path[0] = '\0';  /* don't unlink the live file in writer_free */
 
@@ -1567,10 +1613,14 @@ s3_err_t store_mpu_complete(s3_store_t *s, s3_str_t bucket, s3_str_t key,
     char hex[65];
     hash_bucket_key(bucket, key, hex);
     char target_dir[4096];
-    if (obj_dir(s, bucket, hex, target_dir, sizeof(target_dir)) < 0
-        || mkdir_p(target_dir, 0700) < 0) {
+    if (obj_dir(s, bucket, hex, target_dir, sizeof(target_dir)) < 0) {
         free(stored_ct);
         return S3_ERR_INTERNAL;
+    }
+    if (mkdir_p(target_dir, 0700) < 0) {
+        s3_err_t e = map_io_err(errno);
+        free(stored_ct);
+        return e;
     }
     char target_path[4096];
     if (obj_path(s, bucket, hex, target_path, sizeof(target_path)) < 0) {
@@ -1582,7 +1632,11 @@ s3_err_t store_mpu_complete(s3_store_t *s, s3_str_t bucket, s3_str_t key,
     char tmp_path[4096];
     snprintf(tmp_path, sizeof(tmp_path), "%s/mpu.XXXXXX", s->tmp_dir);
     int tfd = mkstemp(tmp_path);
-    if (tfd < 0) { free(stored_ct); return S3_ERR_INTERNAL; }
+    if (tfd < 0) {
+        s3_err_t e = map_io_err(errno);
+        free(stored_ct);
+        return e;
+    }
 
     /* Build header — native byte order, like single-PUT. */
     obj_header_t hdr = {0};
@@ -1604,11 +1658,12 @@ s3_err_t store_mpu_complete(s3_store_t *s, s3_str_t bucket, s3_str_t key,
     hdr.mtime_ms = mtime_ms;
     memcpy(hdr.etag, mp_md5, 16);
 
-    if (write(tfd, &hdr, sizeof(hdr)) != (ssize_t)sizeof(hdr)
-        || (ct_n && write(tfd, stored_ct, ct_n) != (ssize_t)ct_n)
-        || (key.n && write(tfd, key.p, key.n) != (ssize_t)key.n)) {
+    if (xwrite(tfd, &hdr, sizeof(hdr)) != (ssize_t)sizeof(hdr)
+        || (ct_n && xwrite(tfd, stored_ct, ct_n) != (ssize_t)ct_n)
+        || (key.n && xwrite(tfd, key.p, key.n) != (ssize_t)key.n)) {
+        s3_err_t e = map_io_err(errno);
         close(tfd); unlink(tmp_path); free(stored_ct);
-        return S3_ERR_INTERNAL;
+        return e;
     }
 
     /* Concatenate part files. */
@@ -1632,11 +1687,12 @@ s3_err_t store_mpu_complete(s3_store_t *s, s3_str_t bucket, s3_str_t key,
             }
             ssize_t off = 0;
             while (off < r) {
-                ssize_t wr = write(tfd, buf + off, (size_t)(r - off));
+                ssize_t wr = xwrite(tfd, buf + off, (size_t)(r - off));
                 if (wr < 0) {
                     if (errno == EINTR) continue;
+                    s3_err_t e = map_io_err(errno);
                     close(pfd); close(tfd); unlink(tmp_path); free(stored_ct);
-                    return S3_ERR_INTERNAL;
+                    return e;
                 }
                 off += wr;
             }
@@ -1644,16 +1700,18 @@ s3_err_t store_mpu_complete(s3_store_t *s, s3_str_t bucket, s3_str_t key,
         close(pfd);
     }
 
-    if (fsync(tfd) < 0) {
+    if (xfsync(tfd) < 0) {
+        s3_err_t e = map_io_err(errno);
         close(tfd); unlink(tmp_path); free(stored_ct);
-        return S3_ERR_INTERNAL;
+        return e;
     }
     close(tfd);
 
     /* Atomic rename and dirfsync. */
     if (rename(tmp_path, target_path) < 0) {
+        s3_err_t e = map_io_err(errno);
         unlink(tmp_path); free(stored_ct);
-        return S3_ERR_INTERNAL;
+        return e;
     }
     fsync_dir(target_dir);
 

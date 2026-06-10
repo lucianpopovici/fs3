@@ -945,6 +945,163 @@ static void t_mpu_gc_skips_unparseable(void) {
     teardown_root();
 }
 
+/* ---- Disk-full (ENOSPC) handling ---------------------------------- */
+
+/* Failure-injecting hooks: write through normally until the byte budget
+ * is exhausted, then fail with ENOSPC. A budget of -1 means unlimited. */
+static long long g_write_budget = -1;
+
+static ssize_t enospc_write(int fd, const void *buf, size_t n) {
+    if (g_write_budget >= 0) {
+        if (g_write_budget == 0) { errno = ENOSPC; return -1; }
+        if ((long long)n > g_write_budget) n = (size_t)g_write_budget;
+        g_write_budget -= (long long)n;
+    }
+    return write(fd, buf, n);
+}
+
+static int enospc_fsync(int fd) {
+    (void)fd;
+    errno = ENOSPC;
+    return -1;
+}
+
+static void clear_io_hooks(void) {
+    s3_store_write_hook = NULL;
+    s3_store_fsync_hook = NULL;
+    g_write_budget = -1;
+}
+
+static int count_tmp_files(void) {
+    char tp[512]; snprintf(tp, sizeof(tp), "%s/tmp", g_root);
+    DIR *d = opendir(tp);
+    if (!d) return -1;
+    int n = 0;
+    struct dirent *e;
+    while ((e = readdir(d))) {
+        if (e->d_name[0] != '.') n++;
+    }
+    closedir(d);
+    return n;
+}
+
+static void t_put_enospc_returns_storage_error(void) {
+    setup_root();
+    s3_store_t *s;
+    store_open(&s, g_root);
+    store_bucket_create(s, S3_STR_LIT("buk"));
+
+    s3_writer_t *w;
+    s3_str_t bb = S3_STR_LIT("buk"), kk = S3_STR_LIT("full");
+    CHECK_EQ(store_put_begin(s, bb, kk, "", &w), S3_OK, "enospc: begin");
+
+    /* Every write from here on fails with ENOSPC. */
+    s3_store_write_hook = enospc_write;
+    g_write_budget = 0;
+    CHECK_EQ(store_put_write(w, "abc", 3), S3_ERR_INSUFFICIENT_STORAGE,
+             "write maps ENOSPC to storage error");
+    clear_io_hooks();
+
+    store_put_abort(w);
+    s3_obj_meta_t m;
+    CHECK_EQ(store_head(s, bb, kk, &m), S3_ERR_NO_SUCH_KEY,
+             "failed PUT left no object");
+    CHECK_EQ(count_tmp_files(), 0, "tmp empty after write-path ENOSPC");
+
+    store_close(s);
+    teardown_root();
+}
+
+static void t_put_enospc_midstream_cleanup(void) {
+    setup_root();
+    s3_store_t *s;
+    store_open(&s, g_root);
+    store_bucket_create(s, S3_STR_LIT("buk"));
+
+    s3_writer_t *w;
+    s3_str_t bb = S3_STR_LIT("buk"), kk = S3_STR_LIT("partial");
+    CHECK_EQ(store_put_begin(s, bb, kk, "", &w), S3_OK, "midstream: begin");
+
+    /* First 4 KB land, then the volume "fills". */
+    char chunk[4096];
+    memset(chunk, 'x', sizeof(chunk));
+    CHECK_EQ(store_put_write(w, chunk, sizeof(chunk)), S3_OK,
+             "first chunk lands");
+    s3_store_write_hook = enospc_write;
+    g_write_budget = 100;
+    CHECK_EQ(store_put_write(w, chunk, sizeof(chunk)),
+             S3_ERR_INSUFFICIENT_STORAGE,
+             "midstream ENOSPC maps to storage error");
+    clear_io_hooks();
+
+    store_put_abort(w);
+    s3_obj_meta_t m;
+    CHECK_EQ(store_head(s, bb, kk, &m), S3_ERR_NO_SUCH_KEY,
+             "partial PUT left no object");
+    CHECK_EQ(count_tmp_files(), 0, "tmp empty after midstream ENOSPC");
+
+    store_close(s);
+    teardown_root();
+}
+
+static void t_put_enospc_commit_path(void) {
+    setup_root();
+    s3_store_t *s;
+    store_open(&s, g_root);
+    store_bucket_create(s, S3_STR_LIT("buk"));
+
+    s3_writer_t *w;
+    s3_str_t bb = S3_STR_LIT("buk"), kk = S3_STR_LIT("late-fail");
+    CHECK_EQ(store_put_begin(s, bb, kk, "", &w), S3_OK, "commit: begin");
+    CHECK_EQ(store_put_write(w, "hello", 5), S3_OK, "commit: write ok");
+
+    /* Delayed allocation: writes succeed, the ENOSPC surfaces at fsync. */
+    s3_store_fsync_hook = enospc_fsync;
+    CHECK_EQ(store_put_commit(w, NULL), S3_ERR_INSUFFICIENT_STORAGE,
+             "fsync ENOSPC at commit maps to storage error");
+    clear_io_hooks();
+
+    s3_obj_meta_t m;
+    CHECK_EQ(store_head(s, bb, kk, &m), S3_ERR_NO_SUCH_KEY,
+             "failed commit never reached the live tree");
+    CHECK_EQ(count_tmp_files(), 0, "tmp empty after commit-path ENOSPC");
+
+    store_close(s);
+    teardown_root();
+}
+
+static void t_mpu_part_enospc(void) {
+    setup_root();
+    s3_store_t *s;
+    store_open(&s, g_root);
+    store_bucket_create(s, S3_STR_LIT("buk"));
+
+    char id[33];
+    s3_str_t bb = S3_STR_LIT("buk"), kk = S3_STR_LIT("mp");
+    CHECK_EQ(store_mpu_create(s, bb, kk, NULL, id), S3_OK, "mpu: create");
+
+    s3_writer_t *w;
+    CHECK_EQ(store_mpu_part_begin(s, bb, kk, id, 1, &w), S3_OK,
+             "mpu: part begin");
+    s3_store_write_hook = enospc_write;
+    g_write_budget = 0;
+    CHECK_EQ(store_mpu_part_write(w, "abc", 3), S3_ERR_INSUFFICIENT_STORAGE,
+             "part write maps ENOSPC to storage error");
+    clear_io_hooks();
+    store_mpu_part_abort(w);
+
+    CHECK_EQ(count_tmp_files(), 0, "tmp empty after part ENOSPC");
+    /* The upload itself is still alive — the client can retry the part. */
+    s3_mpu_info_t *ups = NULL;
+    size_t n = 0;
+    store_list_mpu_uploads(s, bb, S3_STR_NULL, &ups, &n);
+    CHECK_EQ(n, 1, "upload survives a failed part");
+    store_mpu_uploads_free(ups, n);
+
+    store_close(s);
+    teardown_root();
+}
+
 /* ---- Main --------------------------------------------------------- */
 
 int main(void) {
@@ -977,6 +1134,10 @@ int main(void) {
     t_list_mpu_uploads_no_bucket();
     t_mpu_gc_reaps_stale();
     t_mpu_gc_skips_unparseable();
+    t_put_enospc_returns_storage_error();
+    t_put_enospc_midstream_cleanup();
+    t_put_enospc_commit_path();
+    t_mpu_part_enospc();
 
     if (failures == 0) { printf("ALL TESTS PASSED\n"); return 0; }
     printf("%d FAILURES\n", failures);

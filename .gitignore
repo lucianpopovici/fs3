@@ -62,3 +62,11 @@ tests/test_xml
 tests/test_xml_legacy
 tests/test_xml_fuzz
 tests/test_sigv4
+
+# Python bytecode from test helpers
+__pycache__/
+
+# Session-restore tarballs and build artifacts
+fs3-*.tar.gz
+fs3-static
+packaging/synology/*.spk

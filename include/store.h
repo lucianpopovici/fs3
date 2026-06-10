@@ -53,6 +53,13 @@ void     store_close(s3_store_t *s);
  * disable the check (the default). */
 void     store_set_min_free_bytes(s3_store_t *s, uint64_t min_free_bytes);
 
+/* Test seams. Tests may point these at wrappers that inject I/O failures
+ * (e.g. ENOSPC after N bytes) to exercise disk-full handling without a
+ * real full filesystem. Leave NULL (the default) in production: the store
+ * then calls write()/fsync() directly. */
+extern ssize_t (*s3_store_write_hook)(int fd, const void *buf, size_t n);
+extern int     (*s3_store_fsync_hook)(int fd);
+
 /* ---- Buckets ---- */
 
 s3_err_t store_bucket_create(s3_store_t *s, s3_str_t name);

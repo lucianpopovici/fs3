@@ -109,7 +109,7 @@ static const err_entry_t ERR_TABLE[] = {
     { S3_ERR_BAD_DIGEST,                 400, "XAmzContentSHA256Mismatch","The provided x-amz-content-sha256 header does not match the body." },
     { S3_ERR_INVALID_PART,               400, "InvalidPart",              "One or more of the specified parts could not be found." },
     { S3_ERR_MALFORMED_XML,              400, "MalformedXML",             "The XML you provided was not well-formed."         },
-    { S3_ERR_INSUFFICIENT_STORAGE,       507, "QuotaExceeded",            "The server storage quota has been reached."        },
+    { S3_ERR_INSUFFICIENT_STORAGE,       507, "QuotaExceeded",            "There is insufficient storage available to complete the request." },
 };
 
 static const err_entry_t *err_lookup(s3_err_t e) {
