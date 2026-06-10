@@ -1,6 +1,15 @@
 # CLAUDE.md — share permissions / package-user write access
 
-> **STATUS: code complete, hardware test pending (2026-06-10).**
+> **STATUS: VERIFIED ON HARDWARE (2026-06-10, DS1515+ / DSM 7.1).**
+> DSM created the `fs3` package user; postinst's chown worked; PUT
+> objects land owned by `fs3:fs3` in the default data dir with no
+> manual steps. The failure path was exercised for real: pointing
+> FS3_DATA at a root-owned `/volume1` dir leaves the package stopped
+> with the readable preflight message in `fs3.log` (no crash loop), and
+> a `chown fs3` on the dir makes the same path work. Original plan
+> below for reference.
+>
+> Previous status: code complete, hardware test pending (2026-06-10).
 > Approach (a) implemented: wizard default is the package-owned
 > `/var/packages/fs3/var/data`, with volume paths as the documented
 > advanced option. `postinst` chowns `VAR_DIR` recursively and the data

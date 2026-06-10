@@ -1,6 +1,16 @@
 # CLAUDE.md — TLS / encryption in transit
 
-> **STATUS: done via Option A, hardware test pending (2026-06-10).**
+> **STATUS: done via Option A; key facts verified on hardware
+> (2026-06-10, DS1515+ / DSM 7.1).** Confirmed on the real box:
+> the SPK binds 127.0.0.1 and port 9000 is unreachable from the LAN;
+> and the host-header trap below resolves favorably — DSM's global
+> `/etc/nginx/proxy.conf` (included by every reverse-proxy vhost) sets
+> `proxy_set_header Host $http_host;`, so the original Host reaches fs3
+> and SigV4 verifies through the proxy. Remaining: actually creating
+> the reverse-proxy entry is a DSM-UI step (the
+> SYNO.Core.AppPortal.ReverseProxy API rejected scripted `create` with
+> undocumented validation errors 4152/4155) and an end-to-end HTTPS
+> round-trip through it.
 > SPK default bind is now `127.0.0.1` (`start-stop-status` defaults +
 > `postinst`); the wizard offers an explicit "Expose on the LAN (plain
 > HTTP)" opt-out that sets `FS3_BIND=0.0.0.0`. The README ("Synology

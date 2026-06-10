@@ -54,8 +54,11 @@ cp "${PROJ_ROOT}/LICENSE" "${BUILD}/spk/LICENSE" 2>/dev/null || echo "fs3" > "${
 chmod 755 "${BUILD}/spk/scripts/"*
 
 # ---- the .spk is an (uncompressed) tar of the spk tree ----
+# Entry names must be bare ("INFO", "package.tgz"), not "./INFO" —
+# DSM 7.1's installer rejects ./-prefixed members with "failed to sort
+# spks, the spk might not exist or invalid format" (error 263).
 OUT="${HERE}/fs3-${VERSION}.spk"
-( cd "${BUILD}/spk" && tar cf "${OUT}" ./* )
+( cd "${BUILD}/spk" && tar cf "${OUT}" -- * )
 
 echo "built: ${OUT}"
 echo "  version:     ${VERSION}"

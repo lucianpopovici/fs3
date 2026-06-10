@@ -1,5 +1,1 @@
-{
-  "port-config": {
-    "protocol-file": "conf/fs3.sc"
-  }
-}
+{"port-config":"conf/fs3.sc"}

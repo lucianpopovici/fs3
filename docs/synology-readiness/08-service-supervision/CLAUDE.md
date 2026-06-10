@@ -1,7 +1,13 @@
 # CLAUDE.md — service supervision / auto-restart
 
-> **STATUS: fallback implemented (2026-06-10); DSM-native path still
-> open.** `start-stop-status` now runs fs3 under a watchdog that
+> **STATUS: fallback implemented and HARDWARE-VERIFIED (2026-06-10,
+> DS1515+ / DSM 7.1); DSM-native path still open.** On the real NAS:
+> `kill -9` of fs3 → watchdog respawned it within ~1 s, data intact,
+> `synopkg status` still "running". Note DSM 7.1 wraps
+> start-stop-status in an auto-generated systemd unit (the install log
+> shows an implicit `systemd-unit` resource worker), which may be the
+> road to DSM-native supervision — unexplored. Reboot-autostart not yet
+> tested (needs a NAS reboot). `start-stop-status` now runs fs3 under a watchdog that
 > respawns it on unexpected exit with 1s→60s exponential backoff (reset
 > after a 60s-healthy run); `stop` raises a stop flag first so
 > intentional stops don't respawn, and the DSM status contract (0/3) is
