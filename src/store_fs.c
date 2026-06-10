@@ -265,6 +265,40 @@ static int tmp_open(const s3_store_t *s, char *out_path, size_t cap) {
 /* Lifecycle                                                              */
 /* ===================================================================== */
 
+/* Crash recovery: clear ROOT/tmp/. Every file there is by definition an
+ * uncommitted write — commits rename *out* of tmp — so after an unclean
+ * shutdown they are orphans that can never be part of a live object.
+ * Unconditional and safe. The data/ tree is deliberately NOT scanned:
+ * committed objects are atomic by construction (fsync-before-rename),
+ * so there is nothing to verify there. MPU staging dirs are NOT touched
+ * either — a fresh upload may be actively resumed by a client; the
+ * periodic GC reaps them by TTL.
+ *
+ * Runs from store_open, before the server accepts connections, so it
+ * cannot race a live writer. */
+static void recover_tmp_dir(const s3_store_t *s) {
+    DIR *d = opendir(s->tmp_dir);
+    if (!d) return;
+    int n = 0;
+    uint64_t bytes = 0;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        if (e->d_name[0] == '.') continue;
+        char p[4096];
+        if (snprintf(p, sizeof(p), "%s/%s", s->tmp_dir, e->d_name)
+            >= (int)sizeof(p)) continue;
+        struct stat st;
+        if (stat(p, &st) == 0 && S_ISREG(st.st_mode)) bytes += (uint64_t)st.st_size;
+        if (unlink(p) == 0) n++;
+        else LOG_W("recover: unlink %s: %s", p, strerror(errno));
+    }
+    closedir(d);
+    if (n > 0) {
+        LOG_I("recovered %d orphaned temp file(s) (%llu bytes) from %s",
+              n, (unsigned long long)bytes, s->tmp_dir);
+    }
+}
+
 s3_err_t store_open(s3_store_t **out, const char *root) {
     if (!out || !root) return S3_ERR_INVALID_ARGUMENT;
 
@@ -290,6 +324,8 @@ s3_err_t store_open(s3_store_t **out, const char *root) {
         store_close(s);
         return S3_ERR_INTERNAL;
     }
+
+    recover_tmp_dir(s);
 
     *out = s;
     return S3_OK;

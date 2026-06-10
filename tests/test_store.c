@@ -1102,6 +1102,80 @@ static void t_mpu_part_enospc(void) {
     teardown_root();
 }
 
+/* ---- Startup recovery ---------------------------------------------- */
+
+/* Drop a fake orphan into ROOT/tmp (as a crash mid-PUT would leave). */
+static void plant_orphan(const char *name, const char *content) {
+    char p[512];
+    snprintf(p, sizeof(p), "%s/tmp/%s", g_root, name);
+    FILE *fp = fopen(p, "w");
+    assert(fp != NULL);
+    fputs(content, fp);
+    fclose(fp);
+}
+
+static void t_recover_clears_orphan_tmp(void) {
+    setup_root();
+    /* First open creates the tree; close so we can plant + reopen. */
+    s3_store_t *s;
+    store_open(&s, g_root);
+    store_close(s);
+
+    plant_orphan("obj.AbCdEf", "half-written object");
+    plant_orphan("mpu.XyZzYx", "half-written part");
+
+    store_open(&s, g_root);
+    CHECK_EQ(count_tmp_files(), 0, "recovery cleared tmp orphans");
+    store_close(s);
+    teardown_root();
+}
+
+static void t_recover_preserves_committed(void) {
+    setup_root();
+    s3_store_t *s;
+    store_open(&s, g_root);
+    store_bucket_create(s, S3_STR_LIT("buk"));
+    put(s, "buk", "survivor", "precious", 8, "text/plain", NULL);
+    store_close(s);
+
+    plant_orphan("obj.000000", "junk");
+
+    store_open(&s, g_root);
+    CHECK_EQ(count_tmp_files(), 0, "orphan gone after recovery");
+    char buf[16] = {0};
+    size_t got;
+    s3_obj_meta_t m;
+    CHECK_EQ(get_all(s, "buk", "survivor", buf, sizeof(buf), &got, &m),
+             S3_OK, "committed object survives recovery");
+    CHECK_EQ(got, 8, "size intact");
+    CHECK(memcmp(buf, "precious", 8) == 0, "body intact");
+    store_close(s);
+    teardown_root();
+}
+
+static void t_recover_leaves_fresh_mpu(void) {
+    setup_root();
+    s3_store_t *s;
+    store_open(&s, g_root);
+    store_bucket_create(s, S3_STR_LIT("buk"));
+    char id[33];
+    CHECK_EQ(store_mpu_create(s, S3_STR_LIT("buk"), S3_STR_LIT("inflight"),
+                              NULL, id), S3_OK, "mpu create");
+    store_close(s);
+
+    plant_orphan("obj.111111", "junk");
+
+    store_open(&s, g_root);
+    s3_mpu_info_t *ups = NULL;
+    size_t n = 0;
+    store_list_mpu_uploads(s, S3_STR_LIT("buk"), S3_STR_NULL, &ups, &n);
+    CHECK_EQ(n, 1, "in-flight upload survives recovery");
+    store_mpu_uploads_free(ups, n);
+    CHECK_EQ(count_tmp_files(), 0, "orphan gone, mpu untouched");
+    store_close(s);
+    teardown_root();
+}
+
 /* ---- Main --------------------------------------------------------- */
 
 int main(void) {
@@ -1138,6 +1212,9 @@ int main(void) {
     t_put_enospc_midstream_cleanup();
     t_put_enospc_commit_path();
     t_mpu_part_enospc();
+    t_recover_clears_orphan_tmp();
+    t_recover_preserves_committed();
+    t_recover_leaves_fresh_mpu();
 
     if (failures == 0) { printf("ALL TESTS PASSED\n"); return 0; }
     printf("%d FAILURES\n", failures);
