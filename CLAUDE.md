@@ -286,7 +286,10 @@ For when "wait, what was I doing in phase 5?" is the question:
 - **Phase 10** — Server-side object copy (`PUT` with
   `x-amz-copy-source`), and `?acl` stub for both bucket and object
   level (GET returns static FULL_CONTROL ACL, PUT discards body).
-  The current state.
+- **Phase 11** — `GET /healthz` health endpoint,
+  `--credentials-file` (one `ak:sk` per line, `#` comments),
+  and `--min-free-bytes` disk quota (reject uploads when the volume's
+  free space drops below the threshold). The current state.
 
 ## Decisions for next phase
 
@@ -306,3 +309,24 @@ When picking up phase 11, in rough order of value:
 Don't tackle erasure coding, distributed mode, or IAM. Those aren't
 "the next phase of fs3" — those would be a different project (and
 the answer to that project is rustfs, not fs3).
+
+## Synology / NAS deployment
+
+fs3 is packaged as a Synology SPK under `packaging/synology/` (build with
+`cd packaging/synology && ./build-spk.sh`; needs `make fs3-static`
+first). The package targets the DS1515+ (Intel Atom C2538 = avoton
+platform) and statically links libcrypto for DSM-version portability.
+
+Before trusting fs3 on a NAS with real data, read
+`docs/synology-readiness/CLAUDE.md` — it indexes one brief per gap
+between "demo that passes tests" and "production-grade on a NAS,"
+prioritized. The Tier-1 gaps (disk-full behavior, share permissions,
+TLS) are correctness/safety issues specific to the NAS context, not
+feature polish. That index also flags a present-tense config-injection
+bug (`fs3.conf` is sourced as shell) worth fixing regardless of which
+features get built.
+
+Note: the briefs were written against a phase-8-era snapshot; phases
+9–11 (Range, bulk delete, copy, ACL stubs, `/healthz`,
+`--credentials-file`, `--min-free-bytes`) have since landed, so check
+each brief's "current state" claims against the code before acting.
