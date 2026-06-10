@@ -12,7 +12,9 @@ PKG_DIR="${SYNOPKG_PKGDEST:-/var/packages/fs3/target}"
 VAR_DIR="${SYNOPKG_PKGVAR:-/var/packages/fs3/var}"
 
 BIN="${PKG_DIR}/bin/fs3"
-PID_FILE="${VAR_DIR}/fs3.pid"
+PID_FILE="${VAR_DIR}/fs3.pid"          # the watchdog's PID
+CHILD_PID_FILE="${VAR_DIR}/fs3.child.pid"  # the fs3 process itself
+STOP_FILE="${VAR_DIR}/fs3.stop"        # presence = "don't respawn"
 LOG_FILE="${VAR_DIR}/fs3.log"
 CONF_FILE="${VAR_DIR}/fs3.conf"
 CRED_FILE="${VAR_DIR}/credentials"
@@ -80,6 +82,40 @@ preflight_data_dir() {
     rm -f "${probe}"
 }
 
+# Watchdog: run fs3 in the foreground and respawn it if it exits without
+# being asked to stop (STOP_FILE). Restart backoff doubles 1s → 60s so a
+# crash-loop (bad config, port taken) idles instead of cooking a core; a
+# run that survives 60s is considered healthy and resets the backoff.
+#
+# This is the FALLBACK supervision model: the watchdog itself is not
+# supervised, so a killed watchdog means no auto-restart until the next
+# DSM start. DSM-native service supervision is the preferred answer once
+# verified on real hardware — see
+# docs/synology-readiness/08-service-supervision.
+watchdog() {
+    backoff=1
+    while [ ! -f "${STOP_FILE}" ]; do
+        started=$(date +%s)
+        "${BIN}" "$@" &
+        echo $! > "${CHILD_PID_FILE}"
+        wait $!
+        rc=$?
+        rm -f "${CHILD_PID_FILE}"
+        [ -f "${STOP_FILE}" ] && break
+        echo "fs3 exited unexpectedly (rc=${rc}); restarting in ${backoff}s" \
+            >> "${LOG_FILE}"
+        sleep "${backoff}"
+        now=$(date +%s)
+        if [ $((now - started)) -ge 60 ]; then
+            backoff=1
+        else
+            backoff=$((backoff * 2))
+            [ "${backoff}" -gt 60 ] && backoff=60
+        fi
+    done
+    rm -f "${PID_FILE}"
+}
+
 start_daemon() {
     mkdir -p "${VAR_DIR}"
     preflight_data_dir
@@ -106,26 +142,47 @@ start_daemon() {
         set -- "$@" --credentials-file "${CRED_FILE}" --require-auth
     fi
 
-    # Launch in background, record PID. fs3 logs to stderr; redirect to file.
-    "${BIN}" "$@" >> "${LOG_FILE}" 2>&1 &
+    # Launch the watchdog; it records fs3's own PID in CHILD_PID_FILE.
+    # fs3 logs to stderr; redirect to file.
+    rm -f "${STOP_FILE}"
+    watchdog "$@" >> "${LOG_FILE}" 2>&1 &
     echo $! > "${PID_FILE}"
 }
 
+# Kill a PID gracefully: TERM, wait up to 10s, then KILL.
+kill_and_wait() {
+    [ -n "$1" ] && kill -0 "$1" 2>/dev/null || return 0
+    kill "$1" 2>/dev/null
+    i=0
+    while [ $i -lt 10 ] && kill -0 "$1" 2>/dev/null; do
+        sleep 1
+        i=$((i + 1))
+    done
+    kill -9 "$1" 2>/dev/null
+    return 0
+}
+
 stop_daemon() {
+    # Order matters: raise the stop flag first so the watchdog won't
+    # respawn, then stop fs3, then reap the watchdog (it may be mid-
+    # backoff sleep rather than waiting on the child).
+    touch "${STOP_FILE}"
+    if [ -f "${CHILD_PID_FILE}" ]; then
+        kill_and_wait "$(cat "${CHILD_PID_FILE}")"
+        rm -f "${CHILD_PID_FILE}"
+    fi
     if [ -f "${PID_FILE}" ]; then
-        PID="$(cat "${PID_FILE}")"
-        if [ -n "${PID}" ] && kill -0 "${PID}" 2>/dev/null; then
-            kill "${PID}" 2>/dev/null
-            # Wait up to 10s for graceful shutdown.
-            i=0
-            while [ $i -lt 10 ] && kill -0 "${PID}" 2>/dev/null; do
-                sleep 1
-                i=$((i + 1))
-            done
-            kill -9 "${PID}" 2>/dev/null
-        fi
+        WPID="$(cat "${PID_FILE}")"
+        # Give the watchdog a moment to notice and exit on its own.
+        i=0
+        while [ $i -lt 3 ] && [ -n "${WPID}" ] && kill -0 "${WPID}" 2>/dev/null; do
+            sleep 1
+            i=$((i + 1))
+        done
+        kill_and_wait "${WPID}"
         rm -f "${PID_FILE}"
     fi
+    rm -f "${STOP_FILE}"
 }
 
 daemon_status() {
