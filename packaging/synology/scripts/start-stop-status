@@ -29,6 +29,10 @@ FS3_ACCESS_KEY=""
 FS3_SECRET_KEY=""
 FS3_GC_INTERVAL="60"
 FS3_GC_MAX_AGE="86400"
+# Admin listener (always 127.0.0.1): /healthz + Prometheus /metrics.
+# Scrape remotely via a DSM reverse-proxy entry or an SSH tunnel.
+# Set to 0 to disable.
+FS3_METRICS_PORT="9101"
 
 # Load saved configuration. The file is parsed line-by-line and NEVER
 # sourced: conf values come from install-wizard input, and sourcing
@@ -47,7 +51,7 @@ load_conf() {
         esac
         case "${key}" in
             FS3_PORT|FS3_BIND|FS3_DATA|FS3_REQUIRE_AUTH|FS3_ACCESS_KEY|\
-            FS3_SECRET_KEY|FS3_GC_INTERVAL|FS3_GC_MAX_AGE)
+            FS3_SECRET_KEY|FS3_GC_INTERVAL|FS3_GC_MAX_AGE|FS3_METRICS_PORT)
                 eval "${key}=\${val}" ;;
         esac
     done < "${CONF_FILE}"
@@ -83,6 +87,9 @@ start_daemon() {
     set -- -a "${FS3_BIND}" -p "${FS3_PORT}" -d "${FS3_DATA}" \
            --mpu-gc-interval "${FS3_GC_INTERVAL}" \
            --mpu-gc-max-age "${FS3_GC_MAX_AGE}"
+    if [ "${FS3_METRICS_PORT}" != "0" ] && [ -n "${FS3_METRICS_PORT}" ]; then
+        set -- "$@" --metrics-port "${FS3_METRICS_PORT}"
+    fi
 
     if [ "${FS3_REQUIRE_AUTH}" = "1" ]; then
         # Credentials live in a 0600 file, passed via --credentials-file

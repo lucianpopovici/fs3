@@ -1174,6 +1174,7 @@ int route_dispatch_send_body(conn_t *c) {
         c->get_reader = NULL;
         return -1;
     }
+    if (n > 0) c->bytes_out_body += (uint64_t)n;
     if (n == 0) {
         /* EOF — body fully sent. */
         store_get_close(c->get_reader);

@@ -53,6 +53,18 @@ void     store_close(s3_store_t *s);
  * disable the check (the default). */
 void     store_set_min_free_bytes(s3_store_t *s, uint64_t min_free_bytes);
 
+/* Point-in-time stats for the metrics endpoint: bucket count, in-flight
+ * multipart uploads, and data-volume usage from statvfs. Cheap (two
+ * shallow readdir passes + one statvfs) but not free — call per scrape,
+ * not per request. */
+typedef struct {
+    uint64_t buckets;
+    uint64_t mpu_inflight;
+    uint64_t volume_used_bytes;
+    uint64_t volume_free_bytes;
+} s3_admin_stats_t;
+void     store_admin_stats(s3_store_t *s, s3_admin_stats_t *out);
+
 /* Test seams. Tests may point these at wrappers that inject I/O failures
  * (e.g. ENOSPC after N bytes) to exercise disk-full handling without a
  * real full filesystem. Leave NULL (the default) in production: the store

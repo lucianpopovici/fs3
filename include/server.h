@@ -40,6 +40,12 @@ typedef struct {
      * dribbling clients. 0 disables the sweep. */
     int                    idle_timeout_s;
 
+    /* Admin/metrics listener. When non-zero, a second listener bound to
+     * 127.0.0.1:<metrics_port> serves GET /healthz and GET /metrics
+     * (Prometheus text format). Localhost-only by design — front it
+     * with the DSM reverse proxy or an SSH tunnel to scrape remotely. */
+    uint16_t               metrics_port;
+
     /* Optional tick callback, invoked from the event loop at most once
      * per second, between event batches (so never concurrently with a
      * request). main.c uses it to act on signal flags — e.g. the SIGHUP

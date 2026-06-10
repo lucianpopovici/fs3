@@ -94,6 +94,16 @@ typedef struct conn {
      * its idle-connection sweep. */
     time_t             last_activity;
 
+    /* Request accounting (NULL metrics = disabled). req_start_ns is
+     * stamped when llhttp begins a message; bytes_out_body counts
+     * sendfile'd GET body bytes (wbuf/ext_body are counted from their
+     * lengths); metrics_flushed guards against double-recording when
+     * the write path is re-entered. */
+    struct fs3_metrics *metrics;
+    uint64_t           req_start_ns;
+    uint64_t           bytes_out_body;
+    int                metrics_flushed;
+
     /* Read buffer: bytes are fed to llhttp via llhttp_execute() */
     char               rbuf[CONN_RBUF_SZ];
     size_t             rlen;
@@ -196,7 +206,7 @@ typedef struct conn {
 /* Lifecycle */
 conn_t *conn_create(int fd, const char *peer, struct s3_store *store,
                     struct sigv4_verifier *auth, int auth_required,
-                    uint64_t max_body_bytes);
+                    uint64_t max_body_bytes, struct fs3_metrics *metrics);
 void    conn_destroy(conn_t *c);
 
 /* I/O readiness callbacks. Return 0 to keep alive, -1 to close. */

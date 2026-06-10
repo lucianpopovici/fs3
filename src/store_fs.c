@@ -345,6 +345,50 @@ void store_set_min_free_bytes(s3_store_t *s, uint64_t min_free_bytes) {
     if (s) s->min_free_bytes = min_free_bytes;
 }
 
+/* Count non-hidden entries in a directory. Returns 0 if it can't open. */
+static uint64_t count_dir_entries(const char *path) {
+    DIR *d = opendir(path);
+    if (!d) return 0;
+    uint64_t n = 0;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        if (e->d_name[0] != '.') n++;
+    }
+    closedir(d);
+    return n;
+}
+
+void store_admin_stats(s3_store_t *s, s3_admin_stats_t *out) {
+    if (!out) return;
+    memset(out, 0, sizeof(*out));
+    if (!s) return;
+
+    out->buckets = count_dir_entries(s->buckets_dir);
+
+    /* In-flight MPUs: one dir per upload under mpu/<bucket>/. */
+    DIR *d = opendir(s->mpu_dir);
+    if (d) {
+        struct dirent *e;
+        while ((e = readdir(d)) != NULL) {
+            if (e->d_name[0] == '.') continue;
+            char p[4096];
+            if (snprintf(p, sizeof(p), "%s/%s", s->mpu_dir, e->d_name)
+                < (int)sizeof(p)) {
+                out->mpu_inflight += count_dir_entries(p);
+            }
+        }
+        closedir(d);
+    }
+
+    struct statvfs st;
+    if (statvfs(s->root, &st) == 0) {
+        uint64_t total = (uint64_t)st.f_frsize * st.f_blocks;
+        uint64_t avail = (uint64_t)st.f_frsize * st.f_bavail;
+        out->volume_free_bytes = avail;
+        out->volume_used_bytes = total > avail ? total - avail : 0;
+    }
+}
+
 /* Check disk quota. Returns S3_ERR_INSUFFICIENT_STORAGE if the filesystem
  * hosting the store root has fewer than s->min_free_bytes available.
  * Returns S3_OK if the quota is not set or if there is enough space.

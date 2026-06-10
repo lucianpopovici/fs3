@@ -49,6 +49,8 @@ FS3_DATA=${DATA}
 FS3_REQUIRE_AUTH=${REQUIRE_AUTH}
 FS3_GC_INTERVAL=60
 FS3_GC_MAX_AGE=86400
+# /healthz + Prometheus /metrics on 127.0.0.1:<port>; 0 disables.
+FS3_METRICS_PORT=9101
 EOF
 
 mkdir -p "${DATA}"

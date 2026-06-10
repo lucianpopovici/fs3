@@ -38,6 +38,7 @@ static void usage(const char *argv0) {
         "      --max-body-size <N>    reject request bodies > N with 413 (default 5G; 0 = off)\n"
         "      --max-conns <num>      concurrent connection cap (default 512)\n"
         "      --idle-timeout <sec>   close idle connections after this long (default 60; 0 = off)\n"
+        "      --metrics-port <num>   serve /healthz + /metrics on 127.0.0.1:<num> (0 = off)\n"
         "      --mpu-gc-interval N    seconds between MPU GC sweeps (default 60)\n"
         "      --mpu-gc-max-age N     seconds before a stale MPU is reaped (default 86400)\n"
         "  -v, --verbose              debug logging\n"
@@ -167,6 +168,7 @@ enum {
     OPT_MAX_BODY_SIZE,
     OPT_MAX_CONNS,
     OPT_IDLE_TIMEOUT,
+    OPT_METRICS_PORT,
 };
 
 int main(int argc, char **argv) {
@@ -186,6 +188,7 @@ int main(int argc, char **argv) {
     uint64_t max_body_bytes = 5ULL * 1024 * 1024 * 1024;  /* 5 GiB */
     int max_conns = 512;
     int idle_timeout_s = 60;
+    int metrics_port = 0;         /* 0 = no admin/metrics listener */
     sigv4_verifier_t *auth = NULL;
     reload_ctx_t reload_ctx = {0};
 
@@ -200,6 +203,7 @@ int main(int argc, char **argv) {
         { "max-body-size",    required_argument, NULL, OPT_MAX_BODY_SIZE },
         { "max-conns",        required_argument, NULL, OPT_MAX_CONNS },
         { "idle-timeout",     required_argument, NULL, OPT_IDLE_TIMEOUT },
+        { "metrics-port",     required_argument, NULL, OPT_METRICS_PORT },
         { "mpu-gc-interval",  required_argument, NULL, OPT_MPU_GC_INTERVAL },
         { "mpu-gc-max-age",   required_argument, NULL, OPT_MPU_GC_MAX_AGE },
         { "verbose",          no_argument,       NULL, 'v' },
@@ -286,6 +290,13 @@ int main(int argc, char **argv) {
                     return 2;
                 }
                 break;
+            case OPT_METRICS_PORT:
+                metrics_port = atoi(optarg);
+                if (metrics_port < 1 || metrics_port > 65535) {
+                    fprintf(stderr, "--metrics-port must be 1..65535\n");
+                    return 2;
+                }
+                break;
             case OPT_MPU_GC_INTERVAL:
                 gc_interval_s = atoi(optarg);
                 if (gc_interval_s < 1) {
@@ -338,6 +349,7 @@ int main(int argc, char **argv) {
         .min_free_bytes = min_free_bytes,
         .max_body_bytes = max_body_bytes,
         .idle_timeout_s = idle_timeout_s,
+        .metrics_port   = (uint16_t)metrics_port,
         .tick_cb        = reload_tick,
         .tick_user      = &reload_ctx,
     };

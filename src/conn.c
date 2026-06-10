@@ -26,6 +26,7 @@
 
 #include "conn.h"
 #include "log.h"
+#include "metrics.h"
 #include "route.h"
 #include "sigv4.h"
 #include "store.h"
@@ -36,6 +37,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <time.h>
 #include <unistd.h>
 
 /* ------------------------------------------------------------------------- */
@@ -72,7 +74,7 @@ static void parser_init(conn_t *c) {
 
 conn_t *conn_create(int fd, const char *peer, struct s3_store *store,
                     struct sigv4_verifier *auth, int auth_required,
-                    uint64_t max_body_bytes) {
+                    uint64_t max_body_bytes, struct fs3_metrics *metrics) {
     conn_t *c = calloc(1, sizeof(*c));
     if (!c) return NULL;
     c->fd = fd;
@@ -81,6 +83,7 @@ conn_t *conn_create(int fd, const char *peer, struct s3_store *store,
     c->auth = auth;
     c->auth_required = auth_required;
     c->max_body_bytes = max_body_bytes;
+    c->metrics = metrics;
     snprintf(c->peer, sizeof(c->peer), "%s", peer ? peer : "?");
     parser_init(c);
     return c;
@@ -172,6 +175,9 @@ static void request_reset(conn_t *c) {
     c->delete_pending = 0;
     c->delete_bucket = (s3_str_t){0};
     c->body_limit_hit = 0;
+    c->req_start_ns = 0;
+    c->bytes_out_body = 0;
+    c->metrics_flushed = 0;
 
     /* Belt-and-suspenders: by the time we reset, route_dispatch_complete
      * (PUT path) or route_dispatch_send_body (GET path) should have
@@ -193,13 +199,39 @@ static void request_reset(conn_t *c) {
 /* llhttp callbacks                                                          */
 /* ------------------------------------------------------------------------- */
 
+static uint64_t mono_now_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
 static int cb_on_message_begin(llhttp_t *p) {
     conn_t *c = p->data;
     /* On a keep-alive connection, on_message_begin fires for each new
      * request. We've already reset state when the previous response was
-     * fully written, so this is a no-op in normal flow. */
-    (void)c;
+     * fully written, so this is a no-op in normal flow — except for
+     * stamping the request start for the duration metric. */
+    c->req_start_ns = mono_now_ns();
     return 0;
+}
+
+/* Account a finished request. Called from the write path once the
+ * response is fully drained; metrics_flushed makes it idempotent (the
+ * write path can be re-entered, and close paths call it too). The
+ * status is parsed back out of wbuf ("HTTP/1.1 NNN ...") so the many
+ * response builders don't each need to report it. */
+static void metrics_flush(conn_t *c) {
+    if (!c->metrics || c->metrics_flushed) return;
+    if (c->wlen < 12) return;  /* no response was built (dropped conn) */
+    c->metrics_flushed = 1;
+    int status = atoi(c->wbuf + 9);
+    double dur_s = -1;
+    if (c->req_start_ns > 0) {
+        dur_s = (double)(mono_now_ns() - c->req_start_ns) / 1e9;
+    }
+    metrics_record(c->metrics, c->req.method, status, dur_s,
+                   c->req.body_consumed,
+                   (uint64_t)c->wlen + c->ext_body_len + c->bytes_out_body);
 }
 
 /* Callback for the chunk decoder: forwards verified chunk-data bytes
@@ -308,7 +340,14 @@ static int cb_on_headers_complete(llhttp_t *p) {
      * dispatch — but return 0 (not -1) so llhttp continues to
      * on_body/on_message_complete, which lets us write the response
      * cleanly and either keep the connection alive or close it. */
-    if (c->auth) {
+    /* /_health is exempt from auth: liveness probes (DSM, uptime
+     * monitors, the SPK watchdog) don't hold SigV4 credentials, and the
+     * response is a constant — nothing to leak. "_" is invalid in
+     * bucket names, so the path can't shadow a real bucket. */
+    int is_health = (c->req.path.n == 8
+                     && memcmp(c->req.path.p, "/_health", 8) == 0);
+
+    if (c->auth && !is_health) {
         /* Look up authorization header. If missing and auth not strictly
          * required, fall through. */
         const s3_str_t *auth_h = NULL;
@@ -696,6 +735,9 @@ int conn_on_writable(conn_t *c) {
             if (r == 0) break;           /* done */
         }
     }
+
+    /* Response fully drained — account the request before reset/close. */
+    metrics_flush(c);
 
     if (!c->req.keep_alive) {
         c->state = CST_CLOSING;

@@ -216,5 +216,61 @@ check_eq "bad reload keeps previous credentials" "$st" "STATUS=200"
 rm -f "$CRED_FILE"
 stop_server
 
+# ===================================================================
+# 6. Admin listener: /healthz + /metrics; auth-exempt /_health
+# ===================================================================
+MPORT=$((PORT + 1))
+MURL="http://127.0.0.1:$MPORT"
+start_server --metrics-port "$MPORT"
+
+body=$(curl -s "$MURL/healthz")
+check_eq "admin /healthz" "$body" "ok"
+curl -s "$MURL/metrics" | grep -q "^fs3_up 1$" && PASS=$((PASS+1)) || \
+    { FAIL=$((FAIL+1)); printf '\nFAIL: fs3_up missing\n'; }
+printf '.'
+
+# Generate some traffic, then check the counters moved.
+curl -s -X PUT "$URL/p12metrics" -o /dev/null
+head -c 5000 /dev/zero | tr '\0' 'm' > /tmp/fs3-p12-$$.mobj
+curl -s -X PUT "$URL/p12metrics/obj" --data-binary @/tmp/fs3-p12-$$.mobj -o /dev/null
+curl -s "$URL/p12metrics/obj" -o /dev/null
+scrape=$(curl -s "$MURL/metrics")
+put2xx=$(echo "$scrape" | grep 'fs3_requests_total{method="PUT",status="2xx"}' | awk '{print $2}')
+[ "${put2xx:-0}" -ge 2 ] && PASS=$((PASS+1)) || \
+    { FAIL=$((FAIL+1)); printf '\nFAIL: PUT 2xx counter=%s, want >=2\n' "$put2xx"; }
+printf '.'
+bin=$(echo "$scrape" | grep '^fs3_bytes_in_total' | awk '{print $2}')
+[ "${bin:-0}" -ge 5000 ] && PASS=$((PASS+1)) || \
+    { FAIL=$((FAIL+1)); printf '\nFAIL: bytes_in=%s, want >=5000\n' "$bin"; }
+printf '.'
+bout=$(echo "$scrape" | grep '^fs3_bytes_out_total' | awk '{print $2}')
+[ "${bout:-0}" -ge 5000 ] && PASS=$((PASS+1)) || \
+    { FAIL=$((FAIL+1)); printf '\nFAIL: bytes_out=%s, want >=5000 (GET body)\n' "$bout"; }
+printf '.'
+# DATA persists across this suite's sections, so count, don't assume 1.
+nb=$(ls "$DATA/buckets" | wc -l | tr -d ' ')
+echo "$scrape" | grep -q "^fs3_buckets_total $nb$" && PASS=$((PASS+1)) || \
+    { FAIL=$((FAIL+1)); printf '\nFAIL: buckets gauge != %s\n' "$nb"; }
+printf '.'
+dcount=$(echo "$scrape" | grep '^fs3_request_duration_seconds_count' | awk '{print $2}')
+[ "${dcount:-0}" -ge 3 ] && PASS=$((PASS+1)) || \
+    { FAIL=$((FAIL+1)); printf '\nFAIL: duration count=%s, want >=3\n' "$dcount"; }
+printf '.'
+
+# The S3 namespace stays clean: /metrics there is just a missing bucket.
+code=$(curl -s "$URL/metrics" -o /dev/null -w "%{http_code}")
+check_eq "S3 port does not serve /metrics" "$code" "404"
+stop_server
+
+# /_health works without credentials even when auth is required.
+printf '%s:%s\n' "$ALICE_AK" "$ALICE_SK" > "$CRED_FILE"
+start_server --credentials-file "$CRED_FILE" --require-auth
+code=$(curl -s "$URL/_health" -o /dev/null -w "%{http_code}")
+check_eq "/_health auth-exempt under require-auth" "$code" "200"
+code=$(curl -s "$URL/" -o /dev/null -w "%{http_code}")
+check_eq "everything else still requires auth" "$code" "403"
+rm -f "$CRED_FILE"
+stop_server
+
 printf '\n===== phase12 e2e: %d passed, %d failed =====\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

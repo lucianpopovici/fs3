@@ -12,6 +12,7 @@
 #include "server.h"
 #include "conn.h"
 #include "log.h"
+#include "metrics.h"
 #include "store.h"
 
 #include <arpa/inet.h>
@@ -32,7 +33,9 @@
 struct server {
     server_cfg_t  cfg;
     int           listen_fd;
+    int           admin_fd;     /* -1 unless cfg.metrics_port > 0 */
     int           epoll_fd;
+    fs3_metrics_t metrics;      /* plain counters; single-threaded loop */
     volatile int  stop;
     int           n_conns;
     conn_t       *conns_head;   /* intrusive doubly-linked list */
@@ -94,11 +97,77 @@ static int listen_socket(const char *addr, uint16_t port, int backlog) {
     return fd;
 }
 
+/* ------------------------------------------------------------------- */
+/* Admin listener: GET /healthz + GET /metrics on 127.0.0.1 only.      */
+/*                                                                     */
+/* Deliberately not wired into the conn_t/llhttp machinery: requests   */
+/* are two fixed paths from local monitoring agents. The socket is     */
+/* handled synchronously with short send/recv timeouts — worst case a  */
+/* local client stalls the loop for ~200 ms, which is an acceptable    */
+/* trade for keeping the admin path ~60 lines with no state machine.   */
+/* ------------------------------------------------------------------- */
+
+static void admin_respond(int fd, const char *status, const char *ctype,
+                          const char *body, size_t blen) {
+    char head[256];
+    int n = snprintf(head, sizeof(head),
+                     "HTTP/1.1 %s\r\n"
+                     "Server: fs3/0.2\r\n"
+                     "Content-Type: %s\r\n"
+                     "Content-Length: %zu\r\n"
+                     "Connection: close\r\n"
+                     "\r\n",
+                     status, ctype, blen);
+    if (n < 0 || n >= (int)sizeof(head)) return;
+    (void)!write(fd, head, (size_t)n);
+    if (blen) (void)!write(fd, body, blen);
+}
+
+static void admin_handle(server_t *s) {
+    for (;;) {
+        int fd = accept4(s->admin_fd, NULL, NULL, SOCK_CLOEXEC);
+        if (fd < 0) {
+            if (errno == EINTR) continue;
+            return;  /* EAGAIN — drained */
+        }
+        struct timeval tv = { .tv_usec = 200 * 1000 };
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+        char req[2048];
+        ssize_t r = read(fd, req, sizeof(req) - 1);
+        if (r <= 0) { close(fd); continue; }
+        req[r] = '\0';
+
+        if (strncmp(req, "GET /healthz", 12) == 0
+            || strncmp(req, "HEAD /healthz", 13) == 0) {
+            admin_respond(fd, "200 OK", "text/plain", "ok\n", 3);
+        } else if (strncmp(req, "GET /metrics", 12) == 0) {
+            static char body[32 * 1024];
+            int blen = metrics_render(&s->metrics, s->store,
+                                      body, sizeof(body));
+            if (blen < 0) {
+                admin_respond(fd, "500 Internal Server Error",
+                              "text/plain", "render overflow\n", 16);
+            } else {
+                admin_respond(fd, "200 OK",
+                              "text/plain; version=0.0.4",
+                              body, (size_t)blen);
+            }
+        } else {
+            admin_respond(fd, "404 Not Found", "text/plain",
+                          "not found\n", 10);
+        }
+        close(fd);
+    }
+}
+
 server_t *server_create(const server_cfg_t *cfg) {
     server_t *s = calloc(1, sizeof(*s));
     if (!s) return NULL;
     s->cfg = *cfg;
     s->listen_fd = -1;
+    s->admin_fd = -1;
     s->epoll_fd = -1;
 
     if (!cfg->data_root) {
@@ -136,6 +205,22 @@ server_t *server_create(const server_cfg_t *cfg) {
 
     LOG_I("listening on %s:%u", cfg->bind_addr, cfg->port);
 
+    /* Admin/metrics listener — localhost only, by design. */
+    if (cfg->metrics_port > 0) {
+        s->admin_fd = listen_socket("127.0.0.1", cfg->metrics_port, 16);
+        if (s->admin_fd < 0) goto fail;
+        struct epoll_event aev = {
+            .events = EPOLLIN,
+            .data.ptr = s,          /* server ptr = admin listener marker */
+        };
+        if (epoll_ctl(s->epoll_fd, EPOLL_CTL_ADD, s->admin_fd, &aev) < 0) {
+            LOG_E("epoll_ctl ADD admin: %s", strerror(errno));
+            goto fail;
+        }
+        LOG_I("metrics on 127.0.0.1:%u (/healthz, /metrics)",
+              cfg->metrics_port);
+    }
+
     /* GC defaults: sweep every 60s, reap uploads older than 24h.
      * Config may override either for testing or admin policy. */
     s->gc_interval_s = cfg->gc_interval_s > 0 ? cfg->gc_interval_s : 60;
@@ -163,6 +248,7 @@ void server_destroy(server_t *s) {
         conn_destroy(c);
     }
     if (s->listen_fd >= 0) close(s->listen_fd);
+    if (s->admin_fd  >= 0) close(s->admin_fd);
     if (s->epoll_fd  >= 0) close(s->epoll_fd);
     if (s->store) store_close(s->store);
     free(s);
@@ -223,7 +309,7 @@ static void accept_new(server_t *s) {
 
         conn_t *c = conn_create(fd, peer, s->store,
                                 s->cfg.auth, s->cfg.auth_required,
-                                s->cfg.max_body_bytes);
+                                s->cfg.max_body_bytes, &s->metrics);
         if (!c) {
             LOG_E("conn_create OOM");
             close(fd);
@@ -286,6 +372,12 @@ int server_run(server_t *s) {
             /* Listening socket */
             if (e->data.ptr == NULL) {
                 if (e->events & EPOLLIN) accept_new(s);
+                continue;
+            }
+
+            /* Admin/metrics listener (marker: the server pointer). */
+            if (e->data.ptr == (void *)s) {
+                if (e->events & EPOLLIN) admin_handle(s);
                 continue;
             }
 
