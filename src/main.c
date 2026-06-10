@@ -28,6 +28,9 @@ static void usage(const char *argv0) {
         "      --credentials-file <f> load credentials from file (one ak:sk per line)\n"
         "      --require-auth         reject requests without an Authorization header\n"
         "      --min-free-bytes <N>   reject uploads when disk free < N (K/M/G suffix ok)\n"
+        "      --max-body-size <N>    reject request bodies > N with 413 (default 5G; 0 = off)\n"
+        "      --max-conns <num>      concurrent connection cap (default 512)\n"
+        "      --idle-timeout <sec>   close idle connections after this long (default 60; 0 = off)\n"
         "      --mpu-gc-interval N    seconds between MPU GC sweeps (default 60)\n"
         "      --mpu-gc-max-age N     seconds before a stale MPU is reaped (default 86400)\n"
         "  -v, --verbose              debug logging\n"
@@ -109,6 +112,9 @@ enum {
     OPT_MIN_FREE_BYTES,
     OPT_MPU_GC_INTERVAL,
     OPT_MPU_GC_MAX_AGE,
+    OPT_MAX_BODY_SIZE,
+    OPT_MAX_CONNS,
+    OPT_IDLE_TIMEOUT,
 };
 
 int main(int argc, char **argv) {
@@ -120,6 +126,14 @@ int main(int argc, char **argv) {
     int gc_interval_s = 0;        /* 0 → server defaults to 60 */
     uint64_t gc_max_age_ms = 0;   /* 0 → server defaults to 24h */
     uint64_t min_free_bytes = 0;  /* 0 → no quota */
+    /* Defaults sized for small hardware (the SPK targets a 2 GB-RAM
+     * NAS): bodies capped at the S3 single-PUT limit, a connection cap
+     * whose fixed buffers stay well under 100 MB, and an idle sweep so
+     * stuck clients can't pin slots. Each is flag-overridable; 0
+     * disables the body cap / idle sweep. */
+    uint64_t max_body_bytes = 5ULL * 1024 * 1024 * 1024;  /* 5 GiB */
+    int max_conns = 512;
+    int idle_timeout_s = 60;
     sigv4_verifier_t *auth = NULL;
 
     static struct option opts[] = {
@@ -130,6 +144,9 @@ int main(int argc, char **argv) {
         { "credentials-file", required_argument, NULL, OPT_CREDENTIALS_FILE },
         { "require-auth",     no_argument,       NULL, OPT_REQUIRE_AUTH },
         { "min-free-bytes",   required_argument, NULL, OPT_MIN_FREE_BYTES },
+        { "max-body-size",    required_argument, NULL, OPT_MAX_BODY_SIZE },
+        { "max-conns",        required_argument, NULL, OPT_MAX_CONNS },
+        { "idle-timeout",     required_argument, NULL, OPT_IDLE_TIMEOUT },
         { "mpu-gc-interval",  required_argument, NULL, OPT_MPU_GC_INTERVAL },
         { "mpu-gc-max-age",   required_argument, NULL, OPT_MPU_GC_MAX_AGE },
         { "verbose",          no_argument,       NULL, 'v' },
@@ -182,6 +199,34 @@ int main(int argc, char **argv) {
                     return 2;
                 }
                 break;
+            case OPT_MAX_BODY_SIZE:
+                /* "0" disables; parse_size returns 0 for both "0" and
+                 * garbage, so check the spelling explicitly. */
+                if (strcmp(optarg, "0") == 0) {
+                    max_body_bytes = 0;
+                } else {
+                    max_body_bytes = parse_size(optarg);
+                    if (max_body_bytes == 0) {
+                        fprintf(stderr, "--max-body-size: invalid size '%s'\n",
+                                optarg);
+                        return 2;
+                    }
+                }
+                break;
+            case OPT_MAX_CONNS:
+                max_conns = atoi(optarg);
+                if (max_conns < 1) {
+                    fprintf(stderr, "--max-conns must be >= 1\n");
+                    return 2;
+                }
+                break;
+            case OPT_IDLE_TIMEOUT:
+                idle_timeout_s = atoi(optarg);
+                if (idle_timeout_s < 0) {
+                    fprintf(stderr, "--idle-timeout must be >= 0 (0 disables)\n");
+                    return 2;
+                }
+                break;
             case OPT_MPU_GC_INTERVAL:
                 gc_interval_s = atoi(optarg);
                 if (gc_interval_s < 1) {
@@ -219,13 +264,15 @@ int main(int argc, char **argv) {
         .bind_addr     = addr,
         .port          = (uint16_t)port,
         .backlog       = 1024,
-        .max_conns     = 4096,
+        .max_conns     = max_conns,
         .data_root     = data_root,
         .auth          = auth,
         .auth_required = require_auth,
         .gc_interval_s = gc_interval_s,
         .gc_max_age_ms = gc_max_age_ms,
         .min_free_bytes = min_free_bytes,
+        .max_body_bytes = max_body_bytes,
+        .idle_timeout_s = idle_timeout_s,
     };
 
     g_server = server_create(&cfg);

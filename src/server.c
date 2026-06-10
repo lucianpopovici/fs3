@@ -43,6 +43,10 @@ struct server {
     time_t        gc_last_run;       /* monotonic seconds */
     int           gc_interval_s;     /* sweep cadence */
     uint64_t      gc_max_age_ms;     /* TTL */
+    /* Idle-connection sweep (cfg.idle_timeout_s > 0). Runs at most once
+     * per second, after the event batch is processed — never before,
+     * since the events array may hold pointers into conns we'd free. */
+    time_t        idle_last_sweep;
 };
 
 static void list_push(conn_t **head, conn_t *c) {
@@ -217,12 +221,14 @@ static void accept_new(server_t *s) {
         snprintf(peer + pl, sizeof(peer) - pl, ":%u", ntohs(sa.sin_port));
 
         conn_t *c = conn_create(fd, peer, s->store,
-                                s->cfg.auth, s->cfg.auth_required);
+                                s->cfg.auth, s->cfg.auth_required,
+                                s->cfg.max_body_bytes);
         if (!c) {
             LOG_E("conn_create OOM");
             close(fd);
             continue;
         }
+        c->last_activity = time(NULL);
 
         struct epoll_event ev = {
             .events = EPOLLIN | EPOLLRDHUP,
@@ -275,6 +281,7 @@ int server_run(server_t *s) {
             }
 
             conn_t *c = e->data.ptr;
+            c->last_activity = now;
 
             if (e->events & (EPOLLERR | EPOLLHUP | EPOLLRDHUP)) {
                 /* Drain any final readable data first, but on hard error close. */
@@ -304,6 +311,25 @@ int server_run(server_t *s) {
             }
 
             reset_conn_events(s, c);
+        }
+
+        /* Idle-connection sweep, AFTER the event batch: closing during
+         * the batch would leave dangling pointers in events[]. A slow
+         * but progressing client keeps refreshing last_activity above,
+         * so only truly stalled connections are reclaimed. */
+        if (s->cfg.idle_timeout_s > 0 && now != s->idle_last_sweep) {
+            s->idle_last_sweep = now;
+            conn_t *c = s->conns_head;
+            while (c) {
+                conn_t *next = c->list_next;
+                if (now - c->last_activity >= s->cfg.idle_timeout_s) {
+                    LOG_D("closing idle conn fd=%d peer=%s (%llds)",
+                          c->fd, c->peer,
+                          (long long)(now - c->last_activity));
+                    close_conn(s, c);
+                }
+                c = next;
+            }
         }
     }
 

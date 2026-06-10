@@ -29,6 +29,16 @@ typedef struct {
      * with 507 if the underlying filesystem has fewer than this many
      * bytes free at the time the upload starts. */
     uint64_t               min_free_bytes;
+
+    /* Request body ceiling. When non-zero, a request whose declared
+     * Content-Length exceeds it — or whose streamed body grows past it —
+     * is rejected with 413 EntityTooLarge. 0 disables the check. */
+    uint64_t               max_body_bytes;
+
+    /* Idle-connection timeout in seconds. Connections with no socket
+     * activity for this long are closed to reclaim slots from stuck or
+     * dribbling clients. 0 disables the sweep. */
+    int                    idle_timeout_s;
 } server_cfg_t;
 
 server_t *server_create(const server_cfg_t *cfg);

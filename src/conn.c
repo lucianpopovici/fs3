@@ -71,7 +71,8 @@ static void parser_init(conn_t *c) {
 }
 
 conn_t *conn_create(int fd, const char *peer, struct s3_store *store,
-                    struct sigv4_verifier *auth, int auth_required) {
+                    struct sigv4_verifier *auth, int auth_required,
+                    uint64_t max_body_bytes) {
     conn_t *c = calloc(1, sizeof(*c));
     if (!c) return NULL;
     c->fd = fd;
@@ -79,6 +80,7 @@ conn_t *conn_create(int fd, const char *peer, struct s3_store *store,
     c->store = store;
     c->auth = auth;
     c->auth_required = auth_required;
+    c->max_body_bytes = max_body_bytes;
     snprintf(c->peer, sizeof(c->peer), "%s", peer ? peer : "?");
     parser_init(c);
     return c;
@@ -169,6 +171,7 @@ static void request_reset(conn_t *c) {
     c->mpu_upload_id[0] = '\0';
     c->delete_pending = 0;
     c->delete_bucket = (s3_str_t){0};
+    c->body_limit_hit = 0;
 
     /* Belt-and-suspenders: by the time we reset, route_dispatch_complete
      * (PUT path) or route_dispatch_send_body (GET path) should have
@@ -349,6 +352,20 @@ static int cb_on_headers_complete(llhttp_t *p) {
 
     c->state = CST_READ_BODY;
 
+    /* Body-size ceiling, declared-length check. A request announcing a
+     * Content-Length past the cap is rejected before a writer is opened
+     * or any byte hits disk. Chunked/lying clients are caught by the
+     * running-total check in cb_on_body instead. */
+    if (c->max_body_bytes > 0 && !c->req.chunked
+        && c->req.content_length_hint > c->max_body_bytes) {
+        LOG_D("declared body %llu > cap %llu on %s",
+              (unsigned long long)c->req.content_length_hint,
+              (unsigned long long)c->max_body_bytes, c->peer);
+        c->body_limit_hit = 1;
+        if (route_build_error(c, S3_ERR_ENTITY_TOO_LARGE) < 0) return -1;
+        return 0;
+    }
+
     /* Dispatch to the router. For PUT this opens a writer (so on_body
      * can stream into it); for GET/HEAD/DELETE/list, this builds the
      * full response now and transitions to CST_WRITE_RESPONSE. */
@@ -388,6 +405,39 @@ static int cb_on_headers_complete(llhttp_t *p) {
 static int cb_on_body(llhttp_t *p, const char *at, size_t len) {
     conn_t *c = p->data;
     c->req.body_consumed += len;
+
+    /* Body-size ceiling, streaming check. body_consumed counts wire
+     * bytes, so for chunked-SigV4 it slightly overcounts the payload
+     * (chunk framing included) — fine for a bound. Fire only once, and
+     * only if no response is queued yet (an earlier auth/route error may
+     * already be in wbuf while the body drains). */
+    if (c->body_limit_hit) return 0;  /* 413 already queued; drain */
+    if (c->max_body_bytes > 0
+        && c->req.body_consumed > c->max_body_bytes
+        && c->wlen == 0 && !c->ext_body) {
+        LOG_D("streamed body exceeded cap %llu on %s",
+              (unsigned long long)c->max_body_bytes, c->peer);
+        c->body_limit_hit = 1;
+        /* Abort anything the request had in flight; same invariant as
+         * the disk-full path: no temp file survives a failed PUT. */
+        if (c->put_writer) {
+            if (c->mpu_is_part_upload) store_mpu_part_abort(c->put_writer);
+            else                       store_put_abort(c->put_writer);
+            c->put_writer = NULL;
+        }
+        if (c->chunk_decoder) {
+            sigv4_chunk_free(c->chunk_decoder);
+            c->chunk_decoder = NULL;
+        }
+        if (c->body_hash_ctx) {
+            sigv4_body_hash_free(c->body_hash_ctx);
+            c->body_hash_ctx = NULL;
+        }
+        c->mpu_complete_pending = 0;
+        c->delete_pending = 0;
+        if (route_build_error(c, S3_ERR_ENTITY_TOO_LARGE) < 0) return -1;
+        return 0;
+    }
 
     /* Chunked SigV4: feed bytes to the decoder, which calls back via
      * chunk_data_to_route for each verified data segment. The decoder

@@ -82,6 +82,18 @@ typedef struct conn {
      * present, else allow" — useful for compatibility transitions. */
     int                auth_required;
 
+    /* Request body ceiling (0 = unlimited). Checked against the declared
+     * Content-Length at headers-complete and against the running byte
+     * count as the body streams, so a client that lies about (or omits)
+     * its length is still bounded. body_limit_hit latches the 413 so the
+     * remaining body drains silently without rebuilding the response. */
+    uint64_t           max_body_bytes;
+    int                body_limit_hit;
+
+    /* Last socket activity (seconds). Maintained by server.c; used by
+     * its idle-connection sweep. */
+    time_t             last_activity;
+
     /* Read buffer: bytes are fed to llhttp via llhttp_execute() */
     char               rbuf[CONN_RBUF_SZ];
     size_t             rlen;
@@ -183,7 +195,8 @@ typedef struct conn {
 
 /* Lifecycle */
 conn_t *conn_create(int fd, const char *peer, struct s3_store *store,
-                    struct sigv4_verifier *auth, int auth_required);
+                    struct sigv4_verifier *auth, int auth_required,
+                    uint64_t max_body_bytes);
 void    conn_destroy(conn_t *c);
 
 /* I/O readiness callbacks. Return 0 to keep alive, -1 to close. */
