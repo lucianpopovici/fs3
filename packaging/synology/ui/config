@@ -1,0 +1,13 @@
+{
+  ".url": {
+    "SYNO.SDS.fs3.Application": {
+      "type": "url",
+      "title": "fs3 Object Storage",
+      "desc": "S3-compatible object storage endpoint",
+      "icon": "images/fs3_{0}.png",
+      "url": "/webman/3rdparty/fs3/index.cgi",
+      "allUsers": true,
+      "grantPrivilege": "local"
+    }
+  }
+}

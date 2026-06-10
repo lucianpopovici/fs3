@@ -1,0 +1,3 @@
+#!/bin/sh
+# postupgrade — runs after an upgrade. Conf in VAR is preserved.
+exit 0

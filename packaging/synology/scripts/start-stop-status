@@ -1,0 +1,164 @@
+#!/bin/sh
+# start-stop-status — DSM package lifecycle control for fs3.
+#
+# DSM calls this with one of: start | stop | status | log
+# Environment provided by DSM:
+#   SYNOPKG_PKGDEST       — where package.tgz was extracted (our install root)
+#   SYNOPKG_PKGVAR        — per-package writable var dir (/var/packages/fs3/var)
+#   SYNOPKG_PKGNAME       — "fs3"
+#   SYNOPKG_TEMP_LOGFILE  — write a message here to surface it in the DSM UI
+
+PKG_DIR="${SYNOPKG_PKGDEST:-/var/packages/fs3/target}"
+VAR_DIR="${SYNOPKG_PKGVAR:-/var/packages/fs3/var}"
+
+BIN="${PKG_DIR}/bin/fs3"
+PID_FILE="${VAR_DIR}/fs3.pid"
+LOG_FILE="${VAR_DIR}/fs3.log"
+CONF_FILE="${VAR_DIR}/fs3.conf"
+CRED_FILE="${VAR_DIR}/credentials"
+
+# Defaults; overridden by ${CONF_FILE} written from the install wizard.
+# Bind localhost by default: TLS is provided by putting DSM's reverse
+# proxy in front (see README), so fs3 itself should not be the public
+# face. Set FS3_BIND=0.0.0.0 in fs3.conf for direct plaintext LAN access.
+FS3_PORT="9000"
+FS3_BIND="127.0.0.1"
+FS3_DATA="${VAR_DIR}/data"
+FS3_REQUIRE_AUTH="0"
+FS3_ACCESS_KEY=""
+FS3_SECRET_KEY=""
+FS3_GC_INTERVAL="60"
+FS3_GC_MAX_AGE="86400"
+
+# Load saved configuration. The file is parsed line-by-line and NEVER
+# sourced: conf values come from install-wizard input, and sourcing
+# would let a crafted value (e.g. a key containing `"; reboot; "`)
+# execute as shell. Unknown keys are ignored. A single pair of
+# surrounding double quotes is stripped for compatibility with confs
+# written by older (sourced-format) versions of this package.
+load_conf() {
+    [ -f "${CONF_FILE}" ] || return 0
+    while IFS= read -r line || [ -n "${line}" ]; do
+        case "${line}" in ''|'#'*) continue ;; esac
+        key="${line%%=*}"
+        val="${line#*=}"
+        case "${val}" in
+            '"'*'"') val="${val#\"}"; val="${val%\"}" ;;
+        esac
+        case "${key}" in
+            FS3_PORT|FS3_BIND|FS3_DATA|FS3_REQUIRE_AUTH|FS3_ACCESS_KEY|\
+            FS3_SECRET_KEY|FS3_GC_INTERVAL|FS3_GC_MAX_AGE)
+                eval "${key}=\${val}" ;;
+        esac
+    done < "${CONF_FILE}"
+}
+
+# Abort a start with a message the user can actually find: the package
+# log, and the DSM UI via SYNOPKG_TEMP_LOGFILE.
+fail_start() {
+    echo "fs3: $1" >> "${LOG_FILE}"
+    if [ -n "${SYNOPKG_TEMP_LOGFILE}" ]; then
+        echo "$1" > "${SYNOPKG_TEMP_LOGFILE}"
+    fi
+    exit 1
+}
+
+# mkdir -p succeeding is not proof of writability: the data folder may
+# exist but be unwritable by the package user (typical when it points at
+# a shared folder whose permissions weren't granted). Probe before
+# launching so the failure is a readable message, not a crash loop.
+preflight_data_dir() {
+    mkdir -p "${FS3_DATA}" 2>/dev/null
+    probe="${FS3_DATA}/.fs3-write-probe.$$"
+    if ! ( : > "${probe}" ) 2>/dev/null; then
+        fail_start "cannot write to data folder '${FS3_DATA}' as user '$(id -un 2>/dev/null || echo unknown)'. Grant this user write access in DSM (Control Panel > Shared Folder > Edit > Permissions), or point FS3_DATA in ${CONF_FILE} at a folder the package owns (e.g. ${VAR_DIR}/data)."
+    fi
+    rm -f "${probe}"
+}
+
+start_daemon() {
+    mkdir -p "${VAR_DIR}"
+    preflight_data_dir
+
+    set -- -a "${FS3_BIND}" -p "${FS3_PORT}" -d "${FS3_DATA}" \
+           --mpu-gc-interval "${FS3_GC_INTERVAL}" \
+           --mpu-gc-max-age "${FS3_GC_MAX_AGE}"
+
+    if [ "${FS3_REQUIRE_AUTH}" = "1" ]; then
+        # Credentials live in a 0600 file, passed via --credentials-file
+        # so the secret never appears on the command line (visible in ps).
+        # Migrate from an old-format conf that still carries the keys.
+        if [ ! -f "${CRED_FILE}" ] && [ -n "${FS3_ACCESS_KEY}" ]; then
+            umask 077
+            printf '%s:%s\n' "${FS3_ACCESS_KEY}" "${FS3_SECRET_KEY}" > "${CRED_FILE}"
+        fi
+        if [ ! -f "${CRED_FILE}" ]; then
+            fail_start "authentication is enabled (FS3_REQUIRE_AUTH=1) but ${CRED_FILE} does not exist. Create it with one access_key:secret_key per line, or set FS3_REQUIRE_AUTH=0 in ${CONF_FILE}."
+        fi
+        chmod 600 "${CRED_FILE}" 2>/dev/null
+        set -- "$@" --credentials-file "${CRED_FILE}" --require-auth
+    fi
+
+    # Launch in background, record PID. fs3 logs to stderr; redirect to file.
+    "${BIN}" "$@" >> "${LOG_FILE}" 2>&1 &
+    echo $! > "${PID_FILE}"
+}
+
+stop_daemon() {
+    if [ -f "${PID_FILE}" ]; then
+        PID="$(cat "${PID_FILE}")"
+        if [ -n "${PID}" ] && kill -0 "${PID}" 2>/dev/null; then
+            kill "${PID}" 2>/dev/null
+            # Wait up to 10s for graceful shutdown.
+            i=0
+            while [ $i -lt 10 ] && kill -0 "${PID}" 2>/dev/null; do
+                sleep 1
+                i=$((i + 1))
+            done
+            kill -9 "${PID}" 2>/dev/null
+        fi
+        rm -f "${PID_FILE}"
+    fi
+}
+
+daemon_status() {
+    if [ -f "${PID_FILE}" ]; then
+        PID="$(cat "${PID_FILE}")"
+        if [ -n "${PID}" ] && kill -0 "${PID}" 2>/dev/null; then
+            return 0
+        fi
+    fi
+    return 1
+}
+
+load_conf
+
+case "$1" in
+    start)
+        if daemon_status; then
+            exit 0
+        fi
+        start_daemon
+        exit 0
+        ;;
+    stop)
+        stop_daemon
+        exit 0
+        ;;
+    status)
+        if daemon_status; then
+            exit 0
+        else
+            # DSM convention: 3 = stopped/not running.
+            exit 3
+        fi
+        ;;
+    log)
+        echo "${LOG_FILE}"
+        exit 0
+        ;;
+    *)
+        echo "usage: $0 {start|stop|status|log}"
+        exit 1
+        ;;
+esac

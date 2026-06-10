@@ -1,0 +1,89 @@
+[
+  {
+    "step_title": "fs3 Object Storage — configuration",
+    "items": [
+      {
+        "type": "textfield",
+        "desc": "Port for the S3 endpoint",
+        "subitems": [
+          {
+            "key": "wizard_fs3_port",
+            "desc": "Port",
+            "defaultValue": "9000",
+            "validator": {
+              "allowBlank": false,
+              "regex": {
+                "expr": "/^[0-9]{2,5}$/",
+                "errorText": "Enter a valid port number (e.g. 9000)."
+              }
+            }
+          }
+        ]
+      },
+      {
+        "type": "textfield",
+        "desc": "Folder where objects are stored. The default lives inside the package's own area and works without extra setup. If you point this at a shared folder instead (e.g. /volume1/fs3-data), you must grant the fs3 package user write access to it in DSM: Control Panel > Shared Folder > Edit > Permissions.",
+        "subitems": [
+          {
+            "key": "wizard_fs3_data",
+            "desc": "Data folder",
+            "defaultValue": "/var/packages/fs3/var/data",
+            "validator": {
+              "allowBlank": false,
+              "regex": {
+                "expr": "/^\\/.+/",
+                "errorText": "Enter an absolute path beginning with /."
+              }
+            }
+          }
+        ]
+      },
+      {
+        "type": "singleselect",
+        "desc": "Expose fs3 directly on the network over plain HTTP? If disabled (recommended), fs3 listens on 127.0.0.1 only, and you reach it via an HTTPS reverse-proxy entry in DSM (Control Panel > Login Portal > Advanced > Reverse Proxy, destination http://localhost:PORT). Plain HTTP sends credentials and data unencrypted — enable this only on a trusted LAN.",
+        "subitems": [
+          {
+            "key": "wizard_fs3_expose_lan",
+            "desc": "Expose on the LAN (plain HTTP)",
+            "defaultValue": false
+          }
+        ]
+      },
+      {
+        "type": "singleselect",
+        "desc": "Require SigV4 authentication? If enabled, clients must present the access key and secret below. If disabled, anyone who can reach the port has full access.",
+        "subitems": [
+          {
+            "key": "wizard_fs3_enable_auth",
+            "desc": "Require authentication",
+            "defaultValue": false
+          }
+        ]
+      },
+      {
+        "type": "textfield",
+        "desc": "Access key (only used if authentication is enabled). Looks like AKIA...; you choose the value.",
+        "subitems": [
+          {
+            "key": "wizard_fs3_access_key",
+            "desc": "Access key",
+            "defaultValue": "",
+            "validator": { "allowBlank": true }
+          }
+        ]
+      },
+      {
+        "type": "password",
+        "desc": "Secret key (only used if authentication is enabled). Use a long random string.",
+        "subitems": [
+          {
+            "key": "wizard_fs3_secret_key",
+            "desc": "Secret key",
+            "defaultValue": "",
+            "validator": { "allowBlank": true }
+          }
+        ]
+      }
+    ]
+  }
+]

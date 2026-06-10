@@ -1,0 +1,7 @@
+#!/bin/sh
+# postuninst — runs after package removal.
+# We intentionally do NOT delete user data: it may live on a share the
+# user cares about. Only remove our pid/log/conf scaffolding.
+VAR_DIR="${SYNOPKG_PKGVAR:-/var/packages/fs3/var}"
+rm -f "${VAR_DIR}/fs3.pid" "${VAR_DIR}/fs3.log"
+exit 0

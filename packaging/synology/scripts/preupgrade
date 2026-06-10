@@ -1,0 +1,4 @@
+#!/bin/sh
+# preupgrade — runs before an upgrade replaces files.
+# The conf file lives in VAR which survives upgrade, so nothing to save.
+exit 0

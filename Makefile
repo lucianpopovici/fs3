@@ -51,6 +51,14 @@ all: fs3
 fs3: $(OBJS)
 	$(CC) $(OBJS) -o $@ $(LDFLAGS)
 
+# Statically-linked-libcrypto build for portable deployment (e.g. the
+# Synology SPK). glibc stays dynamic — DSM provides a recent glibc, and
+# fully-static glibc has NSS/DNS pitfalls. Only libcrypto is pinned in,
+# which is the one ABI that varies across DSM versions.
+fs3-static: $(OBJS)
+	$(CC) $(OBJS) -o $@ -Wl,-Bstatic -l:libcrypto.a -Wl,-Bdynamic -lpthread -ldl
+	strip $@
+
 # Our code: strict warnings
 src/%.o: src/%.c
 	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@

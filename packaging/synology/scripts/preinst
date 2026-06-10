@@ -1,0 +1,3 @@
+#!/bin/sh
+# preinst — runs before package files are extracted. Nothing to do.
+exit 0

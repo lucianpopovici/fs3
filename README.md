@@ -223,6 +223,63 @@ clock → RequestTimeTooSkewed, malformed Authorization → AccessDenied.
 All eight targets pass under both release (`-O2`) and DEBUG (ASan +
 UBSan) builds with zero warnings, leaks, or sanitizer findings.
 
+## Synology deployment
+
+fs3 ships as a Synology SPK (see `packaging/synology/`; build with
+`make fs3-static && cd packaging/synology && ./build-spk.sh`). The
+package runs fs3 as a dedicated DSM package user and stores its config
+in `/var/packages/fs3/var/fs3.conf` (parsed `KEY=value` lines — the file
+is data, never sourced as shell). SigV4 credentials live separately in
+`/var/packages/fs3/var/credentials` (mode 0600, one
+`access_key:secret_key` per line — the format `--credentials-file`
+expects), so the secret never appears in the conf or on the command
+line.
+
+### HTTPS via the DSM reverse proxy
+
+fs3 speaks plain HTTP only. SigV4 authenticates requests but does not
+encrypt them — credentials in the `Authorization` header and object
+payloads travel in the clear. The supported HTTPS setup is to put DSM's
+built-in reverse proxy (which manages real certificates, including
+Let's Encrypt) in front:
+
+```
+client --HTTPS--> DSM nginx (TLS termination) --HTTP--> fs3 on 127.0.0.1:9000
+```
+
+The SPK binds fs3 to `127.0.0.1` by default, so the proxy is the only
+public face and no plaintext port is exposed. To set it up:
+
+1. DSM Control Panel → Login Portal → Advanced → Reverse Proxy →
+   Create.
+2. Source: protocol HTTPS, your hostname (e.g. `s3.nas.example.com`),
+   port 443 (or a dedicated port). Destination: protocol HTTP, hostname
+   `localhost`, port 9000 (or whatever you chose at install).
+3. Point clients at `https://s3.nas.example.com` instead of
+   `http://NAS-IP:9000`.
+
+**SigV4 host-header caveat:** clients sign the `Host` header they
+connect to. The proxy must forward the original `Host` to fs3
+(nginx's `proxy_set_header Host $host`), or signature verification
+fails with `SignatureDoesNotMatch`. DSM's reverse proxy preserves the
+original Host header by default; if signed requests fail through the
+proxy but work directly, this is the first thing to check.
+
+To skip the proxy and expose plain HTTP on the LAN instead, either
+tick "Expose on the LAN" in the install wizard or set
+`FS3_BIND=0.0.0.0` in `fs3.conf` and restart the package. Only do this
+on a network where you trust every host.
+
+### Data folder permissions
+
+By default objects are stored under `/var/packages/fs3/var/data`, which
+the package user owns by construction. If you point the data folder at
+a shared folder (e.g. `/volume1/fs3-data`), DSM does **not**
+automatically grant the package user access: give it write permission
+via Control Panel → Shared Folder → Edit → Permissions. The package
+probes writability before starting and reports a clear error in the
+DSM UI if it can't write, rather than crash-looping.
+
 ## What's next
 
 The natural next pieces, in rough order:

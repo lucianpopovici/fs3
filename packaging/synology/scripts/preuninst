@@ -1,0 +1,3 @@
+#!/bin/sh
+# preuninst — runs before package removal.
+exit 0
