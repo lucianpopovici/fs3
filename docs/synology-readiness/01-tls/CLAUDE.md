@@ -1,23 +1,27 @@
 # CLAUDE.md — TLS / encryption in transit
 
-> **STATUS: done via Option A; key facts verified on hardware
-> (2026-06-10, DS1515+ / DSM 7.1).** Confirmed on the real box:
-> the SPK binds 127.0.0.1 and port 9000 is unreachable from the LAN;
-> and the host-header trap below resolves favorably — DSM's global
-> `/etc/nginx/proxy.conf` (included by every reverse-proxy vhost) sets
-> `proxy_set_header Host $http_host;`, so the original Host reaches fs3
-> and SigV4 verifies through the proxy. Remaining: actually creating
-> the reverse-proxy entry is a DSM-UI step (the
-> SYNO.Core.AppPortal.ReverseProxy API rejected scripted `create` with
-> undocumented validation errors 4152/4155) and an end-to-end HTTPS
-> round-trip through it.
-> SPK default bind is now `127.0.0.1` (`start-stop-status` defaults +
-> `postinst`); the wizard offers an explicit "Expose on the LAN (plain
-> HTTP)" opt-out that sets `FS3_BIND=0.0.0.0`. The README ("Synology
-> deployment" section) and the DSM tile (`ui/index.cgi`) document the
-> reverse-proxy setup and the SigV4 host-header trap. Still to verify
-> on real DSM: that DSM's generated proxy config preserves the original
-> Host header so signed requests validate end-to-end.
+> **STATUS: DONE via Option A, VERIFIED END-TO-END ON HARDWARE
+> (2026-06-10, DS1515+ / DSM 7.1).** The SPK binds `127.0.0.1` (LAN
+> can't reach port 9000; wizard offers an explicit plain-HTTP opt-out);
+> README and DSM tile document the proxy setup. Verified through a real
+> DSM reverse-proxy entry (HTTPS `s3.beci.local:8443` →
+> `http://localhost:9000`): SigV4-signed mkbucket / PUT / GET / list /
+> DELETE all verify through the proxy, plaintext on the TLS port is
+> rejected, unauthenticated requests still 403. The host-header trap
+> resolves favorably — DSM's `/etc/nginx/proxy.conf` sets
+> `proxy_set_header Host $http_host;`, so the original Host reaches fs3.
+>
+> Operational notes from the verification: (1) creating the entry is a
+> DSM-UI step — the SYNO.Core.AppPortal.ReverseProxy API rejects
+> scripted `create` with undocumented errors 4152/4155; (2) the entry
+> routes by exact SNI/Host, so clients must resolve the chosen hostname
+> and sign for it; (3) DSM serves its default self-signed Synology cert
+> until a real one is assigned (Control Panel → Security →
+> Certificate), so clients need `--no-verify-ssl` or the cert pinned;
+> (4) if Nginx Proxy Manager runs in Docker on the same NAS, it cannot
+> reach fs3's 127.0.0.1 bind from a bridge network (and it owned 9443
+> here) — use DSM's own reverse proxy for fs3, or rebind fs3 to the
+> docker bridge gateway.
 
 **Problem:** fs3 speaks plaintext HTTP only. SigV4 authenticates a
 request (proves the sender holds the secret key and the body wasn't
