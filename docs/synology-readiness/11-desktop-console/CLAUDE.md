@@ -1,6 +1,7 @@
 # CLAUDE.md — desktop console / DSM tile
 
-> **STATUS: DONE (2026-06-11), DSM hardware check pending.** Took the
+> **STATUS: DONE and HARDWARE-VERIFIED (2026-06-11, DS1515+ /
+> DSM 7.1).** Took the
 > middle path between "richer read-only" and "full config editing":
 > the tile now shows live state and manages credentials, nothing else.
 >
@@ -34,8 +35,11 @@
 >   CSRF token file appeared `fs3:fs3 0600` after the tile was opened,
 >   so the credential forms are live (not the SSH-fallback text). The
 >   `/buckets` endpoint serves real data (`immich-backup 5 16545132`).
->   Still pending a manual click-through: an add/remove credential
->   POST from inside DSM.
+>   The add-credential POST was exercised for real from inside DSM:
+>   the credentials file grew by one key (atomic rewrite, still 0600),
+>   the conf flipped to `FS3_REQUIRE_AUTH=1`, and after the package
+>   restart fs3 came up with `--require-auth --credentials-file`.
+>   Unsigned requests now get 403; `/_health` stays auth-exempt.
 
 **Problem:** the DSM desktop tile (`packaging/synology/ui/`) is a static
 info page — it shows connection strings, status, and AWS CLI examples,

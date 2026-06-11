@@ -114,8 +114,8 @@ done" but survivable on a trusted LAN in the meantime.
     SPK triggers a DSM trust-level warning. Mostly unavoidable without a
     Synology developer cert; brief explains the options.
 
-11. **[11-desktop-console](11-desktop-console/CLAUDE.md)** — **DONE
-    (2026-06-11), DSM hardware check pending.** The tile is now a small
+11. **[11-desktop-console](11-desktop-console/CLAUDE.md)** — **DONE and
+    HARDWARE-VERIFIED (2026-06-11).** The tile is now a small
     admin console: live bucket stats (new `GET /buckets` on the admin
     listener, backed by `store_bucket_stats()`) and SigV4 credential
     add/remove with CSRF + Origin checks, strict key charset, atomic
