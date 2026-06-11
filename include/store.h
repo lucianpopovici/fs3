@@ -65,6 +65,17 @@ typedef struct {
 } s3_admin_stats_t;
 void     store_admin_stats(s3_store_t *s, s3_admin_stats_t *out);
 
+/* Per-bucket stats for the admin /buckets endpoint: object count and
+ * total logical (body) bytes. Walks the bucket's data shards reading
+ * one header per object — O(objects) opens, so call per scrape or
+ * page load, not per request. */
+typedef struct {
+    uint64_t objects;
+    uint64_t bytes;
+} s3_bucket_stats_t;
+s3_err_t store_bucket_stats(s3_store_t *s, s3_str_t bucket,
+                            s3_bucket_stats_t *out);
+
 /* Test seams. Tests may point these at wrappers that inject I/O failures
  * (e.g. ENOSPC after N bytes) to exercise disk-full handling without a
  * real full filesystem. Leave NULL (the default) in production: the store

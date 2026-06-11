@@ -11,8 +11,10 @@ periodic GC of abandoned multipart uploads, HTTP Range requests,
 bulk-delete (`?delete`), bucket subresources (location/versioning
 stubs), server-side object copy, ACL stubs, health + Prometheus
 metrics endpoints, disk-full/quota handling, startup crash recovery,
-request resource bounds, and SIGHUP credential rotation. ~290 explicit
-tests + 50K fuzz iterations green under both `-O2` and ASan + UBSan.
+request resource bounds, SIGHUP credential rotation, and a DSM-tile
+admin console (live bucket stats + credential management). ~340
+explicit tests + 50K fuzz iterations green under both `-O2` and
+ASan + UBSan.
 
 ## First five minutes on a fresh box
 
@@ -131,7 +133,7 @@ read time — the read path already does this.
 
 | target | language | what it exercises |
 |---|---|---|
-| `tests/test_store` | C | 27 unit tests: bucket CRUD, single PUT/GET round-trip, sendfile, listing with prefix/delimiter, persistence across `store_open`/`store_close`, multipart lifecycle, list_buckets, list_mpu_uploads (with prefix filter), mpu_gc reaping behavior |
+| `tests/test_store` | C | 28 unit tests: bucket CRUD, single PUT/GET round-trip, sendfile, listing with prefix/delimiter, persistence across `store_open`/`store_close`, multipart lifecycle, list_buckets, bucket_stats, list_mpu_uploads (with prefix filter), mpu_gc reaping behavior |
 | `tests/test_xml` | C | 25 tests of the extended XML library (escaping, parsing, security limits) |
 | `tests/test_xml_legacy` | C | one round-trip showing the original calling style still works |
 | `tests/test_xml_fuzz` | C | 50,000 random inputs through the parser, must not crash |
@@ -142,9 +144,10 @@ read time — the read path already does this.
 | `tests/test_e2e_phase9.sh` | bash + curl | 45 integration tests of Range GET (206/416), bulk delete (`?delete`), and bucket subresources (`?location`, `?versioning`) |
 | `tests/test_e2e_phase10.sh` | bash + curl | 27 integration tests of server-side object copy and `?acl` stub |
 | `tests/test_e2e_phase11.sh` | bash + curl + python | 16 integration tests of `/_health`, `--credentials-file`, `--min-free-bytes` quota |
-| `tests/test_e2e_phase12.sh` | bash + curl + python | 34 integration tests of startup recovery, `--max-body-size` (413), `--idle-timeout`, `--max-conns`, SIGHUP credential reload, and the `--metrics-port` admin listener |
+| `tests/test_e2e_phase12.sh` | bash + curl + python | 37 integration tests of startup recovery, `--max-body-size` (413), `--idle-timeout`, `--max-conns`, SIGHUP credential reload, and the `--metrics-port` admin listener (`/healthz`, `/metrics`, `/buckets`) |
+| `tests/test_ui_cgi.sh` | bash | 45 tests of the DSM-tile admin console CGI driven against a scratch var dir: conf parsing without sourcing, HTML escaping, CSRF token + Origin checks, credential add/replace/remove with validation and the last-key lockout guard, SIGHUP delivery, live bucket stats via a real admin listener |
 
-All eight targets pass under both `-O2` and DEBUG (ASan + UBSan).
+All targets pass under both `-O2` and DEBUG (ASan + UBSan).
 
 `make test` runs everything sequentially; each suite is also runnable
 standalone. The auth suite is the slowest (~30s; chunked SigV4 tests

@@ -257,9 +257,18 @@ dcount=$(echo "$scrape" | grep '^fs3_request_duration_seconds_count' | awk '{pri
     { FAIL=$((FAIL+1)); printf '\nFAIL: duration count=%s, want >=3\n' "$dcount"; }
 printf '.'
 
+# Admin /buckets: one "name objects bytes" line per bucket. p12metrics
+# holds exactly the 5000-byte object uploaded above.
+bline=$(curl -s "$MURL/buckets" | grep '^p12metrics ')
+check_eq "/buckets stats line" "$bline" "p12metrics 1 5000"
+nlines=$(curl -s "$MURL/buckets" | wc -l | tr -d ' ')
+check_eq "/buckets lists every bucket" "$nlines" "$nb"
+
 # The S3 namespace stays clean: /metrics there is just a missing bucket.
 code=$(curl -s "$URL/metrics" -o /dev/null -w "%{http_code}")
 check_eq "S3 port does not serve /metrics" "$code" "404"
+code=$(curl -s "$URL/buckets" -o /dev/null -w "%{http_code}")
+check_eq "S3 port does not serve /buckets" "$code" "404"
 stop_server
 
 # /_health works without credentials even when auth is required.

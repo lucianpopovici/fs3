@@ -123,6 +123,33 @@ static void admin_respond(int fd, const char *status, const char *ctype,
     if (blen) (void)!write(fd, body, blen);
 }
 
+/* Render bucket stats as plain text, one bucket per line:
+ *   <name> <objects> <bytes>\n
+ * Easy to consume from shell (the DSM tile's CGI) and from scripts.
+ * Returns bytes written, or -1 if cap was too small. */
+static int admin_render_buckets(struct s3_store *store,
+                                char *buf, size_t cap) {
+    s3_bucket_info_t *list = NULL;
+    size_t n = 0;
+    if (store_list_buckets(store, &list, &n) != S3_OK) return -1;
+
+    size_t off = 0;
+    int rc = 0;
+    for (size_t i = 0; i < n; i++) {
+        s3_bucket_stats_t bs;
+        s3_str_t name = { list[i].name, strlen(list[i].name) };
+        if (store_bucket_stats(store, name, &bs) != S3_OK) continue;
+        int w = snprintf(buf + off, cap - off, "%s %llu %llu\n",
+                         list[i].name,
+                         (unsigned long long)bs.objects,
+                         (unsigned long long)bs.bytes);
+        if (w < 0 || (size_t)w >= cap - off) { rc = -1; break; }
+        off += (size_t)w;
+    }
+    store_buckets_free(list, n);
+    return rc < 0 ? -1 : (int)off;
+}
+
 static void admin_handle(server_t *s) {
     for (;;) {
         int fd = accept4(s->admin_fd, NULL, NULL, SOCK_CLOEXEC);
@@ -142,6 +169,16 @@ static void admin_handle(server_t *s) {
         if (strncmp(req, "GET /healthz", 12) == 0
             || strncmp(req, "HEAD /healthz", 13) == 0) {
             admin_respond(fd, "200 OK", "text/plain", "ok\n", 3);
+        } else if (strncmp(req, "GET /buckets", 12) == 0) {
+            static char body[64 * 1024];
+            int blen = admin_render_buckets(s->store, body, sizeof(body));
+            if (blen < 0) {
+                admin_respond(fd, "500 Internal Server Error",
+                              "text/plain", "render overflow\n", 16);
+            } else {
+                admin_respond(fd, "200 OK", "text/plain",
+                              body, (size_t)blen);
+            }
         } else if (strncmp(req, "GET /metrics", 12) == 0) {
             static char body[32 * 1024];
             int blen = metrics_render(&s->metrics, s->store,

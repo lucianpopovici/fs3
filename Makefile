@@ -100,6 +100,8 @@ test: $(TEST_BINS) fs3
 	@./tests/test_e2e_phase11.sh
 	@echo "=== test_e2e_phase12 (recovery / body cap / idle timeout / conn cap) ==="
 	@./tests/test_e2e_phase12.sh
+	@echo "=== test_ui_cgi (DSM tile admin console) ==="
+	@./tests/test_ui_cgi.sh
 
 tests/test_store: tests/test_store.c src/store_fs.o src/log.o
 	$(CC) $(CFLAGS) $(INCLUDES) tests/test_store.c \
