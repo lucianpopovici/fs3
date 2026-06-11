@@ -29,9 +29,13 @@
 >   stats round-trip), `t_bucket_stats` in `tests/test_store.c`, and
 >   `/buckets` coverage in `tests/test_e2e_phase12.sh`. Green under
 >   `-O2` and ASan+UBSan.
-> - Still to verify on the DS1515+: the DSM CGI user can actually
->   write `${VAR_DIR}` (the page degrades to SSH instructions if not),
->   and the tile renders/POSTs correctly inside DSM's iframe.
+> - Hardware check (2026-06-11, DS1515+ / DSM 7.1, v0.9.0): the CGI
+>   runs as the `fs3` package user and CAN write `${VAR_DIR}` — the
+>   CSRF token file appeared `fs3:fs3 0600` after the tile was opened,
+>   so the credential forms are live (not the SSH-fallback text). The
+>   `/buckets` endpoint serves real data (`immich-backup 5 16545132`).
+>   Still pending a manual click-through: an add/remove credential
+>   POST from inside DSM.
 
 **Problem:** the DSM desktop tile (`packaging/synology/ui/`) is a static
 info page — it shows connection strings, status, and AWS CLI examples,
