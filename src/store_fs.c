@@ -455,6 +455,8 @@ static int dir_has_files(const char *path) {
     return found;
 }
 
+static int rm_rf(const char *path);   /* defined with the MPU helpers */
+
 /* Recursively rmdir a tree of empty directories. */
 static int rmdir_tree(const char *path) {
     DIR *d = opendir(path);
@@ -482,6 +484,15 @@ s3_err_t store_bucket_delete(s3_store_t *s, s3_str_t name) {
     char dp[4096];
     snprintf(dp, sizeof(dp), "%s/" S3_STR_FMT, s->data_dir, S3_STR_ARG(name));
     if (dir_has_files(dp)) return S3_ERR_BUCKET_NOT_EMPTY;
+
+    /* Drop any in-flight multipart uploads first. Left behind, they could
+     * be completed into a later bucket of the same name. */
+    char mp[4096];
+    snprintf(mp, sizeof(mp), "%s/" S3_STR_FMT, s->mpu_dir, S3_STR_ARG(name));
+    if (rm_rf(mp) < 0) {
+        LOG_W("bucket_delete rm_rf %s: %s", mp, strerror(errno));
+        return S3_ERR_INTERNAL;
+    }
 
     /* Remove empty subtree under data/<bucket>/, then bucket marker dir. */
     rmdir_tree(dp);
@@ -654,6 +665,14 @@ s3_err_t store_put_commit(s3_writer_t *w, s3_obj_meta_t *meta_out) {
     /* Compute final path. */
     s3_str_t bucket = { w->bucket_dup, strlen(w->bucket_dup) };
     s3_str_t key    = { w->key_dup,    w->hdr.key_len };
+
+    /* The body streamed across many event-loop turns; the bucket may have
+     * been deleted meanwhile (bucket_delete can't see tmp/ writes). Without
+     * this re-check, mkdir_p below would resurrect data/<bucket>/ and the
+     * object would reappear if the bucket name is ever recreated. */
+    if (!store_bucket_exists(w->store, bucket)) {
+        writer_free(w); return S3_ERR_NO_SUCH_BUCKET;
+    }
     char hex[65];
     hash_bucket_key(bucket, key, hex);
 
@@ -1524,7 +1543,10 @@ s3_err_t store_mpu_part_commit(s3_writer_t *w, char etag_hex_out[33]) {
     }
     close(w->fd); w->fd = -1;
     if (rename(w->tmp_path, w->final_path) < 0) {
-        s3_err_t e = map_io_err(errno);
+        /* ENOENT: the upload dir vanished mid-stream (abort, GC, or
+         * bucket delete ran while this part was uploading). */
+        s3_err_t e = errno == ENOENT ? S3_ERR_NO_SUCH_UPLOAD
+                                     : map_io_err(errno);
         writer_free(w); return e;
     }
     w->tmp_path[0] = '\0';  /* don't unlink the live file in writer_free */

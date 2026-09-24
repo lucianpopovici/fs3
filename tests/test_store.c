@@ -179,6 +179,91 @@ static void t_bucket_delete(void) {
     teardown_root();
 }
 
+/* Race: bucket deleted while a PUT is still streaming into tmp/. The
+ * commit must fail rather than resurrect data/<bucket>/, and the object
+ * must not reappear if the bucket name is recreated. */
+static void t_put_commit_after_bucket_delete(void) {
+    setup_root();
+    s3_store_t *s;
+    store_open(&s, g_root);
+    s3_str_t b = S3_STR_LIT("racy");
+    store_bucket_create(s, b);
+
+    s3_writer_t *w = NULL;
+    CHECK_EQ(store_put_begin(s, b, S3_STR_LIT("k"), "text/plain", &w),
+             S3_OK, "race put: begin");
+    CHECK_EQ(store_put_write(w, "ghost", 5), S3_OK, "race put: write");
+    CHECK_EQ(store_bucket_delete(s, b), S3_OK,
+             "race put: delete succeeds with PUT in flight");
+    CHECK_EQ(store_put_commit(w, NULL), S3_ERR_NO_SUCH_BUCKET,
+             "race put: commit -> NoSuchBucket");
+
+    char dp[512];
+    snprintf(dp, sizeof(dp), "%s/data/racy", g_root);
+    struct stat st;
+    CHECK(stat(dp, &st) < 0 && errno == ENOENT,
+          "race put: data/<bucket> not resurrected");
+
+    CHECK_EQ(store_bucket_create(s, b), S3_OK, "race put: recreate");
+    s3_obj_meta_t m;
+    CHECK_EQ(store_head(s, b, S3_STR_LIT("k"), &m), S3_ERR_NO_SUCH_KEY,
+             "race put: no ghost object in recreated bucket");
+
+    store_close(s);
+    teardown_root();
+}
+
+/* Bucket delete must drop in-flight multipart uploads, so an old upload
+ * can't be completed into a recreated bucket of the same name. */
+static void t_mpu_after_bucket_delete(void) {
+    setup_root();
+    s3_store_t *s;
+    store_open(&s, g_root);
+    s3_str_t b = S3_STR_LIT("racy");
+    s3_str_t k = S3_STR_LIT("k");
+    store_bucket_create(s, b);
+
+    char upload_id[33];
+    CHECK_EQ(store_mpu_create(s, b, k, NULL, upload_id), S3_OK,
+             "race mpu: create");
+    s3_part_ref_t part = { .part_number = 1 };
+    s3_writer_t *w = NULL;
+    store_mpu_part_begin(s, b, k, upload_id, 1, &w);
+    store_mpu_part_write(w, "p1", 2);
+    CHECK_EQ(store_mpu_part_commit(w, part.etag_hex), S3_OK,
+             "race mpu: part 1 commit");
+
+    /* Part 2 is mid-stream when the bucket goes away. */
+    w = NULL;
+    CHECK_EQ(store_mpu_part_begin(s, b, k, upload_id, 2, &w), S3_OK,
+             "race mpu: part 2 begin");
+    store_mpu_part_write(w, "p2", 2);
+
+    CHECK_EQ(store_bucket_delete(s, b), S3_OK,
+             "race mpu: delete with upload in flight");
+    char mp[512];
+    snprintf(mp, sizeof(mp), "%s/mpu/racy", g_root);
+    struct stat st;
+    CHECK(stat(mp, &st) < 0 && errno == ENOENT,
+          "race mpu: mpu/<bucket> removed");
+
+    char etag[33];
+    CHECK_EQ(store_mpu_part_commit(w, etag), S3_ERR_NO_SUCH_UPLOAD,
+             "race mpu: in-flight part commit -> NoSuchUpload");
+
+    CHECK_EQ(store_bucket_create(s, b), S3_OK, "race mpu: recreate");
+    char cetag[40];
+    CHECK_EQ(store_mpu_complete(s, b, k, upload_id, &part, 1, cetag, NULL),
+             S3_ERR_NO_SUCH_UPLOAD,
+             "race mpu: old upload can't complete into recreated bucket");
+    s3_obj_meta_t m;
+    CHECK_EQ(store_head(s, b, k, &m), S3_ERR_NO_SUCH_KEY,
+             "race mpu: no ghost object");
+
+    store_close(s);
+    teardown_root();
+}
+
 static void t_put_get_simple(void) {
     setup_root();
     s3_store_t *s;
@@ -1184,6 +1269,8 @@ int main(void) {
     t_open_close();
     t_bucket_create_validate();
     t_bucket_delete();
+    t_put_commit_after_bucket_delete();
+    t_mpu_after_bucket_delete();
     t_put_get_simple();
     t_put_overwrite();
     t_put_streaming();
