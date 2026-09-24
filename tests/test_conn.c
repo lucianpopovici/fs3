@@ -68,7 +68,7 @@ static s3_store_t *setup_store(void) {
     assert(r != NULL);
     s3_store_t *s = NULL;
     assert(store_open(&s, g_root) == S3_OK);
-    assert(store_bucket_create(s, S3_STR_LIT("bkt"), "") == S3_OK);
+    assert(store_bucket_create(s, S3_STR_LIT("bkt")) == S3_OK);
     return s;
 }
 
@@ -128,7 +128,7 @@ static void t_read_budget_yields(void) {
     const size_t body = 3 * CONN_READ_BUDGET;
     size_t total;
     int fd = pipe_with_put("big", body, &total);
-    conn_t *c = conn_create(fd, "test", s, NULL, NULL, 0, 0, 0, NULL);
+    conn_t *c = conn_create(fd, "test", s, NULL, NULL, 0, 0, NULL);
 
     CHECK_EQ(conn_on_readable(c), 0, "first event keeps conn open");
     CHECK(c->read_yielded, "first event yields at budget");
@@ -165,7 +165,7 @@ static void t_small_request_one_event(void) {
     s3_store_t *s = setup_store();
     size_t total;
     int fd = pipe_with_put("small", 1000, &total);
-    conn_t *c = conn_create(fd, "test", s, NULL, NULL, 0, 0, 0, NULL);
+    conn_t *c = conn_create(fd, "test", s, NULL, NULL, 0, 0, NULL);
 
     CHECK_EQ(conn_on_readable(c), 0, "event keeps conn open");
     CHECK(!c->read_yielded, "no yield under budget");
@@ -250,7 +250,7 @@ static void check_runs_off_loop(s3_store_t *s, iopool_t *pool,
                                 size_t req_n, const char *want_status,
                                 char *resp) {
     int fd = pipe_with(req, req_n);
-    conn_t *c = conn_create(fd, "test", s, pool, NULL, 0, 0, 0, NULL);
+    conn_t *c = conn_create(fd, "test", s, pool, NULL, 0, 0, NULL);
 
     hook_arm();
     int rc = conn_on_readable(c);
@@ -346,7 +346,7 @@ static void t_orphaned_job(void) {
     const char *req = "PUT /bkt/orphan HTTP/1.1\r\nHost: x\r\n"
                       "Content-Length: 3\r\n\r\nabc";
     int fd = pipe_with(req, strlen(req));
-    conn_t *c = conn_create(fd, "test", s, pool, NULL, 0, 0, 0, NULL);
+    conn_t *c = conn_create(fd, "test", s, pool, NULL, 0, 0, NULL);
 
     hook_arm();
     CHECK_EQ(conn_on_readable(c), 0, "orphan: readable");
@@ -373,7 +373,7 @@ static void t_pool_destroy_drains(void) {
     const char *req = "PUT /bkt/drain HTTP/1.1\r\nHost: x\r\n"
                       "Content-Length: 3\r\n\r\nxyz";
     int fd = pipe_with(req, strlen(req));
-    conn_t *c = conn_create(fd, "test", s, pool, NULL, 0, 0, 0, NULL);
+    conn_t *c = conn_create(fd, "test", s, pool, NULL, 0, 0, NULL);
     CHECK_EQ(conn_on_readable(c), 0, "drain: readable");
     CHECK_EQ(c->state, CST_WAIT_JOB, "drain: parked");
     conn_destroy(c);                          /* server shutdown order */

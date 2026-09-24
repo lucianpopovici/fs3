@@ -1,6 +1,6 @@
-/* tests/test_credfile.c — unit tests for the credentials-file v2 parser
+/* tests/test_credfile.c — unit tests for the credentials-file parser
  *
- * main.c is the security boundary for identity mode (brief 12a), so its
+ * main.c is the security boundary for per-user bucket isolation, so its
  * line/field parsing gets a dedicated harness here rather than only
  * end-to-end coverage. Compiled with -DFS3_MAIN_TESTING, which excludes
  * main()/on_signal/g_server from src/main.c (see the test-hook section
@@ -18,8 +18,8 @@
 /* Test hooks declared in main.c under FS3_MAIN_TESTING, mirroring
  * sigv4.c's SIGV4_TESTING seam. */
 int main_test_parse_and_add_cred(sigv4_verifier_t *v, const char *spec);
-int main_test_parse_cred_v2_line(sigv4_verifier_t *v, char *line);
 int main_test_load_credentials_file(sigv4_verifier_t *v, const char *path);
+int main_test_valid_identity(const char *u);
 
 static int g_pass = 0, g_fail = 0;
 
@@ -30,86 +30,109 @@ static int g_pass = 0, g_fail = 0;
 } while (0)
 
 /* ---------------------------------------------------------------- */
-/* parse_cred_v2_line — line-level                                  */
+/* parse_and_add_cred — "access_key:secret_key[:user]"              */
 /* ---------------------------------------------------------------- */
 
-static void t_v2_line_valid(void) {
+static void t_cred_no_user_defaults_to_access_key(void) {
     sigv4_verifier_t *v = sigv4_create();
-    char line[256];
-    strcpy(line, "AKIAALICE0000000001\talice\t1700000000000\tlaptop\tsecretvalue");
-    CHECK(main_test_parse_cred_v2_line(v, line) == 0, "valid v2 line accepted");
+    CHECK(main_test_parse_and_add_cred(v, "AKIAALICE0000000001:secretvalue") == 0,
+          "ak:sk with no user accepted");
     sigv4_destroy(v);
 }
 
-static void t_v2_line_admin_empty_owner(void) {
+static void t_cred_with_explicit_user(void) {
     sigv4_verifier_t *v = sigv4_create();
-    char line[256];
-    strcpy(line, "AKIAADMIN000000000A\t\t1700000000000\tinstall\tsecretvalue");
-    CHECK(main_test_parse_cred_v2_line(v, line) == 0, "empty-owner v2 line accepted");
+    CHECK(main_test_parse_and_add_cred(v, "AKIAALICE0000000001:secretvalue:alice") == 0,
+          "ak:sk:user accepted");
     sigv4_destroy(v);
 }
 
-static void t_v2_line_secret_with_colon_preserved(void) {
-    /* ':' is not a safe separator for v2 (that's why it's tab-separated
-     * with the secret last) — a colon in the secret must parse fine. */
+static void t_cred_no_colon_rejected(void) {
     sigv4_verifier_t *v = sigv4_create();
-    char line[256];
-    strcpy(line, "AKIAALICE0000000001\talice\t1700000000000\tlaptop\tsecret:with:colons");
-    CHECK(main_test_parse_cred_v2_line(v, line) == 0,
-          "secret containing ':' accepted");
+    CHECK(main_test_parse_and_add_cred(v, "AKIANOOCLON") == -1,
+          "spec with no colon rejected");
     sigv4_destroy(v);
 }
 
-static void t_v2_line_too_few_tabs_rejected(void) {
+static void t_cred_empty_secret_rejected(void) {
     sigv4_verifier_t *v = sigv4_create();
-    char line[256];
-    strcpy(line, "AKIAALICE0000000001\talice\t1700000000000\tlaptop");
-    CHECK(main_test_parse_cred_v2_line(v, line) == -1,
-          "line with only 3 tabs (missing secret) rejected");
+    CHECK(main_test_parse_and_add_cred(v, "AKIAALICE0000000001:") == -1,
+          "empty secret rejected");
     sigv4_destroy(v);
 }
 
-static void t_v2_line_bad_access_key_charset_rejected(void) {
+static void t_cred_empty_access_key_rejected(void) {
     sigv4_verifier_t *v = sigv4_create();
-    char line[256];
-    strcpy(line, "akia-lowercase-and-dash\talice\t1700000000000\tlaptop\tsecretvalue");
-    CHECK(main_test_parse_cred_v2_line(v, line) == -1,
-          "lowercase/dash access key rejected");
+    CHECK(main_test_parse_and_add_cred(v, ":secretvalue") == -1,
+          "empty access key rejected");
     sigv4_destroy(v);
 }
 
-static void t_v2_line_empty_secret_rejected(void) {
+static void t_cred_empty_user_field_rejected(void) {
+    /* "ak:sk:" — a trailing colon with nothing after it is a malformed
+     * (not merely ownerless) user field. */
     sigv4_verifier_t *v = sigv4_create();
-    char line[256];
-    strcpy(line, "AKIAALICE0000000001\talice\t1700000000000\tlaptop\t");
-    CHECK(main_test_parse_cred_v2_line(v, line) == -1, "empty secret rejected");
+    CHECK(main_test_parse_and_add_cred(v, "AKIAALICE0000000001:secretvalue:") == -1,
+          "empty user after second colon rejected");
     sigv4_destroy(v);
 }
 
-static void t_v2_line_non_numeric_created_ms_rejected(void) {
+static void t_cred_duplicate_access_key_rejected(void) {
     sigv4_verifier_t *v = sigv4_create();
-    char line[256];
-    strcpy(line, "AKIAALICE0000000001\talice\tnot-a-number\tlaptop\tsecretvalue");
-    CHECK(main_test_parse_cred_v2_line(v, line) == -1,
-          "non-numeric created_ms rejected");
+    CHECK(main_test_parse_and_add_cred(v, "AKIAALICE0000000001:secretvalue") == 0,
+          "first add succeeds");
+    CHECK(main_test_parse_and_add_cred(v, "AKIAALICE0000000001:othersecret") == -1,
+          "duplicate access key rejected");
     sigv4_destroy(v);
 }
 
-static void t_v2_line_tab_in_owner_naturally_rejected(void) {
-    /* A stray TAB meant to be part of "owner" instead splits the line
-     * one field early: what was meant as the rest of the owner lands in
-     * created_ms, which then fails its digits-only check. There is no
-     * way to escape a TAB in v2 — this is the expected failure mode. */
+/* Known format limitation, documented rather than silently assumed: a
+ * secret containing a literal ':' is split at the second colon, so any
+ * remainder after it is misparsed as a user rather than kept as part of
+ * the secret. This still returns 0 (a user field IS present, from the
+ * parser's point of view) — it is a behavior to be aware of when
+ * choosing secrets, not a parser bug to fix here. */
+static void t_cred_secret_with_colon_reinterprets_remainder_as_user(void) {
     sigv4_verifier_t *v = sigv4_create();
-    char line[256];
-    strcpy(line, "AKIAALICE0000000001\towner\twith\ttab\t1700000000000\tlabel\tsecretvalue");
-    CHECK(main_test_parse_cred_v2_line(v, line) == -1,
-          "stray TAB in intended owner field rejected");
+    CHECK(main_test_parse_and_add_cred(v, "AKIAALICE0000000001:sec:ret") == 0,
+          "secret containing ':' parses (remainder becomes the user field)");
     sigv4_destroy(v);
 }
 
 /* ---------------------------------------------------------------- */
-/* load_credentials_file — file-level, magic detection + fallback   */
+/* valid_identity                                                   */
+/* ---------------------------------------------------------------- */
+
+static void t_identity_valid(void) {
+    CHECK(main_test_valid_identity("alice") == 1, "plain name accepted");
+    CHECK(main_test_valid_identity("AKIAALICE0000000001") == 1,
+          "access-key-shaped name accepted");
+}
+
+static void t_identity_empty_rejected(void) {
+    CHECK(main_test_valid_identity("") == 0, "empty identity rejected");
+}
+
+static void t_identity_with_space_rejected(void) {
+    CHECK(main_test_valid_identity("alice smith") == 0,
+          "identity with space rejected");
+}
+
+static void t_identity_with_colon_rejected(void) {
+    CHECK(main_test_valid_identity("alice:smith") == 0,
+          "identity with ':' rejected (it's the credential-line separator)");
+}
+
+static void t_identity_too_long_rejected(void) {
+    char buf[300];
+    memset(buf, 'a', sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = '\0';
+    CHECK(main_test_valid_identity(buf) == 0,
+          "identity longer than SIGV4_USER_MAX rejected");
+}
+
+/* ---------------------------------------------------------------- */
+/* load_credentials_file                                            */
 /* ---------------------------------------------------------------- */
 
 static char g_path[256];
@@ -125,70 +148,57 @@ static void write_file(const char *content) {
 
 static void cleanup_file(void) { unlink(g_path); }
 
-static void t_v1_line_still_works(void) {
-    write_file("# comment\nAKIALEGACY00000001:secretvalue\n");
+static void t_load_file_basic(void) {
+    write_file(
+        "# comment\n"
+        "AKIAALICE0000000001:secretalice:alice\n"
+        "AKIABOB000000000001:secretbob\n"
+        "\n"
+        "AKIAADMIN000000000A:secretadmin:root\n");
     sigv4_verifier_t *v = sigv4_create();
     CHECK(main_test_load_credentials_file(v, g_path) == 0,
-          "v1 file (no v2 magic) still loads");
+          "file with 3 valid lines loads");
     sigv4_destroy(v);
     cleanup_file();
 }
 
-static void t_v2_magic_detected_and_parsed(void) {
+static void t_load_file_with_bad_line_fails_closed(void) {
     write_file(
-        "#fs3-credentials v2\n"
-        "AKIAALICE0000000001\talice\t1700000000000\tlaptop\tsecretalice\n"
-        "AKIABOB000000000001\tbob\t1700000000001\tbackup\tsecretbob\n"
-        "AKIAADMIN000000000A\t\t1700000000002\tinstall\tsecretadmin\n");
-    sigv4_verifier_t *v = sigv4_create();
-    CHECK(main_test_load_credentials_file(v, g_path) == 0,
-          "v2 file with 3 valid lines loads");
-    sigv4_destroy(v);
-    cleanup_file();
-}
-
-static void t_v2_file_with_invalid_line_fails_closed(void) {
-    write_file(
-        "#fs3-credentials v2\n"
-        "AKIAALICE0000000001\talice\t1700000000000\tlaptop\tsecretalice\n"
-        "not-a-valid-v2-line\n");
+        "AKIAALICE0000000001:secretalice:alice\n"
+        "not-a-valid-line\n");
     sigv4_verifier_t *v = sigv4_create();
     CHECK(main_test_load_credentials_file(v, g_path) != 0,
-          "v2 file with one malformed line fails the whole load");
+          "file with one malformed line fails the whole load");
     sigv4_destroy(v);
     cleanup_file();
 }
 
-static void t_near_miss_magic_falls_back_to_v1(void) {
-    /* Not an exact match for "#fs3-credentials v2" (trailing space) —
-     * must NOT be treated as v2. Since it starts with '#', v1 parsing
-     * treats it as a comment and moves on; the tab-shaped second line
-     * has no ':' for v1 to split on and so is rejected as v1, which is
-     * the correct fail-closed outcome for content that looks v2-ish but
-     * didn't hit the exact magic. */
-    write_file(
-        "#fs3-credentials v2 \n"
-        "AKIAALICE0000000001\talice\t1700000000000\tlaptop\tsecretalice\n");
+static void t_load_file_empty_fails(void) {
+    write_file("# only comments\n\n");
     sigv4_verifier_t *v = sigv4_create();
     CHECK(main_test_load_credentials_file(v, g_path) != 0,
-          "near-miss magic line falls back to v1 and rejects the tab-shaped line");
+          "file with no credential lines fails");
     sigv4_destroy(v);
     cleanup_file();
 }
 
 int main(void) {
-    t_v2_line_valid();
-    t_v2_line_admin_empty_owner();
-    t_v2_line_secret_with_colon_preserved();
-    t_v2_line_too_few_tabs_rejected();
-    t_v2_line_bad_access_key_charset_rejected();
-    t_v2_line_empty_secret_rejected();
-    t_v2_line_non_numeric_created_ms_rejected();
-    t_v2_line_tab_in_owner_naturally_rejected();
-    t_v1_line_still_works();
-    t_v2_magic_detected_and_parsed();
-    t_v2_file_with_invalid_line_fails_closed();
-    t_near_miss_magic_falls_back_to_v1();
+    t_cred_no_user_defaults_to_access_key();
+    t_cred_with_explicit_user();
+    t_cred_no_colon_rejected();
+    t_cred_empty_secret_rejected();
+    t_cred_empty_access_key_rejected();
+    t_cred_empty_user_field_rejected();
+    t_cred_duplicate_access_key_rejected();
+    t_cred_secret_with_colon_reinterprets_remainder_as_user();
+    t_identity_valid();
+    t_identity_empty_rejected();
+    t_identity_with_space_rejected();
+    t_identity_with_colon_rejected();
+    t_identity_too_long_rejected();
+    t_load_file_basic();
+    t_load_file_with_bad_line_fails_closed();
+    t_load_file_empty_fails();
 
     fprintf(stderr, "===== %d passed, %d failed =====\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;

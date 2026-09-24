@@ -283,6 +283,8 @@ static int tmp_open(const s3_store_t *s, char *out_path, size_t cap) {
  *
  * Runs from store_open, before the server accepts connections, so it
  * cannot race a live writer. */
+static int rm_rf(const char *path);
+
 static void recover_tmp_dir(const s3_store_t *s) {
     DIR *d = opendir(s->tmp_dir);
     if (!d) return;
@@ -295,7 +297,13 @@ static void recover_tmp_dir(const s3_store_t *s) {
         if (snprintf(p, sizeof(p), "%s/%s", s->tmp_dir, e->d_name)
             >= (int)sizeof(p)) continue;
         struct stat st;
-        if (stat(p, &st) == 0 && S_ISREG(st.st_mode)) bytes += (uint64_t)st.st_size;
+        if (lstat(p, &st) == 0 && S_ISDIR(st.st_mode)) {
+            /* A bucket being assembled (store_bucket_create_owned). */
+            if (rm_rf(p) == 0) n++;
+            else LOG_W("recover: rm_rf %s: %s", p, strerror(errno));
+            continue;
+        }
+        if (S_ISREG(st.st_mode)) bytes += (uint64_t)st.st_size;
         if (unlink(p) == 0) n++;
         else LOG_W("recover: unlink %s: %s", p, strerror(errno));
     }
@@ -415,67 +423,156 @@ static s3_err_t quota_check(const s3_store_t *s) {
 /* Bucket ops                                                             */
 /* ===================================================================== */
 
-/* Write (or overwrite) <bucket_dir>/owner atomically: tmp + fsync +
- * rename + fsync(dir), mirroring store_mpu_create's meta-file discipline.
- * No trailing newline. Caller holds ns_mu. Not O_EXCL: also used to
- * reassign an existing bucket's owner, where a leftover tmp file from a
- * prior crash must not block the write. */
-static s3_err_t bucket_write_owner_locked(const char *bucket_dir, const char *owner) {
-    char path[4160], tmp[4160];
-    if (snprintf(path, sizeof(path), "%s/owner", bucket_dir) >= (int)sizeof(path))
-        return S3_ERR_INTERNAL;
-    if (snprintf(tmp, sizeof(tmp), "%s/owner.tmp", bucket_dir) >= (int)sizeof(tmp))
-        return S3_ERR_INTERNAL;
+/* ---- Bucket metadata: buckets/<bucket>/meta ------------------------
+ *
+ *   id=<32 hex>       random per creation: a bucket deleted and re-created
+ *                     under the same name is a different bucket
+ *   owner=<user>      identity that owns it; empty = ownerless
+ *
+ * Buckets from before per-user isolation have no meta file: ownerless,
+ * with an empty id. */
 
-    int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+static int random_hex_id(char *out, size_t out_n);
+
+/* Write `owner`/`id` as dir/meta, atomically (tmp + fsync + rename). */
+static s3_err_t write_bucket_meta(const char *dir, const char *id,
+                                  const char *owner) {
+    char tmp[4200], final[4200];
+    snprintf(tmp, sizeof(tmp), "%s/meta.tmp", dir);
+    snprintf(final, sizeof(final), "%s/meta", dir);
+    int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
     if (fd < 0) return map_io_err(errno);
-    size_t n = strlen(owner);
-    ssize_t w = xwrite(fd, owner, n);
-    if (w < 0 || (size_t)w != n || xfsync(fd) < 0) {
-        s3_err_t e = map_io_err(errno);
-        close(fd);
-        unlink(tmp);
+    char buf[256];
+    int n = snprintf(buf, sizeof(buf), "id=%s\nowner=%s\n", id,
+                     owner ? owner : "");
+    if (n < 0 || (size_t)n >= sizeof(buf)
+        || xwrite(fd, buf, (size_t)n) != n || xfsync(fd) < 0) {
+        s3_err_t e = (n < 0 || (size_t)n >= sizeof(buf))
+                     ? S3_ERR_INTERNAL : map_io_err(errno);
+        close(fd); unlink(tmp);
         return e;
     }
     close(fd);
-    if (rename(tmp, path) < 0) {
+    if (rename(tmp, final) < 0) {
         s3_err_t e = map_io_err(errno);
         unlink(tmp);
         return e;
     }
-    fsync_dir(bucket_dir);
+    fsync_dir(dir);
     return S3_OK;
 }
 
-s3_err_t store_bucket_create(s3_store_t *s, s3_str_t name, const char *owner) {
+/* Read <bucket_dir>/meta into out (fields "" if absent). */
+static void read_bucket_meta(const char *bucket_dir, s3_bucket_meta_t *out) {
+    memset(out, 0, sizeof(*out));
+    char mp[4200];
+    snprintf(mp, sizeof(mp), "%s/meta", bucket_dir);
+    FILE *fp = fopen(mp, "re");
+    if (!fp) return;
+    char line[256];
+    while (fgets(line, sizeof(line), fp)) {
+        line[strcspn(line, "\r\n")] = '\0';
+        if (strncmp(line, "id=", 3) == 0)
+            snprintf(out->id, sizeof(out->id), "%.32s", line + 3);
+        else if (strncmp(line, "owner=", 6) == 0)
+            snprintf(out->owner, sizeof(out->owner), "%.128s", line + 6);
+    }
+    fclose(fp);
+}
+
+s3_err_t store_bucket_create(s3_store_t *s, s3_str_t name) {
+    return store_bucket_create_owned(s, name, NULL);
+}
+
+/* The bucket dir and its meta are assembled under tmp/ and renamed into
+ * buckets/ in one step, so a bucket never exists without its owner
+ * (a crash leaves only a tmp/ dir, swept at startup). */
+s3_err_t store_bucket_create_owned(s3_store_t *s, s3_str_t name,
+                                   const char *owner) {
     if (!s) return S3_ERR_INVALID_ARGUMENT;
     if (!valid_bucket_name(name)) return S3_ERR_INVALID_BUCKET_NAME;
 
     char bp[4096];
     if (bucket_path(s, name, bp, sizeof(bp)) < 0) return S3_ERR_INTERNAL;
 
+    char stage[4096], id[33];
+    snprintf(stage, sizeof(stage), "%s/bucket.XXXXXX", s->tmp_dir);
+    if (random_hex_id(id, sizeof(id)) < 0) return S3_ERR_INTERNAL;
+    if (!mkdtemp(stage)) return map_io_err(errno);
+    s3_err_t e = write_bucket_meta(stage, id, owner);
+    if (e != S3_OK) { rm_rf(stage); return e; }
+
+    /* ns_mu: the exists check and the rename are one step. rename() would
+     * also replace an *empty* dir — a pre-isolation bucket marker — so
+     * the explicit check is what keeps an existing bucket from being
+     * taken over. */
     pthread_mutex_lock(&s->ns_mu);
-    if (mkdir(bp, 0700) < 0) {
-        pthread_mutex_unlock(&s->ns_mu);
-        if (errno == EEXIST) return S3_ERR_BUCKET_ALREADY_EXISTS;
+    if (store_bucket_exists(s, name)) {
+        e = S3_ERR_BUCKET_ALREADY_EXISTS;
+    } else if (rename(stage, bp) < 0) {
         LOG_W("bucket_create %s: %s", bp, strerror(errno));
-        return S3_ERR_INTERNAL;
+        e = map_io_err(errno);
+    } else {
+        /* Pre-create the per-bucket data subtree to avoid races later. */
+        char dp[4096];
+        snprintf(dp, sizeof(dp), "%s/" S3_STR_FMT, s->data_dir,
+                 S3_STR_ARG(name));
+        (void)mkdir(dp, 0700);
     }
-    if (owner && owner[0]) {
-        s3_err_t oe = bucket_write_owner_locked(bp, owner);
-        if (oe != S3_OK) {
-            /* Never leave a half-created bucket behind. */
-            rmdir(bp);
-            pthread_mutex_unlock(&s->ns_mu);
-            return oe;
+    pthread_mutex_unlock(&s->ns_mu);
+    if (e != S3_OK) { rm_rf(stage); return e; }
+    fsync_dir(s->buckets_dir);
+    return S3_OK;
+}
+
+s3_err_t store_bucket_meta(s3_store_t *s, s3_str_t name,
+                           s3_bucket_meta_t *out) {
+    if (!s || !out) return S3_ERR_INVALID_ARGUMENT;
+    char bp[4096];
+    if (bucket_path(s, name, bp, sizeof(bp)) < 0) return S3_ERR_INTERNAL;
+    if (!store_bucket_exists(s, name)) return S3_ERR_NO_SUCH_BUCKET;
+    read_bucket_meta(bp, out);
+    return S3_OK;
+}
+
+s3_err_t store_bucket_set_owner(s3_store_t *s, s3_str_t name,
+                                const char *owner) {
+    if (!s || !owner) return S3_ERR_INVALID_ARGUMENT;
+    char bp[4096];
+    if (bucket_path(s, name, bp, sizeof(bp)) < 0) return S3_ERR_INTERNAL;
+    pthread_mutex_lock(&s->ns_mu);
+    s3_err_t e = S3_ERR_NO_SUCH_BUCKET;
+    if (store_bucket_exists(s, name)) {
+        s3_bucket_meta_t m;
+        read_bucket_meta(bp, &m);
+        /* A pre-isolation bucket gets its id now; any upload still
+         * streaming into it (captured id "") will then fail its commit
+         * rather than land in a bucket that changed hands. */
+        if (!m.id[0] && random_hex_id(m.id, sizeof(m.id)) < 0)
+            e = S3_ERR_INTERNAL;
+        else
+            e = write_bucket_meta(bp, m.id, owner);
+    }
+    pthread_mutex_unlock(&s->ns_mu);
+    return e;
+}
+
+int store_assign_legacy_owner(s3_store_t *s, const char *owner) {
+    s3_bucket_info_t *list = NULL;
+    size_t n = 0;
+    if (store_list_buckets(s, &list, &n) != S3_OK) return -1;
+    int assigned = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (list[i].owner[0]) continue;
+        s3_str_t name = { list[i].name, strlen(list[i].name) };
+        if (store_bucket_set_owner(s, name, owner) == S3_OK) {
+            assigned++;
+        } else {
+            LOG_W("legacy owner: could not assign %s", list[i].name);
         }
     }
-    /* Pre-create the per-bucket data subtree to avoid races later. */
-    char dp[4096];
-    snprintf(dp, sizeof(dp), "%s/" S3_STR_FMT, s->data_dir, S3_STR_ARG(name));
-    (void)mkdir(dp, 0700);
-    pthread_mutex_unlock(&s->ns_mu);
-    return S3_OK;
+    store_buckets_free(list, n);
+    return assigned;
 }
 
 int store_bucket_exists(s3_store_t *s, s3_str_t name) {
@@ -483,59 +580,6 @@ int store_bucket_exists(s3_store_t *s, s3_str_t name) {
     if (bucket_path(s, name, bp, sizeof(bp)) < 0) return 0;
     struct stat st;
     return stat(bp, &st) == 0 && S_ISDIR(st.st_mode);
-}
-
-s3_err_t store_bucket_owner(s3_store_t *s, s3_str_t name, char *buf, size_t cap) {
-    if (!s || !buf || cap == 0) return S3_ERR_INVALID_ARGUMENT;
-    char bp[4096], op[4160];
-    if (bucket_path(s, name, bp, sizeof(bp)) < 0) return S3_ERR_INTERNAL;
-    if (snprintf(op, sizeof(op), "%s/owner", bp) >= (int)sizeof(op))
-        return S3_ERR_INTERNAL;
-
-    FILE *fp = fopen(op, "r");
-    if (!fp) {
-        /* No owner file — legacy bucket, or one created with owner
-         * NULL/"" — reads back as admin-only, not an error. */
-        if (errno == ENOENT) { buf[0] = '\0'; return S3_OK; }
-        return S3_ERR_INTERNAL;
-    }
-    char *line = NULL;
-    size_t line_cap = 0;
-    ssize_t r = getline(&line, &line_cap, fp);
-    fclose(fp);
-    if (r <= 0) { free(line); buf[0] = '\0'; return S3_OK; }
-    if (r > 0 && line[r-1] == '\n') { line[r-1] = '\0'; r--; }
-    snprintf(buf, cap, "%s", line);
-    free(line);
-    return S3_OK;
-}
-
-s3_err_t store_bucket_set_owner(s3_store_t *s, s3_str_t name, const char *owner) {
-    if (!s) return S3_ERR_INVALID_ARGUMENT;
-    pthread_mutex_lock(&s->ns_mu);
-    if (!store_bucket_exists(s, name)) {
-        pthread_mutex_unlock(&s->ns_mu);
-        return S3_ERR_NO_SUCH_BUCKET;
-    }
-    char bp[4096];
-    if (bucket_path(s, name, bp, sizeof(bp)) < 0) {
-        pthread_mutex_unlock(&s->ns_mu);
-        return S3_ERR_INTERNAL;
-    }
-    s3_err_t e;
-    if (owner && owner[0]) {
-        e = bucket_write_owner_locked(bp, owner);
-    } else {
-        char op[4160];
-        if (snprintf(op, sizeof(op), "%s/owner", bp) >= (int)sizeof(op)) {
-            e = S3_ERR_INTERNAL;
-        } else {
-            unlink(op);
-            e = S3_OK;
-        }
-    }
-    pthread_mutex_unlock(&s->ns_mu);
-    return e;
 }
 
 /* Recursively check whether a directory tree contains any regular files. */
@@ -604,11 +648,11 @@ static s3_err_t bucket_delete_locked(s3_store_t *s, s3_str_t name) {
 
     char bp[4096];
     if (bucket_path(s, name, bp, sizeof(bp)) < 0) return S3_ERR_INTERNAL;
-    /* rmdir requires an empty marker dir; an owner file left behind would
-     * fail it with ENOTEMPTY. Fine if it doesn't exist (legacy bucket). */
-    char op[4160];
-    if (snprintf(op, sizeof(op), "%s/owner", bp) < (int)sizeof(op)) {
-        unlink(op);
+    char meta_p[4200];
+    snprintf(meta_p, sizeof(meta_p), "%s/meta", bp);
+    if (unlink(meta_p) < 0 && errno != ENOENT) {
+        LOG_W("bucket_delete unlink %s: %s", meta_p, strerror(errno));
+        return S3_ERR_INTERNAL;
     }
     if (rmdir(bp) < 0) {
         LOG_W("bucket_delete rmdir %s: %s", bp, strerror(errno));
@@ -650,6 +694,11 @@ struct s3_writer {
      * The content_type/key fields above are NOT used in this mode. */
     int         is_part;
     char        final_path[4096];    /* destination for atomic rename */
+
+    /* Bucket id at put_begin. Commit publishes only if the bucket still
+     * has this id: deleted-and-recreated (maybe by another user) is a
+     * different bucket, even under the same name. */
+    char        bucket_id[33];
 };
 
 static void writer_free(s3_writer_t *w) {
@@ -676,6 +725,13 @@ s3_err_t store_put_begin(s3_store_t *s, s3_str_t bucket, s3_str_t key,
     if (!w) return S3_ERR_INTERNAL;
     w->store = s;
     w->fd = -1;
+    {
+        s3_bucket_meta_t bm;
+        if (store_bucket_meta(s, bucket, &bm) != S3_OK) {
+            writer_free(w); return S3_ERR_NO_SUCH_BUCKET;
+        }
+        memcpy(w->bucket_id, bm.id, sizeof(w->bucket_id));
+    }
 
     w->md5_ctx = EVP_MD_CTX_new();
     if (!w->md5_ctx
@@ -798,11 +854,14 @@ s3_err_t store_put_commit(s3_writer_t *w, s3_obj_meta_t *meta_out) {
 
     /* The body streamed across many event-loop turns and this may run on
      * a worker thread; the bucket may have been deleted meanwhile
-     * (bucket_delete can't see tmp/ writes). Without this re-check under
-     * ns_mu, mkdir_p would resurrect data/<bucket>/ and the object would
-     * reappear if the bucket name is ever recreated. */
+     * (bucket_delete can't see tmp/ writes), and even re-created by
+     * another user. Without this re-check under ns_mu, mkdir_p would
+     * resurrect data/<bucket>/, or the object would land in a bucket
+     * the uploader doesn't own. */
     pthread_mutex_lock(&w->store->ns_mu);
-    if (!store_bucket_exists(w->store, bucket)) {
+    s3_bucket_meta_t bm;
+    if (store_bucket_meta(w->store, bucket, &bm) != S3_OK
+        || strcmp(bm.id, w->bucket_id) != 0) {
         pthread_mutex_unlock(&w->store->ns_mu);
         writer_free(w); return S3_ERR_NO_SUCH_BUCKET;
     }
@@ -1355,6 +1414,9 @@ s3_err_t store_list_buckets(s3_store_t *s,
             }
             arr = na; cap = nc;
         }
+        s3_bucket_meta_t bm;
+        read_bucket_meta(path, &bm);
+        memcpy(arr[n].owner, bm.owner, sizeof(arr[n].owner));
         arr[n].name = strdup(e->d_name);
         if (!arr[n].name) {
             store_buckets_free(arr, n);

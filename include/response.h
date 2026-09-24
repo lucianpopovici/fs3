@@ -84,13 +84,10 @@ int rsp_build_initiate_mpu(conn_t *c, s3_str_t bucket, s3_str_t key,
 int rsp_build_complete_mpu(conn_t *c, s3_str_t bucket, s3_str_t key,
                            const char *etag);
 
-/* Build a ListAllMyBucketsResult XML body, 200 OK. owner_id fills
- * <Owner><ID>/<DisplayName>; NULL or "" falls back to the "fs3"
- * placeholder used outside identity mode. */
+/* Build a ListAllMyBucketsResult XML body, 200 OK. */
 int rsp_build_list_all_my_buckets(conn_t *c,
                                    const s3_bucket_info_t *buckets,
-                                   size_t n_buckets,
-                                   const char *owner_id);
+                                   size_t n_buckets);
 
 /* Build a ListMultipartUploadsResult XML body, 200 OK. */
 int rsp_build_list_mpu_uploads(conn_t *c, s3_str_t bucket, s3_str_t prefix,

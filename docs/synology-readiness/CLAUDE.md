@@ -128,15 +128,18 @@ done" but survivable on a trusted LAN in the meantime.
 
 12. **[12-dsm-identity-binding](12-dsm-identity-binding/CLAUDE.md)** —
     **12a DONE (2026-09-24)**, 12b/12c NOT STARTED. Per-user S3 keys and
-    buckets: each credential/bucket has an owner, and `--identity-mode`
-    (requires `--require-auth`) authorizes every S3 request per bucket
-    owner, with admin (owner-less) keys unrestricted. New v2
-    credentials-file format (owner-scoped, tab-separated). Brings back
-    the per-bucket scoping that 04 skipped. Three sub-phases: 12a (core
-    ownership + authz, sandbox-testable) — done; 12b (management socket
-    + `fs3 ctl`) and 12c (console, needs a DS1515+ spike first) — not
-    started. The DSM tile itself is still 11's info/credential console;
-    it doesn't yet expose per-user keys or buckets (that's 12c).
+    buckets: credentials are `ak:sk[:user]`, each bucket records an
+    owner + a random id (in `buckets/<name>/meta`), and `authz_bucket()`
+    in `route.c` authorizes every S3 request per bucket owner whenever
+    auth is configured, with `--admin <user>` unrestricted and
+    `--legacy-owner <user>` for pre-existing buckets. Brings back the
+    per-bucket scoping that 04 skipped. Three sub-phases: 12a (core
+    ownership + authz, sandbox-testable) — done, landed via a different
+    implementation than the brief originally planned (see the brief's
+    status header for specifics); 12b (management socket + `fs3 ctl`)
+    and 12c (console, needs a DS1515+ spike first) — not started. The
+    DSM tile itself is still 11's info/credential console; it doesn't
+    yet expose per-user keys or buckets (that's 12c).
 
 ## Suggested sequencing
 

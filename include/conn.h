@@ -19,6 +19,7 @@
 
 #include "llhttp.h"
 #include "s3.h"
+#include "sigv4.h"
 
 #define CONN_RBUF_SZ          (16 * 1024)
 #define CONN_WBUF_SZ          (16 * 1024)
@@ -101,17 +102,10 @@ typedef struct conn {
      * present, else allow" — useful for compatibility transitions. */
     int                auth_required;
 
-    /* Identity mode (server_cfg_t.identity_mode, connection-lifetime):
-     * when set, route.c's authz() enforces bucket ownership per
-     * principal/admin below instead of allowing every authenticated
-     * request through. */
-    int                identity_mode;
-
-    /* Principal that signed the current request, copied at verify time
-     * (never a pointer into the credential list — see sigv4_verify_principal).
-     * Reset to "" / 0 between pipelined requests in request_reset. */
-    char               principal[128];
-    int                principal_admin;
+    /* Who signed the current request (set on successful SigV4 verify,
+     * cleared per request). id.user[0] == '\0' means anonymous. Used by
+     * route.c to enforce bucket ownership whenever `auth` is set. */
+    sigv4_id_t         id;
 
     /* Request body ceiling (0 = unlimited). Checked against the declared
      * Content-Length at headers-complete and against the running byte
@@ -244,7 +238,6 @@ typedef struct conn {
 conn_t *conn_create(int fd, const char *peer, struct s3_store *store,
                     struct iopool *pool,
                     struct sigv4_verifier *auth, int auth_required,
-                    int identity_mode,
                     uint64_t max_body_bytes, struct fs3_metrics *metrics);
 void    conn_destroy(conn_t *c);
 

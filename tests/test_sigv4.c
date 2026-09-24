@@ -490,12 +490,12 @@ static void t_verify_delete(void) {
 }
 
 /* ---------------------------------------------------------------- */
-/* Principal capture (brief 12a)                                    */
+/* Identity capture (per-user bucket isolation)                     */
 /* ---------------------------------------------------------------- */
 
-/* Shared header set for the principal tests: the same AWS worked
+/* Shared header set for the identity tests: the same AWS worked
  * example as t_verify_aws_s3_get_example, whose signature depends only
- * on the access key + secret, not on the owner bound to that key. */
+ * on the access key + secret, not on the user bound to that key. */
 static void set_aws_s3_get_example_headers(conn_t *c) {
     c->req.method = (s3_str_t){ "GET", 3 };
     c->req.path   = (s3_str_t){ "/test.txt", 9 };
@@ -513,49 +513,49 @@ static void set_aws_s3_get_example_headers(conn_t *c) {
     c->req.n_headers = 4;
 }
 
-static void t_verify_principal_owned(void) {
+static void t_verify_id_user_captured(void) {
     sigv4_verifier_t *v = sigv4_create();
-    sigv4_add_cred_owned(v, "AKIAIOSFODNN7EXAMPLE",
-                            "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY", "alice");
+    sigv4_add_cred_user(v, "AKIAIOSFODNN7EXAMPLE",
+                           "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY", "alice");
     sigv4_set_clock(v, 1369353600);
 
     conn_t c = {0};
     set_aws_s3_get_example_headers(&c);
 
-    char owner[128] = {0};
-    int is_admin = -1;
-    s3_err_t e = sigv4_verify_principal(v, &c, owner, sizeof(owner), &is_admin);
-    CHECK(e == S3_OK, "owned cred verifies");
-    CHECK_EQ_STR(owner, (int)strlen(owner), "alice", "principal copied out");
-    CHECK(is_admin == 0, "owned cred is not admin");
+    sigv4_id_t id = {0};
+    id.is_admin = -1;
+    s3_err_t e = sigv4_verify_id(v, &c, &id);
+    CHECK(e == S3_OK, "cred with explicit user verifies");
+    CHECK_EQ_STR(id.user, (int)strlen(id.user), "alice", "user copied out");
+    CHECK(id.is_admin == 0, "not registered as admin");
     sigv4_destroy(v);
 }
 
-static void t_verify_principal_admin_when_no_owner(void) {
+static void t_verify_id_defaults_to_access_key_and_admin_flag(void) {
     sigv4_verifier_t *v = sigv4_create();
-    /* Plain sigv4_add_cred (v1-style, no owner) — same key/secret as
-     * above, so the same request signature verifies. */
+    /* No user given — defaults to the access key — which is then
+     * registered as an admin. */
     sigv4_add_cred(v, "AKIAIOSFODNN7EXAMPLE",
                       "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY");
+    sigv4_add_admin(v, "AKIAIOSFODNN7EXAMPLE");
     sigv4_set_clock(v, 1369353600);
 
     conn_t c = {0};
     set_aws_s3_get_example_headers(&c);
 
-    char owner[128];
-    strcpy(owner, "UNTOUCHED");
-    int is_admin = -1;
-    s3_err_t e = sigv4_verify_principal(v, &c, owner, sizeof(owner), &is_admin);
+    sigv4_id_t id = {0};
+    s3_err_t e = sigv4_verify_id(v, &c, &id);
     CHECK(e == S3_OK, "ownerless cred verifies");
-    CHECK(owner[0] == '\0', "ownerless cred reports empty owner");
-    CHECK(is_admin == 1, "ownerless cred is admin");
+    CHECK_EQ_STR(id.user, (int)strlen(id.user), "AKIAIOSFODNN7EXAMPLE",
+                "user defaults to access key");
+    CHECK(id.is_admin == 1, "registered admin user is flagged");
     sigv4_destroy(v);
 }
 
-static void t_verify_principal_untouched_on_failure(void) {
+static void t_verify_id_untouched_on_failure(void) {
     sigv4_verifier_t *v = sigv4_create();
-    sigv4_add_cred_owned(v, "AKIAIOSFODNN7EXAMPLE",
-                            "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY", "alice");
+    sigv4_add_cred_user(v, "AKIAIOSFODNN7EXAMPLE",
+                           "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY", "alice");
     sigv4_set_clock(v, 1369353600);
 
     conn_t c = {0};
@@ -567,13 +567,13 @@ static void t_verify_principal_untouched_on_failure(void) {
         strlen("AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request, SignedHeaders=host;range;x-amz-date, Signature=5d66fb2d81386a1a76b0d6d11ff033d15eef06699e0706d32b211f38fde2462d")
     };
 
-    char owner[128];
-    strcpy(owner, "SENTINEL");
-    int is_admin = 99;
-    s3_err_t e = sigv4_verify_principal(v, &c, owner, sizeof(owner), &is_admin);
+    sigv4_id_t id;
+    strcpy(id.user, "SENTINEL");
+    id.is_admin = 99;
+    s3_err_t e = sigv4_verify_id(v, &c, &id);
     CHECK(e != S3_OK, "tampered signature fails");
-    CHECK(strcmp(owner, "SENTINEL") == 0, "owner_out untouched on failure");
-    CHECK(is_admin == 99, "is_admin_out untouched on failure");
+    CHECK(strcmp(id.user, "SENTINEL") == 0, "id_out->user untouched on failure");
+    CHECK(id.is_admin == 99, "id_out->is_admin untouched on failure");
     sigv4_destroy(v);
 }
 
@@ -646,9 +646,9 @@ int main(void) {
     t_verify_put_with_body();
     t_verify_get_with_query();
     t_verify_delete();
-    t_verify_principal_owned();
-    t_verify_principal_admin_when_no_owner();
-    t_verify_principal_untouched_on_failure();
+    t_verify_id_user_captured();
+    t_verify_id_defaults_to_access_key_and_admin_flag();
+    t_verify_id_untouched_on_failure();
     t_body_hash_empty();
     t_body_hash_single_chunk();
     t_body_hash_multiple_chunks();

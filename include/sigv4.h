@@ -38,14 +38,20 @@ int sigv4_add_cred(sigv4_verifier_t *v,
                    const char *access_key,
                    const char *secret_key);
 
-/* Like sigv4_add_cred, but binds the credential to an owner principal.
- * `owner` NULL or "" means an admin credential (unrestricted, matches
- * today's sigv4_add_cred behavior); a non-empty owner scopes the
- * credential to that principal for identity-mode authorization. */
-int sigv4_add_cred_owned(sigv4_verifier_t *v,
-                         const char *access_key,
-                         const char *secret_key,
-                         const char *owner);
+/* Longest owner identity (user name, or access key used as one). */
+#define SIGV4_USER_MAX 128
+
+/* Like sigv4_add_cred, with the identity that owns buckets created with
+ * this key. NULL/empty user means the access key itself. Several keys
+ * may share a user (key rotation keeps the user's buckets). */
+int sigv4_add_cred_user(sigv4_verifier_t *v,
+                        const char *access_key,
+                        const char *secret_key,
+                        const char *user);
+
+/* Mark a user as admin: sees and may act on every bucket. Admins are not
+ * affected by sigv4_swap_creds. Returns 0 on success. */
+int sigv4_add_admin(sigv4_verifier_t *v, const char *user);
 
 /* Free the verifier and its credentials. */
 void sigv4_destroy(sigv4_verifier_t *v);
@@ -80,17 +86,15 @@ void sigv4_set_max_skew(sigv4_verifier_t *v, int max_skew_seconds);
  * On non-OK return, no state on `c` is modified. */
 s3_err_t sigv4_verify(const sigv4_verifier_t *v, const struct conn *c);
 
-/* Like sigv4_verify, but on S3_OK also copies the matched credential's
- * owner into `owner_out` (a caller-owned buffer of `owner_cap` bytes;
- * "" if the credential is an admin credential) and sets *is_admin_out.
- * This is a snapshot, never a pointer into the verifier's credential
- * list, so it stays valid across a later sigv4_swap_creds (e.g. a
- * SIGHUP reload racing a long-lived request). owner_out/is_admin_out
- * may be NULL to skip that output. On non-OK return, neither output is
- * touched. */
-s3_err_t sigv4_verify_principal(const sigv4_verifier_t *v, const struct conn *c,
-                                char *owner_out, size_t owner_cap,
-                                int *is_admin_out);
+/* Who signed a verified request. */
+typedef struct {
+    char user[SIGV4_USER_MAX + 1];
+    int  is_admin;
+} sigv4_id_t;
+
+/* sigv4_verify, also filling *id_out (if non-NULL) on S3_OK. */
+s3_err_t sigv4_verify_id(const sigv4_verifier_t *v, const struct conn *c,
+                         sigv4_id_t *id_out);
 
 /* Detect whether the request uses streaming chunked SigV4
  * (x-amz-content-sha256: STREAMING-AWS4-HMAC-SHA256-PAYLOAD). Call

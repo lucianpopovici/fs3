@@ -1,13 +1,50 @@
 # CLAUDE.md — DSM identity binding (per-user keys and buckets)
 
-> **STATUS: 12a DONE (2026-09-24), sandbox-verified under `-O2` and
-> DEBUG (ASan+UBSan), including the SIGHUP-vs-in-flight-request
-> use-after-free regression. 12b (management socket + `fs3 ctl`) and
-> 12c (DSM console UI, needs hardware) NOT STARTED.** Written against
-> `main` @ `2eb7b9b` (2026-09-24). Builds on 04-credential-management
-> (done) and replaces the per-bucket scoping that 04 deliberately
-> skipped. Supersedes the "config editing" half of 11-desktop-console
-> (12a only — the console itself is still 11's; 12c will replace it).
+> **STATUS: the 12a goal is DONE (2026-09-24), but NOT via the plan
+> below.** This brief's spec (v2 credentials file, `--identity-mode`,
+> `sigv4_verify_principal`, `authz()`, `buckets/<name>/owner`) was
+> built and then discarded in favor of an independently-built
+> implementation from a different session
+> (`session_01PHNX7TKk6izKYohF6nQbKX`, commits `a9efec0`/`30cae60`)
+> that landed on `main` first and covers the same goal with a more
+> complete design (a per-bucket random id defeats a
+> delete-and-recreate-under-another-owner race that this brief's plan
+> didn't address). **Read the code, not the steps below, for what's
+> actually there:**
+> - `src/sigv4.c`: `cred_t.user` (defaults to the access key),
+>   `sigv4_add_cred_user`, a separate `admin_t` list via
+>   `sigv4_add_admin` (not affected by `sigv4_swap_creds`),
+>   `sigv4_verify_id(v, c, sigv4_id_t *id_out)` — copies `user` +
+>   `is_admin` out at verify time, same use-after-free-avoidance
+>   property this brief called for, just under a different name.
+> - `src/main.c`: credentials are `ak:sk[:user]` (`parse_and_add_cred`),
+>   not a separate v2 file format. `--admin <user>` and
+>   `--legacy-owner <user>` replace this brief's `--identity-mode`.
+> - `src/store_fs.c`: `buckets/<bucket>/meta` (`id=`/`owner=` lines,
+>   written via a `tmp/bucket.XXXXXX` stage + rename, not a bare
+>   `owner` file) via `store_bucket_create_owned`/`store_bucket_meta`/
+>   `store_bucket_set_owner`/`store_assign_legacy_owner`. Commits
+>   capture the bucket id at `put_begin` and re-check it, so a bucket
+>   deleted and recreated (even by another user) mid-upload can't
+>   silently receive the object.
+> - `src/route.c`: `authz_bucket()` is the single choke point, called
+>   from `route_dispatch_headers` (covers bucket- and object-level
+>   requests together via `is_bucket_create()`), plus a second call in
+>   `handle_object_copy` for the copy source.
+> - Tests: `tests/test_e2e_isolation.sh` (52 checks, including a
+>   SIGHUP-vs-in-flight-request ASan/UBSan regression via
+>   `tests/sign_slow_put.py`), plus store/sigv4/credfile unit coverage.
+>   All green under `-O2` and DEBUG.
+>
+> 12b (management socket + `fs3 ctl`) and 12c (DSM console UI, needs
+> hardware) are still NOT STARTED and the plan for those below is
+> still a reasonable starting point — just translate "principal" →
+> "user", `sigv4_verify_principal` → `sigv4_verify_id`, and the v2
+> credentials-file steps → whatever `fs3 ctl`/the management socket
+> decides to write into the `ak:sk[:user]` file instead.
+>
+> Everything below this point is the **original plan**, preserved for
+> context. Its step-by-step detail for 12a no longer matches the tree.
 
 **Goal:** a DSM user opens the fs3 tile, sees *their own* S3 access
 keys and buckets, mints and revokes keys (secret shown once), and

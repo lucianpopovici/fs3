@@ -99,34 +99,33 @@ The protocol surface covered today:
   content-type; URL-decodes the source path
 - ACL stub: `GET /<bucket>?acl` and `GET /<bucket>/<key>?acl` return a
   static FULL_CONTROL ACL; `PUT` accepts and discards the body → 200
-- Identity mode (`--identity-mode`, requires `--require-auth`; brief
-  12a): credentials-file v2 (`#fs3-credentials v2` magic line,
-  tab-separated `access_key/owner/created_ms/label/secret`, empty owner
-  = admin) binds each credential to an owner principal; buckets get an
-  owner file (`buckets/<name>/owner`) set at creation; every S3
-  operation is authorized through a single `authz()` choke point in
-  `src/route.c` — admin keys are unrestricted, a non-admin principal
-  can only touch buckets they own, and a bucket with no owner file
-  (legacy, or created with identity mode off) is admin-only. v1
-  `ak:sk` credential lines still work as owner-less admin keys, and
-  with `--identity-mode` off nothing changes from pre-12a behavior.
+- Per-user bucket isolation (auth only): credentials are
+  `ak:sk[:user]` (user defaults to the access key); a bucket is owned by
+  its creator's user; `authz_bucket()` in `route.c` gates every bucket/
+  object request (and the copy source) — owner or `--admin`, else 403.
+  `ListAllMyBuckets` is filtered. Ownerless buckets (pre-isolation, or
+  made with auth off) are admin-only until `--legacy-owner <user>`.
+  Anonymous requests under auth (no `--require-auth`) get 403. No auth
+  configured = no identities, no checks.
 
 What we *don't* do:
 - HTTP `Range:` multi-range (`bytes=A-B,C-D`; only single-range spec)
 - SigV4 trailer variants (`STREAMING-...-TRAILER`)
 - Bucket subresources: `?lifecycle`, `?cors` (location + versioning are stubs)
 - Pagination on ListMultipartUploads (always `IsTruncated=false`)
-- Full IAM: identity mode (above) is bucket-ownership authorization
-  only — no policies, no conditions, no roles, no STS, and DSM
-  usernames are opaque strings to fs3 core (no NSS/`getpwnam` calls).
-  See `docs/synology-readiness/12-dsm-identity-binding/CLAUDE.md`.
+- Any kind of IAM beyond static `access_key:secret_key[:user]` pairs and
+  bucket ownership. No policies, grants, shared buckets, STS, or console.
 - Replication, versioning, lifecycle rules, server-side encryption
 
 ## On-disk layout
 
 ```
 <root>/
-  buckets/<bucket>/                 # one empty dir per bucket
+  buckets/<bucket>/                 # one dir per bucket
+    meta                            # id=<32 hex>, owner=<user> (absent on
+                                    # pre-isolation buckets: ownerless).
+                                    # The id changes on delete+re-create;
+                                    # commits re-check it (writer.bucket_id)
   data/<bucket>/<NN>/<NN>/<hex>     # objects, sharded by hash prefix
                                     # file = obj_header_t + content_type
                                     # + key + body
@@ -135,6 +134,8 @@ What we *don't* do:
     part-00001, part-00002, ...     # each part's bytes verbatim, named
                                     # with MD5 in the dir
   tmp/                              # staging area for atomic renames
+                                    # (files, and bucket.XXXXXX dirs being
+                                    # assembled by bucket create)
 ```
 
 Object header is `obj_header_t`, schema 2 (bumped from 1 when we added
@@ -147,22 +148,22 @@ read time — the read path already does this.
 
 | target | language | what it exercises |
 |---|---|---|
-| `tests/test_store` | C | 43 unit tests: bucket CRUD (incl. delete racing an in-flight PUT/MPU, a threaded commit-vs-bucket-delete race on `ns_mu`, and per-bucket owner-file create/read/delete/reassign/ENOSPC-rollback), single PUT/GET round-trip, sendfile, listing with prefix/delimiter, persistence across `store_open`/`store_close`, multipart lifecycle, list_buckets, bucket_stats, list_mpu_uploads (with prefix filter), mpu_gc reaping behavior |
+| `tests/test_store` | C | 43 unit tests: bucket CRUD (incl. delete racing an in-flight PUT/MPU, a threaded commit-vs-bucket-delete race on `ns_mu`, and a bucket-meta write failure under ENOSPC leaving no half-created marker dir), bucket owner/id meta, legacy buckets can't be taken over and are assigned by `--legacy-owner`, a commit into a deleted-then-re-created bucket is refused, single PUT/GET round-trip, sendfile, listing with prefix/delimiter, persistence across `store_open`/`store_close`, multipart lifecycle, list_buckets, bucket_stats, list_mpu_uploads (with prefix filter), mpu_gc reaping behavior |
 | `tests/test_conn` | C | 5 unit tests of the per-connection request path over a pipe: the per-event read budget yields and resumes, a yielded conn isn't closed on peer hangup; PUT commit, copy, MPU part and MPU complete park the conn and run on an iopool worker (a blocking fsync hook proves the loop thread is free); an orphaned job completes safely; pool shutdown drains queued jobs |
 | `tests/test_xml` | C | 25 tests of the extended XML library (escaping, parsing, security limits) |
 | `tests/test_xml_legacy` | C | one round-trip showing the original calling style still works |
 | `tests/test_xml_fuzz` | C | 50,000 random inputs through the parser, must not crash |
-| `tests/test_sigv4` | C | 43 unit tests of canonical request, string-to-sign, signing key derivation against AWS test vectors, plus `sigv4_verify_principal`'s owner/admin capture and its untouched-on-failure guarantee |
-| `tests/test_credfile` | C | 20 unit tests of the credentials-file v2 parser (`main.c`, via a `FS3_MAIN_TESTING` test seam): field validation, magic-line detection, v1 fallback, fail-closed on a malformed line |
+| `tests/test_sigv4` | C | 43 unit tests of canonical request, string-to-sign, signing key derivation against AWS test vectors, plus `sigv4_verify_id`'s user/admin capture (including the access-key-default and untouched-on-failure cases) |
+| `tests/test_credfile` | C | 24 unit tests of `main.c`'s credentials parser via a `FS3_MAIN_TESTING` test seam: `ak:sk[:user]` line parsing, `valid_identity` field validation, and `load_credentials_file`'s fail-closed-on-a-malformed-line behavior |
 | `tests/test_e2e.sh` | bash + curl | 23 integration tests: every bucket/object verb, listing edge cases, keep-alive pipelining, large objects, ext_body spillover, ListAllMyBuckets |
 | `tests/test_e2e_auth.sh` | bash + python | 28 integration tests of SigV4 with real signatures from botocore (header mode + streaming chunked) |
 | `tests/test_e2e_mpu.sh` | bash + curl | 26 integration tests of the full multipart lifecycle including ListMultipartUploads, prefix filter, abort, malformed XML, large parts |
 | `tests/test_e2e_phase9.sh` | bash + curl | 45 integration tests of Range GET (206/416), bulk delete (`?delete`), and bucket subresources (`?location`, `?versioning`) |
 | `tests/test_e2e_phase10.sh` | bash + curl | 27 integration tests of server-side object copy and `?acl` stub |
-| `tests/test_e2e_phase11.sh` | bash + curl + python | 16 integration tests of `/_health`, `--credentials-file`, `--min-free-bytes` quota |
+| `tests/test_e2e_phase11.sh` | bash + curl + python | 18 integration tests of `/_health`, `--credentials-file`, `--min-free-bytes` quota |
+| `tests/test_e2e_isolation.sh` | bash + python | 52 integration tests of per-user bucket isolation: every verb denied cross-user, shared users and key-as-user, filtered ListAllMyBuckets, copy source/destination checks, `--admin`, SIGHUP key rotation keeping buckets, ownerless buckets + `--legacy-owner`, anonymous requests under auth, and a SIGHUP-vs-in-flight-request ASan/UBSan use-after-free regression (`tests/sign_slow_put.py`) |
 | `tests/test_e2e_phase12.sh` | bash + curl + python | 39 integration tests of startup recovery, `--max-body-size` (413), `--idle-timeout`, `--max-conns`, SIGHUP credential reload, the `--metrics-port` admin listener (`/healthz`, `/metrics`, `/buckets`), and half-closed large uploads |
-| `tests/test_ui_cgi.sh` | bash | 45 tests of the DSM-tile admin console CGI driven against a scratch var dir: conf parsing without sourcing, HTML escaping, CSRF token + Origin checks, credential add/replace/remove with validation and the last-key lockout guard, SIGHUP delivery, live bucket stats via a real admin listener |
-| `tests/test_e2e_identity.sh` | bash + curl + python | 31 integration tests of `--identity-mode` (brief 12a): per-bucket-owner 403s across every S3 verb, CopyObject checked both directions, ListAllMyBuckets filtered per principal, admin bypass, an admin-only legacy bucket, `--identity-mode` requiring `--require-auth`, and a SIGHUP-credential-reload-vs-in-flight-request ASan/UBSan regression (`tests/sign_slow_put.py`) |
+| `tests/test_ui_cgi.sh` | bash | 56 tests of the DSM-tile admin console CGI driven against a scratch var dir: conf parsing without sourcing, HTML escaping, CSRF token + Origin checks, credential add/replace/remove with validation, the optional user field (kept when a secret is replaced) and the last-key lockout guard, SIGHUP delivery, live bucket stats via a real admin listener |
 
 All targets pass under both `-O2` and DEBUG (ASan + UBSan), except one
 pre-existing, unrelated flake under DEBUG:

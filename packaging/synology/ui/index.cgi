@@ -115,7 +115,7 @@ handle_post() {
     [ "${CONTENT_LENGTH}" -gt 8192 ] && redirect e_req
     body="$(dd bs=1 count="${CONTENT_LENGTH}" 2>/dev/null)"
 
-    F_ACTION=""; F_AK=""; F_SK=""; F_TOK=""
+    F_ACTION=""; F_AK=""; F_SK=""; F_USER=""; F_TOK=""
     oldifs="${IFS}"; IFS='&'
     for pair in ${body}; do
         k="${pair%%=*}"; v="${pair#*=}"
@@ -123,6 +123,7 @@ handle_post() {
             action) F_ACTION="${v}" ;;
             ak)     F_AK="${v}" ;;
             sk)     F_SK="${v}" ;;
+            user)   F_USER="${v}" ;;
             tok)    F_TOK="${v}" ;;
         esac
     done
@@ -137,13 +138,28 @@ handle_post() {
     addkey)
         valid_key "${F_AK}" 3 64   || redirect e_ak
         valid_key "${F_SK}" 8 128  || redirect e_sk
+        # The user owns the buckets this key creates. Empty: a replaced
+        # key keeps the user it had (so a secret change never moves its
+        # buckets away); a new key is its own user.
+        if [ -n "${F_USER}" ]; then
+            valid_key "${F_USER}" 1 64 || redirect e_user
+        elif [ -f "${CRED_FILE}" ]; then
+            F_USER="$(awk -F: -v k="${F_AK}" \
+                '!/^[ \t]*#/ && NF >= 3 && $1 == k { sub(/[ \t\r]+$/, "", $3);
+                                                   print $3; exit }' \
+                "${CRED_FILE}")"
+        fi
         # Keep comments and other keys; same access key is replaced.
         {
             [ -f "${CRED_FILE}" ] && \
                 awk -F: -v k="${F_AK}" \
                     '/^[ \t]*#/ || NF < 2 { print; next } $1 != k' \
                     "${CRED_FILE}"
-            printf '%s:%s\n' "${F_AK}" "${F_SK}"
+            if [ -n "${F_USER}" ]; then
+                printf '%s:%s:%s\n' "${F_AK}" "${F_SK}" "${F_USER}"
+            else
+                printf '%s:%s\n' "${F_AK}" "${F_SK}"
+            fi
         } | write_creds || redirect e_write
 
         if [ "${FS3_REQUIRE_AUTH}" != "1" ]; then
@@ -226,6 +242,7 @@ case "${QUERY_STRING}" in
     *m=removed*) MSG="Credential removed and reloaded." ;;
     *m=e_csrf*)  MSG="Error: the form expired (security token mismatch). Reload the page and try again." ;;
     *m=e_ak*)    MSG="Error: the access key must be 3&ndash;64 characters from A&ndash;Z a&ndash;z 0&ndash;9 . _ -" ;;
+    *m=e_user*)  MSG="Error: the user must be 1&ndash;64 characters from A&ndash;Z a&ndash;z 0&ndash;9 . _ -" ;;
     *m=e_sk*)    MSG="Error: the secret key must be 8&ndash;128 characters from A&ndash;Z a&ndash;z 0&ndash;9 . _ -" ;;
     *m=e_last*)  MSG="Error: refusing to remove the last credential while authentication is enabled &mdash; that would lock every client out." ;;
     *m=e_nokey*) MSG="Error: no such access key." ;;
@@ -314,7 +331,12 @@ else
             case "${cline}" in *:*) ;; *) continue ;; esac
             ak="${cline%%:*}"
             hak="$(html_escape "${ak}")"
-            KEYROWS="${KEYROWS}<tr><td><code>${hak}</code></td><td>
+            rest="${cline#*:}"
+            case "${rest}" in
+                *:*) huser="<code>$(html_escape "${rest#*:}")</code>" ;;
+                *)   huser="<span class=\"muted\">${hak} (the key itself)</span>" ;;
+            esac
+            KEYROWS="${KEYROWS}<tr><td><code>${hak}</code></td><td>${huser}</td><td>
 <form method=\"post\" onsubmit=\"return confirm('Remove access key ${hak}?');\">
 <input type=\"hidden\" name=\"action\" value=\"delkey\">
 <input type=\"hidden\" name=\"tok\" value=\"${TOKEN}\">
@@ -323,7 +345,7 @@ else
         done < "${CRED_FILE}"
     fi
     if [ -n "${KEYROWS}" ]; then
-        CREDS_HTML="<table><tr><th>Access key</th><th></th></tr>${KEYROWS}</table>"
+        CREDS_HTML="<table><tr><th>Access key</th><th>Owns buckets as user</th><th></th></tr>${KEYROWS}</table>"
     else
         CREDS_HTML="<p class=\"muted\">No credentials defined.</p>"
     fi
@@ -341,13 +363,19 @@ authentication; you will be asked to restart the package once.</p>"
        pattern=\"[A-Za-z0-9._-]{3,64}\" required></label>
 <label>Secret key <input name=\"sk\" type=\"password\" size=\"28\" maxlength=\"128\"
        pattern=\"[A-Za-z0-9._-]{8,128}\" required></label>
+<label>User (optional) <input name=\"user\" size=\"16\" maxlength=\"64\"
+       pattern=\"[A-Za-z0-9._-]{1,64}\"></label>
 <button type=\"submit\">Add / replace</button>
 </p>
 </form>
 <p class=\"muted\">Keys may contain letters, digits and <code>. _ -</code>
 (generate a secret with e.g. <code>openssl rand -hex 32</code>). Adding an
-existing access key replaces its secret. Changes are reloaded by the running
-server without a restart.</p>
+existing access key replaces its secret (and keeps its user unless you enter
+a new one). Each bucket belongs to the user of the key that created it, and
+other users cannot see it. To rotate a key without losing access to your
+buckets, give the new key the <em>same user</em> as the old one, then remove
+the old key. Without a user, a new key is its own user. Changes are reloaded
+by the running server without a restart.</p>
 ${RESTART_NOTE}"
 fi
 

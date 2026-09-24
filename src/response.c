@@ -509,26 +509,23 @@ int rsp_build_complete_mpu(conn_t *c, s3_str_t bucket, s3_str_t key,
 
 int rsp_build_list_all_my_buckets(conn_t *c,
                                    const s3_bucket_info_t *buckets,
-                                   size_t n_buckets,
-                                   const char *owner_id) {
+                                   size_t n_buckets) {
     XMLNode *root = create_node("ListAllMyBucketsResult");
     if (!root) return -1;
     if (add_attr(root, "xmlns", "http://s3.amazonaws.com/doc/2006-03-01/") < 0) {
         free_tree(root); return -1;
     }
 
-    /* AWS requires <Owner> with ID + DisplayName. Outside identity mode
-     * (or without an admin/owner principal) fs3 has no identity model,
-     * so owner_id is the caller's placeholder ("fs3"); in identity mode
-     * it's the requesting principal. */
-    if (!owner_id || !owner_id[0]) owner_id = "fs3";
+    /* AWS requires <Owner> with ID + DisplayName. fs3 has no identity
+     * model, so we emit placeholder values that look plausible enough
+     * for clients that parse the response. */
     XMLNode *owner = create_node("Owner");
     if (!owner || add_child(root, owner) < 0) {
         if (owner) free_tree(owner);
         free_tree(root); return -1;
     }
-    xml_text_child(owner, "ID",          owner_id);
-    xml_text_child(owner, "DisplayName", owner_id);
+    xml_text_child(owner, "ID",          "fs3");
+    xml_text_child(owner, "DisplayName", "fs3");
 
     XMLNode *list = create_node("Buckets");
     if (!list || add_child(root, list) < 0) {

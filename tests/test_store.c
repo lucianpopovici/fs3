@@ -135,8 +135,8 @@ static void t_bucket_create_validate(void) {
     s3_store_t *s;
     store_open(&s, g_root);
 
-    CHECK_EQ(store_bucket_create(s, S3_STR_LIT("ok-bucket"), ""), S3_OK, "valid name");
-    CHECK_EQ(store_bucket_create(s, S3_STR_LIT("ok-bucket"), ""),
+    CHECK_EQ(store_bucket_create(s, S3_STR_LIT("ok-bucket")), S3_OK, "valid name");
+    CHECK_EQ(store_bucket_create(s, S3_STR_LIT("ok-bucket")),
              S3_ERR_BUCKET_ALREADY_EXISTS, "create exists");
     CHECK(store_bucket_exists(s, S3_STR_LIT("ok-bucket")), "exists");
 
@@ -152,7 +152,7 @@ static void t_bucket_create_validate(void) {
     };
     for (size_t i = 0; i < sizeof(bad)/sizeof(bad[0]); i++) {
         s3_str_t n = { bad[i].name, strlen(bad[i].name) };
-        CHECK_EQ(store_bucket_create(s, n, ""), S3_ERR_INVALID_BUCKET_NAME, bad[i].why);
+        CHECK_EQ(store_bucket_create(s, n), S3_ERR_INVALID_BUCKET_NAME, bad[i].why);
     }
 
     store_close(s);
@@ -165,102 +165,17 @@ static void t_bucket_delete(void) {
     store_open(&s, g_root);
 
     s3_str_t b = S3_STR_LIT("delete-test");
-    CHECK_EQ(store_bucket_create(s, b, ""), S3_OK, "create");
+    CHECK_EQ(store_bucket_create(s, b), S3_OK, "create");
     CHECK_EQ(store_bucket_delete(s, b), S3_OK, "delete empty");
     CHECK(!store_bucket_exists(s, b), "gone after delete");
     CHECK_EQ(store_bucket_delete(s, b), S3_ERR_NO_SUCH_BUCKET, "delete missing");
 
     /* Non-empty bucket cannot be deleted. */
-    CHECK_EQ(store_bucket_create(s, b, ""), S3_OK, "recreate");
+    CHECK_EQ(store_bucket_create(s, b), S3_OK, "recreate");
     s3_obj_meta_t m;
     CHECK_EQ(put(s, "delete-test", "key1", "data", 4, "text/plain", &m),
              S3_OK, "put object");
     CHECK_EQ(store_bucket_delete(s, b), S3_ERR_BUCKET_NOT_EMPTY, "non-empty");
-
-    store_close(s);
-    teardown_root();
-}
-
-static void t_bucket_create_writes_owner(void) {
-    setup_root();
-    s3_store_t *s;
-    store_open(&s, g_root);
-
-    s3_str_t b = S3_STR_LIT("owned-bucket");
-    CHECK_EQ(store_bucket_create(s, b, "alice"), S3_OK, "create with owner");
-    char buf[128];
-    CHECK_EQ(store_bucket_owner(s, b, buf, sizeof(buf)), S3_OK, "read owner");
-    CHECK(strcmp(buf, "alice") == 0, "owner round-trips");
-
-    store_close(s);
-    teardown_root();
-}
-
-static void t_bucket_create_empty_owner_is_admin_only(void) {
-    setup_root();
-    s3_store_t *s;
-    store_open(&s, g_root);
-
-    s3_str_t b = S3_STR_LIT("admin-bucket");
-    CHECK_EQ(store_bucket_create(s, b, ""), S3_OK, "create with empty owner");
-    char buf[128];
-    CHECK_EQ(store_bucket_owner(s, b, buf, sizeof(buf)), S3_OK, "read owner");
-    CHECK(buf[0] == '\0', "empty owner reads back as admin-only");
-
-    store_close(s);
-    teardown_root();
-}
-
-static void t_bucket_owner_missing_file_reads_admin(void) {
-    setup_root();
-    s3_store_t *s;
-    store_open(&s, g_root);
-
-    /* Simulate a legacy bucket that predates ownership: mkdir the marker
-     * dir directly, bypassing store_bucket_create. */
-    char bp[512];
-    snprintf(bp, sizeof(bp), "%s/buckets/legacy", g_root);
-    CHECK(mkdir(bp, 0700) == 0, "mkdir legacy marker dir");
-
-    s3_str_t b = S3_STR_LIT("legacy");
-    char buf[128];
-    CHECK_EQ(store_bucket_owner(s, b, buf, sizeof(buf)), S3_OK,
-             "missing owner file is not an error");
-    CHECK(buf[0] == '\0', "legacy bucket reads back as admin-only");
-
-    store_close(s);
-    teardown_root();
-}
-
-static void t_bucket_delete_removes_owner_then_rmdir_succeeds(void) {
-    setup_root();
-    s3_store_t *s;
-    store_open(&s, g_root);
-
-    s3_str_t b = S3_STR_LIT("owned-delete");
-    CHECK_EQ(store_bucket_create(s, b, "bob"), S3_OK, "create with owner");
-    CHECK_EQ(store_bucket_delete(s, b), S3_OK,
-             "delete succeeds despite owner file (regression: ENOTEMPTY)");
-    CHECK(!store_bucket_exists(s, b), "gone after delete");
-
-    store_close(s);
-    teardown_root();
-}
-
-static void t_bucket_set_owner_reassigns(void) {
-    setup_root();
-    s3_store_t *s;
-    store_open(&s, g_root);
-
-    s3_str_t b = S3_STR_LIT("reassign-me");
-    CHECK_EQ(store_bucket_create(s, b, ""), S3_OK, "create admin-only");
-    CHECK_EQ(store_bucket_set_owner(s, b, "carol"), S3_OK, "reassign");
-    char buf[128];
-    CHECK_EQ(store_bucket_owner(s, b, buf, sizeof(buf)), S3_OK, "read owner");
-    CHECK(strcmp(buf, "carol") == 0, "reassigned owner round-trips");
-
-    CHECK_EQ(store_bucket_set_owner(s, S3_STR_LIT("no-such-bucket"), "dave"),
-             S3_ERR_NO_SUCH_BUCKET, "reassign missing bucket fails");
 
     store_close(s);
     teardown_root();
@@ -274,7 +189,7 @@ static void t_put_commit_after_bucket_delete(void) {
     s3_store_t *s;
     store_open(&s, g_root);
     s3_str_t b = S3_STR_LIT("racy");
-    store_bucket_create(s, b, "");
+    store_bucket_create(s, b);
 
     s3_writer_t *w = NULL;
     CHECK_EQ(store_put_begin(s, b, S3_STR_LIT("k"), "text/plain", &w),
@@ -291,7 +206,7 @@ static void t_put_commit_after_bucket_delete(void) {
     CHECK(stat(dp, &st) < 0 && errno == ENOENT,
           "race put: data/<bucket> not resurrected");
 
-    CHECK_EQ(store_bucket_create(s, b, ""), S3_OK, "race put: recreate");
+    CHECK_EQ(store_bucket_create(s, b), S3_OK, "race put: recreate");
     s3_obj_meta_t m;
     CHECK_EQ(store_head(s, b, S3_STR_LIT("k"), &m), S3_ERR_NO_SUCH_KEY,
              "race put: no ghost object in recreated bucket");
@@ -308,7 +223,7 @@ static void t_mpu_after_bucket_delete(void) {
     store_open(&s, g_root);
     s3_str_t b = S3_STR_LIT("racy");
     s3_str_t k = S3_STR_LIT("k");
-    store_bucket_create(s, b, "");
+    store_bucket_create(s, b);
 
     char upload_id[33];
     CHECK_EQ(store_mpu_create(s, b, k, NULL, upload_id), S3_OK,
@@ -338,7 +253,7 @@ static void t_mpu_after_bucket_delete(void) {
     CHECK_EQ(store_mpu_part_commit(w, etag), S3_ERR_NO_SUCH_UPLOAD,
              "race mpu: in-flight part commit -> NoSuchUpload");
 
-    CHECK_EQ(store_bucket_create(s, b, ""), S3_OK, "race mpu: recreate");
+    CHECK_EQ(store_bucket_create(s, b), S3_OK, "race mpu: recreate");
     char cetag[40];
     CHECK_EQ(store_mpu_complete(s, b, k, upload_id, &part, 1, cetag, NULL),
              S3_ERR_NO_SUCH_UPLOAD,
@@ -396,7 +311,7 @@ static void t_commit_races_bucket_delete(void) {
 
     s3_store_fsync_hook = race_fsync;
     for (int i = 0; i < 500 && !bad; i++) {
-        store_bucket_create(s, b, "");
+        store_bucket_create(s, b);
         race_commit_t rc = {0};
         store_put_begin(s, b, S3_STR_LIT("k"), "text/plain", &rc.w);
         store_put_write(rc.w, "x", 1);
@@ -434,12 +349,146 @@ static void t_commit_races_bucket_delete(void) {
     teardown_root();
 }
 
+/* ---- Bucket ownership ----------------------------------------------- */
+
+static int is_hex32(const char *id) {
+    if (strlen(id) != 32) return 0;
+    for (int i = 0; i < 32; i++)
+        if (!strchr("0123456789abcdef", id[i])) return 0;
+    return 1;
+}
+
+static void t_bucket_owner_meta(void) {
+    setup_root();
+    s3_store_t *s;
+    store_open(&s, g_root);
+    s3_str_t b = S3_STR_LIT("alices");
+    s3_bucket_meta_t m1, m2;
+
+    CHECK_EQ(store_bucket_create_owned(s, b, "alice"), S3_OK, "create owned");
+    CHECK_EQ(store_bucket_meta(s, b, &m1), S3_OK, "meta");
+    CHECK(strcmp(m1.owner, "alice") == 0, "owner recorded");
+    CHECK(is_hex32(m1.id), "id is 32 hex");
+    CHECK_EQ(store_bucket_create_owned(s, b, "bob"),
+             S3_ERR_BUCKET_ALREADY_EXISTS, "name taken, whoever asks");
+    CHECK_EQ(store_bucket_meta(s, b, &m2), S3_OK, "meta again");
+    CHECK(strcmp(m2.owner, "alice") == 0, "still alice's");
+
+    CHECK_EQ(store_bucket_create(s, S3_STR_LIT("nobodys")), S3_OK,
+             "create ownerless");
+    CHECK_EQ(store_bucket_meta(s, S3_STR_LIT("nobodys"), &m2), S3_OK, "meta");
+    CHECK(m2.owner[0] == '\0' && is_hex32(m2.id), "ownerless, but has id");
+    CHECK_EQ(store_bucket_meta(s, S3_STR_LIT("missing"), &m2),
+             S3_ERR_NO_SUCH_BUCKET, "meta of missing bucket");
+
+    s3_bucket_info_t *list; size_t n;
+    CHECK_EQ(store_list_buckets(s, &list, &n), S3_OK, "list");
+    CHECK_EQ(n, 2, "two buckets");
+    for (size_t i = 0; i < n; i++) {
+        if (strcmp(list[i].name, "alices") == 0)
+            CHECK(strcmp(list[i].owner, "alice") == 0, "list: owner");
+        else
+            CHECK(list[i].owner[0] == '\0', "list: ownerless");
+    }
+    store_buckets_free(list, n);
+
+    /* Delete removes the meta file too; re-creating makes a new bucket. */
+    CHECK_EQ(store_bucket_delete(s, b), S3_OK, "delete owned bucket");
+    CHECK_EQ(store_bucket_create_owned(s, b, "alice"), S3_OK, "recreate");
+    CHECK_EQ(store_bucket_meta(s, b, &m2), S3_OK, "meta after recreate");
+    CHECK(strcmp(m1.id, m2.id) != 0, "re-created bucket has a new id");
+
+    store_close(s);
+    teardown_root();
+}
+
+/* A bucket from before ownership (bare marker dir) is ownerless, can't be
+ * claimed by creating it, and is handed over by assign_legacy_owner. */
+static void t_legacy_bucket_owner(void) {
+    setup_root();
+    s3_store_t *s;
+    store_open(&s, g_root);
+    char bp[512];
+    snprintf(bp, sizeof(bp), "%s/buckets/oldbucket", g_root);
+    CHECK_EQ(mkdir(bp, 0700), 0, "make pre-ownership bucket");
+    CHECK_EQ(store_bucket_create_owned(s, S3_STR_LIT("alices"), "alice"),
+             S3_OK, "an owned bucket too");
+
+    s3_bucket_meta_t m;
+    CHECK_EQ(store_bucket_meta(s, S3_STR_LIT("oldbucket"), &m), S3_OK, "meta");
+    CHECK(m.owner[0] == '\0' && m.id[0] == '\0', "legacy: no owner, no id");
+    CHECK_EQ(store_bucket_create_owned(s, S3_STR_LIT("oldbucket"), "bob"),
+             S3_ERR_BUCKET_ALREADY_EXISTS,
+             "legacy bucket can't be taken over by creating it");
+    CHECK_EQ(store_bucket_meta(s, S3_STR_LIT("oldbucket"), &m), S3_OK, "meta");
+    CHECK(m.owner[0] == '\0', "still ownerless");
+
+    CHECK_EQ(store_assign_legacy_owner(s, "carol"), 1, "one bucket assigned");
+    CHECK_EQ(store_bucket_meta(s, S3_STR_LIT("oldbucket"), &m), S3_OK, "meta");
+    CHECK(strcmp(m.owner, "carol") == 0 && is_hex32(m.id),
+          "carol owns it, and it has an id now");
+    CHECK_EQ(store_bucket_meta(s, S3_STR_LIT("alices"), &m), S3_OK, "meta");
+    CHECK(strcmp(m.owner, "alice") == 0, "owned bucket untouched");
+    CHECK_EQ(store_assign_legacy_owner(s, "carol"), 0, "idempotent");
+
+    CHECK_EQ(store_bucket_delete(s, S3_STR_LIT("oldbucket")), S3_OK,
+             "assigned legacy bucket deletes normally");
+    store_close(s);
+    teardown_root();
+}
+
+/* Alice is uploading into her bucket; it is deleted and bob creates a
+ * bucket with the same name before her upload commits. Her object must
+ * not land in bob's bucket. */
+static void t_commit_into_recreated_bucket(void) {
+    setup_root();
+    s3_store_t *s;
+    store_open(&s, g_root);
+    s3_str_t b = S3_STR_LIT("contested");
+    store_bucket_create_owned(s, b, "alice");
+
+    s3_writer_t *w = NULL;
+    CHECK_EQ(store_put_begin(s, b, S3_STR_LIT("k"), "text/plain", &w), S3_OK,
+             "alice begins upload");
+    store_put_write(w, "alice's data", 12);
+    CHECK_EQ(store_bucket_delete(s, b), S3_OK, "bucket deleted mid-upload");
+    CHECK_EQ(store_bucket_create_owned(s, b, "bob"), S3_OK,
+             "bob takes the name");
+    CHECK_EQ(store_put_commit(w, NULL), S3_ERR_NO_SUCH_BUCKET,
+             "alice's commit refused: not the bucket she started in");
+    s3_obj_meta_t m;
+    CHECK_EQ(store_head(s, b, S3_STR_LIT("k"), &m), S3_ERR_NO_SUCH_KEY,
+             "nothing landed in bob's bucket");
+    store_close(s);
+    teardown_root();
+}
+
+/* A crash while assembling a bucket leaves a dir in tmp/; startup
+ * recovery removes it. */
+static void t_recover_clears_staged_bucket(void) {
+    setup_root();
+    char d[512], f[600];
+    snprintf(d, sizeof(d), "%s/tmp", g_root);
+    mkdir(d, 0700);
+    snprintf(d, sizeof(d), "%s/tmp/bucket.ABCDEF", g_root);
+    CHECK_EQ(mkdir(d, 0700), 0, "staged bucket dir");
+    snprintf(f, sizeof(f), "%s/meta", d);
+    FILE *fp = fopen(f, "w"); fputs("id=x\nowner=alice\n", fp); fclose(fp);
+
+    s3_store_t *s;
+    CHECK_EQ(store_open(&s, g_root), S3_OK, "open");
+    struct stat st;
+    CHECK(stat(d, &st) < 0, "staged bucket dir removed");
+    store_close(s);
+    teardown_root();
+}
+
 static void t_put_get_simple(void) {
     setup_root();
     s3_store_t *s;
     store_open(&s, g_root);
 
-    store_bucket_create(s, S3_STR_LIT("buk1"), "");
+    store_bucket_create(s, S3_STR_LIT("buk1"));
 
     const char *body = "Hello, S3 world!";
     size_t blen = strlen(body);
@@ -475,7 +524,7 @@ static void t_put_overwrite(void) {
     setup_root();
     s3_store_t *s;
     store_open(&s, g_root);
-    store_bucket_create(s, S3_STR_LIT("buk"), "");
+    store_bucket_create(s, S3_STR_LIT("buk"));
 
     s3_obj_meta_t m1, m2;
     CHECK_EQ(put(s, "buk", "k", "first",  5, "text/plain", &m1), S3_OK, "v1");
@@ -498,7 +547,7 @@ static void t_put_streaming(void) {
     setup_root();
     s3_store_t *s;
     store_open(&s, g_root);
-    store_bucket_create(s, S3_STR_LIT("big"), "");
+    store_bucket_create(s, S3_STR_LIT("big"));
 
     size_t total = 5 * 1024 * 1024;
     char *body = malloc(total);
@@ -549,7 +598,7 @@ static void t_get_sendfile(void) {
     setup_root();
     s3_store_t *s;
     store_open(&s, g_root);
-    store_bucket_create(s, S3_STR_LIT("buk"), "");
+    store_bucket_create(s, S3_STR_LIT("buk"));
 
     const char *body = "send via sendfile";
     size_t blen = strlen(body);
@@ -585,7 +634,7 @@ static void t_delete(void) {
     setup_root();
     s3_store_t *s;
     store_open(&s, g_root);
-    store_bucket_create(s, S3_STR_LIT("buk"), "");
+    store_bucket_create(s, S3_STR_LIT("buk"));
 
     put(s, "buk", "k", "data", 4, "", NULL);
     s3_str_t bb = S3_STR_LIT("buk"), kk = S3_STR_LIT("k");
@@ -611,7 +660,7 @@ static void t_missing(void) {
     s3_obj_meta_t m;
     CHECK_EQ(store_head(s, bb, kk, &m), S3_ERR_NO_SUCH_BUCKET, "head no bucket");
 
-    store_bucket_create(s, S3_STR_LIT("buk"), "");
+    store_bucket_create(s, S3_STR_LIT("buk"));
     s3_str_t b2 = S3_STR_LIT("buk"), kk2 = S3_STR_LIT("nokey");
     CHECK_EQ(store_head(s, b2, kk2, &m), S3_ERR_NO_SUCH_KEY, "head no key");
 
@@ -625,7 +674,7 @@ static void t_keys_with_funny_chars(void) {
     setup_root();
     s3_store_t *s;
     store_open(&s, g_root);
-    store_bucket_create(s, S3_STR_LIT("buk"), "");
+    store_bucket_create(s, S3_STR_LIT("buk"));
 
     const char *keys[] = {
         "simple",
@@ -662,7 +711,7 @@ static void t_list_basic(void) {
     setup_root();
     s3_store_t *s;
     store_open(&s, g_root);
-    store_bucket_create(s, S3_STR_LIT("buk"), "");
+    store_bucket_create(s, S3_STR_LIT("buk"));
 
     /* Insert in arbitrary order. */
     const char *keys[] = {
@@ -696,7 +745,7 @@ static void t_list_prefix(void) {
     setup_root();
     s3_store_t *s;
     store_open(&s, g_root);
-    store_bucket_create(s, S3_STR_LIT("buk"), "");
+    store_bucket_create(s, S3_STR_LIT("buk"));
 
     const char *keys[] = {
         "photos/cat.jpg", "photos/dog.jpg", "videos/x.mp4", "music/y.mp3"
@@ -723,7 +772,7 @@ static void t_list_delimiter(void) {
     setup_root();
     s3_store_t *s;
     store_open(&s, g_root);
-    store_bucket_create(s, S3_STR_LIT("buk"), "");
+    store_bucket_create(s, S3_STR_LIT("buk"));
 
     const char *keys[] = {
         "photos/cat.jpg", "photos/dog.jpg", "videos/x.mp4",
@@ -762,7 +811,7 @@ static void t_list_marker(void) {
     setup_root();
     s3_store_t *s;
     store_open(&s, g_root);
-    store_bucket_create(s, S3_STR_LIT("buk"), "");
+    store_bucket_create(s, S3_STR_LIT("buk"));
     const char *keys[] = { "a", "buk", "c", "d", "e" };
     for (int i = 0; i < 5; i++) put(s, "buk", keys[i], "x", 1, "", NULL);
 
@@ -788,7 +837,7 @@ static void t_list_max_keys(void) {
     setup_root();
     s3_store_t *s;
     store_open(&s, g_root);
-    store_bucket_create(s, S3_STR_LIT("buk"), "");
+    store_bucket_create(s, S3_STR_LIT("buk"));
     for (int i = 0; i < 100; i++) {
         char k[16]; snprintf(k, sizeof(k), "k%03d", i);
         put(s, "buk", k, "x", 1, "", NULL);
@@ -812,7 +861,7 @@ static void t_abort_does_not_create(void) {
     setup_root();
     s3_store_t *s;
     store_open(&s, g_root);
-    store_bucket_create(s, S3_STR_LIT("buk"), "");
+    store_bucket_create(s, S3_STR_LIT("buk"));
 
     s3_writer_t *w;
     s3_str_t bb = S3_STR_LIT("buk"), kk = S3_STR_LIT("aborted");
@@ -846,7 +895,7 @@ static void t_persistence(void) {
 
     s3_store_t *s1;
     store_open(&s1, g_root);
-    store_bucket_create(s1, S3_STR_LIT("buk"), "");
+    store_bucket_create(s1, S3_STR_LIT("buk"));
     put(s1, "buk", "persist-me", "data42", 6, "text/plain", NULL);
     store_close(s1);
 
@@ -880,7 +929,7 @@ static void t_mpu_basic(void) {
     setup_root();
     s3_store_t *s;
     CHECK_EQ(store_open(&s, g_root), S3_OK, "mpu: store_open");
-    CHECK(store_bucket_create(s, S3_STR_LIT("buk"), "") == S3_OK,
+    CHECK(store_bucket_create(s, S3_STR_LIT("buk")) == S3_OK,
           "mpu: bucket create");
 
     char upload_id[33];
@@ -955,7 +1004,7 @@ static void t_mpu_abort(void) {
     setup_root();
     s3_store_t *s;
     CHECK_EQ(store_open(&s, g_root), S3_OK, "mpu_abort: open");
-    store_bucket_create(s, S3_STR_LIT("buk"), "");
+    store_bucket_create(s, S3_STR_LIT("buk"));
 
     char upload_id[33];
     CHECK(store_mpu_create(s, S3_STR_LIT("buk"), S3_STR_LIT("k1"),
@@ -988,7 +1037,7 @@ static void t_mpu_invalid_part_list(void) {
     setup_root();
     s3_store_t *s;
     CHECK_EQ(store_open(&s, g_root), S3_OK, "mpu_inv: open");
-    store_bucket_create(s, S3_STR_LIT("buk"), "");
+    store_bucket_create(s, S3_STR_LIT("buk"));
     char upload_id[33];
     store_mpu_create(s, S3_STR_LIT("buk"), S3_STR_LIT("k1"), NULL, upload_id);
 
@@ -1027,7 +1076,7 @@ static void t_mpu_unknown_upload(void) {
     setup_root();
     s3_store_t *s;
     CHECK_EQ(store_open(&s, g_root), S3_OK, "mpu_unk: open");
-    store_bucket_create(s, S3_STR_LIT("buk"), "");
+    store_bucket_create(s, S3_STR_LIT("buk"));
 
     /* Try to upload a part to a non-existent upload */
     s3_writer_t *w;
@@ -1061,9 +1110,9 @@ static void t_list_buckets_three(void) {
     setup_root();
     s3_store_t *s;
     CHECK_EQ(store_open(&s, g_root), S3_OK, "lb_three: open");
-    store_bucket_create(s, S3_STR_LIT("alpha"), "");
-    store_bucket_create(s, S3_STR_LIT("bravo"), "");
-    store_bucket_create(s, S3_STR_LIT("charlie"), "");
+    store_bucket_create(s, S3_STR_LIT("alpha"));
+    store_bucket_create(s, S3_STR_LIT("bravo"));
+    store_bucket_create(s, S3_STR_LIT("charlie"));
 
     s3_bucket_info_t *bs = NULL;
     size_t n = 0;
@@ -1088,7 +1137,7 @@ static void t_bucket_stats(void) {
     setup_root();
     s3_store_t *s;
     CHECK_EQ(store_open(&s, g_root), S3_OK, "stats: open");
-    store_bucket_create(s, S3_STR_LIT("statbuk"), "");
+    store_bucket_create(s, S3_STR_LIT("statbuk"));
 
     s3_bucket_stats_t st;
     CHECK_EQ(store_bucket_stats(s, S3_STR_LIT("statbuk"), &st), S3_OK,
@@ -1130,7 +1179,7 @@ static void t_list_mpu_uploads_basic(void) {
     setup_root();
     s3_store_t *s;
     CHECK_EQ(store_open(&s, g_root), S3_OK, "lmu: open");
-    store_bucket_create(s, S3_STR_LIT("buk"), "");
+    store_bucket_create(s, S3_STR_LIT("buk"));
 
     char id1[33], id2[33], id3[33];
     store_mpu_create(s, S3_STR_LIT("buk"), S3_STR_LIT("photos/a.jpg"), NULL, id1);
@@ -1183,7 +1232,7 @@ static void t_mpu_gc_reaps_stale(void) {
     setup_root();
     s3_store_t *s;
     CHECK_EQ(store_open(&s, g_root), S3_OK, "gc: open");
-    store_bucket_create(s, S3_STR_LIT("buk"), "");
+    store_bucket_create(s, S3_STR_LIT("buk"));
 
     /* Two uploads — one recent, one ancient */
     char fresh_id[33], stale_id[33];
@@ -1219,7 +1268,7 @@ static void t_mpu_gc_skips_unparseable(void) {
     setup_root();
     s3_store_t *s;
     CHECK_EQ(store_open(&s, g_root), S3_OK, "gc_skip: open");
-    store_bucket_create(s, S3_STR_LIT("buk"), "");
+    store_bucket_create(s, S3_STR_LIT("buk"));
 
     char id[33];
     store_mpu_create(s, S3_STR_LIT("buk"), S3_STR_LIT("k"), NULL, id);
@@ -1284,7 +1333,7 @@ static void t_put_enospc_returns_storage_error(void) {
     setup_root();
     s3_store_t *s;
     store_open(&s, g_root);
-    store_bucket_create(s, S3_STR_LIT("buk"), "");
+    store_bucket_create(s, S3_STR_LIT("buk"));
 
     s3_writer_t *w;
     s3_str_t bb = S3_STR_LIT("buk"), kk = S3_STR_LIT("full");
@@ -1315,8 +1364,8 @@ static void t_bucket_owner_write_failure_leaves_no_marker_dir(void) {
     s3_str_t b = S3_STR_LIT("will-fail");
     s3_store_write_hook = enospc_write;
     g_write_budget = 0;
-    CHECK_EQ(store_bucket_create(s, b, "alice"), S3_ERR_INSUFFICIENT_STORAGE,
-             "owner write ENOSPC maps to storage error");
+    CHECK_EQ(store_bucket_create_owned(s, b, "alice"), S3_ERR_INSUFFICIENT_STORAGE,
+             "meta write ENOSPC maps to storage error");
     clear_io_hooks();
 
     CHECK(!store_bucket_exists(s, b),
@@ -1330,7 +1379,7 @@ static void t_put_enospc_midstream_cleanup(void) {
     setup_root();
     s3_store_t *s;
     store_open(&s, g_root);
-    store_bucket_create(s, S3_STR_LIT("buk"), "");
+    store_bucket_create(s, S3_STR_LIT("buk"));
 
     s3_writer_t *w;
     s3_str_t bb = S3_STR_LIT("buk"), kk = S3_STR_LIT("partial");
@@ -1362,7 +1411,7 @@ static void t_put_enospc_commit_path(void) {
     setup_root();
     s3_store_t *s;
     store_open(&s, g_root);
-    store_bucket_create(s, S3_STR_LIT("buk"), "");
+    store_bucket_create(s, S3_STR_LIT("buk"));
 
     s3_writer_t *w;
     s3_str_t bb = S3_STR_LIT("buk"), kk = S3_STR_LIT("late-fail");
@@ -1388,7 +1437,7 @@ static void t_mpu_part_enospc(void) {
     setup_root();
     s3_store_t *s;
     store_open(&s, g_root);
-    store_bucket_create(s, S3_STR_LIT("buk"), "");
+    store_bucket_create(s, S3_STR_LIT("buk"));
 
     char id[33];
     s3_str_t bb = S3_STR_LIT("buk"), kk = S3_STR_LIT("mp");
@@ -1448,7 +1497,7 @@ static void t_recover_preserves_committed(void) {
     setup_root();
     s3_store_t *s;
     store_open(&s, g_root);
-    store_bucket_create(s, S3_STR_LIT("buk"), "");
+    store_bucket_create(s, S3_STR_LIT("buk"));
     put(s, "buk", "survivor", "precious", 8, "text/plain", NULL);
     store_close(s);
 
@@ -1471,7 +1520,7 @@ static void t_recover_leaves_fresh_mpu(void) {
     setup_root();
     s3_store_t *s;
     store_open(&s, g_root);
-    store_bucket_create(s, S3_STR_LIT("buk"), "");
+    store_bucket_create(s, S3_STR_LIT("buk"));
     char id[33];
     CHECK_EQ(store_mpu_create(s, S3_STR_LIT("buk"), S3_STR_LIT("inflight"),
                               NULL, id), S3_OK, "mpu create");
@@ -1498,14 +1547,13 @@ int main(void) {
     t_open_close();
     t_bucket_create_validate();
     t_bucket_delete();
-    t_bucket_create_writes_owner();
-    t_bucket_create_empty_owner_is_admin_only();
-    t_bucket_owner_missing_file_reads_admin();
-    t_bucket_delete_removes_owner_then_rmdir_succeeds();
-    t_bucket_set_owner_reassigns();
     t_put_commit_after_bucket_delete();
     t_mpu_after_bucket_delete();
     t_commit_races_bucket_delete();
+    t_bucket_owner_meta();
+    t_legacy_bucket_owner();
+    t_commit_into_recreated_bucket();
+    t_recover_clears_staged_bucket();
     t_put_get_simple();
     t_put_overwrite();
     t_put_streaming();

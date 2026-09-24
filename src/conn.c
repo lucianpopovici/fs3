@@ -76,7 +76,6 @@ static void parser_init(conn_t *c) {
 conn_t *conn_create(int fd, const char *peer, struct s3_store *store,
                     struct iopool *pool,
                     struct sigv4_verifier *auth, int auth_required,
-                    int identity_mode,
                     uint64_t max_body_bytes, struct fs3_metrics *metrics) {
     conn_t *c = calloc(1, sizeof(*c));
     if (!c) return NULL;
@@ -86,7 +85,6 @@ conn_t *conn_create(int fd, const char *peer, struct s3_store *store,
     c->pool = pool;
     c->auth = auth;
     c->auth_required = auth_required;
-    c->identity_mode = identity_mode;
     c->max_body_bytes = max_body_bytes;
     c->metrics = metrics;
     snprintf(c->peer, sizeof(c->peer), "%s", peer ? peer : "?");
@@ -198,11 +196,10 @@ static void request_reset(conn_t *c) {
     c->copy_bucket = (s3_str_t){0};
     c->copy_key = (s3_str_t){0};
     c->body_limit_hit = 0;
+    memset(&c->id, 0, sizeof(c->id));
     c->req_start_ns = 0;
     c->bytes_out_body = 0;
     c->metrics_flushed = 0;
-    c->principal[0] = '\0';
-    c->principal_admin = 0;
 
     /* Belt-and-suspenders: by the time we reset, route_dispatch_complete
      * (PUT path) or route_dispatch_send_body (GET path) should have
@@ -383,9 +380,7 @@ static int cb_on_headers_complete(llhttp_t *p) {
             }
         }
         if (auth_h || c->auth_required) {
-            s3_err_t e = sigv4_verify_principal(c->auth, c,
-                                                c->principal, sizeof(c->principal),
-                                                &c->principal_admin);
+            s3_err_t e = sigv4_verify_id(c->auth, c, &c->id);
             if (e != S3_OK) {
                 LOG_D("sigv4 verify failed (err=%d) on %s",
                       (int)e, c->peer);

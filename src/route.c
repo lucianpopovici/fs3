@@ -168,38 +168,45 @@ static char *scratch_alloc(conn_t *c, size_t n) {
 static void scratch_reset(conn_t *c) { c->req_scratch_used = 0; }
 
 /* ===================================================================== */
-/* Authorization (brief 12a — identity mode)                             */
+/* Service-level (PATH = "/")                                            */
 /* ===================================================================== */
 
-typedef enum {
-    AUTHZ_OP_ACCESS,        /* must be the bucket's owner, or admin */
-    AUTHZ_OP_CREATE_BUCKET, /* any authenticated principal may create */
-} authz_op_t;
+/* ===================================================================== */
+/* Bucket ownership                                                       */
+/* ===================================================================== */
+/*
+ * With auth configured, every bucket belongs to the identity that
+ * created it (the credential's user, or its access key), and only that
+ * identity — or an --admin user — may see or act on it or its objects.
+ * Ownerless buckets (from before isolation, or created in no-auth mode)
+ * are admin-only until --legacy-owner assigns them. Anonymous requests
+ * (auth configured without --require-auth) own nothing and get 403.
+ * Without auth there are no identities and no checks: open mode is
+ * unchanged.
+ */
 
-/* Single choke point for bucket-ownership authorization. Identity mode
- * off means today's behavior, unchanged (always allow). Must be called
- * before any writer, staging dir, or iopool job is created for the
- * request — denying after one exists leaves it orphaned. */
-static s3_err_t authz(conn_t *c, s3_str_t bucket, authz_op_t op) {
-    if (!c->identity_mode) return S3_OK;
-    if (c->principal_admin) return S3_OK;
-    if (c->principal[0] == '\0') {
-        /* No authenticated non-admin principal. Must never fall through
-         * to the owner strcmp below: an admin-only bucket has an empty
-         * owner string too, and empty would spuriously match empty. */
-        return S3_ERR_ACCESS_DENIED;
-    }
-    if (op == AUTHZ_OP_CREATE_BUCKET) return S3_OK;
-    char owner[128];
-    s3_err_t oe = store_bucket_owner(c->store, bucket, owner, sizeof(owner));
-    if (oe != S3_OK) return oe;
-    if (owner[0] != '\0' && strcmp(owner, c->principal) == 0) return S3_OK;
+/* S3_OK if this request may act on `bucket`. S3_ERR_NO_SUCH_BUCKET is
+ * passed through for the handler to report its own way; anything else
+ * is a denial. */
+static s3_err_t authz_bucket(conn_t *c, s3_str_t bucket) {
+    if (!c->auth) return S3_OK;
+    if (!c->id.user[0]) return S3_ERR_ACCESS_DENIED;
+    s3_bucket_meta_t m;
+    s3_err_t e = store_bucket_meta(c->store, bucket, &m);
+    if (e != S3_OK) return e;
+    if (c->id.is_admin) return S3_OK;
+    if (m.owner[0] && strcmp(m.owner, c->id.user) == 0) return S3_OK;
     return S3_ERR_ACCESS_DENIED;
 }
 
-/* ===================================================================== */
-/* Service-level (PATH = "/")                                            */
-/* ===================================================================== */
+/* Is this request "PUT /bucket" (create), as opposed to PUT /bucket?acl? */
+static int is_bucket_create(conn_t *c) {
+    if (!method_is(c, "PUT")) return 0;
+    if (c->req.query.n == 0) return 1;
+    char *qb = scratch_alloc(c, c->req.query.n + 1);
+    s3_str_t v;
+    return !(qb && query_param(c->req.query, "acl", qb, c->req.query.n, &v));
+}
 
 static int handle_service(conn_t *c) {
     /* Only GET is meaningful; everything else is method-not-allowed. */
@@ -210,36 +217,28 @@ static int handle_service(conn_t *c) {
     /* GET / → ListAllMyBuckets */
     s3_bucket_info_t *buckets = NULL;
     size_t n_buckets = 0;
+    if (c->auth && !c->id.user[0]) {
+        return rsp_build_s3_error(c, S3_ERR_ACCESS_DENIED,
+                                  S3_STR_LIT("/"), NULL);
+    }
     s3_err_t e = store_list_buckets(c->store, &buckets, &n_buckets);
     if (e != S3_OK) {
         return rsp_build_s3_error(c, e, S3_STR_LIT("/"), NULL);
     }
-
-    const char *owner_id = "fs3";
-    if (c->identity_mode) {
-        owner_id = c->principal_admin ? "admin"
-                 : (c->principal[0] ? c->principal : "fs3");
-        if (!c->principal_admin) {
-            /* Filter to buckets owned by this principal. store_buckets_free
-             * only walks [0, kept), so free dropped entries individually
-             * during the compaction — the array itself is one allocation
-             * regardless of how many slots we keep, so no realloc needed. */
-            size_t kept = 0;
-            for (size_t i = 0; i < n_buckets; i++) {
-                char ob[128];
-                s3_str_t nm = { buckets[i].name, strlen(buckets[i].name) };
-                if (store_bucket_owner(c->store, nm, ob, sizeof(ob)) == S3_OK
-                    && ob[0] != '\0' && strcmp(ob, c->principal) == 0) {
-                    buckets[kept++] = buckets[i];
-                } else {
-                    free(buckets[i].name);
-                }
+    /* Each user sees only their own buckets; admins see all. */
+    if (c->auth && !c->id.is_admin) {
+        size_t kept = 0;
+        for (size_t i = 0; i < n_buckets; i++) {
+            if (buckets[i].owner[0]
+                && strcmp(buckets[i].owner, c->id.user) == 0) {
+                buckets[kept++] = buckets[i];
+            } else {
+                free(buckets[i].name);
             }
-            n_buckets = kept;
         }
+        n_buckets = kept;
     }
-
-    int rc = rsp_build_list_all_my_buckets(c, buckets, n_buckets, owner_id);
+    int rc = rsp_build_list_all_my_buckets(c, buckets, n_buckets);
     store_buckets_free(buckets, n_buckets);
     return rc;
 }
@@ -381,24 +380,6 @@ static int handle_bulk_delete_finish(conn_t *c, s3_str_t bucket) {
 /* ===================================================================== */
 
 static int handle_bucket(conn_t *c, s3_str_t bucket) {
-    /* Identity-mode authorization. A PUT with no ?acl is a real
-     * CreateBucket (any principal may create); everything else here
-     * (including a PUT ?acl) requires bucket ownership. Detected before
-     * the ?acl branch below so a non-owner's "PUT ?acl" isn't
-     * misclassified as a create and let through. */
-    int has_acl = 0;
-    if (c->req.query.n > 0) {
-        char *qb_a = scratch_alloc(c, c->req.query.n + 1);
-        s3_str_t v_a;
-        if (qb_a && query_param(c->req.query, "acl", qb_a, c->req.query.n, &v_a)) {
-            has_acl = 1;
-        }
-    }
-    authz_op_t bop = (method_is(c, "PUT") && !has_acl)
-                    ? AUTHZ_OP_CREATE_BUCKET : AUTHZ_OP_ACCESS;
-    s3_err_t az = authz(c, bucket, bop);
-    if (az != S3_OK) return rsp_build_s3_error(c, az, c->req.path, NULL);
-
     /* ?acl — GET returns ACL XML; PUT accepts and discards the body. */
     if (c->req.query.n > 0) {
         char *qb = scratch_alloc(c, c->req.query.n + 1);
@@ -416,8 +397,15 @@ static int handle_bucket(conn_t *c, s3_str_t bucket) {
     }
 
     if (method_is(c, "PUT")) {
-        s3_err_t e = store_bucket_create(c->store, bucket,
-                                         c->identity_mode ? c->principal : "");
+        /* Create. With auth, the signer owns the new bucket. */
+        const char *owner = NULL;
+        if (c->auth) {
+            if (!c->id.user[0])
+                return rsp_build_s3_error(c, S3_ERR_ACCESS_DENIED,
+                                          c->req.path, NULL);
+            owner = c->id.user;
+        }
+        s3_err_t e = store_bucket_create_owned(c->store, bucket, owner);
         if (e == S3_OK) {
             char loc[1100];
             int n = snprintf(loc, sizeof(loc),
@@ -881,15 +869,12 @@ static int handle_object_copy(conn_t *c, s3_str_t dst_bucket, s3_str_t dst_key) 
     s3_str_t src_bucket = { p,         src_bucket_n };
     s3_str_t src_key    = { slash + 1, src_key_n    };
 
-    /* Destination bucket was already checked by route_dispatch_headers's
-     * single choke point (dst_bucket == its `bucket`). The source bucket
-     * is only known now, so it gets its own check here: without it, a
-     * non-owner could copy objects out of a bucket they don't own by
-     * naming it as the copy source instead of the destination. */
-    s3_err_t az_src = authz(c, src_bucket, AUTHZ_OP_ACCESS);
-    if (az_src != S3_OK) {
+    /* The destination was authorized at dispatch; the source is a second
+     * bucket and needs its own check. */
+    s3_err_t ae = authz_bucket(c, src_bucket);
+    if (ae != S3_OK && ae != S3_ERR_NO_SUCH_BUCKET) {
         free(src_buf);
-        return rsp_build_s3_error(c, az_src, c->req.path, NULL);
+        return rsp_build_s3_error(c, ae, c->req.path, NULL);
     }
 
     /* Open source. */
@@ -1222,20 +1207,20 @@ int route_dispatch_headers(conn_t *c) {
         return handle_service(c);
     }
 
+    /* Everything below acts on an existing bucket, except creating one. */
+    if (!(key.n == 0 && is_bucket_create(c))) {
+        s3_err_t ae = authz_bucket(c, bucket);
+        if (ae != S3_OK && ae != S3_ERR_NO_SUCH_BUCKET) {
+            return rsp_build_s3_error(c, ae, c->req.path, NULL);
+        }
+    }
+
     /* Bucket-level: "/bucket" or "/bucket/" with no key */
     if (key.n == 0) {
         return handle_bucket(c, bucket);
     }
 
     /* Object-level: "/bucket/key" */
-
-    /* Identity-mode authorization: covers object PUT/GET/HEAD/DELETE,
-     * object ?acl, CopyObject's destination bucket, and all four MPU
-     * operations below — they all key off `bucket` and none of them
-     * touches the store before this point. CopyObject's source bucket
-     * gets a second, separate check inside handle_object_copy. */
-    s3_err_t az = authz(c, bucket, AUTHZ_OP_ACCESS);
-    if (az != S3_OK) return rsp_build_s3_error(c, az, c->req.path, NULL);
 
     /* Object-level ?acl: GET returns ACL XML; PUT accepts and ignores body.
      * Both require the object to exist for GET. PUT is a no-op for fs3

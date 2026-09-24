@@ -19,11 +19,6 @@ typedef struct {
     struct sigv4_verifier *auth;
     int                    auth_required;
 
-    /* Per-user bucket/credential ownership (brief 12a). Requires
-     * auth_required — checked at startup in main.c, not here — since
-     * unsigned requests would otherwise bypass ownership entirely. */
-    int                    identity_mode;
-
     /* Multipart upload GC. Defaults (when fields are 0) are 60 s
      * sweep cadence and 24 h TTL. Override mainly for tests that want
      * to force quick reaping; production has no reason to retune. */
@@ -55,6 +50,11 @@ typedef struct {
      * completion, server-side copy). 0 runs that work inline on the
      * event loop — the pre-iopool behaviour. */
     int                    io_threads;
+
+    /* When set, every bucket without an owner (created before per-user
+     * isolation, or while auth was off) is assigned to this user at
+     * startup. Ownerless buckets are otherwise admin-only under auth. */
+    const char            *legacy_owner;
 
     /* Optional tick callback, invoked from the event loop at most once
      * per second, between event batches (so never concurrently with a
