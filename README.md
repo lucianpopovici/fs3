@@ -261,7 +261,10 @@ With auth on, each user sees only their own buckets. Buckets that
 predate per-user isolation are given, at startup, to `FS3_LEGACY_OWNER`
 in `fs3.conf` — by default the first user in the credentials file, so
 an existing single-user install keeps access to everything after the
-upgrade. `FS3_ADMIN=<user>` names a user who can see every bucket.
+upgrade. `FS3_ADMIN=<user>` names a user who can see every bucket. The
+DSM tile's credential form has an optional *User* field: to rotate a key
+without losing access to your buckets, add the new key with the same user,
+then remove the old one (replacing a key's secret keeps its user).
 
 ### HTTPS via the DSM reverse proxy
 

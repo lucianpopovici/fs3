@@ -177,6 +177,30 @@ check_eq  "replace keeps one line per key" "$(wc -l < "$CRED" | tr -d ' ')" "2"
 check_eq  "replaced secret stored" \
           "$(grep -c '^testkey:replaced-secret$' "$CRED" || true)" "1"
 
+# Users: buckets belong to a key's user, so the console must write the
+# optional user field and never drop it when a key's secret is replaced.
+out=$(cgi_post "action=addkey&ak=rotkey&sk=rotsecret-1&user=alice&tok=$TOKEN")
+check_has "key with user added" "$out" "m=added"
+check_eq  "user written as third field" \
+          "$(grep -c '^rotkey:rotsecret-1:alice$' "$CRED" || true)" "1"
+out=$(cgi_post "action=addkey&ak=rotkey&sk=rotsecret-2&tok=$TOKEN")
+check_eq  "replacing the secret keeps the user" \
+          "$(grep -c '^rotkey:rotsecret-2:alice$' "$CRED" || true)" "1"
+out=$(cgi_post "action=addkey&ak=rotkey&sk=rotsecret-3&user=bob&tok=$TOKEN")
+check_eq  "an explicit user replaces it" \
+          "$(grep -c '^rotkey:rotsecret-3:bob$' "$CRED" || true)" "1"
+out=$(cgi_post "action=addkey&ak=rotkey&sk=rotsecret-4&user=bad%3Auser&tok=$TOKEN")
+check_has "invalid user rejected" "$out" "m=e_user"
+check_eq  "rejected user wrote nothing" \
+          "$(grep -c '^rotkey:rotsecret-3:bob$' "$CRED" || true)" "1"
+page=$(cgi_get)
+check_has   "page shows a key's user" "$page" "<code>bob</code>"
+check_has   "page marks a key that is its own user" "$page" "testkey (the key itself)"
+check_lacks "page never shows secrets" "$page" "rotsecret-3"
+out=$(cgi_post "action=delkey&ak=rotkey&tok=$TOKEN")
+check_has "key with user removed" "$out" "m=removed"
+check_eq  "back to two keys" "$(wc -l < "$CRED" | tr -d ' ')" "2"
+
 # SIGHUP reached the recorded child pid.
 for _ in $(seq 1 20); do [ -f "$HUPFILE" ] && break; sleep 0.1; done
 [ -f "$HUPFILE" ] && { PASS=$((PASS+1)); printf '.'; } \

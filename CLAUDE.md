@@ -162,7 +162,7 @@ read time — the read path already does this.
 | `tests/test_e2e_phase11.sh` | bash + curl + python | 18 integration tests of `/_health`, `--credentials-file`, `--min-free-bytes` quota |
 | `tests/test_e2e_isolation.sh` | bash + python | 49 integration tests of per-user bucket isolation: every verb denied cross-user, shared users and key-as-user, filtered ListAllMyBuckets, copy source/destination checks, `--admin`, SIGHUP key rotation keeping buckets, ownerless buckets + `--legacy-owner`, anonymous requests under auth |
 | `tests/test_e2e_phase12.sh` | bash + curl + python | 39 integration tests of startup recovery, `--max-body-size` (413), `--idle-timeout`, `--max-conns`, SIGHUP credential reload, the `--metrics-port` admin listener (`/healthz`, `/metrics`, `/buckets`), and half-closed large uploads |
-| `tests/test_ui_cgi.sh` | bash | 45 tests of the DSM-tile admin console CGI driven against a scratch var dir: conf parsing without sourcing, HTML escaping, CSRF token + Origin checks, credential add/replace/remove with validation and the last-key lockout guard, SIGHUP delivery, live bucket stats via a real admin listener |
+| `tests/test_ui_cgi.sh` | bash | 56 tests of the DSM-tile admin console CGI driven against a scratch var dir: conf parsing without sourcing, HTML escaping, CSRF token + Origin checks, credential add/replace/remove with validation, the optional user field (kept when a secret is replaced) and the last-key lockout guard, SIGHUP delivery, live bucket stats via a real admin listener |
 
 All targets pass under both `-O2` and DEBUG (ASan + UBSan).
 
