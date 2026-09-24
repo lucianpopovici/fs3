@@ -83,6 +83,7 @@ typedef struct cred {
     char       *access_key;
     uint8_t    *secret_key;     /* not NUL-terminated, as bytes */
     size_t      secret_len;
+    char       *owner;          /* NULL/empty = admin (unrestricted) */
     struct cred *next;
 } cred_t;
 
@@ -110,6 +111,7 @@ void sigv4_destroy(sigv4_verifier_t *v) {
             OPENSSL_cleanse(c->secret_key, c->secret_len);
             free(c->secret_key);
         }
+        free(c->owner);
         free(c);
         c = next;
     }
@@ -123,9 +125,10 @@ void sigv4_swap_creds(sigv4_verifier_t *a, sigv4_verifier_t *b) {
     b->creds = tmp;
 }
 
-int sigv4_add_cred(sigv4_verifier_t *v,
-                   const char *access_key,
-                   const char *secret_key) {
+int sigv4_add_cred_owned(sigv4_verifier_t *v,
+                         const char *access_key,
+                         const char *secret_key,
+                         const char *owner) {
     if (!v || !access_key || !secret_key) return -1;
     /* Reject duplicate access keys. */
     for (cred_t *c = v->creds; c; c = c->next) {
@@ -136,8 +139,9 @@ int sigv4_add_cred(sigv4_verifier_t *v,
     c->access_key = strdup(access_key);
     size_t sn = strlen(secret_key);
     c->secret_key = malloc(sn);
-    if (!c->access_key || !c->secret_key) {
-        free(c->access_key); free(c->secret_key); free(c);
+    c->owner = (owner && owner[0]) ? strdup(owner) : NULL;
+    if (!c->access_key || !c->secret_key || (owner && owner[0] && !c->owner)) {
+        free(c->access_key); free(c->secret_key); free(c->owner); free(c);
         return -1;
     }
     memcpy(c->secret_key, secret_key, sn);
@@ -145,6 +149,12 @@ int sigv4_add_cred(sigv4_verifier_t *v,
     c->next = v->creds;
     v->creds = c;
     return 0;
+}
+
+int sigv4_add_cred(sigv4_verifier_t *v,
+                   const char *access_key,
+                   const char *secret_key) {
+    return sigv4_add_cred_owned(v, access_key, secret_key, NULL);
 }
 
 void sigv4_set_clock(sigv4_verifier_t *v, int64_t fixed_now) {
@@ -713,7 +723,9 @@ static int parse_amz_date(s3_str_t d, int64_t *out) {
 #define CR_BUF_SZ      (32 * 1024)
 #define STS_BUF_SZ     (1 * 1024)
 
-s3_err_t sigv4_verify(const sigv4_verifier_t *v, const conn_t *c) {
+s3_err_t sigv4_verify_principal(const sigv4_verifier_t *v, const conn_t *c,
+                                char *owner_out, size_t owner_cap,
+                                int *is_admin_out) {
     if (!v || !c) return S3_ERR_ACCESS_DENIED;
 
     /* 1. Authorization header */
@@ -796,7 +808,21 @@ s3_err_t sigv4_verify(const sigv4_verifier_t *v, const conn_t *c) {
     if (CRYPTO_memcmp(want, ap.signature.p, 64) != 0) {
         return S3_ERR_SIGNATURE_DOES_NOT_MATCH;
     }
+
+    /* Snapshot the principal into caller-owned storage. Never hand back a
+     * pointer into the cred list: sigv4_swap_creds can run (on SIGHUP)
+     * between now and when a long-lived request finishes. */
+    if (owner_out && owner_cap) {
+        snprintf(owner_out, owner_cap, "%s", cr->owner ? cr->owner : "");
+    }
+    if (is_admin_out) {
+        *is_admin_out = (cr->owner == NULL || cr->owner[0] == '\0');
+    }
     return S3_OK;
+}
+
+s3_err_t sigv4_verify(const sigv4_verifier_t *v, const conn_t *c) {
+    return sigv4_verify_principal(v, c, NULL, 0, NULL);
 }
 
 /* ===================================================================== */

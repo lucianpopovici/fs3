@@ -63,6 +63,7 @@ tests/test_xml
 tests/test_xml_legacy
 tests/test_xml_fuzz
 tests/test_sigv4
+tests/test_credfile
 
 # Python bytecode from test helpers
 __pycache__/

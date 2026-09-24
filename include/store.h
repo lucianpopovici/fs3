@@ -85,9 +85,25 @@ extern int     (*s3_store_fsync_hook)(int fd);
 
 /* ---- Buckets ---- */
 
-s3_err_t store_bucket_create(s3_store_t *s, s3_str_t name);
+/* `owner` NULL or "" creates an admin-only bucket (no owner file, matches
+ * pre-identity-mode behavior). A non-empty owner is written atomically
+ * (tmp+fsync+rename+fsync(dir)) into buckets/<name>/owner before the call
+ * returns S3_OK; if that write fails, the bucket is not left half-created
+ * (the marker dir is removed and the error is returned). */
+s3_err_t store_bucket_create(s3_store_t *s, s3_str_t name, const char *owner);
 s3_err_t store_bucket_delete(s3_store_t *s, s3_str_t name); /* empty buckets only */
 int      store_bucket_exists(s3_store_t *s, s3_str_t name);
+
+/* Reads the bucket's owner into buf (NUL-terminated, truncated to cap).
+ * A bucket with no owner file (legacy, or created with owner NULL/"")
+ * reads back as "" — admin-only — with S3_OK, not an error. */
+s3_err_t store_bucket_owner(s3_store_t *s, s3_str_t name, char *buf, size_t cap);
+
+/* Reassigns an existing bucket's owner (admin operation; not called from
+ * 12a's routing, but exercised directly by tests and reserved for 12b's
+ * management API). Fails with S3_ERR_NO_SUCH_BUCKET if the bucket
+ * doesn't exist. */
+s3_err_t store_bucket_set_owner(s3_store_t *s, s3_str_t name, const char *owner);
 
 /* ---- Streaming PUT ----
  *

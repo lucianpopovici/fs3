@@ -490,6 +490,94 @@ static void t_verify_delete(void) {
 }
 
 /* ---------------------------------------------------------------- */
+/* Principal capture (brief 12a)                                    */
+/* ---------------------------------------------------------------- */
+
+/* Shared header set for the principal tests: the same AWS worked
+ * example as t_verify_aws_s3_get_example, whose signature depends only
+ * on the access key + secret, not on the owner bound to that key. */
+static void set_aws_s3_get_example_headers(conn_t *c) {
+    c->req.method = (s3_str_t){ "GET", 3 };
+    c->req.path   = (s3_str_t){ "/test.txt", 9 };
+    c->req.query  = (s3_str_t){ NULL, 0 };
+    static const struct { const char *k, *v; } H[] = {
+        { "host",          "examplebucket.s3.amazonaws.com" },
+        { "range",         "bytes=0-9" },
+        { "x-amz-date",    "20130524T000000Z" },
+        { "authorization", "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request, SignedHeaders=host;range;x-amz-date, Signature=5d66fb2d81386a1a76b0d6d11ff033d15eef06699e0706d32b211f38fde2462c" },
+    };
+    for (size_t i = 0; i < 4; i++) {
+        c->req.headers[i].k = (s3_str_t){ H[i].k, strlen(H[i].k) };
+        c->req.headers[i].v = (s3_str_t){ H[i].v, strlen(H[i].v) };
+    }
+    c->req.n_headers = 4;
+}
+
+static void t_verify_principal_owned(void) {
+    sigv4_verifier_t *v = sigv4_create();
+    sigv4_add_cred_owned(v, "AKIAIOSFODNN7EXAMPLE",
+                            "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY", "alice");
+    sigv4_set_clock(v, 1369353600);
+
+    conn_t c = {0};
+    set_aws_s3_get_example_headers(&c);
+
+    char owner[128] = {0};
+    int is_admin = -1;
+    s3_err_t e = sigv4_verify_principal(v, &c, owner, sizeof(owner), &is_admin);
+    CHECK(e == S3_OK, "owned cred verifies");
+    CHECK_EQ_STR(owner, (int)strlen(owner), "alice", "principal copied out");
+    CHECK(is_admin == 0, "owned cred is not admin");
+    sigv4_destroy(v);
+}
+
+static void t_verify_principal_admin_when_no_owner(void) {
+    sigv4_verifier_t *v = sigv4_create();
+    /* Plain sigv4_add_cred (v1-style, no owner) — same key/secret as
+     * above, so the same request signature verifies. */
+    sigv4_add_cred(v, "AKIAIOSFODNN7EXAMPLE",
+                      "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY");
+    sigv4_set_clock(v, 1369353600);
+
+    conn_t c = {0};
+    set_aws_s3_get_example_headers(&c);
+
+    char owner[128];
+    strcpy(owner, "UNTOUCHED");
+    int is_admin = -1;
+    s3_err_t e = sigv4_verify_principal(v, &c, owner, sizeof(owner), &is_admin);
+    CHECK(e == S3_OK, "ownerless cred verifies");
+    CHECK(owner[0] == '\0', "ownerless cred reports empty owner");
+    CHECK(is_admin == 1, "ownerless cred is admin");
+    sigv4_destroy(v);
+}
+
+static void t_verify_principal_untouched_on_failure(void) {
+    sigv4_verifier_t *v = sigv4_create();
+    sigv4_add_cred_owned(v, "AKIAIOSFODNN7EXAMPLE",
+                            "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY", "alice");
+    sigv4_set_clock(v, 1369353600);
+
+    conn_t c = {0};
+    set_aws_s3_get_example_headers(&c);
+    /* Tamper the last hex digit of the signature, as in
+     * t_verify_wrong_signature. */
+    c.req.headers[3].v = (s3_str_t){
+        "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request, SignedHeaders=host;range;x-amz-date, Signature=5d66fb2d81386a1a76b0d6d11ff033d15eef06699e0706d32b211f38fde2462d",
+        strlen("AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request, SignedHeaders=host;range;x-amz-date, Signature=5d66fb2d81386a1a76b0d6d11ff033d15eef06699e0706d32b211f38fde2462d")
+    };
+
+    char owner[128];
+    strcpy(owner, "SENTINEL");
+    int is_admin = 99;
+    s3_err_t e = sigv4_verify_principal(v, &c, owner, sizeof(owner), &is_admin);
+    CHECK(e != S3_OK, "tampered signature fails");
+    CHECK(strcmp(owner, "SENTINEL") == 0, "owner_out untouched on failure");
+    CHECK(is_admin == 99, "is_admin_out untouched on failure");
+    sigv4_destroy(v);
+}
+
+/* ---------------------------------------------------------------- */
 /* Body-hash streaming API                                          */
 /* ---------------------------------------------------------------- */
 
@@ -558,6 +646,9 @@ int main(void) {
     t_verify_put_with_body();
     t_verify_get_with_query();
     t_verify_delete();
+    t_verify_principal_owned();
+    t_verify_principal_admin_when_no_owner();
+    t_verify_principal_untouched_on_failure();
     t_body_hash_empty();
     t_body_hash_single_chunk();
     t_body_hash_multiple_chunks();

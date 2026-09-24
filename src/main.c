@@ -11,13 +11,22 @@
 #include <string.h>
 #include <stdint.h>
 
+/* g_server/on_signal pull in server.h symbols (server_stop), which would
+ * drag src/server.o and its whole dependency chain into a unit test
+ * binary that only wants the credentials-file parser below. Excluded
+ * when FS3_MAIN_TESTING is defined — see the test-hook section at the
+ * bottom of this file. */
+#ifndef FS3_MAIN_TESTING
 static server_t *g_server;
+#endif
 static volatile sig_atomic_t g_reload;
 
+#ifndef FS3_MAIN_TESTING
 static void on_signal(int sig) {
     (void)sig;
     if (g_server) server_stop(g_server);
 }
+#endif
 
 static void on_sighup(int sig) {
     (void)sig;
@@ -34,6 +43,8 @@ static void usage(const char *argv0) {
         "      --credentials-file <f> load credentials from file (one ak:sk per line);\n"
         "                             SIGHUP re-reads the file for downtime-free rotation\n"
         "      --require-auth         reject requests without an Authorization header\n"
+        "      --identity-mode        authorize per bucket owner (v2 credentials file);\n"
+        "                             requires --require-auth\n"
         "      --min-free-bytes <N>   reject uploads when disk free < N (K/M/G suffix ok)\n"
         "      --max-body-size <N>    reject request bodies > N with 413 (default 5G; 0 = off)\n"
         "      --max-conns <num>      concurrent connection cap (default 512)\n"
@@ -81,8 +92,85 @@ static int parse_and_add_cred(sigv4_verifier_t *v, const char *spec) {
     return 0;
 }
 
-/* Load credentials from a file. Format: one "access_key:secret_key" per line.
- * Lines starting with '#' and blank lines are ignored. Returns 0 on success. */
+/* ---- Credentials file v2 (owner-scoped) ------------------------------
+ *
+ * First line, verbatim, selects the format:
+ *   "#fs3-credentials v2"
+ * Every subsequent non-blank, non-'#' line is:
+ *   access_key <TAB> owner <TAB> created_ms <TAB> label <TAB> secret
+ * The secret is the last field, so it may contain anything except TAB
+ * or newline (":" is not a safe separator here — secrets may legally
+ * contain it — hence tab-separated with the secret last, not first).
+ * An empty owner field means an admin credential. created_ms/label are
+ * validated but not otherwise consulted in 12a (reserved for 12b's
+ * `GET /keys`). This is the security boundary for identity mode, so
+ * every field is validated strictly; no silent best-effort parsing. */
+
+static int valid_v2_access_key(const char *s, size_t n) {
+    if (n == 0 || n > 64) return 0;
+    for (size_t i = 0; i < n; i++) {
+        char ch = s[i];
+        if (!((ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9'))) return 0;
+    }
+    return 1;
+}
+
+/* Owner/label fields: no control characters (a literal TAB here means
+ * the line didn't split where expected), length-bounded. Empty is
+ * allowed — callers decide what an empty owner means. */
+static int valid_v2_text_field(const char *s, size_t n, size_t max_len) {
+    if (n > max_len) return 0;
+    for (size_t i = 0; i < n; i++) {
+        unsigned char ch = (unsigned char)s[i];
+        if (ch < 0x20 || ch == 0x7f) return 0;
+    }
+    return 1;
+}
+
+static int valid_v2_created_ms(const char *s, size_t n) {
+    if (n == 0 || n > 20) return 0;
+    for (size_t i = 0; i < n; i++) {
+        if (s[i] < '0' || s[i] > '9') return 0;
+    }
+    return 1;
+}
+
+/* Parses one v2 line in place (already stripped of trailing \r/\n only —
+ * NOT trailing whitespace, since the secret is the last field and must
+ * be taken verbatim). Returns 0 on success, -1 on a malformed or
+ * invalid line. */
+static int parse_cred_v2_line(sigv4_verifier_t *v, char *line) {
+    char *t1 = strchr(line, '\t');
+    if (!t1) return -1;
+    char *t2 = strchr(t1 + 1, '\t');
+    if (!t2) return -1;
+    char *t3 = strchr(t2 + 1, '\t');
+    if (!t3) return -1;
+    char *t4 = strchr(t3 + 1, '\t');
+    if (!t4) return -1;
+
+    char *ak = line;       size_t ak_n     = (size_t)(t1 - ak);
+    char *owner = t1 + 1;  size_t owner_n  = (size_t)(t2 - owner);
+    char *cms = t2 + 1;    size_t cms_n    = (size_t)(t3 - cms);
+    char *label = t3 + 1;  size_t label_n  = (size_t)(t4 - label);
+    char *secret = t4 + 1; /* remainder to end of line */
+
+    if (!valid_v2_access_key(ak, ak_n))            return -1;
+    if (!valid_v2_text_field(owner, owner_n, 127)) return -1;
+    if (!valid_v2_created_ms(cms, cms_n))          return -1;
+    if (!valid_v2_text_field(label, label_n, 127)) return -1;
+    if (secret[0] == '\0')                         return -1;
+
+    *t1 = '\0'; *t2 = '\0'; *t3 = '\0'; *t4 = '\0';
+    return sigv4_add_cred_owned(v, ak, secret, owner_n ? owner : NULL) == 0
+         ? 0 : -1;
+}
+
+/* Load credentials from a file. Format auto-detected from line 1: v2
+ * (see above) if it is exactly "#fs3-credentials v2", else v1 — one
+ * "access_key:secret_key" per line, '#' comments and blank lines
+ * ignored, every credential an owner-less admin key. Returns 0 on
+ * success. */
 static int load_credentials_file(sigv4_verifier_t *v, const char *path) {
     FILE *f = fopen(path, "r");
     if (!f) {
@@ -91,12 +179,33 @@ static int load_credentials_file(sigv4_verifier_t *v, const char *path) {
         return -1;
     }
     char line[512];
-    int lineno = 0, loaded = 0;
+    int lineno = 0, loaded = 0, is_v2 = 0;
     while (fgets(line, sizeof(line), f)) {
         lineno++;
         size_t n = strlen(line);
-        while (n > 0 && (line[n-1] == '\n' || line[n-1] == '\r'
-                         || line[n-1] == ' '  || line[n-1] == '\t'))
+        while (n > 0 && (line[n-1] == '\n' || line[n-1] == '\r'))
+            line[--n] = '\0';
+
+        if (lineno == 1 && strcmp(line, "#fs3-credentials v2") == 0) {
+            is_v2 = 1;
+            continue;
+        }
+
+        if (is_v2) {
+            if (n == 0 || line[0] == '#') continue;
+            if (parse_cred_v2_line(v, line) < 0) {
+                fprintf(stderr, "%s:%d: invalid v2 credential line\n", path, lineno);
+                fclose(f);
+                return -1;
+            }
+            loaded++;
+            continue;
+        }
+
+        /* v1: also strip trailing space/tab — unlike v2, the secret
+         * isn't a delimited last field here, so it can't legally
+         * contain trailing whitespace anyway. */
+        while (n > 0 && (line[n-1] == ' ' || line[n-1] == '\t'))
             line[--n] = '\0';
         if (n == 0 || line[0] == '#') continue;
         if (parse_and_add_cred(v, line) < 0) {
@@ -111,7 +220,8 @@ static int load_credentials_file(sigv4_verifier_t *v, const char *path) {
         fprintf(stderr, "%s: no credentials found\n", path);
         return -1;
     }
-    fprintf(stderr, "loaded %d credential(s) from %s\n", loaded, path);
+    fprintf(stderr, "loaded %d credential(s) from %s (%s)\n", loaded, path,
+            is_v2 ? "v2" : "v1");
     return 0;
 }
 
@@ -164,6 +274,7 @@ enum {
     OPT_AUTH = 256,
     OPT_CREDENTIALS_FILE,
     OPT_REQUIRE_AUTH,
+    OPT_IDENTITY_MODE,
     OPT_MIN_FREE_BYTES,
     OPT_MPU_GC_INTERVAL,
     OPT_MPU_GC_MAX_AGE,
@@ -174,12 +285,14 @@ enum {
     OPT_IO_THREADS,
 };
 
+#ifndef FS3_MAIN_TESTING
 int main(int argc, char **argv) {
     const char *addr = "127.0.0.1";
     const char *data_root = "/tmp/fs3-data";
     int port = 9000;
     int verbose = 0;
     int require_auth = 0;
+    int identity_mode = 0;
     int gc_interval_s = 0;        /* 0 → server defaults to 60 */
     uint64_t gc_max_age_ms = 0;   /* 0 → server defaults to 24h */
     uint64_t min_free_bytes = 0;  /* 0 → no quota */
@@ -206,6 +319,7 @@ int main(int argc, char **argv) {
         { "auth",             required_argument, NULL, OPT_AUTH },
         { "credentials-file", required_argument, NULL, OPT_CREDENTIALS_FILE },
         { "require-auth",     no_argument,       NULL, OPT_REQUIRE_AUTH },
+        { "identity-mode",    no_argument,       NULL, OPT_IDENTITY_MODE },
         { "min-free-bytes",   required_argument, NULL, OPT_MIN_FREE_BYTES },
         { "max-body-size",    required_argument, NULL, OPT_MAX_BODY_SIZE },
         { "max-conns",        required_argument, NULL, OPT_MAX_CONNS },
@@ -261,6 +375,9 @@ int main(int argc, char **argv) {
                 break;
             case OPT_REQUIRE_AUTH:
                 require_auth = 1;
+                break;
+            case OPT_IDENTITY_MODE:
+                identity_mode = 1;
                 break;
             case OPT_MIN_FREE_BYTES:
                 min_free_bytes = parse_size(optarg);
@@ -335,6 +452,13 @@ int main(int argc, char **argv) {
         return 2;
     }
 
+    if (identity_mode && !require_auth) {
+        /* Without --require-auth, an unsigned request has no principal
+         * and would bypass bucket ownership entirely. */
+        fprintf(stderr, "--identity-mode requires --require-auth\n");
+        return 2;
+    }
+
     log_init(verbose ? LOG_DEBUG : LOG_INFO);
 
     /* Ignore SIGPIPE; we handle EPIPE on write() instead. */
@@ -359,6 +483,7 @@ int main(int argc, char **argv) {
         .data_root     = data_root,
         .auth          = auth,
         .auth_required = require_auth,
+        .identity_mode = identity_mode,
         .gc_interval_s = gc_interval_s,
         .gc_max_age_ms = gc_max_age_ms,
         .min_free_bytes = min_free_bytes,
@@ -383,3 +508,32 @@ int main(int argc, char **argv) {
     sigv4_destroy(auth);
     return rc < 0 ? 1 : 0;
 }
+#endif /* FS3_MAIN_TESTING */
+
+/* ===================================================================== */
+/* Test hooks (only enabled when FS3_MAIN_TESTING is defined)             */
+/* ===================================================================== */
+#ifdef FS3_MAIN_TESTING
+
+/* Thin non-static wrappers around the static credentials-file parser,
+ * mirroring sigv4.c's SIGV4_TESTING seam. This file is the security
+ * boundary for identity mode, so it gets a dedicated unit harness
+ * (tests/test_credfile.c) rather than only end-to-end coverage. */
+
+int main_test_parse_and_add_cred(sigv4_verifier_t *v, const char *spec);
+int main_test_parse_cred_v2_line(sigv4_verifier_t *v, char *line);
+int main_test_load_credentials_file(sigv4_verifier_t *v, const char *path);
+
+int main_test_parse_and_add_cred(sigv4_verifier_t *v, const char *spec) {
+    return parse_and_add_cred(v, spec);
+}
+
+int main_test_parse_cred_v2_line(sigv4_verifier_t *v, char *line) {
+    return parse_cred_v2_line(v, line);
+}
+
+int main_test_load_credentials_file(sigv4_verifier_t *v, const char *path) {
+    return load_credentials_file(v, path);
+}
+
+#endif /* FS3_MAIN_TESTING */

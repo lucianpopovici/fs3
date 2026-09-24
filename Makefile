@@ -74,7 +74,7 @@ $(XML_DIR)/%.o: $(XML_DIR)/%.c
 
 # ----- Tests --------------------------------------------------------
 
-TEST_BINS := tests/test_store tests/test_conn tests/test_xml tests/test_xml_legacy tests/test_xml_fuzz tests/test_sigv4
+TEST_BINS := tests/test_store tests/test_conn tests/test_xml tests/test_xml_legacy tests/test_xml_fuzz tests/test_sigv4 tests/test_credfile
 
 test: $(TEST_BINS) fs3
 	@echo "=== test_store ==="
@@ -89,6 +89,8 @@ test: $(TEST_BINS) fs3
 	@./tests/test_xml_fuzz 50000
 	@echo "=== test_sigv4 ==="
 	@./tests/test_sigv4
+	@echo "=== test_credfile ==="
+	@./tests/test_credfile
 	@echo "=== test_e2e (HTTP integration) ==="
 	@./tests/test_e2e.sh
 	@echo "=== test_e2e_auth (SigV4 integration) ==="
@@ -105,6 +107,8 @@ test: $(TEST_BINS) fs3
 	@./tests/test_e2e_phase12.sh
 	@echo "=== test_ui_cgi (DSM tile admin console) ==="
 	@./tests/test_ui_cgi.sh
+	@echo "=== test_e2e_identity (per-bucket ownership / authz) ==="
+	@./tests/test_e2e_identity.sh
 
 tests/test_store: tests/test_store.c src/store_fs.o src/log.o
 	$(CC) $(CFLAGS) $(INCLUDES) tests/test_store.c \
@@ -134,6 +138,14 @@ tests/test_xml_fuzz: $(XML_DIR)/tests/test_fuzz.c $(XML_DIR)/xml_parser.o
 # server build.
 tests/test_sigv4: tests/test_sigv4.c src/sigv4.c
 	$(CC) $(CFLAGS) $(INCLUDES) -DSIGV4_TESTING tests/test_sigv4.c src/sigv4.c \
+	    $(LDFLAGS) -o $@
+
+# test_credfile needs the FS3_MAIN_TESTING macro to expose main.c's
+# credentials-file parser and exclude main()/on_signal, so it can supply
+# its own main() without pulling in server.c's dependency chain.
+tests/test_credfile: tests/test_credfile.c src/main.c src/sigv4.c src/log.c
+	$(CC) $(CFLAGS) $(INCLUDES) -DFS3_MAIN_TESTING \
+	    tests/test_credfile.c src/main.c src/sigv4.c src/log.c \
 	    $(LDFLAGS) -o $@
 
 clean:

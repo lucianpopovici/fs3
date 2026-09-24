@@ -101,6 +101,18 @@ typedef struct conn {
      * present, else allow" — useful for compatibility transitions. */
     int                auth_required;
 
+    /* Identity mode (server_cfg_t.identity_mode, connection-lifetime):
+     * when set, route.c's authz() enforces bucket ownership per
+     * principal/admin below instead of allowing every authenticated
+     * request through. */
+    int                identity_mode;
+
+    /* Principal that signed the current request, copied at verify time
+     * (never a pointer into the credential list — see sigv4_verify_principal).
+     * Reset to "" / 0 between pipelined requests in request_reset. */
+    char               principal[128];
+    int                principal_admin;
+
     /* Request body ceiling (0 = unlimited). Checked against the declared
      * Content-Length at headers-complete and against the running byte
      * count as the body streams, so a client that lies about (or omits)
@@ -232,6 +244,7 @@ typedef struct conn {
 conn_t *conn_create(int fd, const char *peer, struct s3_store *store,
                     struct iopool *pool,
                     struct sigv4_verifier *auth, int auth_required,
+                    int identity_mode,
                     uint64_t max_body_bytes, struct fs3_metrics *metrics);
 void    conn_destroy(conn_t *c);
 

@@ -415,23 +415,67 @@ static s3_err_t quota_check(const s3_store_t *s) {
 /* Bucket ops                                                             */
 /* ===================================================================== */
 
-s3_err_t store_bucket_create(s3_store_t *s, s3_str_t name) {
+/* Write (or overwrite) <bucket_dir>/owner atomically: tmp + fsync +
+ * rename + fsync(dir), mirroring store_mpu_create's meta-file discipline.
+ * No trailing newline. Caller holds ns_mu. Not O_EXCL: also used to
+ * reassign an existing bucket's owner, where a leftover tmp file from a
+ * prior crash must not block the write. */
+static s3_err_t bucket_write_owner_locked(const char *bucket_dir, const char *owner) {
+    char path[4160], tmp[4160];
+    if (snprintf(path, sizeof(path), "%s/owner", bucket_dir) >= (int)sizeof(path))
+        return S3_ERR_INTERNAL;
+    if (snprintf(tmp, sizeof(tmp), "%s/owner.tmp", bucket_dir) >= (int)sizeof(tmp))
+        return S3_ERR_INTERNAL;
+
+    int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0) return map_io_err(errno);
+    size_t n = strlen(owner);
+    ssize_t w = xwrite(fd, owner, n);
+    if (w < 0 || (size_t)w != n || xfsync(fd) < 0) {
+        s3_err_t e = map_io_err(errno);
+        close(fd);
+        unlink(tmp);
+        return e;
+    }
+    close(fd);
+    if (rename(tmp, path) < 0) {
+        s3_err_t e = map_io_err(errno);
+        unlink(tmp);
+        return e;
+    }
+    fsync_dir(bucket_dir);
+    return S3_OK;
+}
+
+s3_err_t store_bucket_create(s3_store_t *s, s3_str_t name, const char *owner) {
     if (!s) return S3_ERR_INVALID_ARGUMENT;
     if (!valid_bucket_name(name)) return S3_ERR_INVALID_BUCKET_NAME;
 
     char bp[4096];
     if (bucket_path(s, name, bp, sizeof(bp)) < 0) return S3_ERR_INTERNAL;
 
-    if (mkdir(bp, 0700) == 0) {
-        /* Pre-create the per-bucket data subtree to avoid races later. */
-        char dp[4096];
-        snprintf(dp, sizeof(dp), "%s/" S3_STR_FMT, s->data_dir, S3_STR_ARG(name));
-        (void)mkdir(dp, 0700);
-        return S3_OK;
+    pthread_mutex_lock(&s->ns_mu);
+    if (mkdir(bp, 0700) < 0) {
+        pthread_mutex_unlock(&s->ns_mu);
+        if (errno == EEXIST) return S3_ERR_BUCKET_ALREADY_EXISTS;
+        LOG_W("bucket_create %s: %s", bp, strerror(errno));
+        return S3_ERR_INTERNAL;
     }
-    if (errno == EEXIST) return S3_ERR_BUCKET_ALREADY_EXISTS;
-    LOG_W("bucket_create %s: %s", bp, strerror(errno));
-    return S3_ERR_INTERNAL;
+    if (owner && owner[0]) {
+        s3_err_t oe = bucket_write_owner_locked(bp, owner);
+        if (oe != S3_OK) {
+            /* Never leave a half-created bucket behind. */
+            rmdir(bp);
+            pthread_mutex_unlock(&s->ns_mu);
+            return oe;
+        }
+    }
+    /* Pre-create the per-bucket data subtree to avoid races later. */
+    char dp[4096];
+    snprintf(dp, sizeof(dp), "%s/" S3_STR_FMT, s->data_dir, S3_STR_ARG(name));
+    (void)mkdir(dp, 0700);
+    pthread_mutex_unlock(&s->ns_mu);
+    return S3_OK;
 }
 
 int store_bucket_exists(s3_store_t *s, s3_str_t name) {
@@ -439,6 +483,59 @@ int store_bucket_exists(s3_store_t *s, s3_str_t name) {
     if (bucket_path(s, name, bp, sizeof(bp)) < 0) return 0;
     struct stat st;
     return stat(bp, &st) == 0 && S_ISDIR(st.st_mode);
+}
+
+s3_err_t store_bucket_owner(s3_store_t *s, s3_str_t name, char *buf, size_t cap) {
+    if (!s || !buf || cap == 0) return S3_ERR_INVALID_ARGUMENT;
+    char bp[4096], op[4160];
+    if (bucket_path(s, name, bp, sizeof(bp)) < 0) return S3_ERR_INTERNAL;
+    if (snprintf(op, sizeof(op), "%s/owner", bp) >= (int)sizeof(op))
+        return S3_ERR_INTERNAL;
+
+    FILE *fp = fopen(op, "r");
+    if (!fp) {
+        /* No owner file — legacy bucket, or one created with owner
+         * NULL/"" — reads back as admin-only, not an error. */
+        if (errno == ENOENT) { buf[0] = '\0'; return S3_OK; }
+        return S3_ERR_INTERNAL;
+    }
+    char *line = NULL;
+    size_t line_cap = 0;
+    ssize_t r = getline(&line, &line_cap, fp);
+    fclose(fp);
+    if (r <= 0) { free(line); buf[0] = '\0'; return S3_OK; }
+    if (r > 0 && line[r-1] == '\n') { line[r-1] = '\0'; r--; }
+    snprintf(buf, cap, "%s", line);
+    free(line);
+    return S3_OK;
+}
+
+s3_err_t store_bucket_set_owner(s3_store_t *s, s3_str_t name, const char *owner) {
+    if (!s) return S3_ERR_INVALID_ARGUMENT;
+    pthread_mutex_lock(&s->ns_mu);
+    if (!store_bucket_exists(s, name)) {
+        pthread_mutex_unlock(&s->ns_mu);
+        return S3_ERR_NO_SUCH_BUCKET;
+    }
+    char bp[4096];
+    if (bucket_path(s, name, bp, sizeof(bp)) < 0) {
+        pthread_mutex_unlock(&s->ns_mu);
+        return S3_ERR_INTERNAL;
+    }
+    s3_err_t e;
+    if (owner && owner[0]) {
+        e = bucket_write_owner_locked(bp, owner);
+    } else {
+        char op[4160];
+        if (snprintf(op, sizeof(op), "%s/owner", bp) >= (int)sizeof(op)) {
+            e = S3_ERR_INTERNAL;
+        } else {
+            unlink(op);
+            e = S3_OK;
+        }
+    }
+    pthread_mutex_unlock(&s->ns_mu);
+    return e;
 }
 
 /* Recursively check whether a directory tree contains any regular files. */
@@ -507,6 +604,12 @@ static s3_err_t bucket_delete_locked(s3_store_t *s, s3_str_t name) {
 
     char bp[4096];
     if (bucket_path(s, name, bp, sizeof(bp)) < 0) return S3_ERR_INTERNAL;
+    /* rmdir requires an empty marker dir; an owner file left behind would
+     * fail it with ENOTEMPTY. Fine if it doesn't exist (legacy bucket). */
+    char op[4160];
+    if (snprintf(op, sizeof(op), "%s/owner", bp) < (int)sizeof(op)) {
+        unlink(op);
+    }
     if (rmdir(bp) < 0) {
         LOG_W("bucket_delete rmdir %s: %s", bp, strerror(errno));
         return S3_ERR_INTERNAL;

@@ -390,6 +390,7 @@ static void accept_new(server_t *s) {
 
         conn_t *c = conn_create(fd, peer, s->store, s->pool,
                                 s->cfg.auth, s->cfg.auth_required,
+                                s->cfg.identity_mode,
                                 s->cfg.max_body_bytes, &s->metrics);
         if (!c) {
             LOG_E("conn_create OOM");

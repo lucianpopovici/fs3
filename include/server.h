@@ -19,6 +19,11 @@ typedef struct {
     struct sigv4_verifier *auth;
     int                    auth_required;
 
+    /* Per-user bucket/credential ownership (brief 12a). Requires
+     * auth_required — checked at startup in main.c, not here — since
+     * unsigned requests would otherwise bypass ownership entirely. */
+    int                    identity_mode;
+
     /* Multipart upload GC. Defaults (when fields are 0) are 60 s
      * sweep cadence and 24 h TTL. Override mainly for tests that want
      * to force quick reaping; production has no reason to retune. */

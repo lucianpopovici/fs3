@@ -99,14 +99,27 @@ The protocol surface covered today:
   content-type; URL-decodes the source path
 - ACL stub: `GET /<bucket>?acl` and `GET /<bucket>/<key>?acl` return a
   static FULL_CONTROL ACL; `PUT` accepts and discards the body → 200
+- Identity mode (`--identity-mode`, requires `--require-auth`; brief
+  12a): credentials-file v2 (`#fs3-credentials v2` magic line,
+  tab-separated `access_key/owner/created_ms/label/secret`, empty owner
+  = admin) binds each credential to an owner principal; buckets get an
+  owner file (`buckets/<name>/owner`) set at creation; every S3
+  operation is authorized through a single `authz()` choke point in
+  `src/route.c` — admin keys are unrestricted, a non-admin principal
+  can only touch buckets they own, and a bucket with no owner file
+  (legacy, or created with identity mode off) is admin-only. v1
+  `ak:sk` credential lines still work as owner-less admin keys, and
+  with `--identity-mode` off nothing changes from pre-12a behavior.
 
 What we *don't* do:
 - HTTP `Range:` multi-range (`bytes=A-B,C-D`; only single-range spec)
 - SigV4 trailer variants (`STREAMING-...-TRAILER`)
 - Bucket subresources: `?lifecycle`, `?cors` (location + versioning are stubs)
 - Pagination on ListMultipartUploads (always `IsTruncated=false`)
-- Any kind of IAM beyond static `access_key:secret_key` pairs from the
-  CLI. No policies, no STS, no console.
+- Full IAM: identity mode (above) is bucket-ownership authorization
+  only — no policies, no conditions, no roles, no STS, and DSM
+  usernames are opaque strings to fs3 core (no NSS/`getpwnam` calls).
+  See `docs/synology-readiness/12-dsm-identity-binding/CLAUDE.md`.
 - Replication, versioning, lifecycle rules, server-side encryption
 
 ## On-disk layout
@@ -134,12 +147,13 @@ read time — the read path already does this.
 
 | target | language | what it exercises |
 |---|---|---|
-| `tests/test_store` | C | 37 unit tests: bucket CRUD (incl. delete racing an in-flight PUT/MPU, and a threaded commit-vs-bucket-delete race on `ns_mu`), single PUT/GET round-trip, sendfile, listing with prefix/delimiter, persistence across `store_open`/`store_close`, multipart lifecycle, list_buckets, bucket_stats, list_mpu_uploads (with prefix filter), mpu_gc reaping behavior |
+| `tests/test_store` | C | 43 unit tests: bucket CRUD (incl. delete racing an in-flight PUT/MPU, a threaded commit-vs-bucket-delete race on `ns_mu`, and per-bucket owner-file create/read/delete/reassign/ENOSPC-rollback), single PUT/GET round-trip, sendfile, listing with prefix/delimiter, persistence across `store_open`/`store_close`, multipart lifecycle, list_buckets, bucket_stats, list_mpu_uploads (with prefix filter), mpu_gc reaping behavior |
 | `tests/test_conn` | C | 5 unit tests of the per-connection request path over a pipe: the per-event read budget yields and resumes, a yielded conn isn't closed on peer hangup; PUT commit, copy, MPU part and MPU complete park the conn and run on an iopool worker (a blocking fsync hook proves the loop thread is free); an orphaned job completes safely; pool shutdown drains queued jobs |
 | `tests/test_xml` | C | 25 tests of the extended XML library (escaping, parsing, security limits) |
 | `tests/test_xml_legacy` | C | one round-trip showing the original calling style still works |
 | `tests/test_xml_fuzz` | C | 50,000 random inputs through the parser, must not crash |
-| `tests/test_sigv4` | C | 34 unit tests of canonical request, string-to-sign, signing key derivation, against AWS test vectors |
+| `tests/test_sigv4` | C | 43 unit tests of canonical request, string-to-sign, signing key derivation against AWS test vectors, plus `sigv4_verify_principal`'s owner/admin capture and its untouched-on-failure guarantee |
+| `tests/test_credfile` | C | 20 unit tests of the credentials-file v2 parser (`main.c`, via a `FS3_MAIN_TESTING` test seam): field validation, magic-line detection, v1 fallback, fail-closed on a malformed line |
 | `tests/test_e2e.sh` | bash + curl | 23 integration tests: every bucket/object verb, listing edge cases, keep-alive pipelining, large objects, ext_body spillover, ListAllMyBuckets |
 | `tests/test_e2e_auth.sh` | bash + python | 28 integration tests of SigV4 with real signatures from botocore (header mode + streaming chunked) |
 | `tests/test_e2e_mpu.sh` | bash + curl | 26 integration tests of the full multipart lifecycle including ListMultipartUploads, prefix filter, abort, malformed XML, large parts |
@@ -148,8 +162,13 @@ read time — the read path already does this.
 | `tests/test_e2e_phase11.sh` | bash + curl + python | 16 integration tests of `/_health`, `--credentials-file`, `--min-free-bytes` quota |
 | `tests/test_e2e_phase12.sh` | bash + curl + python | 39 integration tests of startup recovery, `--max-body-size` (413), `--idle-timeout`, `--max-conns`, SIGHUP credential reload, the `--metrics-port` admin listener (`/healthz`, `/metrics`, `/buckets`), and half-closed large uploads |
 | `tests/test_ui_cgi.sh` | bash | 45 tests of the DSM-tile admin console CGI driven against a scratch var dir: conf parsing without sourcing, HTML escaping, CSRF token + Origin checks, credential add/replace/remove with validation and the last-key lockout guard, SIGHUP delivery, live bucket stats via a real admin listener |
+| `tests/test_e2e_identity.sh` | bash + curl + python | 31 integration tests of `--identity-mode` (brief 12a): per-bucket-owner 403s across every S3 verb, CopyObject checked both directions, ListAllMyBuckets filtered per principal, admin bypass, an admin-only legacy bucket, `--identity-mode` requiring `--require-auth`, and a SIGHUP-credential-reload-vs-in-flight-request ASan/UBSan regression (`tests/sign_slow_put.py`) |
 
-All targets pass under both `-O2` and DEBUG (ASan + UBSan).
+All targets pass under both `-O2` and DEBUG (ASan + UBSan), except one
+pre-existing, unrelated flake under DEBUG:
+`t_commit_races_bucket_delete` in `tests/test_store` (a tight two-thread
+race on `ns_mu`) reproduces on unmodified `main` too in this sandbox —
+not caused by any brief-12a change. Worth its own session.
 
 `make test` runs everything sequentially; each suite is also runnable
 standalone. The auth suite is the slowest (~30s; chunked SigV4 tests
