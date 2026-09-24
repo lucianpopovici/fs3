@@ -81,13 +81,20 @@ static void hex_encode(const uint8_t *in, size_t in_len, char *out) {
 
 typedef struct cred {
     char       *access_key;
+    char       *user;           /* owner identity; defaults to access_key */
     uint8_t    *secret_key;     /* not NUL-terminated, as bytes */
     size_t      secret_len;
     struct cred *next;
 } cred_t;
 
+typedef struct admin {
+    char         *user;
+    struct admin *next;
+} admin_t;
+
 struct sigv4_verifier {
     cred_t   *creds;
+    admin_t  *admins;           /* not swapped by sigv4_swap_creds */
     int64_t   fixed_now;        /* 0 = real clock */
     int       max_skew;         /* seconds */
 };
@@ -105,6 +112,7 @@ void sigv4_destroy(sigv4_verifier_t *v) {
     while (c) {
         cred_t *next = c->next;
         free(c->access_key);
+        free(c->user);
         if (c->secret_key) {
             /* Zero secrets before freeing. */
             OPENSSL_cleanse(c->secret_key, c->secret_len);
@@ -112,6 +120,13 @@ void sigv4_destroy(sigv4_verifier_t *v) {
         }
         free(c);
         c = next;
+    }
+    admin_t *a = v->admins;
+    while (a) {
+        admin_t *next = a->next;
+        free(a->user);
+        free(a);
+        a = next;
     }
     free(v);
 }
@@ -126,7 +141,16 @@ void sigv4_swap_creds(sigv4_verifier_t *a, sigv4_verifier_t *b) {
 int sigv4_add_cred(sigv4_verifier_t *v,
                    const char *access_key,
                    const char *secret_key) {
+    return sigv4_add_cred_user(v, access_key, secret_key, NULL);
+}
+
+int sigv4_add_cred_user(sigv4_verifier_t *v,
+                        const char *access_key,
+                        const char *secret_key,
+                        const char *user) {
     if (!v || !access_key || !secret_key) return -1;
+    if (!user || !*user) user = access_key;
+    if (strlen(user) > SIGV4_USER_MAX) return -1;
     /* Reject duplicate access keys. */
     for (cred_t *c = v->creds; c; c = c->next) {
         if (strcmp(c->access_key, access_key) == 0) return -1;
@@ -134,16 +158,34 @@ int sigv4_add_cred(sigv4_verifier_t *v,
     cred_t *c = calloc(1, sizeof(*c));
     if (!c) return -1;
     c->access_key = strdup(access_key);
+    c->user = strdup(user);
     size_t sn = strlen(secret_key);
     c->secret_key = malloc(sn);
-    if (!c->access_key || !c->secret_key) {
-        free(c->access_key); free(c->secret_key); free(c);
+    if (!c->access_key || !c->user || !c->secret_key) {
+        free(c->access_key); free(c->user); free(c->secret_key); free(c);
         return -1;
     }
     memcpy(c->secret_key, secret_key, sn);
     c->secret_len = sn;
     c->next = v->creds;
     v->creds = c;
+    return 0;
+}
+
+int sigv4_add_admin(sigv4_verifier_t *v, const char *user) {
+    if (!v || !user || !*user || strlen(user) > SIGV4_USER_MAX) return -1;
+    admin_t *a = calloc(1, sizeof(*a));
+    if (!a) return -1;
+    a->user = strdup(user);
+    if (!a->user) { free(a); return -1; }
+    a->next = v->admins;
+    v->admins = a;
+    return 0;
+}
+
+static int is_admin(const sigv4_verifier_t *v, const char *user) {
+    for (const admin_t *a = v->admins; a; a = a->next)
+        if (strcmp(a->user, user) == 0) return 1;
     return 0;
 }
 
@@ -714,6 +756,11 @@ static int parse_amz_date(s3_str_t d, int64_t *out) {
 #define STS_BUF_SZ     (1 * 1024)
 
 s3_err_t sigv4_verify(const sigv4_verifier_t *v, const conn_t *c) {
+    return sigv4_verify_id(v, c, NULL);
+}
+
+s3_err_t sigv4_verify_id(const sigv4_verifier_t *v, const conn_t *c,
+                         sigv4_id_t *id_out) {
     if (!v || !c) return S3_ERR_ACCESS_DENIED;
 
     /* 1. Authorization header */
@@ -795,6 +842,12 @@ s3_err_t sigv4_verify(const sigv4_verifier_t *v, const conn_t *c) {
     if (ap.signature.n != 64) return S3_ERR_SIGNATURE_DOES_NOT_MATCH;
     if (CRYPTO_memcmp(want, ap.signature.p, 64) != 0) {
         return S3_ERR_SIGNATURE_DOES_NOT_MATCH;
+    }
+    /* Copied out: a SIGHUP reload may free this cred before the request
+     * that verified it is finished. */
+    if (id_out) {
+        snprintf(id_out->user, sizeof(id_out->user), "%s", cr->user);
+        id_out->is_admin = is_admin(v, cr->user);
     }
     return S3_OK;
 }

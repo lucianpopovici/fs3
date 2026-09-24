@@ -51,6 +51,11 @@ typedef struct {
      * event loop — the pre-iopool behaviour. */
     int                    io_threads;
 
+    /* When set, every bucket without an owner (created before per-user
+     * isolation, or while auth was off) is assigned to this user at
+     * startup. Ownerless buckets are otherwise admin-only under auth. */
+    const char            *legacy_owner;
+
     /* Optional tick callback, invoked from the event loop at most once
      * per second, between event batches (so never concurrently with a
      * request). main.c uses it to act on signal flags — e.g. the SIGHUP

@@ -19,6 +19,7 @@
 
 #include "llhttp.h"
 #include "s3.h"
+#include "sigv4.h"
 
 #define CONN_RBUF_SZ          (16 * 1024)
 #define CONN_WBUF_SZ          (16 * 1024)
@@ -100,6 +101,11 @@ typedef struct conn {
      * is set, auth_required=0 means "verify if Authorization is
      * present, else allow" — useful for compatibility transitions. */
     int                auth_required;
+
+    /* Who signed the current request (set on successful SigV4 verify,
+     * cleared per request). id.user[0] == '\0' means anonymous. Used by
+     * route.c to enforce bucket ownership whenever `auth` is set. */
+    sigv4_id_t         id;
 
     /* Request body ceiling (0 = unlimited). Checked against the declared
      * Content-Length at headers-complete and against the running byte

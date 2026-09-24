@@ -103,6 +103,8 @@ test: $(TEST_BINS) fs3
 	@./tests/test_e2e_phase11.sh
 	@echo "=== test_e2e_phase12 (recovery / body cap / idle timeout / conn cap) ==="
 	@./tests/test_e2e_phase12.sh
+	@echo "=== test_e2e_isolation (per-user bucket ownership) ==="
+	@./tests/test_e2e_isolation.sh
 
 tests/test_store: tests/test_store.c src/store_fs.o src/log.o
 	$(CC) $(CFLAGS) $(INCLUDES) tests/test_store.c \

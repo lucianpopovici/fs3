@@ -187,6 +187,28 @@ server_t *server_create(const server_cfg_t *cfg) {
     }
     LOG_I("store opened at %s", cfg->data_root);
 
+    if (cfg->legacy_owner) {
+        int n = store_assign_legacy_owner(s->store, cfg->legacy_owner);
+        if (n < 0) {
+            LOG_E("--legacy-owner: cannot list buckets");
+            goto fail;
+        }
+        if (n > 0) LOG_I("assigned %d ownerless bucket(s) to '%s'",
+                         n, cfg->legacy_owner);
+    } else if (cfg->auth) {
+        /* Say so up front rather than let users discover 403s. */
+        s3_bucket_info_t *list = NULL;
+        size_t nb = 0, ownerless = 0;
+        if (store_list_buckets(s->store, &list, &nb) == S3_OK) {
+            for (size_t i = 0; i < nb; i++) ownerless += !list[i].owner[0];
+            store_buckets_free(list, nb);
+        }
+        if (ownerless > 0)
+            LOG_W("%zu bucket(s) have no owner and are visible to --admin "
+                  "users only; assign them with --legacy-owner <user>",
+                  ownerless);
+    }
+
     if (cfg->io_threads > 0) {
         s->pool = iopool_create(cfg->io_threads);
         if (!s->pool) {

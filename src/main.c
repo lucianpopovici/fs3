@@ -30,10 +30,14 @@ static void usage(const char *argv0) {
         "  -a, --addr <ip>            bind address (default 127.0.0.1)\n"
         "  -p, --port <num>           port (default 9000)\n"
         "  -d, --data <dir>           object store root (default /tmp/fs3-data)\n"
-        "      --auth <ak:sk>         add a SigV4 credential (repeatable)\n"
-        "      --credentials-file <f> load credentials from file (one ak:sk per line);\n"
+        "      --auth <ak:sk[:user]>  add a SigV4 credential (repeatable); buckets are\n"
+        "                             owned by <user>, or by the access key if omitted\n"
+        "      --credentials-file <f> load credentials from file (one ak:sk[:user] per line);\n"
         "                             SIGHUP re-reads the file for downtime-free rotation\n"
         "      --require-auth         reject requests without an Authorization header\n"
+        "      --admin <user>         user who can see and manage every bucket (repeatable)\n"
+        "      --legacy-owner <user>  at startup, give ownerless buckets (made before\n"
+        "                             per-user isolation, or in no-auth mode) to <user>\n"
         "      --min-free-bytes <N>   reject uploads when disk free < N (K/M/G suffix ok)\n"
         "      --max-body-size <N>    reject request bodies > N with 413 (default 5G; 0 = off)\n"
         "      --max-conns <num>      concurrent connection cap (default 512)\n"
@@ -60,28 +64,55 @@ static uint64_t parse_size(const char *s) {
     return (uint64_t)v;
 }
 
-/* Parse "access:secret" into ak/sk and add to verifier. Returns 0 on
- * success. The input string is not modified. */
-static int parse_and_add_cred(sigv4_verifier_t *v, const char *spec) {
-    const char *colon = strchr(spec, ':');
-    if (!colon || colon == spec || colon[1] == 0) {
-        fprintf(stderr, "invalid --auth: expected <access_key>:<secret_key>\n");
-        return -1;
+/* An identity that owns buckets: a user name, or an access key standing
+ * in for one. Stored as a line in each bucket's meta file, so: 1..128
+ * printable ASCII characters, no whitespace, no ':'. */
+static int valid_identity(const char *u) {
+    size_t n = strlen(u);
+    if (n == 0 || n > SIGV4_USER_MAX) return 0;
+    for (size_t i = 0; i < n; i++) {
+        unsigned char ch = (unsigned char)u[i];
+        if (ch <= ' ' || ch >= 0x7f || ch == ':') return 0;
     }
-    size_t ak_n = (size_t)(colon - spec);
-    char *ak = strndup(spec, ak_n);
-    const char *sk = colon + 1;
-    if (!ak) return -1;
-    int rc = sigv4_add_cred(v, ak, sk);
-    free(ak);
-    if (rc != 0) {
-        fprintf(stderr, "failed to add credential (duplicate or OOM)\n");
-        return -1;
-    }
-    return 0;
+    return 1;
 }
 
-/* Load credentials from a file. Format: one "access_key:secret_key" per line.
+/* Parse "access:secret[:user]" and add it to the verifier. Without a
+ * user, the access key is the identity that owns buckets. Returns 0 on
+ * success. The input string is not modified. */
+static int parse_and_add_cred(sigv4_verifier_t *v, const char *spec) {
+    const char *c1 = strchr(spec, ':');
+    const char *c2 = c1 ? strchr(c1 + 1, ':') : NULL;
+    if (!c1 || c1 == spec || c1[1] == 0 || c1[1] == ':'
+        || (c2 && c2[1] == 0)) {
+        fprintf(stderr, "invalid credential: expected "
+                        "<access_key>:<secret_key>[:<user>]\n");
+        return -1;
+    }
+    char *ak = strndup(spec, (size_t)(c1 - spec));
+    char *sk = c2 ? strndup(c1 + 1, (size_t)(c2 - c1 - 1)) : strdup(c1 + 1);
+    const char *user = c2 ? c2 + 1 : NULL;
+    int rc = -1;
+    if (!ak || !sk) goto out;
+    if (!valid_identity(user ? user : ak)) {
+        fprintf(stderr, "invalid credential: user (or access key used as "
+                        "user) must be 1-%d printable characters without "
+                        "spaces or ':'\n", SIGV4_USER_MAX);
+        goto out;
+    }
+    if (sigv4_add_cred_user(v, ak, sk, user) != 0) {
+        fprintf(stderr, "failed to add credential (duplicate or OOM)\n");
+        goto out;
+    }
+    rc = 0;
+out:
+    free(ak);
+    free(sk);
+    return rc;
+}
+
+/* Load credentials from a file. Format: one "access_key:secret_key[:user]"
+ * per line.
  * Lines starting with '#' and blank lines are ignored. Returns 0 on success. */
 static int load_credentials_file(sigv4_verifier_t *v, const char *path) {
     FILE *f = fopen(path, "r");
@@ -172,6 +203,8 @@ enum {
     OPT_IDLE_TIMEOUT,
     OPT_METRICS_PORT,
     OPT_IO_THREADS,
+    OPT_ADMIN,
+    OPT_LEGACY_OWNER,
 };
 
 int main(int argc, char **argv) {
@@ -196,6 +229,9 @@ int main(int argc, char **argv) {
      * this many threads so the event loop stays responsive. A handful is
      * plenty: the work is disk-bound, not CPU-bound. */
     int io_threads = 4;
+    const char *admins[32];
+    int n_admins = 0;
+    const char *legacy_owner = NULL;
     sigv4_verifier_t *auth = NULL;
     reload_ctx_t reload_ctx = {0};
 
@@ -212,6 +248,8 @@ int main(int argc, char **argv) {
         { "idle-timeout",     required_argument, NULL, OPT_IDLE_TIMEOUT },
         { "metrics-port",     required_argument, NULL, OPT_METRICS_PORT },
         { "io-threads",       required_argument, NULL, OPT_IO_THREADS },
+        { "admin",            required_argument, NULL, OPT_ADMIN },
+        { "legacy-owner",     required_argument, NULL, OPT_LEGACY_OWNER },
         { "mpu-gc-interval",  required_argument, NULL, OPT_MPU_GC_INTERVAL },
         { "mpu-gc-max-age",   required_argument, NULL, OPT_MPU_GC_MAX_AGE },
         { "verbose",          no_argument,       NULL, 'v' },
@@ -305,6 +343,25 @@ int main(int argc, char **argv) {
                     return 2;
                 }
                 break;
+            case OPT_ADMIN:
+                if (!valid_identity(optarg)) {
+                    fprintf(stderr, "--admin: invalid user name '%s'\n", optarg);
+                    return 2;
+                }
+                if (n_admins == (int)(sizeof(admins) / sizeof(admins[0]))) {
+                    fprintf(stderr, "--admin: at most %d admins\n", n_admins);
+                    return 2;
+                }
+                admins[n_admins++] = optarg;
+                break;
+            case OPT_LEGACY_OWNER:
+                if (!valid_identity(optarg)) {
+                    fprintf(stderr, "--legacy-owner: invalid user name '%s'\n",
+                            optarg);
+                    return 2;
+                }
+                legacy_owner = optarg;
+                break;
             case OPT_IO_THREADS:
                 io_threads = atoi(optarg);
                 if (io_threads < 0 || io_threads > 64) {
@@ -333,6 +390,17 @@ int main(int argc, char **argv) {
     if (require_auth && !auth) {
         fprintf(stderr, "--require-auth requires at least one --auth credential\n");
         return 2;
+    }
+    if (n_admins > 0 && !auth) {
+        fprintf(stderr, "--admin requires --auth or --credentials-file\n");
+        return 2;
+    }
+    for (int i = 0; i < n_admins; i++) {
+        if (sigv4_add_admin(auth, admins[i]) != 0) {
+            fprintf(stderr, "--admin: out of memory\n");
+            sigv4_destroy(auth);
+            return 1;
+        }
     }
 
     log_init(verbose ? LOG_DEBUG : LOG_INFO);
@@ -366,6 +434,7 @@ int main(int argc, char **argv) {
         .idle_timeout_s = idle_timeout_s,
         .metrics_port   = (uint16_t)metrics_port,
         .io_threads     = io_threads,
+        .legacy_owner   = legacy_owner,
         .tick_cb        = reload_tick,
         .tick_user      = &reload_ctx,
     };

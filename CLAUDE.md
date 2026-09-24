@@ -97,21 +97,33 @@ The protocol surface covered today:
   content-type; URL-decodes the source path
 - ACL stub: `GET /<bucket>?acl` and `GET /<bucket>/<key>?acl` return a
   static FULL_CONTROL ACL; `PUT` accepts and discards the body → 200
+- Per-user bucket isolation (auth only): credentials are
+  `ak:sk[:user]` (user defaults to the access key); a bucket is owned by
+  its creator's user; `authz_bucket()` in `route.c` gates every bucket/
+  object request (and the copy source) — owner or `--admin`, else 403.
+  `ListAllMyBuckets` is filtered. Ownerless buckets (pre-isolation, or
+  made with auth off) are admin-only until `--legacy-owner <user>`.
+  Anonymous requests under auth (no `--require-auth`) get 403. No auth
+  configured = no identities, no checks.
 
 What we *don't* do:
 - HTTP `Range:` multi-range (`bytes=A-B,C-D`; only single-range spec)
 - SigV4 trailer variants (`STREAMING-...-TRAILER`)
 - Bucket subresources: `?lifecycle`, `?cors` (location + versioning are stubs)
 - Pagination on ListMultipartUploads (always `IsTruncated=false`)
-- Any kind of IAM beyond static `access_key:secret_key` pairs from the
-  CLI. No policies, no STS, no console.
+- Any kind of IAM beyond static `access_key:secret_key[:user]` pairs and
+  bucket ownership. No policies, grants, shared buckets, STS, or console.
 - Replication, versioning, lifecycle rules, server-side encryption
 
 ## On-disk layout
 
 ```
 <root>/
-  buckets/<bucket>/                 # one empty dir per bucket
+  buckets/<bucket>/                 # one dir per bucket
+    meta                            # id=<32 hex>, owner=<user> (absent on
+                                    # pre-isolation buckets: ownerless).
+                                    # The id changes on delete+re-create;
+                                    # commits re-check it (writer.bucket_id)
   data/<bucket>/<NN>/<NN>/<hex>     # objects, sharded by hash prefix
                                     # file = obj_header_t + content_type
                                     # + key + body
@@ -120,6 +132,8 @@ What we *don't* do:
     part-00001, part-00002, ...     # each part's bytes verbatim, named
                                     # with MD5 in the dir
   tmp/                              # staging area for atomic renames
+                                    # (files, and bucket.XXXXXX dirs being
+                                    # assembled by bucket create)
 ```
 
 Object header is `obj_header_t`, schema 2 (bumped from 1 when we added
@@ -132,7 +146,7 @@ read time — the read path already does this.
 
 | target | language | what it exercises |
 |---|---|---|
-| `tests/test_store` | C | 37 unit tests: bucket CRUD (incl. delete racing an in-flight PUT/MPU, and a threaded commit-vs-bucket-delete race on `ns_mu`), single PUT/GET round-trip, sendfile, listing with prefix/delimiter, persistence across `store_open`/`store_close`, multipart lifecycle, list_buckets, list_mpu_uploads (with prefix filter), mpu_gc reaping behavior |
+| `tests/test_store` | C | 41 unit tests: bucket CRUD (incl. delete racing an in-flight PUT/MPU, and a threaded commit-vs-bucket-delete race on `ns_mu`), bucket owner/id meta, legacy buckets can't be taken over and are assigned by `--legacy-owner`, a commit into a deleted-then-re-created bucket is refused, single PUT/GET round-trip, sendfile, listing with prefix/delimiter, persistence across `store_open`/`store_close`, multipart lifecycle, list_buckets, list_mpu_uploads (with prefix filter), mpu_gc reaping behavior |
 | `tests/test_conn` | C | 5 unit tests of the per-connection request path over a pipe: the per-event read budget yields and resumes, a yielded conn isn't closed on peer hangup; PUT commit, copy, MPU part and MPU complete park the conn and run on an iopool worker (a blocking fsync hook proves the loop thread is free); an orphaned job completes safely; pool shutdown drains queued jobs |
 | `tests/test_xml` | C | 25 tests of the extended XML library (escaping, parsing, security limits) |
 | `tests/test_xml_legacy` | C | one round-trip showing the original calling style still works |
@@ -143,10 +157,11 @@ read time — the read path already does this.
 | `tests/test_e2e_mpu.sh` | bash + curl | 26 integration tests of the full multipart lifecycle including ListMultipartUploads, prefix filter, abort, malformed XML, large parts |
 | `tests/test_e2e_phase9.sh` | bash + curl | 45 integration tests of Range GET (206/416), bulk delete (`?delete`), and bucket subresources (`?location`, `?versioning`) |
 | `tests/test_e2e_phase10.sh` | bash + curl | 27 integration tests of server-side object copy and `?acl` stub |
-| `tests/test_e2e_phase11.sh` | bash + curl + python | 16 integration tests of `/_health`, `--credentials-file`, `--min-free-bytes` quota |
+| `tests/test_e2e_phase11.sh` | bash + curl + python | 18 integration tests of `/_health`, `--credentials-file`, `--min-free-bytes` quota |
+| `tests/test_e2e_isolation.sh` | bash + python | 49 integration tests of per-user bucket isolation: every verb denied cross-user, shared users and key-as-user, filtered ListAllMyBuckets, copy source/destination checks, `--admin`, SIGHUP key rotation keeping buckets, ownerless buckets + `--legacy-owner`, anonymous requests under auth |
 | `tests/test_e2e_phase12.sh` | bash + curl + python | 36 integration tests of startup recovery, `--max-body-size` (413), `--idle-timeout`, `--max-conns`, SIGHUP credential reload, the `--metrics-port` admin listener, and half-closed large uploads |
 
-All nine targets pass under both `-O2` and DEBUG (ASan + UBSan).
+All ten targets pass under both `-O2` and DEBUG (ASan + UBSan).
 
 `make test` runs everything sequentially; each suite is also runnable
 standalone. The auth suite is the slowest (~30s; chunked SigV4 tests

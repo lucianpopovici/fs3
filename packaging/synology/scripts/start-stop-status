@@ -29,6 +29,13 @@ FS3_DATA="${VAR_DIR}/data"
 FS3_REQUIRE_AUTH="0"
 FS3_ACCESS_KEY=""
 FS3_SECRET_KEY=""
+# Per-user bucket isolation (auth only). FS3_ADMIN names a user who can
+# see and manage every bucket. FS3_LEGACY_OWNER receives buckets that have
+# no owner (created before isolation existed, or with auth off); empty
+# means the first user in the credentials file, so a single-user install
+# keeps its buckets across the upgrade.
+FS3_ADMIN=""
+FS3_LEGACY_OWNER=""
 FS3_GC_INTERVAL="60"
 FS3_GC_MAX_AGE="86400"
 # Admin listener (always 127.0.0.1): /healthz + Prometheus /metrics.
@@ -53,7 +60,8 @@ load_conf() {
         esac
         case "${key}" in
             FS3_PORT|FS3_BIND|FS3_DATA|FS3_REQUIRE_AUTH|FS3_ACCESS_KEY|\
-            FS3_SECRET_KEY|FS3_GC_INTERVAL|FS3_GC_MAX_AGE|FS3_METRICS_PORT)
+            FS3_SECRET_KEY|FS3_GC_INTERVAL|FS3_GC_MAX_AGE|FS3_METRICS_PORT|\
+            FS3_ADMIN|FS3_LEGACY_OWNER)
                 eval "${key}=\${val}" ;;
         esac
     done < "${CONF_FILE}"
@@ -140,6 +148,19 @@ start_daemon() {
         fi
         chmod 600 "${CRED_FILE}" 2>/dev/null
         set -- "$@" --credentials-file "${CRED_FILE}" --require-auth
+
+        # Identity of the first credential: its :user field, else the key.
+        if [ -z "${FS3_LEGACY_OWNER}" ]; then
+            FS3_LEGACY_OWNER=$(grep -v '^[[:space:]]*#' "${CRED_FILE}" \
+                | awk -F: 'NF >= 2 { gsub(/[[:space:]]+$/, ""); \
+                                     print (NF >= 3 ? $3 : $1); exit }')
+        fi
+        if [ -n "${FS3_LEGACY_OWNER}" ]; then
+            set -- "$@" --legacy-owner "${FS3_LEGACY_OWNER}"
+        fi
+        if [ -n "${FS3_ADMIN}" ]; then
+            set -- "$@" --admin "${FS3_ADMIN}"
+        fi
     fi
 
     # Launch the watchdog; it records fs3's own PID in CHILD_PID_FILE.

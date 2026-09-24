@@ -185,15 +185,18 @@ start_server --credentials-file "$CRED_FILE" --require-auth
 
 st=$(sign "$ALICE_AK" "$ALICE_SK" --method PUT --url "$URL/p12auth")
 check_eq "alice works before reload" "$st" "STATUS=200"
-st=$(sign "$BOB_AK" "$BOB_SK" --method GET --url "$URL/p12auth")
+st=$(sign "$BOB_AK" "$BOB_SK" --method GET --url "$URL/")
 check_eq "bob rejected before reload" "$st" "STATUS=403"
+
+# Bob's checks use GET / (list his own buckets): any valid key may call
+# it, so it tests the credential itself, not ownership of alice's bucket.
 
 # Add bob, HUP, both must work — no restart, same process.
 printf '%s:%s\n' "$BOB_AK" "$BOB_SK" >> "$CRED_FILE"
 kill -HUP "$SP"
 sleep 1.5
 kill -0 "$SP" || { echo "server died on SIGHUP" >&2; exit 1; }
-st=$(sign "$BOB_AK" "$BOB_SK" --method GET --url "$URL/p12auth")
+st=$(sign "$BOB_AK" "$BOB_SK" --method GET --url "$URL/")
 check_eq "bob works after reload" "$st" "STATUS=200"
 st=$(sign "$ALICE_AK" "$ALICE_SK" --method GET --url "$URL/p12auth")
 check_eq "alice still works after reload" "$st" "STATUS=200"
@@ -204,14 +207,14 @@ kill -HUP "$SP"
 sleep 1.5
 st=$(sign "$ALICE_AK" "$ALICE_SK" --method GET --url "$URL/p12auth")
 check_eq "revoked alice rejected after reload" "$st" "STATUS=403"
-st=$(sign "$BOB_AK" "$BOB_SK" --method GET --url "$URL/p12auth")
+st=$(sign "$BOB_AK" "$BOB_SK" --method GET --url "$URL/")
 check_eq "bob unaffected by alice's revocation" "$st" "STATUS=200"
 
 # Malformed file + HUP: keep the old (working) credentials.
 echo "not a credential line at all" > "$CRED_FILE"
 kill -HUP "$SP"
 sleep 1.5
-st=$(sign "$BOB_AK" "$BOB_SK" --method GET --url "$URL/p12auth")
+st=$(sign "$BOB_AK" "$BOB_SK" --method GET --url "$URL/")
 check_eq "bad reload keeps previous credentials" "$st" "STATUS=200"
 
 rm -f "$CRED_FILE"

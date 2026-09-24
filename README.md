@@ -72,10 +72,26 @@ What's working end-to-end:
 
 - **Service-level `ListAllMyBuckets`** (`GET /`) — enumerates the
   buckets directory under `<root>/buckets/`, emitting a
-  `<ListAllMyBucketsResult>` with `<Owner>` (placeholder identity,
-  since fs3 has no IAM model), `<Buckets>` and one `<Bucket>` per
-  bucket with `<Name>` + `<CreationDate>` (the filesystem mtime).
-  Unblocks `aws s3 ls` without a bucket argument.
+  `<ListAllMyBucketsResult>` with `<Owner>` (placeholder identity),
+  `<Buckets>` and one `<Bucket>` per bucket with `<Name>` +
+  `<CreationDate>` (the filesystem mtime). With auth on, only the
+  caller's own buckets are listed (admins see all). Unblocks `aws s3 ls`
+  without a bucket argument.
+
+- **Per-user bucket isolation** — with auth configured, a bucket
+  belongs to the user who created it, and only that user (or an
+  `--admin`) can list, read, write, delete or copy from it; everyone
+  else gets `403 AccessDenied`. A credential's user is the optional third
+  field (`access_key:secret_key:user`), defaulting to the access key, so
+  several keys can share a user and rotating a key keeps the user's
+  buckets. Bucket names stay global: creating a name someone else owns is
+  `409 BucketAlreadyExists`. Buckets created before isolation (or with
+  auth off) have no owner and are admin-only until
+  `--legacy-owner <user>` assigns them at startup. Anonymous requests
+  (auth configured without `--require-auth`) own nothing and are refused.
+  No auth configured means no identities and no isolation, as before.
+  This is ownership only — there are no policies, grants or shared
+  buckets.
 
 - **`ListMultipartUploads`** (`GET /bucket?uploads`) — lists active
   multipart uploads in a bucket. Reads each upload's `meta` file
@@ -166,9 +182,11 @@ so changing a header correctly invalidates the dependent object files.
 ./fs3                                        # listen on 127.0.0.1:9000, no auth
 ./fs3 -a 0.0.0.0 -p 9000 -d /var/lib/fs3 -v  # listen on all interfaces with logs
 
-# With SigV4 auth (use real-looking credentials):
-./fs3 --auth AKIAIOSFODNN7EXAMPLE:wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY \
-      --auth AKIAOTHER:secretXXXXXXXXXXXX \
+# With SigV4 auth (use real-looking credentials). The optional third field
+# is the user that owns the buckets that key creates:
+./fs3 --auth AKIAIOSFODNN7EXAMPLE:wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY:alice \
+      --auth AKIAOTHER:secretXXXXXXXXXXXX:bob \
+      --admin alice \
       --require-auth -d /var/lib/fs3
 
 # Tune the multipart-upload GC (defaults: 60s sweep, 24h TTL):
@@ -235,9 +253,15 @@ package runs fs3 as a dedicated DSM package user and stores its config
 in `/var/packages/fs3/var/fs3.conf` (parsed `KEY=value` lines — the file
 is data, never sourced as shell). SigV4 credentials live separately in
 `/var/packages/fs3/var/credentials` (mode 0600, one
-`access_key:secret_key` per line — the format `--credentials-file`
+`access_key:secret_key[:user]` per line — the format `--credentials-file`
 expects), so the secret never appears in the conf or on the command
 line.
+
+With auth on, each user sees only their own buckets. Buckets that
+predate per-user isolation are given, at startup, to `FS3_LEGACY_OWNER`
+in `fs3.conf` — by default the first user in the credentials file, so
+an existing single-user install keeps access to everything after the
+upgrade. `FS3_ADMIN=<user>` names a user who can see every bucket.
 
 ### HTTPS via the DSM reverse proxy
 
