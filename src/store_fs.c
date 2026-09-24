@@ -1440,6 +1440,67 @@ void store_buckets_free(s3_bucket_info_t *list, size_t n) {
     free(list);
 }
 
+/* Read just the header of one object file and accumulate into stats.
+ * Unreadable or non-object files are skipped, not errors: the walk is
+ * advisory (admin display), and a file mid-rename shouldn't fail it. */
+static void stats_count_file(const char *path, s3_bucket_stats_t *st) {
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return;
+    obj_header_t h;
+    ssize_t r = pread(fd, &h, sizeof(h), 0);
+    close(fd);
+    if (r != (ssize_t)sizeof(h)
+        || memcmp(h.magic, OBJ_MAGIC, OBJ_MAGIC_LEN) != 0)
+        return;
+    st->objects++;
+    st->bytes += h.data_size;
+}
+
+s3_err_t store_bucket_stats(s3_store_t *s, s3_str_t bucket,
+                            s3_bucket_stats_t *out) {
+    if (!s || !out) return S3_ERR_INVALID_ARGUMENT;
+    memset(out, 0, sizeof(*out));
+    if (!valid_bucket_name(bucket)) return S3_ERR_INVALID_BUCKET_NAME;
+    if (!store_bucket_exists(s, bucket)) return S3_ERR_NO_SUCH_BUCKET;
+
+    char dp[4096];
+    snprintf(dp, sizeof(dp), "%s/" S3_STR_FMT, s->data_dir, S3_STR_ARG(bucket));
+
+    /* Same two-level shard walk as walk_bucket, but header-only. */
+    DIR *d1 = opendir(dp);
+    if (!d1) return S3_OK;   /* bucket exists but has no data dir yet */
+    struct dirent *e1;
+    while ((e1 = readdir(d1)) != NULL) {
+        if (e1->d_name[0] == '.') continue;
+        char p2[4096];
+        int n2 = snprintf(p2, sizeof(p2), "%s/%s", dp, e1->d_name);
+        if (n2 < 0 || (size_t)n2 >= sizeof(p2)) continue;
+        DIR *d2 = opendir(p2);
+        if (!d2) continue;
+        struct dirent *e2;
+        while ((e2 = readdir(d2)) != NULL) {
+            if (e2->d_name[0] == '.') continue;
+            char p3[4096];
+            int n3 = snprintf(p3, sizeof(p3), "%s/%s", p2, e2->d_name);
+            if (n3 < 0 || (size_t)n3 >= sizeof(p3)) continue;
+            DIR *d3 = opendir(p3);
+            if (!d3) continue;
+            struct dirent *e3;
+            while ((e3 = readdir(d3)) != NULL) {
+                if (e3->d_name[0] == '.') continue;
+                char path[4096];
+                int np = snprintf(path, sizeof(path), "%s/%s", p3, e3->d_name);
+                if (np < 0 || (size_t)np >= sizeof(path)) continue;
+                stats_count_file(path, out);
+            }
+            closedir(d3);
+        }
+        closedir(d2);
+    }
+    closedir(d1);
+    return S3_OK;
+}
+
 /* ===================================================================== */
 /* Multipart upload                                                       */
 /* ===================================================================== */

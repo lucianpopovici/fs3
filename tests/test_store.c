@@ -1133,6 +1133,46 @@ static void t_list_buckets_three(void) {
     teardown_root();
 }
 
+static void t_bucket_stats(void) {
+    setup_root();
+    s3_store_t *s;
+    CHECK_EQ(store_open(&s, g_root), S3_OK, "stats: open");
+    store_bucket_create(s, S3_STR_LIT("statbuk"));
+
+    s3_bucket_stats_t st;
+    CHECK_EQ(store_bucket_stats(s, S3_STR_LIT("statbuk"), &st), S3_OK,
+             "stats on empty bucket");
+    CHECK(st.objects == 0 && st.bytes == 0, "empty bucket is 0/0");
+
+    s3_obj_meta_t m;
+    CHECK_EQ(put(s, "statbuk", "a", "12345", 5, "text/plain", &m), S3_OK,
+             "put a");
+    CHECK_EQ(put(s, "statbuk", "b", "1234567890", 10, "text/plain", &m),
+             S3_OK, "put b");
+    CHECK_EQ(put(s, "statbuk", "empty", "", 0, "text/plain", &m), S3_OK,
+             "put empty");
+    CHECK_EQ(store_bucket_stats(s, S3_STR_LIT("statbuk"), &st), S3_OK,
+             "stats after puts");
+    CHECK(st.objects == 3, "three objects counted");
+    CHECK(st.bytes == 15, "logical bytes summed");
+
+    /* Overwriting must not double-count. */
+    CHECK_EQ(put(s, "statbuk", "a", "123", 3, "text/plain", &m), S3_OK,
+             "overwrite a");
+    CHECK_EQ(store_bucket_stats(s, S3_STR_LIT("statbuk"), &st), S3_OK,
+             "stats after overwrite");
+    CHECK(st.objects == 3, "overwrite keeps count");
+    CHECK(st.bytes == 13, "overwrite adjusts bytes");
+
+    CHECK_EQ(store_bucket_stats(s, S3_STR_LIT("no-such"), &st),
+             S3_ERR_NO_SUCH_BUCKET, "stats on missing bucket");
+    CHECK_EQ(store_bucket_stats(s, S3_STR_LIT("BAD_NAME"), &st),
+             S3_ERR_INVALID_BUCKET_NAME, "stats on invalid name");
+
+    store_close(s);
+    teardown_root();
+}
+
 /* ---- ListMultipartUploads ----------------------------------------- */
 
 static void t_list_mpu_uploads_basic(void) {
@@ -1515,6 +1555,7 @@ int main(void) {
     t_mpu_unknown_upload();
     t_list_buckets_empty();
     t_list_buckets_three();
+    t_bucket_stats();
     t_list_mpu_uploads_basic();
     t_list_mpu_uploads_no_bucket();
     t_mpu_gc_reaps_stale();

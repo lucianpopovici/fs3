@@ -31,6 +31,18 @@ the install-wizard values (including the secret key) into that file
 unescaped, so a crafted value — e.g. a secret key containing
 `"; reboot; "` — would execute as shell when the package started.
 
+## A second present-tense bug, found and fixed during the 0.9.0 upgrade
+
+**FIXED (2026-06-11).** DSM runs `postinst` during package *upgrades*
+too (`SYNOPKG_PKG_STATUS=UPGRADE`), with none of the `wizard_*`
+variables set — and `postinst` unconditionally regenerated `fs3.conf`
+from those variables. Every upgrade therefore reset the conf to
+defaults, most dangerously flipping `FS3_REQUIRE_AUTH` back to `0`:
+upgrading a SigV4-protected install silently produced an open,
+unauthenticated endpoint (observed for real on the DS1515+ after the
+0.8.0 → 0.9.0-1 upgrade). `postinst` now preserves the existing conf
+and credentials when `SYNOPKG_PKG_STATUS=UPGRADE`; fixed in 0.9.0-2.
+
 ## The gaps, by priority
 
 These are ordered by my judgment of "what would actually stop me trusting
@@ -102,9 +114,14 @@ done" but survivable on a trusted LAN in the meantime.
     SPK triggers a DSM trust-level warning. Mostly unavoidable without a
     Synology developer cert; brief explains the options.
 
-11. **[11-desktop-console](11-desktop-console/CLAUDE.md)** — the DSM tile
-    is an info page, not a control panel. Lowest priority; the conf-file
-    workflow is fine.
+11. **[11-desktop-console](11-desktop-console/CLAUDE.md)** — **DONE and
+    HARDWARE-VERIFIED (2026-06-11).** The tile is now a small
+    admin console: live bucket stats (new `GET /buckets` on the admin
+    listener, backed by `store_bucket_stats()`) and SigV4 credential
+    add/remove with CSRF + Origin checks, strict key charset, atomic
+    0600 writes, live SIGHUP reload, and a last-key lockout guard. No
+    conf editing or restart from the UI by design. Tested by
+    `tests/test_ui_cgi.sh` (45 checks).
 
 ## Suggested sequencing
 

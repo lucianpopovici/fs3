@@ -1,5 +1,46 @@
 # CLAUDE.md — desktop console / DSM tile
 
+> **STATUS: DONE and HARDWARE-VERIFIED (2026-06-11, DS1515+ /
+> DSM 7.1).** Took the
+> middle path between "richer read-only" and "full config editing":
+> the tile now shows live state and manages credentials, nothing else.
+>
+> - The localhost admin listener gained `GET /buckets` — one
+>   `<name> <objects> <bytes>` line per bucket — backed by a new
+>   `store_bucket_stats()` (header-only walk of the bucket's data
+>   shards, `src/store_fs.c`).
+> - `ui/index.cgi` renders a live bucket table (name / objects /
+>   human size, with totals) fetched from that endpoint, with helpful
+>   fallbacks when the package is stopped or the listener is disabled.
+> - Credential management: add/replace/remove SigV4 keys from the
+>   tile. Writes go tmp + chmod 600 + rename to the Phase-11
+>   credentials file; a running server is reloaded live via SIGHUP to
+>   the recorded child pid. Adding the first key flips
+>   `FS3_REQUIRE_AUTH=1` in the conf (with a one-time restart prompt);
+>   removing the last key while auth is on is refused (lockout guard).
+> - Security posture (the brief's traps, addressed): conf parsed
+>   line-by-line, never sourced; CSRF token (random, 0600, daily
+>   rotation) plus Origin/Host check on POSTs; keys restricted to
+>   `[A-Za-z0-9._-]` with *no* URL-decode pass, so `:`/newlines can't
+>   be smuggled into the credentials file; secrets never rendered back;
+>   only fixed message codes reflect into the page. No package restart
+>   and no general conf editing from the UI — deliberately.
+> - Tests: `tests/test_ui_cgi.sh` (45 checks, drives the CGI against a
+>   scratch dir via the `FS3_VAR_DIR` seam, including a live-server
+>   stats round-trip), `t_bucket_stats` in `tests/test_store.c`, and
+>   `/buckets` coverage in `tests/test_e2e_phase12.sh`. Green under
+>   `-O2` and ASan+UBSan.
+> - Hardware check (2026-06-11, DS1515+ / DSM 7.1, v0.9.0): the CGI
+>   runs as the `fs3` package user and CAN write `${VAR_DIR}` — the
+>   CSRF token file appeared `fs3:fs3 0600` after the tile was opened,
+>   so the credential forms are live (not the SSH-fallback text). The
+>   `/buckets` endpoint serves real data (`immich-backup 5 16545132`).
+>   The add-credential POST was exercised for real from inside DSM:
+>   the credentials file grew by one key (atomic rewrite, still 0600),
+>   the conf flipped to `FS3_REQUIRE_AUTH=1`, and after the package
+>   restart fs3 came up with `--require-auth --credentials-file`.
+>   Unsigned requests now get 403; `/_health` stays auth-exempt.
+
 **Problem:** the DSM desktop tile (`packaging/synology/ui/`) is a static
 info page — it shows connection strings, status, and AWS CLI examples,
 but you can't *do* anything from it. All configuration (port, data

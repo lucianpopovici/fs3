@@ -11,8 +11,10 @@ periodic GC of abandoned multipart uploads, HTTP Range requests,
 bulk-delete (`?delete`), bucket subresources (location/versioning
 stubs), server-side object copy, ACL stubs, health + Prometheus
 metrics endpoints, disk-full/quota handling, startup crash recovery,
-request resource bounds, and SIGHUP credential rotation. ~290 explicit
-tests + 50K fuzz iterations green under both `-O2` and ASan + UBSan.
+request resource bounds, SIGHUP credential rotation, and a DSM-tile
+admin console (live bucket stats + credential management). ~340
+explicit tests + 50K fuzz iterations green under both `-O2` and
+ASan + UBSan.
 
 ## First five minutes on a fresh box
 
@@ -146,7 +148,7 @@ read time — the read path already does this.
 
 | target | language | what it exercises |
 |---|---|---|
-| `tests/test_store` | C | 41 unit tests: bucket CRUD (incl. delete racing an in-flight PUT/MPU, and a threaded commit-vs-bucket-delete race on `ns_mu`), bucket owner/id meta, legacy buckets can't be taken over and are assigned by `--legacy-owner`, a commit into a deleted-then-re-created bucket is refused, single PUT/GET round-trip, sendfile, listing with prefix/delimiter, persistence across `store_open`/`store_close`, multipart lifecycle, list_buckets, list_mpu_uploads (with prefix filter), mpu_gc reaping behavior |
+| `tests/test_store` | C | 42 unit tests: bucket CRUD (incl. delete racing an in-flight PUT/MPU, and a threaded commit-vs-bucket-delete race on `ns_mu`), bucket owner/id meta, legacy buckets can't be taken over and are assigned by `--legacy-owner`, a commit into a deleted-then-re-created bucket is refused, single PUT/GET round-trip, sendfile, listing with prefix/delimiter, persistence across `store_open`/`store_close`, multipart lifecycle, list_buckets, bucket_stats, list_mpu_uploads (with prefix filter), mpu_gc reaping behavior |
 | `tests/test_conn` | C | 5 unit tests of the per-connection request path over a pipe: the per-event read budget yields and resumes, a yielded conn isn't closed on peer hangup; PUT commit, copy, MPU part and MPU complete park the conn and run on an iopool worker (a blocking fsync hook proves the loop thread is free); an orphaned job completes safely; pool shutdown drains queued jobs |
 | `tests/test_xml` | C | 25 tests of the extended XML library (escaping, parsing, security limits) |
 | `tests/test_xml_legacy` | C | one round-trip showing the original calling style still works |
@@ -159,9 +161,10 @@ read time — the read path already does this.
 | `tests/test_e2e_phase10.sh` | bash + curl | 27 integration tests of server-side object copy and `?acl` stub |
 | `tests/test_e2e_phase11.sh` | bash + curl + python | 18 integration tests of `/_health`, `--credentials-file`, `--min-free-bytes` quota |
 | `tests/test_e2e_isolation.sh` | bash + python | 49 integration tests of per-user bucket isolation: every verb denied cross-user, shared users and key-as-user, filtered ListAllMyBuckets, copy source/destination checks, `--admin`, SIGHUP key rotation keeping buckets, ownerless buckets + `--legacy-owner`, anonymous requests under auth |
-| `tests/test_e2e_phase12.sh` | bash + curl + python | 36 integration tests of startup recovery, `--max-body-size` (413), `--idle-timeout`, `--max-conns`, SIGHUP credential reload, the `--metrics-port` admin listener, and half-closed large uploads |
+| `tests/test_e2e_phase12.sh` | bash + curl + python | 39 integration tests of startup recovery, `--max-body-size` (413), `--idle-timeout`, `--max-conns`, SIGHUP credential reload, the `--metrics-port` admin listener (`/healthz`, `/metrics`, `/buckets`), and half-closed large uploads |
+| `tests/test_ui_cgi.sh` | bash | 45 tests of the DSM-tile admin console CGI driven against a scratch var dir: conf parsing without sourcing, HTML escaping, CSRF token + Origin checks, credential add/replace/remove with validation and the last-key lockout guard, SIGHUP delivery, live bucket stats via a real admin listener |
 
-All ten targets pass under both `-O2` and DEBUG (ASan + UBSan).
+All targets pass under both `-O2` and DEBUG (ASan + UBSan).
 
 `make test` runs everything sequentially; each suite is also runnable
 standalone. The auth suite is the slowest (~30s; chunked SigV4 tests
