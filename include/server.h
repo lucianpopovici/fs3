@@ -46,6 +46,11 @@ typedef struct {
      * with the DSM reverse proxy or an SSH tunnel to scrape remotely. */
     uint16_t               metrics_port;
 
+    /* Worker threads for blocking store work (commit fsync, MPU
+     * completion, server-side copy). 0 runs that work inline on the
+     * event loop — the pre-iopool behaviour. */
+    int                    io_threads;
+
     /* Optional tick callback, invoked from the event loop at most once
      * per second, between event batches (so never concurrently with a
      * request). main.c uses it to act on signal flags — e.g. the SIGHUP

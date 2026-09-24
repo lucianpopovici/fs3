@@ -35,6 +35,9 @@ void log_msg(log_level_t lvl, const char *file, int line,
     const char *base = file;
     for (const char *p = file; *p; p++) if (*p == '/') base = p + 1;
 
+    /* One line = three stdio calls; hold the stream so lines from iopool
+     * worker threads don't interleave. */
+    flockfile(stderr);
     fprintf(stderr, "%s.%03ld [%s] %s:%d ", tbuf,
             ts.tv_nsec / 1000000L, lvl_name(lvl), base, line);
 
@@ -44,4 +47,5 @@ void log_msg(log_level_t lvl, const char *file, int line,
     va_end(ap);
 
     fputc('\n', stderr);
+    funlockfile(stderr);
 }

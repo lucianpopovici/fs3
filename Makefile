@@ -12,9 +12,9 @@ CC      ?= gcc
 CFLAGS  := -std=c11 -O2 -g -Wall -Wextra -Wpedantic \
            -Wshadow -Wstrict-prototypes -Wmissing-prototypes \
            -Wno-unused-parameter \
-           -D_GNU_SOURCE -fstack-protector-strong \
+           -D_GNU_SOURCE -fstack-protector-strong -pthread \
            -MMD -MP
-LDFLAGS := -lcrypto
+LDFLAGS := -lcrypto -pthread
 
 ifeq ($(DEBUG),1)
   CFLAGS  := $(filter-out -O2,$(CFLAGS)) -O0 \
@@ -29,7 +29,8 @@ INCLUDES   := -Iinclude -I$(LLHTTP_DIR)/include -I$(XML_DIR)
 
 # Server objects
 SRV_SRCS := src/main.c src/server.c src/conn.c src/log.c src/store_fs.c \
-            src/route.c src/response.c src/sigv4.c src/metrics.c
+            src/route.c src/response.c src/sigv4.c src/metrics.c \
+            src/iopool.c
 SRV_OBJS := $(SRV_SRCS:.c=.o)
 
 LLHTTP_OBJS := $(LLHTTP_DIR)/src/api.o $(LLHTTP_DIR)/src/http.o \

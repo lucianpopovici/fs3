@@ -17,6 +17,8 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <pthread.h>
+#include <stdint.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -259,6 +261,89 @@ static void t_mpu_after_bucket_delete(void) {
     s3_obj_meta_t m;
     CHECK_EQ(store_head(s, b, k, &m), S3_ERR_NO_SUCH_KEY,
              "race mpu: no ghost object");
+
+    store_close(s);
+    teardown_root();
+}
+
+/* Commits now run on iopool worker threads while the loop thread serves
+ * other requests, e.g. a DELETE of the same bucket. The fsync hook runs
+ * just before the commit's bucket re-check + rename; it releases the
+ * deleter and lingers a random 0–100 µs, so across iterations the delete
+ * lands before, inside, and after that window. Whatever the interleaving,
+ * exactly one side must win: either the object landed and the delete saw
+ * a non-empty bucket, or the delete won and nothing was resurrected. */
+static pthread_mutex_t r_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  r_cv = PTHREAD_COND_INITIALIZER;
+static int             r_go;
+static unsigned        r_linger_ns;
+
+static int race_fsync(int fd) {
+    int rc = fsync(fd);
+    pthread_mutex_lock(&r_mu);
+    r_go = 1;
+    pthread_cond_signal(&r_cv);
+    pthread_mutex_unlock(&r_mu);
+    struct timespec t0, t;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    do clock_gettime(CLOCK_MONOTONIC, &t);
+    while ((uint64_t)(t.tv_sec - t0.tv_sec) * 1000000000ULL
+           + (uint64_t)t.tv_nsec - (uint64_t)t0.tv_nsec < r_linger_ns);
+    return rc;
+}
+
+typedef struct { s3_writer_t *w; s3_err_t rc; } race_commit_t;
+static void *race_commit(void *arg) {
+    race_commit_t *rc = arg;
+    rc->rc = store_put_commit(rc->w, NULL);
+    return NULL;
+}
+
+static void t_commit_races_bucket_delete(void) {
+    setup_root();
+    s3_store_t *s;
+    store_open(&s, g_root);
+    s3_str_t b = S3_STR_LIT("racy");
+    char dp[512];
+    snprintf(dp, sizeof(dp), "%s/data/racy", g_root);
+    srand(12345);
+    int bad = 0, commit_won = 0, delete_won = 0;
+
+    s3_store_fsync_hook = race_fsync;
+    for (int i = 0; i < 500 && !bad; i++) {
+        store_bucket_create(s, b);
+        race_commit_t rc = {0};
+        store_put_begin(s, b, S3_STR_LIT("k"), "text/plain", &rc.w);
+        store_put_write(rc.w, "x", 1);
+
+        r_go = 0;
+        r_linger_ns = (unsigned)(rand() % 100000);
+        pthread_t th;
+        pthread_create(&th, NULL, race_commit, &rc);
+        pthread_mutex_lock(&r_mu);
+        while (!r_go) pthread_cond_wait(&r_cv, &r_mu);
+        pthread_mutex_unlock(&r_mu);
+        s3_err_t d = store_bucket_delete(s, b);
+        pthread_join(th, NULL);
+
+        struct stat st;
+        int data_dir = stat(dp, &st) == 0;
+        if (rc.rc == S3_OK && d == S3_ERR_BUCKET_NOT_EMPTY) {
+            commit_won++;
+            store_delete(s, b, S3_STR_LIT("k"));
+            store_bucket_delete(s, b);
+        } else if (rc.rc == S3_ERR_NO_SUCH_BUCKET && d == S3_OK && !data_dir) {
+            delete_won++;
+        } else {
+            fprintf(stderr, "  iter %d: commit=%d delete=%d data_dir=%d\n",
+                    i, rc.rc, d, data_dir);
+            bad = 1;
+        }
+    }
+    s3_store_fsync_hook = NULL;
+    CHECK(!bad, "commit vs bucket delete: exactly one side wins");
+    CHECK(commit_won > 0 && delete_won > 0,
+          "commit vs bucket delete: both orders exercised");
 
     store_close(s);
     teardown_root();
@@ -1271,6 +1356,7 @@ int main(void) {
     t_bucket_delete();
     t_put_commit_after_bucket_delete();
     t_mpu_after_bucket_delete();
+    t_commit_races_bucket_delete();
     t_put_get_simple();
     t_put_overwrite();
     t_put_streaming();

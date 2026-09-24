@@ -16,6 +16,7 @@
 
 #include "route.h"
 #include "conn.h"
+#include "iopool.h"
 #include "log.h"
 #include "response.h"
 #include "store.h"
@@ -482,6 +483,102 @@ static int handle_bucket(conn_t *c, s3_str_t bucket) {
 
 /* PUT: open a writer and stream body bytes. Response built at message
  * complete time. */
+/* ===================================================================== */
+/* Blocking store work on the iopool                                      */
+/* ===================================================================== */
+/*
+ * Commits (fsync + rename), MPU completion (concatenate + fsync) and
+ * server-side copy can take from milliseconds to minutes. They run as
+ * iopool jobs so the event loop keeps serving other connections; the
+ * conn parks in CST_WAIT_JOB until the job's done() builds the response.
+ *
+ * A job's run() executes on a worker thread and must only touch what the
+ * job owns (writers/readers handed over from the conn, copied names).
+ * done() runs back on the loop thread; if the client went away meanwhile,
+ * job->conn is NULL and done() only cleans up.
+ */
+
+/* Park the conn on `j`. Returns -1 if the job (run inline, pool == NULL)
+ * already failed to build a response, so the caller drops the conn. */
+static int job_submit(conn_t *c, iojob_t *j) {
+    j->conn = c;
+    c->job = j;
+    c->state = CST_WAIT_JOB;
+    iopool_submit(c->pool, j);
+    return c->state == CST_CLOSING ? -1 : 0;
+}
+
+/* In done(): detach from the conn. Returns it, or NULL if orphaned. */
+static conn_t *job_finish(iojob_t *j) {
+    conn_t *c = j->conn;
+    if (c) c->job = NULL;
+    return c;
+}
+
+/* In done(): a response builder can no longer return -1 up through
+ * llhttp, so a failure marks the conn for closing instead. */
+static void job_respond(conn_t *c, int rc) {
+    if (rc < 0) c->state = CST_CLOSING;
+}
+
+/* ---- Commit of a streamed PUT or MPU part --------------------------- */
+
+typedef struct {
+    iojob_t        base;
+    s3_writer_t   *w;
+    int            is_part;
+    s3_err_t       err;
+    s3_obj_meta_t  meta;          /* PUT */
+    char           etag_hex[33];  /* part */
+} commit_job_t;
+
+static void commit_run(iojob_t *j) {
+    commit_job_t *cj = (commit_job_t *)j;
+    if (cj->is_part) cj->err = store_mpu_part_commit(cj->w, cj->etag_hex);
+    else             cj->err = store_put_commit(cj->w, &cj->meta);
+}
+
+static void commit_done(iojob_t *j) {
+    commit_job_t *cj = (commit_job_t *)j;
+    conn_t *c = job_finish(j);
+    if (c) {
+        int rc;
+        if (cj->err != S3_OK) {
+            rc = rsp_build_s3_error(c, cj->err, c->req.path, NULL);
+        } else {
+            char extra[80];
+            if (cj->is_part) {
+                snprintf(extra, sizeof(extra), "ETag: \"%s\"\r\n",
+                         cj->etag_hex);
+            } else {
+                char etag[35]; rsp_format_etag(cj->meta.etag, etag);
+                snprintf(extra, sizeof(extra), "ETag: %s\r\n", etag);
+            }
+            rc = rsp_build_status_with_headers(c, 200, "OK", extra);
+        }
+        job_respond(c, rc);
+    }
+    free(cj);
+}
+
+/* Hand c->put_writer to a commit job. */
+static int submit_commit(conn_t *c, int is_part) {
+    if (!c->put_writer) return -1;  /* programming error */
+    commit_job_t *cj = calloc(1, sizeof(*cj));
+    if (!cj) {
+        if (is_part) store_mpu_part_abort(c->put_writer);
+        else         store_put_abort(c->put_writer);
+        c->put_writer = NULL;
+        return rsp_build_s3_error(c, S3_ERR_INTERNAL, c->req.path, NULL);
+    }
+    cj->base.run  = commit_run;
+    cj->base.done = commit_done;
+    cj->w       = c->put_writer;
+    cj->is_part = is_part;
+    c->put_writer = NULL;          /* owned by the job now */
+    return job_submit(c, &cj->base);
+}
+
 static int handle_object_put_begin(conn_t *c, s3_str_t bucket, s3_str_t key) {
     const s3_str_t *ct_hdr = hdr_get(c, "content-type");
     char ct_buf[128] = {0};
@@ -500,19 +597,9 @@ static int handle_object_put_begin(conn_t *c, s3_str_t bucket, s3_str_t key) {
     return 0;
 }
 
+/* 200 OK with ETag header, once the commit job finishes. */
 static int handle_object_put_complete(conn_t *c) {
-    if (!c->put_writer) return -1;  /* programming error */
-    s3_obj_meta_t m;
-    s3_err_t e = store_put_commit(c->put_writer, &m);
-    c->put_writer = NULL;
-    if (e != S3_OK) {
-        return rsp_build_s3_error(c, e, c->req.path, NULL);
-    }
-    /* 200 OK with ETag header. */
-    char etag[35]; rsp_format_etag(m.etag, etag);
-    char extra[80];
-    snprintf(extra, sizeof(extra), "ETag: %s\r\n", etag);
-    return rsp_build_status_with_headers(c, 200, "OK", extra);
+    return submit_commit(c, 0);
 }
 
 /* Parse an HTTP Range header value of the form "bytes=A-B", "bytes=A-",
@@ -644,6 +731,49 @@ static int handle_object_delete(conn_t *c, s3_str_t bucket, s3_str_t key) {
 /* Object copy (PUT with x-amz-copy-source header)                       */
 /* ===================================================================== */
 
+/* The byte copy and commit, on a worker. */
+typedef struct {
+    iojob_t        base;
+    s3_reader_t   *r;
+    s3_writer_t   *w;
+    s3_err_t       err;
+    s3_obj_meta_t  meta;
+} copy_job_t;
+
+static void copy_run(iojob_t *j) {
+    copy_job_t *cj = (copy_job_t *)j;
+    char xbuf[64 * 1024];
+    int stream_ok = 1;
+    for (;;) {
+        ssize_t n = store_get_read(cj->r, xbuf, sizeof(xbuf));
+        if (n == 0) break;
+        if (n < 0 || store_put_write(cj->w, xbuf, (size_t)n) != S3_OK) {
+            stream_ok = 0;
+            break;
+        }
+    }
+    store_get_close(cj->r);
+    if (!stream_ok) {
+        store_put_abort(cj->w);
+        cj->err = S3_ERR_INTERNAL;
+        return;
+    }
+    cj->err = store_put_commit(cj->w, &cj->meta);
+}
+
+static void copy_done(iojob_t *j) {
+    copy_job_t *cj = (copy_job_t *)j;
+    conn_t *c = job_finish(j);
+    if (c) {
+        job_respond(c, cj->err != S3_OK
+            ? rsp_build_s3_error(c, cj->err, c->req.path, NULL)
+            : rsp_build_copy_object(c, &cj->meta));
+    }
+    free(cj);
+}
+
+/* Validate and open both ends on the loop (cheap, and errors answer
+ * immediately), then hand the byte copy to the pool. */
 static int handle_object_copy(conn_t *c, s3_str_t dst_bucket, s3_str_t dst_key) {
     const s3_str_t *src_hdr = hdr_get(c, "x-amz-copy-source");
 
@@ -696,30 +826,17 @@ static int handle_object_copy(conn_t *c, s3_str_t dst_bucket, s3_str_t dst_key) 
     }
     free(src_buf);  /* src_buf no longer needed; src_bucket/src_key no longer safe */
 
-    /* Stream. */
-    char xbuf[8192];
-    int stream_ok = 1;
-    for (;;) {
-        ssize_t n = store_get_read(reader, xbuf, sizeof(xbuf));
-        if (n == 0) break;
-        if (n < 0 || store_put_write(writer, xbuf, (size_t)n) != S3_OK) {
-            stream_ok = 0;
-            break;
-        }
-    }
-    store_get_close(reader);
-
-    if (!stream_ok) {
+    copy_job_t *cj = calloc(1, sizeof(*cj));
+    if (!cj) {
+        store_get_close(reader);
         store_put_abort(writer);
         return rsp_build_s3_error(c, S3_ERR_INTERNAL, c->req.path, NULL);
     }
-
-    s3_obj_meta_t dst_meta;
-    e = store_put_commit(writer, &dst_meta);
-    if (e != S3_OK) {
-        return rsp_build_s3_error(c, e, c->req.path, NULL);
-    }
-    return rsp_build_copy_object(c, &dst_meta);
+    cj->base.run  = copy_run;
+    cj->base.done = copy_done;
+    cj->r = reader;
+    cj->w = writer;
+    return job_submit(c, &cj->base);
 }
 
 /* ===================================================================== */
@@ -765,16 +882,7 @@ static int handle_mpu_upload_part_begin(conn_t *c, s3_str_t bucket, s3_str_t key
 /* Commit the in-flight part; build a 200 with ETag header. Called from
  * route_dispatch_complete for an active part-upload writer. */
 static int handle_mpu_part_complete(conn_t *c) {
-    if (!c->put_writer) return -1;
-    char etag_hex[33];
-    s3_err_t e = store_mpu_part_commit(c->put_writer, etag_hex);
-    c->put_writer = NULL;
-    if (e != S3_OK) {
-        return rsp_build_s3_error(c, e, c->req.path, NULL);
-    }
-    char extra[80];
-    snprintf(extra, sizeof(extra), "ETag: \"%s\"\r\n", etag_hex);
-    return rsp_build_status_with_headers(c, 200, "OK", extra);
+    return submit_commit(c, 1);
 }
 
 /* POST /bucket/key?uploadId=ID — complete. The XML body lists the parts.
@@ -889,6 +997,43 @@ static long parse_one_part(const char *body, size_t n, size_t start,
     return (long)((size_t)(q - body) + sizeof(close_tag) - 1);
 }
 
+/* Concatenation + fsync + publish, on a worker. Names are copied: the
+ * worker must not read the conn's request buffers. */
+typedef struct {
+    iojob_t         base;
+    s3_store_t     *store;
+    char           *names;        /* bucket bytes then key bytes */
+    size_t          bucket_n, key_n;
+    char            upload_id[33];
+    s3_part_ref_t  *parts;
+    size_t          n_parts;
+    s3_err_t        err;
+    char            etag[40];
+} mpu_complete_job_t;
+
+static void mpu_complete_run(iojob_t *j) {
+    mpu_complete_job_t *mj = (mpu_complete_job_t *)j;
+    s3_str_t bucket = { mj->names, mj->bucket_n };
+    s3_str_t key    = { mj->names + mj->bucket_n, mj->key_n };
+    mj->err = store_mpu_complete(mj->store, bucket, key, mj->upload_id,
+                                 mj->parts, mj->n_parts, mj->etag, NULL);
+}
+
+static void mpu_complete_done(iojob_t *j) {
+    mpu_complete_job_t *mj = (mpu_complete_job_t *)j;
+    conn_t *c = job_finish(j);
+    if (c) {
+        /* c->mpu_bucket/mpu_key are still valid: the request isn't reset
+         * until its response has been written. */
+        job_respond(c, mj->err != S3_OK
+            ? rsp_build_s3_error(c, mj->err, c->req.path, NULL)
+            : rsp_build_complete_mpu(c, c->mpu_bucket, c->mpu_key, mj->etag));
+    }
+    free(mj->parts);
+    free(mj->names);
+    free(mj);
+}
+
 static int handle_mpu_complete_finish(conn_t *c, s3_str_t bucket, s3_str_t key,
                                        const char *upload_id) {
     /* Reject if body overflowed the cap. */
@@ -932,16 +1077,24 @@ static int handle_mpu_complete_finish(conn_t *c, s3_str_t bucket, s3_str_t key,
                                   c->req.path, NULL);
     }
 
-    char etag[40];
-    s3_obj_meta_t meta;
-    s3_err_t e = store_mpu_complete(c->store, bucket, key,
-                                     upload_id, parts, parts_n,
-                                     etag, &meta);
-    free(parts);
-    if (e != S3_OK) {
-        return rsp_build_s3_error(c, e, c->req.path, NULL);
+    mpu_complete_job_t *mj = calloc(1, sizeof(*mj));
+    char *names = malloc(bucket.n + key.n + 1);
+    if (!mj || !names) {
+        free(mj); free(names); free(parts);
+        return rsp_build_s3_error(c, S3_ERR_INTERNAL, c->req.path, NULL);
     }
-    return rsp_build_complete_mpu(c, bucket, key, etag);
+    memcpy(names, bucket.p, bucket.n);
+    memcpy(names + bucket.n, key.p, key.n);
+    mj->base.run  = mpu_complete_run;
+    mj->base.done = mpu_complete_done;
+    mj->store    = c->store;
+    mj->names    = names;
+    mj->bucket_n = bucket.n;
+    mj->key_n    = key.n;
+    snprintf(mj->upload_id, sizeof(mj->upload_id), "%s", upload_id);
+    mj->parts    = parts;
+    mj->n_parts  = parts_n;
+    return job_submit(c, &mj->base);
 }
 
 /* DELETE /bucket/key?uploadId=ID */
@@ -1092,7 +1245,12 @@ int route_dispatch_headers(conn_t *c) {
     if (method_is(c, "PUT")) {
         /* Server-side copy: PUT with x-amz-copy-source header. */
         if (hdr_get(c, "x-amz-copy-source")) {
-            return handle_object_copy(c, bucket, key);
+            /* Runs at message-complete (after any body is verified),
+             * like every other request that needs an iopool job. */
+            c->copy_pending = 1;
+            c->copy_bucket  = bucket;   /* points into req_scratch */
+            c->copy_key     = key;
+            return 0;
         }
         /* Streaming PUT: open writer, then accept body via on_body. */
         return handle_object_put_begin(c, bucket, key);
@@ -1153,6 +1311,10 @@ int route_dispatch_complete(conn_t *c) {
         c->mpu_complete_pending = 0;
         return handle_mpu_complete_finish(c, c->mpu_bucket, c->mpu_key,
                                           c->mpu_upload_id);
+    }
+    if (c->copy_pending) {
+        c->copy_pending = 0;
+        return handle_object_copy(c, c->copy_bucket, c->copy_key);
     }
     if (c->delete_pending) {
         c->delete_pending = 0;
