@@ -109,6 +109,17 @@ int conn_wants_write(const conn_t *c) {
     return 0;
 }
 
+int conn_hup_can_close(const conn_t *c) {
+    /* If we're CST_WRITE_RESPONSE we'll send what we have first; if rbuf
+     * still has bytes the parser will consume them. A read that yielded at
+     * its budget may have left bytes in the socket, so keep going until a
+     * read reaches EOF itself. */
+    return !conn_wants_write(c)
+        && c->rlen == 0
+        && !c->read_yielded
+        && c->state != CST_WRITE_RESPONSE;
+}
+
 /* ------------------------------------------------------------------------- */
 /* Helpers                                                                   */
 /* ------------------------------------------------------------------------- */
@@ -636,6 +647,8 @@ static void rbuf_consume(conn_t *c, size_t n) {
 }
 
 int conn_on_readable(conn_t *c) {
+    size_t budget = CONN_READ_BUDGET;
+    c->read_yielded = 0;
     for (;;) {
         if (c->rlen >= sizeof(c->rbuf)) {
             /* Buffer full. If we're still parsing headers it means the
@@ -653,8 +666,15 @@ int conn_on_readable(conn_t *c) {
             continue;
         }
 
-        ssize_t n = read(c->fd, c->rbuf + c->rlen, sizeof(c->rbuf) - c->rlen);
+        if (budget == 0) {
+            c->read_yielded = 1;
+            return 0;
+        }
+        size_t want = sizeof(c->rbuf) - c->rlen;
+        if (want > budget) want = budget;
+        ssize_t n = read(c->fd, c->rbuf + c->rlen, want);
         if (n > 0) {
+            budget -= (size_t)n;
             c->rlen += (size_t)n;
             ssize_t consumed = feed_parser(c, c->rlen);
             if (consumed < 0) return 0;       /* response built */

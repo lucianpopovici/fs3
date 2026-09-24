@@ -73,11 +73,13 @@ $(XML_DIR)/%.o: $(XML_DIR)/%.c
 
 # ----- Tests --------------------------------------------------------
 
-TEST_BINS := tests/test_store tests/test_xml tests/test_xml_legacy tests/test_xml_fuzz tests/test_sigv4
+TEST_BINS := tests/test_store tests/test_conn tests/test_xml tests/test_xml_legacy tests/test_xml_fuzz tests/test_sigv4
 
 test: $(TEST_BINS) fs3
 	@echo "=== test_store ==="
 	@./tests/test_store
+	@echo "=== test_conn ==="
+	@./tests/test_conn
 	@echo "=== test_xml ==="
 	@./tests/test_xml
 	@echo "=== test_xml_legacy ==="
@@ -104,6 +106,13 @@ test: $(TEST_BINS) fs3
 tests/test_store: tests/test_store.c src/store_fs.o src/log.o
 	$(CC) $(CFLAGS) $(INCLUDES) tests/test_store.c \
 	    src/store_fs.o src/log.o $(LDFLAGS) -o $@
+
+# Everything but main.o/server.o: conn.c pulls in routing, the store,
+# SigV4, responses and metrics.
+CONN_TEST_OBJS := $(filter-out src/main.o src/server.o,$(OBJS))
+tests/test_conn: tests/test_conn.c $(CONN_TEST_OBJS)
+	$(CC) $(CFLAGS) $(INCLUDES) tests/test_conn.c \
+	    $(CONN_TEST_OBJS) $(LDFLAGS) -o $@
 
 tests/test_xml: $(XML_DIR)/tests/test_xml.c $(XML_DIR)/xml_parser.o
 	$(CC) $(CFLAGS) $(INCLUDES) $(XML_DIR)/tests/test_xml.c \

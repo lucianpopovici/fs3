@@ -5,6 +5,7 @@
 #   2. --max-body-size: declared and streamed 413 enforcement
 #   3. --idle-timeout: stalled connections are reclaimed
 #   4. --max-conns: connection cap rejects past the limit
+#   7. read budget: large half-closed uploads still complete
 #
 set -eu
 # The idle-timeout test deliberately writes into a socket the server has
@@ -270,6 +271,33 @@ check_eq "/_health auth-exempt under require-auth" "$code" "200"
 code=$(curl -s "$URL/" -o /dev/null -w "%{http_code}")
 check_eq "everything else still requires auth" "$code" "403"
 rm -f "$CRED_FILE"
+stop_server
+
+# ===================================================================
+# 7. Per-event read budget (CONN_READ_BUDGET)
+# ===================================================================
+start_server --idle-timeout 0
+curl -sS -X PUT "$URL/budgetbkt" -o /dev/null
+
+# A body several read budgets long, followed by a half-close (SHUT_WR),
+# must still get its response. The yield-vs-hangup interaction itself is
+# pinned deterministically in tests/test_conn.c; whether this run hits it
+# depends on socket buffer timing.
+code=$(python3 - "$PORT" <<'EOF'
+import socket, sys
+port = int(sys.argv[1]); size = 4 << 20
+s = socket.create_connection(("127.0.0.1", port))
+s.sendall(b"PUT /budgetbkt/halfclose HTTP/1.1\r\nHost: x\r\n"
+          b"Content-Length: %d\r\n\r\n" % size + b"h" * size)
+s.shutdown(socket.SHUT_WR)
+s.settimeout(30)
+r = s.recv(200)
+print(r.split(b" ")[1].decode() if r else "closed")
+EOF
+)
+check_eq "half-closed large PUT still answered" "$code" "200"
+size=$(curl -s -o /dev/null -w "%{size_download}" "$URL/budgetbkt/halfclose")
+check_eq "half-closed PUT stored full body" "$size" "4194304"
 stop_server
 
 printf '\n===== phase12 e2e: %d passed, %d failed =====\n' "$PASS" "$FAIL"
