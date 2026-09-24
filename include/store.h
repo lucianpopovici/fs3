@@ -85,7 +85,30 @@ extern int     (*s3_store_fsync_hook)(int fd);
 
 /* ---- Buckets ---- */
 
-s3_err_t store_bucket_create(s3_store_t *s, s3_str_t name);
+s3_err_t store_bucket_create(s3_store_t *s, s3_str_t name);   /* ownerless */
+
+/* ---- Bucket ownership ----
+ *
+ * Each bucket records the identity that owns it and a random id that
+ * distinguishes it from any earlier bucket of the same name. Buckets
+ * from before ownership existed read as ownerless with an empty id. */
+typedef struct {
+    char owner[129];   /* "" = ownerless */
+    char id[33];       /* 32 hex, or "" for a pre-ownership bucket */
+} s3_bucket_meta_t;
+
+/* Create a bucket owned by `owner` (NULL/"" = ownerless). Returns
+ * S3_ERR_BUCKET_ALREADY_EXISTS if the name is taken, whoever owns it. */
+s3_err_t store_bucket_create_owned(s3_store_t *s, s3_str_t name,
+                                   const char *owner);
+/* S3_ERR_NO_SUCH_BUCKET if absent. */
+s3_err_t store_bucket_meta(s3_store_t *s, s3_str_t name,
+                           s3_bucket_meta_t *out);
+/* Replace a bucket's owner (keeps its id; gives a pre-ownership bucket one). */
+s3_err_t store_bucket_set_owner(s3_store_t *s, s3_str_t name,
+                                const char *owner);
+/* Give every ownerless bucket to `owner`. Returns how many, or -1. */
+int      store_assign_legacy_owner(s3_store_t *s, const char *owner);
 s3_err_t store_bucket_delete(s3_store_t *s, s3_str_t name); /* empty buckets only */
 int      store_bucket_exists(s3_store_t *s, s3_str_t name);
 
@@ -225,6 +248,7 @@ void     store_list_close(s3_lister_t *l);
 typedef struct {
     char    *name;          /* NUL-terminated, owned */
     uint64_t ctime_ms;      /* bucket creation time */
+    char     owner[129];    /* "" = ownerless */
 } s3_bucket_info_t;
 
 s3_err_t store_list_buckets(s3_store_t *s,

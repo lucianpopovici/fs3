@@ -196,6 +196,7 @@ static void request_reset(conn_t *c) {
     c->copy_bucket = (s3_str_t){0};
     c->copy_key = (s3_str_t){0};
     c->body_limit_hit = 0;
+    memset(&c->id, 0, sizeof(c->id));
     c->req_start_ns = 0;
     c->bytes_out_body = 0;
     c->metrics_flushed = 0;
@@ -379,7 +380,7 @@ static int cb_on_headers_complete(llhttp_t *p) {
             }
         }
         if (auth_h || c->auth_required) {
-            s3_err_t e = sigv4_verify(c->auth, c);
+            s3_err_t e = sigv4_verify_id(c->auth, c, &c->id);
             if (e != S3_OK) {
                 LOG_D("sigv4 verify failed (err=%d) on %s",
                       (int)e, c->peer);

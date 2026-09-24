@@ -113,14 +113,20 @@ check_eq "no-auth request rejected (require-auth)" "$code" "403"
 st=$(sign "$ALICE_AK" "$ALICE_SK" --method PUT --url "$URL/p11bkt")
 check_eq "Alice can create bucket" "$st" "STATUS=200"
 
-# Bob uploads object
-st=$(sign "$BOB_AK" "$BOB_SK" --method PUT --url "$URL/p11bkt/bob-obj" \
+# Bob's key works too — in his own bucket (buckets are per-user; the
+# isolation rules themselves are covered by test_e2e_isolation.sh).
+st=$(sign "$BOB_AK" "$BOB_SK" --method PUT --url "$URL/p11bob")
+check_eq "Bob can create his bucket" "$st" "STATUS=200"
+st=$(sign "$BOB_AK" "$BOB_SK" --method PUT --url "$URL/p11bob/bob-obj" \
      --body "hello from bob" --header "Content-Type:text/plain")
 check_eq "Bob can upload object" "$st" "STATUS=200"
+st=$(sign "$BOB_AK" "$BOB_SK" --method GET --url "$URL/p11bob/bob-obj")
+check_eq "Bob can read his object" "$(echo "$st" | head -1)" "STATUS=200"
 
-# Alice reads Bob's object
-st=$(sign "$ALICE_AK" "$ALICE_SK" --method GET --url "$URL/p11bkt/bob-obj")
-check_eq "Alice can read Bob's object" "$(echo "$st" | head -1)" "STATUS=200"
+# ...but not into Alice's.
+st=$(sign "$BOB_AK" "$BOB_SK" --method PUT --url "$URL/p11bkt/bob-obj" \
+     --body "hello from bob" --header "Content-Type:text/plain")
+check_eq "Bob can't upload into Alice's bucket" "$st" "STATUS=403"
 
 # Wrong secret → 403
 st=$(FS3_AK="$ALICE_AK" FS3_SK="WRONGSECRETKEY000000000000000000" \
@@ -155,7 +161,7 @@ URL2="http://127.0.0.1:$PORT2"
 st=$(sign "$ALICE_AK" "$ALICE_SK" --method PUT --url "$URL2/combo-bkt")
 check_eq "file+flag: Alice (from file) → 200" "$st" "STATUS=200"
 
-st=$(sign "$BOB_AK" "$BOB_SK" --method GET --url "$URL2/combo-bkt")
+st=$(sign "$BOB_AK" "$BOB_SK" --method PUT --url "$URL2/combo-bob")
 check_eq "file+flag: Bob (from --auth) → 200" "$st" "STATUS=200"
 
 stop_server

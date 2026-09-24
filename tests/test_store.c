@@ -349,6 +349,140 @@ static void t_commit_races_bucket_delete(void) {
     teardown_root();
 }
 
+/* ---- Bucket ownership ----------------------------------------------- */
+
+static int is_hex32(const char *id) {
+    if (strlen(id) != 32) return 0;
+    for (int i = 0; i < 32; i++)
+        if (!strchr("0123456789abcdef", id[i])) return 0;
+    return 1;
+}
+
+static void t_bucket_owner_meta(void) {
+    setup_root();
+    s3_store_t *s;
+    store_open(&s, g_root);
+    s3_str_t b = S3_STR_LIT("alices");
+    s3_bucket_meta_t m1, m2;
+
+    CHECK_EQ(store_bucket_create_owned(s, b, "alice"), S3_OK, "create owned");
+    CHECK_EQ(store_bucket_meta(s, b, &m1), S3_OK, "meta");
+    CHECK(strcmp(m1.owner, "alice") == 0, "owner recorded");
+    CHECK(is_hex32(m1.id), "id is 32 hex");
+    CHECK_EQ(store_bucket_create_owned(s, b, "bob"),
+             S3_ERR_BUCKET_ALREADY_EXISTS, "name taken, whoever asks");
+    CHECK_EQ(store_bucket_meta(s, b, &m2), S3_OK, "meta again");
+    CHECK(strcmp(m2.owner, "alice") == 0, "still alice's");
+
+    CHECK_EQ(store_bucket_create(s, S3_STR_LIT("nobodys")), S3_OK,
+             "create ownerless");
+    CHECK_EQ(store_bucket_meta(s, S3_STR_LIT("nobodys"), &m2), S3_OK, "meta");
+    CHECK(m2.owner[0] == '\0' && is_hex32(m2.id), "ownerless, but has id");
+    CHECK_EQ(store_bucket_meta(s, S3_STR_LIT("missing"), &m2),
+             S3_ERR_NO_SUCH_BUCKET, "meta of missing bucket");
+
+    s3_bucket_info_t *list; size_t n;
+    CHECK_EQ(store_list_buckets(s, &list, &n), S3_OK, "list");
+    CHECK_EQ(n, 2, "two buckets");
+    for (size_t i = 0; i < n; i++) {
+        if (strcmp(list[i].name, "alices") == 0)
+            CHECK(strcmp(list[i].owner, "alice") == 0, "list: owner");
+        else
+            CHECK(list[i].owner[0] == '\0', "list: ownerless");
+    }
+    store_buckets_free(list, n);
+
+    /* Delete removes the meta file too; re-creating makes a new bucket. */
+    CHECK_EQ(store_bucket_delete(s, b), S3_OK, "delete owned bucket");
+    CHECK_EQ(store_bucket_create_owned(s, b, "alice"), S3_OK, "recreate");
+    CHECK_EQ(store_bucket_meta(s, b, &m2), S3_OK, "meta after recreate");
+    CHECK(strcmp(m1.id, m2.id) != 0, "re-created bucket has a new id");
+
+    store_close(s);
+    teardown_root();
+}
+
+/* A bucket from before ownership (bare marker dir) is ownerless, can't be
+ * claimed by creating it, and is handed over by assign_legacy_owner. */
+static void t_legacy_bucket_owner(void) {
+    setup_root();
+    s3_store_t *s;
+    store_open(&s, g_root);
+    char bp[512];
+    snprintf(bp, sizeof(bp), "%s/buckets/oldbucket", g_root);
+    CHECK_EQ(mkdir(bp, 0700), 0, "make pre-ownership bucket");
+    CHECK_EQ(store_bucket_create_owned(s, S3_STR_LIT("alices"), "alice"),
+             S3_OK, "an owned bucket too");
+
+    s3_bucket_meta_t m;
+    CHECK_EQ(store_bucket_meta(s, S3_STR_LIT("oldbucket"), &m), S3_OK, "meta");
+    CHECK(m.owner[0] == '\0' && m.id[0] == '\0', "legacy: no owner, no id");
+    CHECK_EQ(store_bucket_create_owned(s, S3_STR_LIT("oldbucket"), "bob"),
+             S3_ERR_BUCKET_ALREADY_EXISTS,
+             "legacy bucket can't be taken over by creating it");
+    CHECK_EQ(store_bucket_meta(s, S3_STR_LIT("oldbucket"), &m), S3_OK, "meta");
+    CHECK(m.owner[0] == '\0', "still ownerless");
+
+    CHECK_EQ(store_assign_legacy_owner(s, "carol"), 1, "one bucket assigned");
+    CHECK_EQ(store_bucket_meta(s, S3_STR_LIT("oldbucket"), &m), S3_OK, "meta");
+    CHECK(strcmp(m.owner, "carol") == 0 && is_hex32(m.id),
+          "carol owns it, and it has an id now");
+    CHECK_EQ(store_bucket_meta(s, S3_STR_LIT("alices"), &m), S3_OK, "meta");
+    CHECK(strcmp(m.owner, "alice") == 0, "owned bucket untouched");
+    CHECK_EQ(store_assign_legacy_owner(s, "carol"), 0, "idempotent");
+
+    CHECK_EQ(store_bucket_delete(s, S3_STR_LIT("oldbucket")), S3_OK,
+             "assigned legacy bucket deletes normally");
+    store_close(s);
+    teardown_root();
+}
+
+/* Alice is uploading into her bucket; it is deleted and bob creates a
+ * bucket with the same name before her upload commits. Her object must
+ * not land in bob's bucket. */
+static void t_commit_into_recreated_bucket(void) {
+    setup_root();
+    s3_store_t *s;
+    store_open(&s, g_root);
+    s3_str_t b = S3_STR_LIT("contested");
+    store_bucket_create_owned(s, b, "alice");
+
+    s3_writer_t *w = NULL;
+    CHECK_EQ(store_put_begin(s, b, S3_STR_LIT("k"), "text/plain", &w), S3_OK,
+             "alice begins upload");
+    store_put_write(w, "alice's data", 12);
+    CHECK_EQ(store_bucket_delete(s, b), S3_OK, "bucket deleted mid-upload");
+    CHECK_EQ(store_bucket_create_owned(s, b, "bob"), S3_OK,
+             "bob takes the name");
+    CHECK_EQ(store_put_commit(w, NULL), S3_ERR_NO_SUCH_BUCKET,
+             "alice's commit refused: not the bucket she started in");
+    s3_obj_meta_t m;
+    CHECK_EQ(store_head(s, b, S3_STR_LIT("k"), &m), S3_ERR_NO_SUCH_KEY,
+             "nothing landed in bob's bucket");
+    store_close(s);
+    teardown_root();
+}
+
+/* A crash while assembling a bucket leaves a dir in tmp/; startup
+ * recovery removes it. */
+static void t_recover_clears_staged_bucket(void) {
+    setup_root();
+    char d[512], f[600];
+    snprintf(d, sizeof(d), "%s/tmp", g_root);
+    mkdir(d, 0700);
+    snprintf(d, sizeof(d), "%s/tmp/bucket.ABCDEF", g_root);
+    CHECK_EQ(mkdir(d, 0700), 0, "staged bucket dir");
+    snprintf(f, sizeof(f), "%s/meta", d);
+    FILE *fp = fopen(f, "w"); fputs("id=x\nowner=alice\n", fp); fclose(fp);
+
+    s3_store_t *s;
+    CHECK_EQ(store_open(&s, g_root), S3_OK, "open");
+    struct stat st;
+    CHECK(stat(d, &st) < 0, "staged bucket dir removed");
+    store_close(s);
+    teardown_root();
+}
+
 static void t_put_get_simple(void) {
     setup_root();
     s3_store_t *s;
@@ -1397,6 +1531,10 @@ int main(void) {
     t_put_commit_after_bucket_delete();
     t_mpu_after_bucket_delete();
     t_commit_races_bucket_delete();
+    t_bucket_owner_meta();
+    t_legacy_bucket_owner();
+    t_commit_into_recreated_bucket();
+    t_recover_clears_staged_bucket();
     t_put_get_simple();
     t_put_overwrite();
     t_put_streaming();

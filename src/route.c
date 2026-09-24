@@ -171,6 +171,43 @@ static void scratch_reset(conn_t *c) { c->req_scratch_used = 0; }
 /* Service-level (PATH = "/")                                            */
 /* ===================================================================== */
 
+/* ===================================================================== */
+/* Bucket ownership                                                       */
+/* ===================================================================== */
+/*
+ * With auth configured, every bucket belongs to the identity that
+ * created it (the credential's user, or its access key), and only that
+ * identity — or an --admin user — may see or act on it or its objects.
+ * Ownerless buckets (from before isolation, or created in no-auth mode)
+ * are admin-only until --legacy-owner assigns them. Anonymous requests
+ * (auth configured without --require-auth) own nothing and get 403.
+ * Without auth there are no identities and no checks: open mode is
+ * unchanged.
+ */
+
+/* S3_OK if this request may act on `bucket`. S3_ERR_NO_SUCH_BUCKET is
+ * passed through for the handler to report its own way; anything else
+ * is a denial. */
+static s3_err_t authz_bucket(conn_t *c, s3_str_t bucket) {
+    if (!c->auth) return S3_OK;
+    if (!c->id.user[0]) return S3_ERR_ACCESS_DENIED;
+    s3_bucket_meta_t m;
+    s3_err_t e = store_bucket_meta(c->store, bucket, &m);
+    if (e != S3_OK) return e;
+    if (c->id.is_admin) return S3_OK;
+    if (m.owner[0] && strcmp(m.owner, c->id.user) == 0) return S3_OK;
+    return S3_ERR_ACCESS_DENIED;
+}
+
+/* Is this request "PUT /bucket" (create), as opposed to PUT /bucket?acl? */
+static int is_bucket_create(conn_t *c) {
+    if (!method_is(c, "PUT")) return 0;
+    if (c->req.query.n == 0) return 1;
+    char *qb = scratch_alloc(c, c->req.query.n + 1);
+    s3_str_t v;
+    return !(qb && query_param(c->req.query, "acl", qb, c->req.query.n, &v));
+}
+
 static int handle_service(conn_t *c) {
     /* Only GET is meaningful; everything else is method-not-allowed. */
     if (!method_is(c, "GET")) {
@@ -180,9 +217,26 @@ static int handle_service(conn_t *c) {
     /* GET / → ListAllMyBuckets */
     s3_bucket_info_t *buckets = NULL;
     size_t n_buckets = 0;
+    if (c->auth && !c->id.user[0]) {
+        return rsp_build_s3_error(c, S3_ERR_ACCESS_DENIED,
+                                  S3_STR_LIT("/"), NULL);
+    }
     s3_err_t e = store_list_buckets(c->store, &buckets, &n_buckets);
     if (e != S3_OK) {
         return rsp_build_s3_error(c, e, S3_STR_LIT("/"), NULL);
+    }
+    /* Each user sees only their own buckets; admins see all. */
+    if (c->auth && !c->id.is_admin) {
+        size_t kept = 0;
+        for (size_t i = 0; i < n_buckets; i++) {
+            if (buckets[i].owner[0]
+                && strcmp(buckets[i].owner, c->id.user) == 0) {
+                buckets[kept++] = buckets[i];
+            } else {
+                free(buckets[i].name);
+            }
+        }
+        n_buckets = kept;
     }
     int rc = rsp_build_list_all_my_buckets(c, buckets, n_buckets);
     store_buckets_free(buckets, n_buckets);
@@ -343,7 +397,15 @@ static int handle_bucket(conn_t *c, s3_str_t bucket) {
     }
 
     if (method_is(c, "PUT")) {
-        s3_err_t e = store_bucket_create(c->store, bucket);
+        /* Create. With auth, the signer owns the new bucket. */
+        const char *owner = NULL;
+        if (c->auth) {
+            if (!c->id.user[0])
+                return rsp_build_s3_error(c, S3_ERR_ACCESS_DENIED,
+                                          c->req.path, NULL);
+            owner = c->id.user;
+        }
+        s3_err_t e = store_bucket_create_owned(c->store, bucket, owner);
         if (e == S3_OK) {
             char loc[1100];
             int n = snprintf(loc, sizeof(loc),
@@ -807,6 +869,14 @@ static int handle_object_copy(conn_t *c, s3_str_t dst_bucket, s3_str_t dst_key) 
     s3_str_t src_bucket = { p,         src_bucket_n };
     s3_str_t src_key    = { slash + 1, src_key_n    };
 
+    /* The destination was authorized at dispatch; the source is a second
+     * bucket and needs its own check. */
+    s3_err_t ae = authz_bucket(c, src_bucket);
+    if (ae != S3_OK && ae != S3_ERR_NO_SUCH_BUCKET) {
+        free(src_buf);
+        return rsp_build_s3_error(c, ae, c->req.path, NULL);
+    }
+
     /* Open source. */
     s3_reader_t *reader = NULL;
     s3_obj_meta_t src_meta;
@@ -1135,6 +1205,14 @@ int route_dispatch_headers(conn_t *c) {
     /* Service-level: "/" */
     if (bucket.n == 0) {
         return handle_service(c);
+    }
+
+    /* Everything below acts on an existing bucket, except creating one. */
+    if (!(key.n == 0 && is_bucket_create(c))) {
+        s3_err_t ae = authz_bucket(c, bucket);
+        if (ae != S3_OK && ae != S3_ERR_NO_SUCH_BUCKET) {
+            return rsp_build_s3_error(c, ae, c->req.path, NULL);
+        }
     }
 
     /* Bucket-level: "/bucket" or "/bucket/" with no key */

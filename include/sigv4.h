@@ -38,6 +38,21 @@ int sigv4_add_cred(sigv4_verifier_t *v,
                    const char *access_key,
                    const char *secret_key);
 
+/* Longest owner identity (user name, or access key used as one). */
+#define SIGV4_USER_MAX 128
+
+/* Like sigv4_add_cred, with the identity that owns buckets created with
+ * this key. NULL/empty user means the access key itself. Several keys
+ * may share a user (key rotation keeps the user's buckets). */
+int sigv4_add_cred_user(sigv4_verifier_t *v,
+                        const char *access_key,
+                        const char *secret_key,
+                        const char *user);
+
+/* Mark a user as admin: sees and may act on every bucket. Admins are not
+ * affected by sigv4_swap_creds. Returns 0 on success. */
+int sigv4_add_admin(sigv4_verifier_t *v, const char *user);
+
 /* Free the verifier and its credentials. */
 void sigv4_destroy(sigv4_verifier_t *v);
 
@@ -70,6 +85,16 @@ void sigv4_set_max_skew(sigv4_verifier_t *v, int max_skew_seconds);
  *
  * On non-OK return, no state on `c` is modified. */
 s3_err_t sigv4_verify(const sigv4_verifier_t *v, const struct conn *c);
+
+/* Who signed a verified request. */
+typedef struct {
+    char user[SIGV4_USER_MAX + 1];
+    int  is_admin;
+} sigv4_id_t;
+
+/* sigv4_verify, also filling *id_out (if non-NULL) on S3_OK. */
+s3_err_t sigv4_verify_id(const sigv4_verifier_t *v, const struct conn *c,
+                         sigv4_id_t *id_out);
 
 /* Detect whether the request uses streaming chunked SigV4
  * (x-amz-content-sha256: STREAMING-AWS4-HMAC-SHA256-PAYLOAD). Call
