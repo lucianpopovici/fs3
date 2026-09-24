@@ -35,6 +35,10 @@ typedef enum {
     CST_READ_HEADERS,    /* feeding bytes to llhttp; headers not yet complete */
     CST_AUTH,            /* headers complete; auth check (Phase 0: no-op) */
     CST_READ_BODY,       /* body bytes streaming through on_body */
+    CST_WAIT_JOB,        /* request complete; blocking store work (commit,
+                          * copy) is running on the iopool. No socket
+                          * interest until the job's done() builds the
+                          * response and moves us to CST_WRITE_RESPONSE. */
     CST_WRITE_RESPONSE,  /* writing response from wbuf */
     CST_CLOSING,
 } conn_state_t;
@@ -79,6 +83,13 @@ typedef struct conn {
 
     /* Reference to the global object store (lifetime == server). */
     struct s3_store   *store;
+
+    /* Worker pool for blocking store work (lifetime == server). NULL runs
+     * that work inline on the event loop. */
+    struct iopool     *pool;
+    /* The job this conn is waiting on (state CST_WAIT_JOB). conn_destroy
+     * orphans it (job->conn = NULL) so it completes without us. */
+    struct iojob      *job;
 
     /* Reference to the global SigV4 verifier (lifetime == server).
      * NULL means auth is disabled — every request is accepted. */
@@ -200,6 +211,12 @@ typedef struct conn {
     s3_str_t           mpu_key;
     char               mpu_upload_id[33];
 
+    /* Server-side copy (PUT with x-amz-copy-source): destination, saved
+     * at headers time and run at message-complete. Points into req_scratch. */
+    int                copy_pending;
+    s3_str_t           copy_bucket;
+    s3_str_t           copy_key;
+
     /* Bulk-delete context (POST /<bucket>?delete) */
     int                delete_pending;
     s3_str_t           delete_bucket;   /* points into req_scratch */
@@ -213,6 +230,7 @@ typedef struct conn {
 
 /* Lifecycle */
 conn_t *conn_create(int fd, const char *peer, struct s3_store *store,
+                    struct iopool *pool,
                     struct sigv4_verifier *auth, int auth_required,
                     uint64_t max_body_bytes, struct fs3_metrics *metrics);
 void    conn_destroy(conn_t *c);
@@ -224,8 +242,9 @@ int     conn_on_writable(conn_t *c);
 int     conn_wants_write(const conn_t *c);
 
 /* Peer hung up (EPOLLRDHUP): is it safe to close now? False while there is
- * a response to send, buffered request bytes, or unread socket data left
- * behind by a read that yielded at CONN_READ_BUDGET. */
+ * a response to send or still to be built (CST_WAIT_JOB), buffered request
+ * bytes, or unread socket data left behind by a read that yielded at
+ * CONN_READ_BUDGET. */
 int     conn_hup_can_close(const conn_t *c);
 
 #endif

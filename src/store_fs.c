@@ -48,6 +48,7 @@
 #include <string.h>
 #include <sys/file.h>
 #include <sys/sendfile.h>
+#include <pthread.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
 #include <sys/time.h>
@@ -92,6 +93,12 @@ struct s3_store {
     char    *buckets_dir;    /* ROOT/buckets */
     char    *mpu_dir;        /* ROOT/mpu — multipart upload staging */
     uint64_t min_free_bytes; /* 0 = no quota check */
+    /* Namespace lock. Commits run on iopool worker threads while the
+     * event loop keeps serving other requests, so the short steps that
+     * create or remove entries in the live tree — bucket-exists check +
+     * mkdir_p + rename, and rm_rf of bucket/upload dirs — are serialized
+     * here. Never held across data writes or fsync of object bytes. */
+    pthread_mutex_t ns_mu;
 };
 
 static char *xstrdup_join(const char *a, const char *b) {
@@ -304,6 +311,7 @@ s3_err_t store_open(s3_store_t **out, const char *root) {
 
     s3_store_t *s = calloc(1, sizeof(*s));
     if (!s) return S3_ERR_INTERNAL;
+    pthread_mutex_init(&s->ns_mu, NULL);
 
     s->root        = strdup(root);
     s->data_dir    = xstrdup_join(root, "data");
@@ -338,6 +346,7 @@ void store_close(s3_store_t *s) {
     free(s->tmp_dir);
     free(s->buckets_dir);
     free(s->mpu_dir);
+    pthread_mutex_destroy(&s->ns_mu);
     free(s);
 }
 
@@ -477,8 +486,7 @@ static int rmdir_tree(const char *path) {
     return rmdir(path);
 }
 
-s3_err_t store_bucket_delete(s3_store_t *s, s3_str_t name) {
-    if (!s) return S3_ERR_INVALID_ARGUMENT;
+static s3_err_t bucket_delete_locked(s3_store_t *s, s3_str_t name) {
     if (!store_bucket_exists(s, name)) return S3_ERR_NO_SUCH_BUCKET;
 
     char dp[4096];
@@ -504,6 +512,16 @@ s3_err_t store_bucket_delete(s3_store_t *s, s3_str_t name) {
         return S3_ERR_INTERNAL;
     }
     return S3_OK;
+}
+
+/* Under ns_mu, so a commit on a worker thread lands either before (the
+ * bucket is non-empty) or after (NoSuchBucket), never in between. */
+s3_err_t store_bucket_delete(s3_store_t *s, s3_str_t name) {
+    if (!s) return S3_ERR_INVALID_ARGUMENT;
+    pthread_mutex_lock(&s->ns_mu);
+    s3_err_t e = bucket_delete_locked(s, name);
+    pthread_mutex_unlock(&s->ns_mu);
+    return e;
 }
 
 /* ===================================================================== */
@@ -666,13 +684,6 @@ s3_err_t store_put_commit(s3_writer_t *w, s3_obj_meta_t *meta_out) {
     s3_str_t bucket = { w->bucket_dup, strlen(w->bucket_dup) };
     s3_str_t key    = { w->key_dup,    w->hdr.key_len };
 
-    /* The body streamed across many event-loop turns; the bucket may have
-     * been deleted meanwhile (bucket_delete can't see tmp/ writes). Without
-     * this re-check, mkdir_p below would resurrect data/<bucket>/ and the
-     * object would reappear if the bucket name is ever recreated. */
-    if (!store_bucket_exists(w->store, bucket)) {
-        writer_free(w); return S3_ERR_NO_SUCH_BUCKET;
-    }
     char hex[65];
     hash_bucket_key(bucket, key, hex);
 
@@ -681,9 +692,21 @@ s3_err_t store_put_commit(s3_writer_t *w, s3_obj_meta_t *meta_out) {
         || obj_path(w->store, bucket, hex, path, sizeof(path)) < 0) {
         writer_free(w); return S3_ERR_INTERNAL;
     }
+
+    /* The body streamed across many event-loop turns and this may run on
+     * a worker thread; the bucket may have been deleted meanwhile
+     * (bucket_delete can't see tmp/ writes). Without this re-check under
+     * ns_mu, mkdir_p would resurrect data/<bucket>/ and the object would
+     * reappear if the bucket name is ever recreated. */
+    pthread_mutex_lock(&w->store->ns_mu);
+    if (!store_bucket_exists(w->store, bucket)) {
+        pthread_mutex_unlock(&w->store->ns_mu);
+        writer_free(w); return S3_ERR_NO_SUCH_BUCKET;
+    }
     if (mkdir_p(dir, 0700) < 0) {
         LOG_E("mkdir_p %s: %s", dir, strerror(errno));
         s3_err_t e = map_io_err(errno);
+        pthread_mutex_unlock(&w->store->ns_mu);
         writer_free(w); return e;
     }
 
@@ -691,8 +714,10 @@ s3_err_t store_put_commit(s3_writer_t *w, s3_obj_meta_t *meta_out) {
     if (rename(w->tmp_path, path) < 0) {
         LOG_E("rename %s -> %s: %s", w->tmp_path, path, strerror(errno));
         s3_err_t e = map_io_err(errno);
+        pthread_mutex_unlock(&w->store->ns_mu);
         writer_free(w); return e;
     }
+    pthread_mutex_unlock(&w->store->ns_mu);
     /* tmp_path is gone; clear so writer_free doesn't unlink the live file. */
     w->tmp_path[0] = '\0';
 
@@ -1542,11 +1567,18 @@ s3_err_t store_mpu_part_commit(s3_writer_t *w, char etag_hex_out[33]) {
         writer_free(w); return e;
     }
     close(w->fd); w->fd = -1;
-    if (rename(w->tmp_path, w->final_path) < 0) {
+    /* ns_mu: an rm_rf of the upload dir (abort, GC, complete, bucket
+     * delete) must not interleave with this rename, or its final rmdir
+     * would fail on the newly-arrived part. */
+    pthread_mutex_lock(&w->store->ns_mu);
+    int rc = rename(w->tmp_path, w->final_path);
+    int rename_errno = errno;
+    pthread_mutex_unlock(&w->store->ns_mu);
+    if (rc < 0) {
         /* ENOENT: the upload dir vanished mid-stream (abort, GC, or
          * bucket delete ran while this part was uploading). */
-        s3_err_t e = errno == ENOENT ? S3_ERR_NO_SUCH_UPLOAD
-                                     : map_io_err(errno);
+        s3_err_t e = rename_errno == ENOENT ? S3_ERR_NO_SUCH_UPLOAD
+                                            : map_io_err(rename_errno);
         writer_free(w); return e;
     }
     w->tmp_path[0] = '\0';  /* don't unlink the live file in writer_free */
@@ -1580,10 +1612,12 @@ s3_err_t store_mpu_abort(s3_store_t *s, s3_str_t bucket, s3_str_t key,
     char meta[4200];
     if (snprintf(meta, sizeof(meta), "%s/meta", dir) >= (int)sizeof(meta))
         return S3_ERR_INTERNAL;
-    if (access(meta, F_OK) < 0) return S3_ERR_NO_SUCH_UPLOAD;
-
-    if (rm_rf(dir) < 0) return S3_ERR_INTERNAL;
-    return S3_OK;
+    pthread_mutex_lock(&s->ns_mu);
+    s3_err_t e = S3_OK;
+    if (access(meta, F_OK) < 0)  e = S3_ERR_NO_SUCH_UPLOAD;
+    else if (rm_rf(dir) < 0)     e = S3_ERR_INTERNAL;
+    pthread_mutex_unlock(&s->ns_mu);
+    return e;
 }
 
 /* Concatenate the part files into a single object file under data/.
@@ -1719,11 +1753,6 @@ s3_err_t store_mpu_complete(s3_store_t *s, s3_str_t bucket, s3_str_t key,
         free(stored_ct);
         return S3_ERR_INTERNAL;
     }
-    if (mkdir_p(target_dir, 0700) < 0) {
-        s3_err_t e = map_io_err(errno);
-        free(stored_ct);
-        return e;
-    }
     char target_path[4096];
     if (obj_path(s, bucket, hex, target_path, sizeof(target_path)) < 0) {
         free(stored_ct);
@@ -1809,18 +1838,28 @@ s3_err_t store_mpu_complete(s3_store_t *s, s3_str_t bucket, s3_str_t key,
     }
     close(tfd);
 
-    /* Atomic rename and dirfsync. */
-    if (rename(tmp_path, target_path) < 0) {
-        s3_err_t e = map_io_err(errno);
+    /* Publish under ns_mu. The concatenation above can take a long time
+     * on a worker thread, so re-check that neither the bucket (delete)
+     * nor the upload (abort/GC) went away meanwhile — if one did, the
+     * later operation wins and nothing is published. The staging dir is
+     * removed in the same critical section, so no concurrent abort can
+     * observe a half-removed upload. */
+    char up_dir[4096], up_meta[4200];
+    mpu_dir_path(s, bucket, upload_id, up_dir, sizeof(up_dir));
+    snprintf(up_meta, sizeof(up_meta), "%s/meta", up_dir);
+    pthread_mutex_lock(&s->ns_mu);
+    s3_err_t pe = S3_OK;
+    if (!store_bucket_exists(s, bucket))          pe = S3_ERR_NO_SUCH_BUCKET;
+    else if (access(up_meta, F_OK) < 0)           pe = S3_ERR_NO_SUCH_UPLOAD;
+    else if (mkdir_p(target_dir, 0700) < 0
+             || rename(tmp_path, target_path) < 0) pe = map_io_err(errno);
+    else                                          rm_rf(up_dir);
+    pthread_mutex_unlock(&s->ns_mu);
+    if (pe != S3_OK) {
         unlink(tmp_path); free(stored_ct);
-        return e;
+        return pe;
     }
     fsync_dir(target_dir);
-
-    /* Clean up the staging dir. */
-    char up_dir[4096];
-    mpu_dir_path(s, bucket, upload_id, up_dir, sizeof(up_dir));
-    rm_rf(up_dir);
 
     /* Fill outputs. */
     if (etag_out) {
@@ -2006,7 +2045,9 @@ int store_mpu_gc(s3_store_t *s, uint64_t now_ms, uint64_t max_age_ms) {
 
             LOG_I("mpu_gc: reaping stale upload %s (age=%" PRIu64 "ms)",
                   ue->d_name, now_ms - ctime_ms);
+            pthread_mutex_lock(&s->ns_mu);
             if (rm_rf(up_dir) == 0) removed++;
+            pthread_mutex_unlock(&s->ns_mu);
         }
         closedir(ud);
     }

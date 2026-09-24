@@ -25,6 +25,7 @@
  */
 
 #include "conn.h"
+#include "iopool.h"
 #include "log.h"
 #include "metrics.h"
 #include "route.h"
@@ -73,6 +74,7 @@ static void parser_init(conn_t *c) {
 }
 
 conn_t *conn_create(int fd, const char *peer, struct s3_store *store,
+                    struct iopool *pool,
                     struct sigv4_verifier *auth, int auth_required,
                     uint64_t max_body_bytes, struct fs3_metrics *metrics) {
     conn_t *c = calloc(1, sizeof(*c));
@@ -80,6 +82,7 @@ conn_t *conn_create(int fd, const char *peer, struct s3_store *store,
     c->fd = fd;
     c->state = CST_READ_HEADERS;
     c->store = store;
+    c->pool = pool;
     c->auth = auth;
     c->auth_required = auth_required;
     c->max_body_bytes = max_body_bytes;
@@ -91,6 +94,9 @@ conn_t *conn_create(int fd, const char *peer, struct s3_store *store,
 
 void conn_destroy(conn_t *c) {
     if (!c) return;
+    /* A job still running on the pool owns its writer/reader; detach it
+     * so its done() cleans up without touching this (freed) conn. */
+    if (c->job) c->job->conn = NULL;
     /* Release any handler-owned state (request was abandoned mid-flight). */
     if (c->put_writer) store_put_abort(c->put_writer);
     if (c->get_reader) store_get_close(c->get_reader);
@@ -117,6 +123,7 @@ int conn_hup_can_close(const conn_t *c) {
     return !conn_wants_write(c)
         && c->rlen == 0
         && !c->read_yielded
+        && c->state != CST_WAIT_JOB
         && c->state != CST_WRITE_RESPONSE;
 }
 
@@ -185,6 +192,9 @@ static void request_reset(conn_t *c) {
     c->mpu_upload_id[0] = '\0';
     c->delete_pending = 0;
     c->delete_bucket = (s3_str_t){0};
+    c->copy_pending = 0;
+    c->copy_bucket = (s3_str_t){0};
+    c->copy_key = (s3_str_t){0};
     c->body_limit_hit = 0;
     c->req_start_ns = 0;
     c->bytes_out_body = 0;
@@ -485,6 +495,7 @@ static int cb_on_body(llhttp_t *p, const char *at, size_t len) {
         }
         c->mpu_complete_pending = 0;
         c->delete_pending = 0;
+        c->copy_pending = 0;
         if (route_build_error(c, S3_ERR_ENTITY_TOO_LARGE) < 0) return -1;
         return 0;
     }
@@ -646,9 +657,17 @@ static void rbuf_consume(conn_t *c, size_t n) {
     c->rlen -= n;
 }
 
+/* The current request no longer needs input: its response is being
+ * written, or is waiting on an iopool job. Pipelined bytes stay in the
+ * socket/rbuf until the response has gone out. */
+static int request_parked(const conn_t *c) {
+    return c->state == CST_WRITE_RESPONSE || c->state == CST_WAIT_JOB;
+}
+
 int conn_on_readable(conn_t *c) {
     size_t budget = CONN_READ_BUDGET;
     c->read_yielded = 0;
+    if (c->state == CST_WAIT_JOB) return 0;
     for (;;) {
         if (c->rlen >= sizeof(c->rbuf)) {
             /* Buffer full. If we're still parsing headers it means the
@@ -662,7 +681,7 @@ int conn_on_readable(conn_t *c) {
             if (consumed < 0) return 0;       /* response built */
             rbuf_consume(c, (size_t)consumed);
             if (consumed == 0) return -1;     /* parser stuck; defensive */
-            if (c->state == CST_WRITE_RESPONSE) return 0;
+            if (request_parked(c)) return 0;
             continue;
         }
 
@@ -679,7 +698,7 @@ int conn_on_readable(conn_t *c) {
             ssize_t consumed = feed_parser(c, c->rlen);
             if (consumed < 0) return 0;       /* response built */
             rbuf_consume(c, (size_t)consumed);
-            if (c->state == CST_WRITE_RESPONSE) return 0;
+            if (request_parked(c)) return 0;
             continue;
         }
         if (n == 0) {
@@ -695,7 +714,7 @@ int conn_on_readable(conn_t *c) {
                           llhttp_get_error_reason(&c->parser));
                 }
             }
-            if (c->state == CST_WRITE_RESPONSE) return 0;
+            if (request_parked(c)) return 0;
             /* Truncated mid-request → drop. */
             if (c->state == CST_READ_HEADERS || c->state == CST_READ_BODY) {
                 return -1;
@@ -714,6 +733,9 @@ int conn_on_readable(conn_t *c) {
 /* ------------------------------------------------------------------------- */
 
 int conn_on_writable(conn_t *c) {
+    /* Nothing to send until the job's done() has built the response. */
+    if (c->state == CST_WAIT_JOB) return 0;
+
     /* Drain wbuf (the response head, plus inline body for small responses). */
     while (c->state == CST_WRITE_RESPONSE && c->wpos < c->wlen) {
         ssize_t n = write(c->fd, c->wbuf + c->wpos, c->wlen - c->wpos);

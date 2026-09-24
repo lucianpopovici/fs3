@@ -173,6 +173,10 @@ so changing a header correctly invalidates the dependent object files.
 
 # Tune the multipart-upload GC (defaults: 60s sweep, 24h TTL):
 ./fs3 --mpu-gc-interval 300 --mpu-gc-max-age 3600 -d /var/lib/fs3
+
+# Commit fsync, server-side copy and multipart completion run on worker
+# threads so they don't stall other clients (default 4; 0 = inline):
+./fs3 --io-threads 2 -d /var/lib/fs3
 ```
 
 Then point any S3 client at the server. The AWS CLI and boto3 work
