@@ -25,6 +25,11 @@
 #define CONN_MAX_HEADERS      64
 #define CONN_HDR_SCRATCH_SZ   (16 * 1024)   /* URL + all header bytes combined */
 #define CONN_REQ_SCRATCH_SZ   (4 * 1024)    /* per-request decoded path/query */
+/* Max socket bytes one conn_on_readable() call may read before yielding
+ * back to the event loop. Epoll is level-triggered, so leftover bytes
+ * re-fire EPOLLIN on the next wait; the cap just stops one fast uploader
+ * from starving every other connection. */
+#define CONN_READ_BUDGET      (256 * 1024)
 
 typedef enum {
     CST_READ_HEADERS,    /* feeding bytes to llhttp; headers not yet complete */
@@ -68,6 +73,9 @@ typedef struct conn {
     int                fd;
     conn_state_t       state;
     int                eof_seen;
+    /* Last conn_on_readable() stopped at CONN_READ_BUDGET with the socket
+     * possibly still holding data: not drained, so not yet at EOF. */
+    int                read_yielded;
 
     /* Reference to the global object store (lifetime == server). */
     struct s3_store   *store;
@@ -214,5 +222,10 @@ int     conn_on_readable(conn_t *c);
 int     conn_on_writable(conn_t *c);
 
 int     conn_wants_write(const conn_t *c);
+
+/* Peer hung up (EPOLLRDHUP): is it safe to close now? False while there is
+ * a response to send, buffered request bytes, or unread socket data left
+ * behind by a read that yielded at CONN_READ_BUDGET. */
+int     conn_hup_can_close(const conn_t *c);
 
 #endif

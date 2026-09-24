@@ -132,6 +132,7 @@ read time — the read path already does this.
 | target | language | what it exercises |
 |---|---|---|
 | `tests/test_store` | C | 36 unit tests: bucket CRUD (incl. delete racing an in-flight PUT/MPU), single PUT/GET round-trip, sendfile, listing with prefix/delimiter, persistence across `store_open`/`store_close`, multipart lifecycle, list_buckets, list_mpu_uploads (with prefix filter), mpu_gc reaping behavior |
+| `tests/test_conn` | C | 2 unit tests of the per-connection read path over a pipe: the per-event read budget yields and resumes, and a yielded conn isn't closed on peer hangup |
 | `tests/test_xml` | C | 25 tests of the extended XML library (escaping, parsing, security limits) |
 | `tests/test_xml_legacy` | C | one round-trip showing the original calling style still works |
 | `tests/test_xml_fuzz` | C | 50,000 random inputs through the parser, must not crash |
@@ -142,9 +143,9 @@ read time — the read path already does this.
 | `tests/test_e2e_phase9.sh` | bash + curl | 45 integration tests of Range GET (206/416), bulk delete (`?delete`), and bucket subresources (`?location`, `?versioning`) |
 | `tests/test_e2e_phase10.sh` | bash + curl | 27 integration tests of server-side object copy and `?acl` stub |
 | `tests/test_e2e_phase11.sh` | bash + curl + python | 16 integration tests of `/_health`, `--credentials-file`, `--min-free-bytes` quota |
-| `tests/test_e2e_phase12.sh` | bash + curl + python | 34 integration tests of startup recovery, `--max-body-size` (413), `--idle-timeout`, `--max-conns`, SIGHUP credential reload, and the `--metrics-port` admin listener |
+| `tests/test_e2e_phase12.sh` | bash + curl + python | 36 integration tests of startup recovery, `--max-body-size` (413), `--idle-timeout`, `--max-conns`, SIGHUP credential reload, the `--metrics-port` admin listener, and half-closed large uploads |
 
-All eight targets pass under both `-O2` and DEBUG (ASan + UBSan).
+All nine targets pass under both `-O2` and DEBUG (ASan + UBSan).
 
 `make test` runs everything sequentially; each suite is also runnable
 standalone. The auth suite is the slowest (~30s; chunked SigV4 tests
@@ -156,7 +157,9 @@ These are decisions made early that the rest of the code depends on.
 Don't quietly undo them.
 
 - **Single-threaded epoll event loop.** No worker threads. No locks.
-  All I/O is non-blocking. The store's filesystem operations are
+  All I/O is non-blocking. Epoll is level-triggered, and each readable
+  event reads at most `CONN_READ_BUDGET` (256 KB) before yielding, so
+  one fast uploader can't starve the other connections. The store's filesystem operations are
   synchronous and that's accepted — the per-request latency budget
   is determined by `fsync()`, not by CPU.
 

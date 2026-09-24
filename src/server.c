@@ -396,12 +396,8 @@ int server_run(server_t *s) {
                 if (conn_on_writable(c) < 0) { close_conn(s, c); continue; }
             }
 
-            /* Hangup with nothing more to write AND no buffered work → close.
-             * If we're CST_WRITE_RESPONSE we'll send what we have first; if
-             * rbuf still has bytes the parser will consume them. */
-            if ((e->events & EPOLLRDHUP) && !conn_wants_write(c)
-                && c->rlen == 0
-                && c->state != CST_WRITE_RESPONSE) {
+            /* Hangup with nothing more to write AND no buffered work → close. */
+            if ((e->events & EPOLLRDHUP) && conn_hup_can_close(c)) {
                 close_conn(s, c);
                 continue;
             }
