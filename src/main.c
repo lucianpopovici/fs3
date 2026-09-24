@@ -39,6 +39,8 @@ static void usage(const char *argv0) {
         "      --max-conns <num>      concurrent connection cap (default 512)\n"
         "      --idle-timeout <sec>   close idle connections after this long (default 60; 0 = off)\n"
         "      --metrics-port <num>   serve /healthz + /metrics on 127.0.0.1:<num> (0 = off)\n"
+        "      --io-threads <num>     worker threads for fsync/copy/MPU completion\n"
+        "                             (default 4; 0 = run them on the event loop)\n"
         "      --mpu-gc-interval N    seconds between MPU GC sweeps (default 60)\n"
         "      --mpu-gc-max-age N     seconds before a stale MPU is reaped (default 86400)\n"
         "  -v, --verbose              debug logging\n"
@@ -169,6 +171,7 @@ enum {
     OPT_MAX_CONNS,
     OPT_IDLE_TIMEOUT,
     OPT_METRICS_PORT,
+    OPT_IO_THREADS,
 };
 
 int main(int argc, char **argv) {
@@ -189,6 +192,10 @@ int main(int argc, char **argv) {
     int max_conns = 512;
     int idle_timeout_s = 60;
     int metrics_port = 0;         /* 0 = no admin/metrics listener */
+    /* Blocking store work (commit fsync, copy, MPU completion) runs on
+     * this many threads so the event loop stays responsive. A handful is
+     * plenty: the work is disk-bound, not CPU-bound. */
+    int io_threads = 4;
     sigv4_verifier_t *auth = NULL;
     reload_ctx_t reload_ctx = {0};
 
@@ -204,6 +211,7 @@ int main(int argc, char **argv) {
         { "max-conns",        required_argument, NULL, OPT_MAX_CONNS },
         { "idle-timeout",     required_argument, NULL, OPT_IDLE_TIMEOUT },
         { "metrics-port",     required_argument, NULL, OPT_METRICS_PORT },
+        { "io-threads",       required_argument, NULL, OPT_IO_THREADS },
         { "mpu-gc-interval",  required_argument, NULL, OPT_MPU_GC_INTERVAL },
         { "mpu-gc-max-age",   required_argument, NULL, OPT_MPU_GC_MAX_AGE },
         { "verbose",          no_argument,       NULL, 'v' },
@@ -297,6 +305,13 @@ int main(int argc, char **argv) {
                     return 2;
                 }
                 break;
+            case OPT_IO_THREADS:
+                io_threads = atoi(optarg);
+                if (io_threads < 0 || io_threads > 64) {
+                    fprintf(stderr, "--io-threads must be 0..64\n");
+                    return 2;
+                }
+                break;
             case OPT_MPU_GC_INTERVAL:
                 gc_interval_s = atoi(optarg);
                 if (gc_interval_s < 1) {
@@ -350,6 +365,7 @@ int main(int argc, char **argv) {
         .max_body_bytes = max_body_bytes,
         .idle_timeout_s = idle_timeout_s,
         .metrics_port   = (uint16_t)metrics_port,
+        .io_threads     = io_threads,
         .tick_cb        = reload_tick,
         .tick_user      = &reload_ctx,
     };

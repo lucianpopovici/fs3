@@ -12,9 +12,9 @@ CC      ?= gcc
 CFLAGS  := -std=c11 -O2 -g -Wall -Wextra -Wpedantic \
            -Wshadow -Wstrict-prototypes -Wmissing-prototypes \
            -Wno-unused-parameter \
-           -D_GNU_SOURCE -fstack-protector-strong \
+           -D_GNU_SOURCE -fstack-protector-strong -pthread \
            -MMD -MP
-LDFLAGS := -lcrypto
+LDFLAGS := -lcrypto -pthread
 
 ifeq ($(DEBUG),1)
   CFLAGS  := $(filter-out -O2,$(CFLAGS)) -O0 \
@@ -29,7 +29,8 @@ INCLUDES   := -Iinclude -I$(LLHTTP_DIR)/include -I$(XML_DIR)
 
 # Server objects
 SRV_SRCS := src/main.c src/server.c src/conn.c src/log.c src/store_fs.c \
-            src/route.c src/response.c src/sigv4.c src/metrics.c
+            src/route.c src/response.c src/sigv4.c src/metrics.c \
+            src/iopool.c
 SRV_OBJS := $(SRV_SRCS:.c=.o)
 
 LLHTTP_OBJS := $(LLHTTP_DIR)/src/api.o $(LLHTTP_DIR)/src/http.o \
@@ -73,11 +74,13 @@ $(XML_DIR)/%.o: $(XML_DIR)/%.c
 
 # ----- Tests --------------------------------------------------------
 
-TEST_BINS := tests/test_store tests/test_xml tests/test_xml_legacy tests/test_xml_fuzz tests/test_sigv4
+TEST_BINS := tests/test_store tests/test_conn tests/test_xml tests/test_xml_legacy tests/test_xml_fuzz tests/test_sigv4
 
 test: $(TEST_BINS) fs3
 	@echo "=== test_store ==="
 	@./tests/test_store
+	@echo "=== test_conn ==="
+	@./tests/test_conn
 	@echo "=== test_xml ==="
 	@./tests/test_xml
 	@echo "=== test_xml_legacy ==="
@@ -106,6 +109,13 @@ test: $(TEST_BINS) fs3
 tests/test_store: tests/test_store.c src/store_fs.o src/log.o
 	$(CC) $(CFLAGS) $(INCLUDES) tests/test_store.c \
 	    src/store_fs.o src/log.o $(LDFLAGS) -o $@
+
+# Everything but main.o/server.o: conn.c pulls in routing, the store,
+# SigV4, responses and metrics.
+CONN_TEST_OBJS := $(filter-out src/main.o src/server.o,$(OBJS))
+tests/test_conn: tests/test_conn.c $(CONN_TEST_OBJS)
+	$(CC) $(CFLAGS) $(INCLUDES) tests/test_conn.c \
+	    $(CONN_TEST_OBJS) $(LDFLAGS) -o $@
 
 tests/test_xml: $(XML_DIR)/tests/test_xml.c $(XML_DIR)/xml_parser.o
 	$(CC) $(CFLAGS) $(INCLUDES) $(XML_DIR)/tests/test_xml.c \

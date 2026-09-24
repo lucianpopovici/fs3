@@ -11,6 +11,7 @@
 
 #include "server.h"
 #include "conn.h"
+#include "iopool.h"
 #include "log.h"
 #include "metrics.h"
 #include "store.h"
@@ -40,6 +41,7 @@ struct server {
     int           n_conns;
     conn_t       *conns_head;   /* intrusive doubly-linked list */
     s3_store_t   *store;        /* shared object store */
+    iopool_t     *pool;         /* NULL when cfg.io_threads == 0 */
     /* Periodic multipart-upload GC. We piggyback on the epoll_wait
      * timeout — once every gc_interval_ms of wall clock, sweep the MPU
      * staging area and reap any upload older than gc_max_age_ms. */
@@ -222,6 +224,15 @@ server_t *server_create(const server_cfg_t *cfg) {
     }
     LOG_I("store opened at %s", cfg->data_root);
 
+    if (cfg->io_threads > 0) {
+        s->pool = iopool_create(cfg->io_threads);
+        if (!s->pool) {
+            LOG_E("iopool_create(%d) failed", cfg->io_threads);
+            goto fail;
+        }
+        LOG_I("io pool: %d worker thread(s)", cfg->io_threads);
+    }
+
     s->listen_fd = listen_socket(cfg->bind_addr, cfg->port, cfg->backlog);
     if (s->listen_fd < 0) goto fail;
 
@@ -241,6 +252,18 @@ server_t *server_create(const server_cfg_t *cfg) {
     }
 
     LOG_I("listening on %s:%u", cfg->bind_addr, cfg->port);
+
+    if (s->pool) {
+        struct epoll_event pev = {
+            .events = EPOLLIN,
+            .data.ptr = s->pool,    /* pool ptr = job-completion marker */
+        };
+        if (epoll_ctl(s->epoll_fd, EPOLL_CTL_ADD, iopool_fd(s->pool),
+                      &pev) < 0) {
+            LOG_E("epoll_ctl ADD iopool: %s", strerror(errno));
+            goto fail;
+        }
+    }
 
     /* Admin/metrics listener — localhost only, by design. */
     if (cfg->metrics_port > 0) {
@@ -282,8 +305,11 @@ void server_destroy(server_t *s) {
             epoll_ctl(s->epoll_fd, EPOLL_CTL_DEL, c->fd, NULL);
         }
         close(c->fd);
-        conn_destroy(c);
+        conn_destroy(c);            /* orphans any job still in flight */
     }
+    /* Workers finish what they hold (a client's fully-received PUT still
+     * gets committed) before the store they write into goes away. */
+    iopool_destroy(s->pool);
     if (s->listen_fd >= 0) close(s->listen_fd);
     if (s->admin_fd  >= 0) close(s->admin_fd);
     if (s->epoll_fd  >= 0) close(s->epoll_fd);
@@ -300,12 +326,30 @@ static int reset_conn_events(server_t *s, conn_t *c) {
      * (level-triggered EOF would busy-loop). */
     if (!c->eof_seen) ev |= EPOLLIN;
     if (conn_wants_write(c)) ev |= EPOLLOUT;
+    /* Parked on an iopool job: nothing to read or write until it's done,
+     * and a level-triggered RDHUP would spin. Only ERR/HUP (always
+     * reported) can wake us, meaning the peer is gone for good. */
+    if (c->state == CST_WAIT_JOB) ev = 0;
     struct epoll_event e = { .events = ev, .data.ptr = c };
     if (epoll_ctl(s->epoll_fd, EPOLL_CTL_MOD, c->fd, &e) < 0) {
         LOG_W("epoll_ctl MOD fd=%d: %s", c->fd, strerror(errno));
         return -1;
     }
     return 0;
+}
+
+static void close_conn(server_t *s, conn_t *c);
+
+/* iopool_reap callback: the job's done() has built c's response (or
+ * marked it closing). Re-arm epoll so EPOLLOUT picks the response up. */
+static void job_finished(struct conn *c, void *user) {
+    server_t *s = user;
+    c->last_activity = time(NULL);
+    if (c->state == CST_CLOSING && !conn_wants_write(c)) {
+        close_conn(s, c);
+        return;
+    }
+    reset_conn_events(s, c);
 }
 
 static void close_conn(server_t *s, conn_t *c) {
@@ -344,7 +388,7 @@ static void accept_new(server_t *s) {
         size_t pl = strlen(peer);
         snprintf(peer + pl, sizeof(peer) - pl, ":%u", ntohs(sa.sin_port));
 
-        conn_t *c = conn_create(fd, peer, s->store,
+        conn_t *c = conn_create(fd, peer, s->store, s->pool,
                                 s->cfg.auth, s->cfg.auth_required,
                                 s->cfg.max_body_bytes, &s->metrics);
         if (!c) {
@@ -403,6 +447,7 @@ int server_run(server_t *s) {
             s->gc_last_run = now;
         }
 
+        int jobs_ready = 0;
         for (int i = 0; i < n; i++) {
             struct epoll_event *e = &events[i];
 
@@ -418,8 +463,23 @@ int server_run(server_t *s) {
                 continue;
             }
 
+            /* iopool job completions (marker: the pool pointer). Reaped
+             * after the batch: job_finished may close a conn that a later
+             * entry of this batch still points at. */
+            if (s->pool && e->data.ptr == (void *)s->pool) {
+                jobs_ready = 1;
+                continue;
+            }
+
             conn_t *c = e->data.ptr;
             c->last_activity = now;
+
+            /* Parked on a job: only ERR/HUP get here, i.e. the peer is
+             * gone. Close now; conn_destroy orphans the job. */
+            if (c->state == CST_WAIT_JOB) {
+                close_conn(s, c);
+                continue;
+            }
 
             if (e->events & (EPOLLERR | EPOLLHUP | EPOLLRDHUP)) {
                 /* Drain any final readable data first, but on hard error close. */
@@ -433,12 +493,8 @@ int server_run(server_t *s) {
                 if (conn_on_writable(c) < 0) { close_conn(s, c); continue; }
             }
 
-            /* Hangup with nothing more to write AND no buffered work → close.
-             * If we're CST_WRITE_RESPONSE we'll send what we have first; if
-             * rbuf still has bytes the parser will consume them. */
-            if ((e->events & EPOLLRDHUP) && !conn_wants_write(c)
-                && c->rlen == 0
-                && c->state != CST_WRITE_RESPONSE) {
+            /* Hangup with nothing more to write AND no buffered work → close. */
+            if ((e->events & EPOLLRDHUP) && conn_hup_can_close(c)) {
                 close_conn(s, c);
                 continue;
             }
@@ -451,6 +507,9 @@ int server_run(server_t *s) {
             reset_conn_events(s, c);
         }
 
+        /* Job completions, AFTER the event batch (see the marker above). */
+        if (jobs_ready) iopool_reap(s->pool, job_finished, s);
+
         /* Idle-connection sweep, AFTER the event batch: closing during
          * the batch would leave dangling pointers in events[]. A slow
          * but progressing client keeps refreshing last_activity above,
@@ -460,7 +519,10 @@ int server_run(server_t *s) {
             conn_t *c = s->conns_head;
             while (c) {
                 conn_t *next = c->list_next;
-                if (now - c->last_activity >= s->cfg.idle_timeout_s) {
+                /* A conn waiting on its job isn't idle: a multi-GB copy
+                 * can legitimately take longer than the timeout. */
+                if (c->state != CST_WAIT_JOB
+                    && now - c->last_activity >= s->cfg.idle_timeout_s) {
                     LOG_D("closing idle conn fd=%d peer=%s (%llds)",
                           c->fd, c->peer,
                           (long long)(now - c->last_activity));

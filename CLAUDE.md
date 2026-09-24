@@ -63,6 +63,7 @@ src/route.c         path parse, dispatch, all S3 handlers
 src/response.c      response builders, XML rendering, error mapping, ETag fmt
 src/store_fs.c      filesystem-backed store: PUT/GET/HEAD/DELETE/LIST/MPU/GC
 src/sigv4.c         header-mode + streaming-chunked SigV4 verifier
+src/iopool.c        worker threads for commit/copy/MPU-complete jobs
 src/log.c           leveled logger
 include/*.h         public APIs
 tests/              test_store.c, test_sigv4.c, three .sh suites
@@ -133,7 +134,8 @@ read time — the read path already does this.
 
 | target | language | what it exercises |
 |---|---|---|
-| `tests/test_store` | C | 28 unit tests: bucket CRUD, single PUT/GET round-trip, sendfile, listing with prefix/delimiter, persistence across `store_open`/`store_close`, multipart lifecycle, list_buckets, bucket_stats, list_mpu_uploads (with prefix filter), mpu_gc reaping behavior |
+| `tests/test_store` | C | 37 unit tests: bucket CRUD (incl. delete racing an in-flight PUT/MPU, and a threaded commit-vs-bucket-delete race on `ns_mu`), single PUT/GET round-trip, sendfile, listing with prefix/delimiter, persistence across `store_open`/`store_close`, multipart lifecycle, list_buckets, bucket_stats, list_mpu_uploads (with prefix filter), mpu_gc reaping behavior |
+| `tests/test_conn` | C | 5 unit tests of the per-connection request path over a pipe: the per-event read budget yields and resumes, a yielded conn isn't closed on peer hangup; PUT commit, copy, MPU part and MPU complete park the conn and run on an iopool worker (a blocking fsync hook proves the loop thread is free); an orphaned job completes safely; pool shutdown drains queued jobs |
 | `tests/test_xml` | C | 25 tests of the extended XML library (escaping, parsing, security limits) |
 | `tests/test_xml_legacy` | C | one round-trip showing the original calling style still works |
 | `tests/test_xml_fuzz` | C | 50,000 random inputs through the parser, must not crash |
@@ -144,7 +146,7 @@ read time — the read path already does this.
 | `tests/test_e2e_phase9.sh` | bash + curl | 45 integration tests of Range GET (206/416), bulk delete (`?delete`), and bucket subresources (`?location`, `?versioning`) |
 | `tests/test_e2e_phase10.sh` | bash + curl | 27 integration tests of server-side object copy and `?acl` stub |
 | `tests/test_e2e_phase11.sh` | bash + curl + python | 16 integration tests of `/_health`, `--credentials-file`, `--min-free-bytes` quota |
-| `tests/test_e2e_phase12.sh` | bash + curl + python | 37 integration tests of startup recovery, `--max-body-size` (413), `--idle-timeout`, `--max-conns`, SIGHUP credential reload, and the `--metrics-port` admin listener (`/healthz`, `/metrics`, `/buckets`) |
+| `tests/test_e2e_phase12.sh` | bash + curl + python | 39 integration tests of startup recovery, `--max-body-size` (413), `--idle-timeout`, `--max-conns`, SIGHUP credential reload, the `--metrics-port` admin listener (`/healthz`, `/metrics`, `/buckets`), and half-closed large uploads |
 | `tests/test_ui_cgi.sh` | bash | 45 tests of the DSM-tile admin console CGI driven against a scratch var dir: conf parsing without sourcing, HTML escaping, CSRF token + Origin checks, credential add/replace/remove with validation and the last-key lockout guard, SIGHUP delivery, live bucket stats via a real admin listener |
 
 All targets pass under both `-O2` and DEBUG (ASan + UBSan).
@@ -158,10 +160,30 @@ upload real payloads).
 These are decisions made early that the rest of the code depends on.
 Don't quietly undo them.
 
-- **Single-threaded epoll event loop.** No worker threads. No locks.
-  All I/O is non-blocking. The store's filesystem operations are
-  synchronous and that's accepted — the per-request latency budget
-  is determined by `fsync()`, not by CPU.
+- **Single-threaded epoll event loop, plus an I/O worker pool.** All
+  connection state, parsing, auth and routing live on the one loop
+  thread; `conn_t` is never touched from another thread. Socket I/O is
+  non-blocking. Epoll is level-triggered, and each readable event reads
+  at most `CONN_READ_BUDGET` (256 KB) before yielding, so one fast
+  uploader can't starve the other connections.
+
+  The slow, blocking store steps — PUT/part commit (fsync + rename),
+  CompleteMultipartUpload (concatenate + fsync) and server-side copy —
+  run as jobs on `src/iopool.c` (`--io-threads`, default 4; 0 runs them
+  inline, the old behaviour). The conn parks in `CST_WAIT_JOB` with no
+  epoll interest; the job's `run()` executes on a worker and only
+  touches what the job owns, and its `done()` runs back on the loop
+  (via an eventfd, reaped *after* each event batch) to build the
+  response. If the client disconnects, `conn_destroy` orphans the job
+  (`job->conn = NULL`) and it still completes. Everything else in the
+  store (listing, HEAD, GET open, delete, MPU create/abort, GC) stays
+  synchronous on the loop.
+
+  The store has exactly one lock, `ns_mu`, held only around the
+  namespace steps that must be atomic against a concurrent commit:
+  bucket-exists check + `mkdir_p` + `rename`, and `rm_rf` of bucket /
+  upload dirs. Never hold it across data writes or fsync of object
+  bytes, and never call another locking store function while holding it.
 
 - **`s3_str_t` is the universal string type.** `(const char *p, size_t
   n)`. Length-bounded, no NUL terminator required. Don't strdup unless
@@ -191,7 +213,10 @@ Don't quietly undo them.
 
 - **`conn_t` and `s3_store_t` are *not* the same lifetime.** `conn_t`
   is per-connection; `s3_store_t` is server-lifetime. Same for
-  `sigv4_verifier_t`. Don't free `c->store` in `conn_destroy`.
+  `sigv4_verifier_t` and the `iopool_t`. Don't free `c->store` in
+  `conn_destroy`. An `iojob_t` can outlive its conn (orphaned) and is
+  freed by its own `done()`; `server_destroy` closes conns, then
+  `iopool_destroy` (drains jobs), then `store_close` — keep that order.
 
 ## Sandbox / tooling gotchas
 
