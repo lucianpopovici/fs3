@@ -3,10 +3,12 @@
 #include "log.h"
 #include "server.h"
 #include "sigv4.h"
+#include "audit.h"
 
 #include <errno.h>
 #include <fcntl.h>
 #include <getopt.h>
+#include <sys/prctl.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <signal.h>
@@ -60,6 +62,8 @@ static void usage(const char *argv0) {
         "                             (default 4; 0 = run them on the event loop)\n"
         "      --mpu-gc-interval N    seconds between MPU GC sweeps (default 60)\n"
         "      --mpu-gc-max-age N     seconds before a stale MPU is reaped (default 86400)\n"
+        "", argv0);
+    fprintf(stderr,
         "      --presign-max-expires N  longest accepted presigned-URL lifetime in\n"
         "                             seconds (default 86400; at most 604800)\n"
         "      --no-presign-admin     refuse presigned URLs signed by an --admin user\n"
@@ -81,6 +85,10 @@ static void usage(const char *argv0) {
         "      --tls-addr <ip>        TLS bind address (default: --addr)\n"
         "      --tls-cert <pem>       certificate chain; --tls-key <pem> key (mode 0600)\n"
         "                             SIGHUP re-reads both (a bad file keeps the old ones)\n"
+        "      --audit-log <file>     append one JSON line per request + admin change\n"
+        "                             (no query strings / signatures); SIGHUP reopens\n"
+        "      --auth-fail-limit N    auth failures per client IP per minute before\n"
+        "                             503 SlowDown backoff (default 20; 0 = off)\n"
         "      --tls-max-per-ip N     concurrent TLS connections per client IP (default 32);\n"
         "                             at most 64 handshakes in flight overall\n"
         "      --require-tls          refuse signed requests over plain HTTP unless\n"
@@ -94,8 +102,7 @@ static void usage(const char *argv0) {
         "      --admin-socket <path>  serve the /v1 admin API on a unix socket (0600)\n"
         "                             (block-public-access is on by default)\n"
         "  -v, --verbose              debug logging\n"
-        "  -h, --help                 this help\n",
-        argv0);
+        "  -h, --help                 this help\n");
 }
 
 /* Parse a size string with optional K/M/G suffix. Returns 0 on error. */
@@ -215,6 +222,7 @@ static void reload_tick(void *user) {
     if (r->cred_file) (void)do_reload(user);
 #ifndef FS3_MAIN_TESTING
     server_tls_reload(g_server);
+    audit_reopen();             /* log rotation */
 #endif
 }
 
@@ -287,6 +295,8 @@ enum {
     OPT_REQUIRE_TLS,
     OPT_REQUIRE_SIGNED_PAYLOAD,
     OPT_TLS_MAX_PER_IP,
+    OPT_AUDIT_LOG,
+    OPT_AUTH_FAIL_LIMIT,
 };
 
 #ifndef FS3_MAIN_TESTING
@@ -354,6 +364,8 @@ int main(int argc, char **argv) {
     const char *admin_socket = NULL;
     int allow_public_write = 0;
     int max_retention_days = 3650;
+    const char *audit_log = NULL;
+    int auth_fail_limit = 20;
     int tls_port = 0, require_tls = 0, require_signed_payload = 0, tls_max_per_ip = 32;
     const char *tls_addr = NULL, *tls_cert = NULL, *tls_key = NULL;
     char trusted_proxies[1024] = "";
@@ -399,6 +411,8 @@ int main(int argc, char **argv) {
         { "tls-key",          required_argument, NULL, OPT_TLS_KEY },
         { "require-tls",      no_argument,       NULL, OPT_REQUIRE_TLS },
         { "tls-max-per-ip",   required_argument, NULL, OPT_TLS_MAX_PER_IP },
+        { "audit-log",        required_argument, NULL, OPT_AUDIT_LOG },
+        { "auth-fail-limit",  required_argument, NULL, OPT_AUTH_FAIL_LIMIT },
         { "require-signed-payload", no_argument, NULL, OPT_REQUIRE_SIGNED_PAYLOAD },
         { "verbose",          no_argument,       NULL, 'v' },
         { "help",             no_argument,       NULL, 'h' },
@@ -590,6 +604,11 @@ int main(int argc, char **argv) {
                 }
                 break;
             case OPT_TLS_ADDR: tls_addr = optarg; break;
+            case OPT_AUDIT_LOG: audit_log = optarg; break;
+            case OPT_AUTH_FAIL_LIMIT:
+                auth_fail_limit = atoi(optarg);
+                if (auth_fail_limit < 0) { fprintf(stderr, "--auth-fail-limit must be >= 0\n"); return 2; }
+                break;
             case OPT_TLS_CERT: tls_cert = optarg; break;
             case OPT_TLS_KEY:  tls_key = optarg; break;
             case OPT_REQUIRE_TLS: require_tls = 1; break;
@@ -625,6 +644,11 @@ int main(int argc, char **argv) {
         }
     }
     if (auth) sigv4_set_presign_policy(auth, presign_max_expires, no_presign_admin);
+    throttle_set_limit(auth_fail_limit);
+    if (audit_log && audit_open(audit_log) < 0) {
+        fprintf(stderr, "--audit-log %s: cannot open: %s\n", audit_log, strerror(errno));
+        return 2;
+    }
     if (tls_port) {
         if (!tls_cert || !tls_key) {
             fprintf(stderr, "--tls-port needs --tls-cert and --tls-key\n");
@@ -657,6 +681,11 @@ int main(int argc, char **argv) {
     }
 
     log_init(verbose ? LOG_DEBUG : LOG_INFO);
+
+    /* Process hardening: no privilege gain through exec'd setuid helpers,
+     * no core dumps carrying secrets. */
+    prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+    prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
 
     /* Ignore SIGPIPE; we handle EPIPE on write() instead. */
     signal(SIGPIPE, SIG_IGN);

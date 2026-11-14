@@ -47,7 +47,8 @@ typedef enum {
     S3_ERR_MALFORMED_POLICY,
     S3_ERR_NO_SUCH_VERSION,
     S3_ERR_POLICY_DENIED,               /* explicit Deny in a bucket policy */
-    S3_ERR_LOCKED,                      /* object lock retention / legal hold */
+    S3_ERR_LOCKED,
+    S3_ERR_SLOW_DOWN,                   /* auth-failure throttling */                      /* object lock retention / legal hold */
     S3_ERR_MAX
 } s3_err_t;
 

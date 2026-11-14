@@ -1,6 +1,7 @@
 /* src/admin.c — admin HTTP API (item 11). See include/admin.h. */
 
 #include "admin.h"
+#include "audit.h"
 #include "json.h"
 #include "log.h"
 #include "store.h"
@@ -291,6 +292,7 @@ static char *keys_create(admin_ctx_t *a, const areq_t *rq, size_t *rn) {
         resp = respond(201, "Created", b, rn);
         OPENSSL_cleanse(b, sizeof(b));
         LOG_I("admin: created access key %s for user %s", ak, user);
+        { char ev[1400]; snprintf(ev, sizeof(ev), "create key %s for %s", ak, user); audit_event("admin-api", ev); }
     }
     OPENSSL_cleanse(sk, sizeof(sk));
     OPENSSL_cleanse(nf, cap);
@@ -334,6 +336,7 @@ static char *keys_delete(admin_ctx_t *a, const char *ak_del, size_t *rn) {
         resp = err_json(500, "Internal Server Error", "reload failed; change rolled back", rn);
     } else {
         LOG_I("admin: deleted access key %s", ak_del);
+        { char ev[1400]; snprintf(ev, sizeof(ev), "delete key %s", ak_del); audit_event("admin-api", ev); }
         resp = respond(200, "OK", "{\"deleted\":true}\n", rn);
     }
     OPENSSL_cleanse(nf, n + 1);
@@ -463,6 +466,7 @@ static char *bucket_route(admin_ctx_t *a, const areq_t *rq, const char *rest,
         if (store_bucket_set_owner(a->cfg.store, b, owner) != S3_OK)
             return err_json(500, "Internal Server Error", "cannot set owner", rn);
         LOG_I("admin: bucket %s owner set to %s", name, owner);
+        { char ev[1400]; snprintf(ev, sizeof(ev), "bucket %s owner %s", name, owner); audit_event("admin-api", ev); }
         return respond(200, "OK", "{\"ok\":true}\n", rn);
     }
     if (!strncmp(sub, "grants/", 7)) {
@@ -483,6 +487,7 @@ static char *bucket_route(admin_ctx_t *a, const areq_t *rq, const char *rest,
         if (store_bucket_grant_set(a->cfg.store, b, user, perms) != S3_OK)
             return err_json(500, "Internal Server Error", "cannot write grants", rn);
         LOG_I("admin: bucket %s grant %s = %d", name, user, perms);
+        { char ev[1400]; snprintf(ev, sizeof(ev), "bucket %s grant %s=%d", name, user, perms); audit_event("admin-api", ev); }
         return respond(200, "OK", "{\"ok\":true}\n", rn);
     }
     return err_json(404, "Not Found", "no such endpoint", rn);

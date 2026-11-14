@@ -13,8 +13,9 @@ CFLAGS  := -std=c11 -O2 -g -Wall -Wextra -Wpedantic \
            -Wshadow -Wstrict-prototypes -Wmissing-prototypes \
            -Wno-unused-parameter \
            -D_GNU_SOURCE -fstack-protector-strong -pthread \
+           -fPIE -D_FORTIFY_SOURCE=2 \
            -MMD -MP
-LDFLAGS := -lcrypto -pthread
+LDFLAGS := -lcrypto -pthread -pie -Wl,-z,relro,-z,now -Wl,-z,noexecstack
 
 # make TLS=1: native TLS listener (links libssl). Switching TLS on/off
 # needs `make clean`, like DEBUG.
@@ -37,7 +38,7 @@ INCLUDES   := -Iinclude -I$(LLHTTP_DIR)/include -I$(XML_DIR)
 # Server objects
 SRV_SRCS := src/main.c src/server.c src/conn.c src/log.c src/store_fs.c \
             src/route.c src/response.c src/sigv4.c src/metrics.c \
-            src/iopool.c src/action.c src/checksum.c src/query.c src/cors.c src/lifecycle.c src/website.c src/json.c src/admin.c src/policy.c src/objlock.c src/tls.c
+            src/iopool.c src/action.c src/checksum.c src/query.c src/cors.c src/lifecycle.c src/website.c src/json.c src/admin.c src/policy.c src/objlock.c src/tls.c src/audit.c
 SRV_OBJS := $(SRV_SRCS:.c=.o)
 
 LLHTTP_OBJS := $(LLHTTP_DIR)/src/api.o $(LLHTTP_DIR)/src/http.o \
@@ -64,7 +65,8 @@ fs3: $(OBJS)
 # fully-static glibc has NSS/DNS pitfalls. Only libcrypto is pinned in,
 # which is the one ABI that varies across DSM versions.
 fs3-static: $(OBJS)
-	$(CC) $(OBJS) -o $@ -Wl,-Bstatic -l:libcrypto.a -Wl,-Bdynamic -lpthread -ldl
+	$(CC) $(OBJS) -o $@ -pie -Wl,-z,relro,-z,now -Wl,-z,noexecstack \
+	    -Wl,-Bstatic -l:libcrypto.a -Wl,-Bdynamic -lpthread -ldl
 	strip $@
 
 # TLS-enabled binary built in one compiler invocation (no .o reuse), so
@@ -138,6 +140,8 @@ test: $(TEST_BINS) fs3
 	@./tests/test_e2e_subresources.sh
 	@echo "=== test_e2e_checksum (item 1: trailers + x-amz-checksum-*) ==="
 	@./tests/test_e2e_checksum.sh
+	@echo "=== test_e2e_audit (audit log + auth throttling) ==="
+	@./tests/test_e2e_audit.sh
 	@echo "=== test_e2e_tls (item 7: native TLS, fs3-tls build) ==="
 	@./tests/test_e2e_tls.sh
 	@echo "=== test_e2e_objlock (item 10: object lock) ==="

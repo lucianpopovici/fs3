@@ -520,6 +520,24 @@ build-then-swap reload as SIGHUP, so a new key works on the next request
 and a deleted one is refused immediately. User names are restricted to
 `[A-Za-z0-9._@-]`.
 
+### Audit log, throttling, hardening
+
+- `--audit-log /var/log/fs3/audit.jsonl` appends one JSON line per
+  request (time, client, user, access key, S3 action, path, status,
+  bytes, duration, presigned/TLS/website flags) and one per admin-API
+  change. Query strings are never logged, so presigned signatures and
+  credentials stay out of it. The file is created 0600; SIGHUP reopens
+  it for rotation.
+- `--auth-fail-limit N` (default 20): after N failed authentications from
+  one client address within a minute, that address gets `503 SlowDown`
+  for an exponentially growing period (2 s … 5 min). Loopback is exempt
+  unless `--trusted-proxy` resolves the real client — behind the DSM
+  proxy, set `--trusted-proxy 127.0.0.1` for throttling to mean anything.
+- Builds use `-fPIE -pie -D_FORTIFY_SOURCE=2 -Wl,-z,relro,-z,now` and
+  non-executable stacks; at startup fs3 sets `PR_SET_NO_NEW_PRIVS` and
+  disables core dumps (`PR_SET_DUMPABLE=0`) so secrets don't land in
+  cores.
+
 ### Monitoring
 
 The SPK starts fs3 with an admin listener on `127.0.0.1:9101`

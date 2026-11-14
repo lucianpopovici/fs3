@@ -124,6 +124,7 @@ static const err_entry_t ERR_TABLE[] = {
     { S3_ERR_NO_SUCH_VERSION,            404, "NoSuchVersion",            "The specified version does not exist." },
     { S3_ERR_POLICY_DENIED,              403, "AccessDenied",             "Access denied by bucket policy." },
     { S3_ERR_LOCKED,                     403, "AccessDenied",             "Access denied: the object version is locked." },
+    { S3_ERR_SLOW_DOWN,                  503, "SlowDown",                 "Please reduce your request rate." },
     { S3_ERR_MALFORMED_POLICY,           400, "MalformedPolicy",          "Policies must be valid JSON within the supported grammar." },
     { S3_ERR_INSUFFICIENT_STORAGE,       507, "QuotaExceeded",            "There is insufficient storage available to complete the request." },
 };

@@ -33,6 +33,7 @@
 #include "sigv4.h"
 #include "store.h"
 #include "tls.h"
+#include "audit.h"
 
 #include <ctype.h>
 #include <errno.h>
@@ -472,7 +473,7 @@ static int cb_on_message_begin(llhttp_t *p) {
  * status is parsed back out of wbuf ("HTTP/1.1 NNN ...") so the many
  * response builders don't each need to report it. */
 static void metrics_flush(conn_t *c) {
-    if (!c->metrics || c->metrics_flushed) return;
+    if (c->metrics_flushed) return;
     if (c->wlen < 12) return;  /* no response was built (dropped conn) */
     c->metrics_flushed = 1;
     int status = atoi(c->wbuf + 9);
@@ -480,6 +481,9 @@ static void metrics_flush(conn_t *c) {
     if (c->req_start_ns > 0) {
         dur_s = (double)(mono_now_ns() - c->req_start_ns) / 1e9;
     }
+    audit_request(c, status, c->req.body_consumed,
+                  (uint64_t)c->wlen + c->ext_body_len + c->bytes_out_body, dur_s);
+    if (!c->metrics) return;
     metrics_record(c->metrics, c->req.method, status, dur_s,
                    c->req.body_consumed,
                    (uint64_t)c->wlen + c->ext_body_len + c->bytes_out_body);
@@ -633,7 +637,16 @@ static int cb_on_headers_complete(llhttp_t *p) {
             return 0;
         }
         if (auth_h || sigv4_has_presign(c) || c->auth_required) {
+            time_t tnow = time(NULL);
+            if (throttle_blocked(c->client_ip, tnow)) {
+                if (route_build_error(c, S3_ERR_SLOW_DOWN) < 0) return -1;
+                return 0;
+            }
             s3_err_t e = sigv4_verify_id(c->auth, c, &c->id);
+            if (e != S3_OK && e != S3_ERR_INTERNAL && e != S3_ERR_NOT_IMPLEMENTED)
+                throttle_fail(c->client_ip, tnow);
+            else if (e == S3_OK)
+                throttle_ok(c->client_ip);
             if (e != S3_OK) {
                 LOG_D("sigv4 verify failed (err=%d) on %s",
                       (int)e, c->peer);
