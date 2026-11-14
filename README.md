@@ -285,8 +285,17 @@ What's working end-to-end:
 
 What's *not* yet wired:
 
-- `ListParts` (`GET /bucket/key?uploadId=`) answers 501.
-- Bucket subresources: location, versioning, lifecycle, CORS, etc.
+- `ListParts` (`GET /bucket/key?uploadId=`) and UploadPartCopy answer 501.
+- Multi-range `Range:` (`bytes=A-B,C-D`).
+- Per-bucket / per-user quotas, background integrity scrub, key expiry /
+  disable, SSE-C, seccomp, `FS_IMMUTABLE_FL` for COMPLIANCE versions.
+- Tag-based lifecycle filters, transitions, website routing rules (all
+  refused with 501 rather than ignored).
+- Replication, server-side encryption, STS.
+
+**Upgrading:** the object header (schema 3), version and lock trees are
+one-way migrations — an older fs3 cannot read data written by this one.
+See `packaging/synology/CHANGELOG.md`.
 
 ## Layout
 
@@ -567,12 +576,7 @@ DSM UI if it can't write, rather than crash-looping.
 
 ## What's next
 
-The natural next pieces, in rough order:
-
-1. **HTTP `Range:` requests on GET** — `206 Partial Content` with
-   `Content-Range:`. The AWS CLI doesn't use ranged GETs by default
-   (verified empirically with 16 MB downloads), but explicit
-   `--range` invocations and other clients (e.g. video players,
-   `dd skip=`) do.
-2. **Bucket subresources**: location, versioning, lifecycle, CORS, etc.
-3. ~~SigV4 trailer variants~~ — done (see Status).
+The gap-closure plan is implemented. Candidates for the next round:
+`ListParts`/UploadPartCopy, quotas (needed now that versioning, Object
+Lock and anonymous access exist), an integrity scrub job, and key
+hygiene (expiry, disable without delete, last-used).

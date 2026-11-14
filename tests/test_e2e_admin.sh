@@ -72,7 +72,7 @@ PY
 }
 
 check_eq "no token → 401" "$(acode "$AURL/v1/keys")" "401"
-sleep 0.6
+sleep 1.2
 check_eq "wrong token → 401" "$(acode -H 'Authorization: Bearer nope' "$AURL/v1/keys")" "401"
 check_eq "retry inside backoff → 429" "$(acode -H "Authorization: Bearer $TOKEN" "$AURL/v1/keys")" "429"
 sleep 2.2

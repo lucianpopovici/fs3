@@ -16,6 +16,47 @@ admin console (live bucket stats + credential management). ~340
 explicit tests + 50K fuzz iterations green under both `-O2` and
 ASan + UBSan.
 
+## Gap-closure work (Nov 2026)
+
+The gap-closure plan (Garage comparison + security addendum) is
+implemented on top of phase 12. Quick map of what it added:
+
+| area | where | tests |
+|---|---|---|
+| S0 subresource routing + F2 `authz(c,b,k,act)` | `src/route.c` (`route_classify`), `src/action.c` (exhaustive table; server refuses to start if incomplete) | `test_e2e_subresources.sh` |
+| F1 object header schema 3 (checksum, version id, flags) | `src/store_fs.c` (`obj_read_hdr` validates every length) | `test_store`, `tests/fixtures/obj_v2_legacy.bin` |
+| Item 1 trailer SigV4 + `x-amz-checksum-*` | `src/checksum.c`, decoder in `src/sigv4.c`, `checksum_setup/finish` in `src/conn.c` | `test_checksum`, `test_chunk_fuzz`, `test_e2e_checksum.sh` |
+| Item 2 presigned URLs + S1 | `extract_auth_params`/`verify_params` in `src/sigv4.c` | `test_sigv4`, `test_e2e_presign.sh` |
+| Item 3 grants, config sidecars + id-keyed cache | `store_bucket_sidecar_*`, `store_sidecar_get[_ttl]` | `test_store`, `test_e2e_isolation.sh` §10 |
+| Item 4 CORS (+ nosniff, CSP sandbox) | `src/cors.c`, `route_cors_decorate` | `test_e2e_cors.sh` |
+| Item 5 lifecycle, S4 striped key locks | `src/lifecycle.c`, `key_lock()` in store | `test_e2e_lifecycle.sh` |
+| Item 6 website listener | `web_dispatch` in route.c, `src/website.c` | `test_e2e_website.sh` |
+| Item 7 native TLS (`make TLS=1` / `make fs3-tls`) | `src/tls.c`, `conn_io_*` in conn.c | `test_e2e_tls.sh` |
+| Item 8 versioning | versioning section at end of store_fs.c | `test_e2e_versioning.sh` |
+| Item 9 bucket policies | `src/policy.c`, `src/json.c` | `test_policy`, `test_json`, `test_e2e_policy.sh` |
+| Item 10 object lock | `src/objlock.c`, store lock sidecars, version guard | `test_e2e_objlock.sh` |
+| Item 11 admin API | `src/admin.c` | `test_e2e_admin.sh` |
+| audit log, auth throttling | `src/audit.c` | `test_e2e_audit.sh` |
+
+Load-bearing rules added on the way:
+- **Lock order:** a key stripe lock (`key_lock(hex)`) before `ns_mu`, never
+  two stripe locks. Every multi-step mutation of one key holds its stripe.
+- **Extra response headers** go through `conn_add_header()`; they are
+  spliced into whatever head is built (`apply_extra_headers`). Don't add
+  new parameters to the head builders.
+- **Unauthenticated paths** (CORS preflight, website) read bucket config
+  with `store_sidecar_get_ttl` (1 s, negative entries cached) — no
+  per-request disk I/O, no bucket enumeration by timing.
+- **Version ids** must pass `store_vid_parse` before any path is built.
+- **Expect: 100-continue** is answered in `cb_on_headers_complete`; without
+  it botocore stalls 1 s per upload.
+- New on-disk trees: `versions/`, `locks/`; new bucket sidecars:
+  `grants`, `cors.xml`, `lifecycle.xml`, `website.xml`, `policy.json`,
+  `object-lock.xml`; bucket `meta` gained `versioning=` / `object_lock=1`.
+
+Not done (see README): `ListParts`, UploadPartCopy, quotas, integrity
+scrub, key expiry/disable, SSE-C, `FS_IMMUTABLE_FL` hardening, seccomp.
+
 ## First five minutes on a fresh box
 
 The sandbox doesn't persist between sessions, so you'll restore from
@@ -24,7 +65,7 @@ the latest tarball under `/mnt/user-data/outputs/`. After
 
 ```sh
 apt-get install -y libssl-dev          # for openssl/evp.h
-pip install --break-system-packages botocore boto3 awscli
+pip install --break-system-packages botocore boto3 awscli "botocore[crt]"
                                         # for tests/sign_request.py and aws cli
 chmod +x tests/*.sh                     # tar may not preserve +x in this env
 mkdir -p ~/.aws && cat > ~/.aws/config <<EOF

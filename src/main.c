@@ -637,8 +637,10 @@ int main(int argc, char **argv) {
                 break;
             }
             case OPT_ADMIN_TOKEN_FILE:
-                if (read_secret_file(optarg, admin_token, sizeof(admin_token)) < 0)
+                if (read_secret_file(optarg, admin_token, sizeof(admin_token)) < 0) {
+                    sigv4_destroy(auth);
                     return 2;
+                }
                 break;
             default:  usage(argv[0]); return 2;
         }
@@ -647,6 +649,7 @@ int main(int argc, char **argv) {
     throttle_set_limit(auth_fail_limit);
     if (audit_log && audit_open(audit_log) < 0) {
         fprintf(stderr, "--audit-log %s: cannot open: %s\n", audit_log, strerror(errno));
+        sigv4_destroy(auth);
         return 2;
     }
     if (tls_port) {
@@ -660,6 +663,7 @@ int main(int argc, char **argv) {
             || kst.st_uid != geteuid()) {
             fprintf(stderr, "%s: TLS key must be a regular file, mode 0600, owned by "
                             "the service user\n", tls_key);
+            sigv4_destroy(auth);
             return 2;
         }
     }
