@@ -4,6 +4,7 @@
 #include "audit.h"
 #include "json.h"
 #include "log.h"
+#include "scrub.h"
 #include "store.h"
 
 #include <openssl/crypto.h>
@@ -616,6 +617,21 @@ char *admin_handle_v1(admin_ctx_t *a, const char *req, size_t n, int via_uds,
         return buckets_list(a, rn);
     }
     if (!strncmp(p, "/v1/buckets/", 12)) return bucket_route(a, &rq, p + 12, rn);
+    if (!strcmp(p, "/v1/scrub")) {
+        if (!a->cfg.scrub) return err_json(501, "Not Implemented", "scrub not configured", rn);
+        if (!strcmp(rq.method, "POST")) {
+            int r = scrub_request(a->cfg.scrub);
+            if (r < 0) return err_json(503, "Service Unavailable", "scrub needs --io-threads > 0", rn);
+            audit_event("admin-api", r == 0 ? "scrub started" : "scrub start requested (already running)");
+        } else if (strcmp(rq.method, "GET") != 0) {
+            return err_json(405, "Method Not Allowed", "use GET or POST", rn);
+        }
+        char out[1024];
+        size_t o = scrub_status_json(a->cfg.scrub, out, sizeof(out) - 2);
+        out[o++] = '\n';
+        out[o] = '\0';
+        return respond(200, "OK", out, rn);
+    }
     if (!strncmp(p, "/v1/users/", 10)) {
         /* /v1/users/<u>/quota */
         const char *u = p + 10, *sl = strchr(u, '/');

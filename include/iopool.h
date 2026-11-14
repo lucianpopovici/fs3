@@ -47,6 +47,8 @@ void      iopool_submit(iopool_t *p, iojob_t *j);
 
 /* eventfd that becomes readable when completed jobs are waiting. */
 int       iopool_fd(const iopool_t *p);
+/* 1 if jobs are queued waiting for a worker (background work backs off). */
+int       iopool_pending(iopool_t *p);
 
 /* Loop thread: run done() for every completed job. For each job whose
  * conn was still attached, after(conn, user) is called once done() has

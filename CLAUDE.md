@@ -60,8 +60,10 @@ Load-bearing rules added on the way:
   `grants`, `cors.xml`, `lifecycle.xml`, `website.xml`, `policy.json`,
   `object-lock.xml`; bucket `meta` gained `versioning=` / `object_lock=1`.
 
-Not done (see README): `ListParts`, UploadPartCopy, quotas, integrity
-scrub, key expiry/disable, SSE-C, `FS_IMMUTABLE_FL` hardening, seccomp.
+Round 2 (Nov 2026) added part records, ListParts, UploadPartCopy,
+user metadata, ListObjectsV2, quotas (`q_*` in store_fs.c) and the
+integrity scrub (`src/scrub.c`, `store_scrub_file`). Not done yet: key
+expiry/disable, SSE-C, `FS_IMMUTABLE_FL` hardening, seccomp.
 
 ## First five minutes on a fresh box
 

@@ -12,6 +12,7 @@
 #include "server.h"
 #include "action.h"
 #include "lifecycle.h"
+#include "scrub.h"
 #include "admin.h"
 #include "objlock.h"
 #include "tls.h"
@@ -60,6 +61,7 @@ struct server {
      * staging area and reap any upload older than gc_max_age_ms. */
     time_t        gc_last_run;       /* monotonic seconds */
     int           lc_running;        /* a sweep job is in flight */
+    scrub_t      *scrub;             /* integrity scrub (item 3) */
     int           lc_last_yday;      /* day of year of the last scheduled run */
     int           lc_pending_now;    /* run at the first tick (--lifecycle-now) */
     time_t        clock_wall_last;   /* clock-jump detection (item 10.6) */
@@ -239,6 +241,10 @@ static void admin_serve_fd(server_t *s, int fd, int via_uds) {
     } else if (strncmp(req, "GET /metrics", 12) == 0) {
         static char body[64 * 1024];
         int blen = metrics_render(&s->metrics, s->store, body, sizeof(body));
+        if (blen >= 0) {
+            int sn = scrub_metrics(s->scrub, body + blen, sizeof(body) - (size_t)blen);
+            blen = sn < 0 ? -1 : blen + sn;
+        }
         if (blen < 0) {
             admin_respond(fd, "500 Internal Server Error",
                           "text/plain", "render overflow\n", 16);
@@ -385,9 +391,21 @@ server_t *server_create(const server_cfg_t *cfg) {
               cfg->tls_port);
     }
 
+    /* Integrity scrub (round 2, item 3). */
+    {
+        scrub_cfg_t scfg = {
+            .store = s->store, .pool = s->pool,
+            .interval_days = cfg->scrub_interval_days, .start_now = cfg->scrub_now,
+            .rate = cfg->scrub_rate, .fail_reads = cfg->scrub_fail_reads,
+        };
+        s->scrub = scrub_create(&scfg);
+        if (!s->scrub) goto fail;
+    }
+
     /* Admin API (item 11). */
     {
         admin_cfg_t ac = {
+            .scrub = s->scrub,
             .store = s->store, .token = cfg->admin_token,
             .cred_file = cfg->admin_cred_file,
             .reload = cfg->admin_reload, .reload_user = cfg->admin_reload_user,
@@ -491,8 +509,11 @@ void server_destroy(server_t *s) {
         conn_destroy(c);            /* orphans any job still in flight */
     }
     /* Workers finish what they hold (a client's fully-received PUT still
-     * gets committed) before the store they write into goes away. */
+     * gets committed) before the store they write into goes away. A
+     * scrub pass stops at its next file and resumes on the next start. */
+    scrub_stop(s->scrub);
     iopool_destroy(s->pool);
+    scrub_destroy(s->scrub);
     if (s->listen_fd >= 0) close(s->listen_fd);
     if (s->web_fd >= 0) close(s->web_fd);
     if (s->tls_fd >= 0) close(s->tls_fd);
@@ -753,6 +774,7 @@ int server_run(server_t *s) {
         }
 
         lc_maybe_start(s, now);
+        scrub_tick(s->scrub, now);
 
         /* Retention trusts the wall clock: warn if it jumps backwards by
          * more than an hour relative to the monotonic clock. */

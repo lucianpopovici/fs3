@@ -85,6 +85,10 @@ static void usage(const char *argv0) {
         "      --tls-addr <ip>        TLS bind address (default: --addr)\n"
         "      --tls-cert <pem>       certificate chain; --tls-key <pem> key (mode 0600)\n"
         "                             SIGHUP re-reads both (a bad file keeps the old ones)\n"
+        "      --scrub-interval-days N  integrity scrub every N days (default 30; 0 = only on demand)\n"
+        "      --scrub-now            start a scrub pass right after startup\n"
+        "      --scrub-rate N         scrub read rate in bytes/s (default 20M; 0 = unthrottled)\n"
+        "      --scrub-fail-reads     GET of a version the scrub found corrupt → 500\n"
         "      --default-bucket-quota N  byte limit for buckets without their own quota (0 = none)\n"
         "      --default-user-quota N    byte limit per user, over the buckets they own (0 = none)\n"
         "      --mpu-min-part-size N  minimum size of every multipart part but the last\n"
@@ -303,6 +307,10 @@ enum {
     OPT_AUTH_FAIL_LIMIT,
     OPT_MPU_MIN_PART_SIZE,
     OPT_DEFAULT_BUCKET_QUOTA,
+    OPT_SCRUB_INTERVAL_DAYS,
+    OPT_SCRUB_NOW,
+    OPT_SCRUB_RATE,
+    OPT_SCRUB_FAIL_READS,
     OPT_DEFAULT_USER_QUOTA,
 };
 
@@ -375,6 +383,8 @@ int main(int argc, char **argv) {
     int auth_fail_limit = 20;
     uint64_t mpu_min_part = 5ULL * 1024 * 1024;   /* S3's minimum */
     uint64_t def_bucket_quota = 0, def_user_quota = 0;   /* 0 = unlimited */
+    int scrub_interval_days = 30, scrub_now = 0, scrub_fail_reads = 0;
+    uint64_t scrub_rate = 20ULL * 1024 * 1024;           /* 20 MiB/s */
     int tls_port = 0, require_tls = 0, require_signed_payload = 0, tls_max_per_ip = 32;
     const char *tls_addr = NULL, *tls_cert = NULL, *tls_key = NULL;
     char trusted_proxies[1024] = "";
@@ -424,6 +434,10 @@ int main(int argc, char **argv) {
         { "auth-fail-limit",  required_argument, NULL, OPT_AUTH_FAIL_LIMIT },
         { "mpu-min-part-size", required_argument, NULL, OPT_MPU_MIN_PART_SIZE },
         { "default-bucket-quota", required_argument, NULL, OPT_DEFAULT_BUCKET_QUOTA },
+        { "scrub-interval-days", required_argument, NULL, OPT_SCRUB_INTERVAL_DAYS },
+        { "scrub-now",        no_argument,       NULL, OPT_SCRUB_NOW },
+        { "scrub-rate",       required_argument, NULL, OPT_SCRUB_RATE },
+        { "scrub-fail-reads", no_argument,       NULL, OPT_SCRUB_FAIL_READS },
         { "default-user-quota",   required_argument, NULL, OPT_DEFAULT_USER_QUOTA },
         { "require-signed-payload", no_argument, NULL, OPT_REQUIRE_SIGNED_PAYLOAD },
         { "verbose",          no_argument,       NULL, 'v' },
@@ -624,6 +638,22 @@ int main(int argc, char **argv) {
                     return 2;
                 }
                 break;
+            case OPT_SCRUB_INTERVAL_DAYS:
+                scrub_interval_days = atoi(optarg);
+                if (scrub_interval_days < 0 || scrub_interval_days > 3650) {
+                    fprintf(stderr, "--scrub-interval-days must be 0..3650\n");
+                    return 2;
+                }
+                break;
+            case OPT_SCRUB_NOW:        scrub_now = 1; break;
+            case OPT_SCRUB_FAIL_READS: scrub_fail_reads = 1; break;
+            case OPT_SCRUB_RATE:
+                scrub_rate = strcmp(optarg, "0") == 0 ? 0 : parse_size(optarg);
+                if (strcmp(optarg, "0") && scrub_rate == 0) {
+                    fprintf(stderr, "--scrub-rate: invalid size '%s'\n", optarg);
+                    return 2;
+                }
+                break;
             case OPT_DEFAULT_BUCKET_QUOTA:
             case OPT_DEFAULT_USER_QUOTA: {
                 uint64_t v = strcmp(optarg, "0") == 0 ? 0 : parse_size(optarg);
@@ -766,6 +796,10 @@ int main(int argc, char **argv) {
         .mpu_min_part_size = mpu_min_part,
         .default_bucket_quota = def_bucket_quota,
         .default_user_quota = def_user_quota,
+        .scrub_interval_days = scrub_interval_days,
+        .scrub_now = scrub_now,
+        .scrub_rate = scrub_rate,
+        .scrub_fail_reads = scrub_fail_reads,
         .tls_port        = (uint16_t)tls_port,
         .tls_addr        = tls_addr,
         .tls_cert        = tls_cert,

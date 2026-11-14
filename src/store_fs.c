@@ -411,6 +411,8 @@ static void q_load(s3_store_t *s);
 static void q_save(s3_store_t *s);
 static void q_bucket_added(s3_store_t *s, s3_str_t name, const char *owner);
 static void q_bucket_removed(s3_store_t *s, s3_str_t name);
+static int  fd_is_known_corrupt(int fd, uint64_t mtime_ms);
+static int  lock_parse_file(const char *path, s3_lock_t *out);
 static void recover_version_links(const s3_store_t *s);
 static void recover_mpu_orphans(const s3_store_t *s);
 static int probe_reflink(const s3_store_t *s);
@@ -3962,6 +3964,11 @@ s3_err_t store_get_open_version(s3_store_t *s, s3_str_t bucket, s3_str_t key,
         return vid ? S3_ERR_METHOD_NOT_ALLOWED : S3_ERR_NO_SUCH_KEY;
     }
 
+    if (fd_is_known_corrupt(fd, h.mtime_ms)) {
+        /* --scrub-fail-reads: never serve bytes the scrub found bad. */
+        close(fd);
+        return S3_ERR_INTERNAL;
+    }
     s3_reader_t *r = calloc(1, sizeof(*r));
     if (!r) { close(fd); return S3_ERR_INTERNAL; }
     r->fd        = fd;
@@ -4406,13 +4413,9 @@ static int lock_path(const s3_store_t *s, s3_str_t bucket, s3_str_t key,
     return (n > 0 && (size_t)n < pcap) ? 0 : -1;
 }
 
-int store_lock_read(s3_store_t *s, s3_str_t bucket, s3_str_t key,
-                    const uint8_t vid[16], s3_lock_t *out) {
+/* 0 ok, 1 absent, -1 unreadable/unparseable. */
+static int lock_parse_file(const char *path, s3_lock_t *out) {
     memset(out, 0, sizeof(*out));
-    char dir[4300], path[4400];
-    if (!valid_bucket_name(bucket) || !valid_key(key)
-        || lock_path(s, bucket, key, vid, dir, sizeof(dir), path, sizeof(path)) < 0)
-        return -1;
     FILE *f = fopen(path, "re");
     if (!f) return errno == ENOENT ? 1 : -1;
     char line[128];
@@ -4429,6 +4432,16 @@ int store_lock_read(s3_store_t *s, s3_str_t bucket, s3_str_t key,
     }
     fclose(f);
     return ok ? 0 : -1;
+}
+
+int store_lock_read(s3_store_t *s, s3_str_t bucket, s3_str_t key,
+                    const uint8_t vid[16], s3_lock_t *out) {
+    memset(out, 0, sizeof(*out));
+    char dir[4300], path[4400];
+    if (!valid_bucket_name(bucket) || !valid_key(key)
+        || lock_path(s, bucket, key, vid, dir, sizeof(dir), path, sizeof(path)) < 0)
+        return -1;
+    return lock_parse_file(path, out);
 }
 
 s3_err_t store_lock_write(s3_store_t *s, s3_str_t bucket, s3_str_t key,
@@ -4531,6 +4544,7 @@ struct q_bucket {
     uint64_t rbytes, robjs;        /* reserved by open writers */
     int      has_cfg;              /* bucket quota sidecar present */
     uint64_t max_bytes, max_objects;
+    uint64_t gen;                  /* bumped on every charge (recount race check) */
 };
 
 struct q_user {
@@ -4630,7 +4644,7 @@ static void q_charge(s3_store_t *s, const char *bucket, int64_t db, int64_t dobj
     if (!db && !dobj) return;
     pthread_mutex_lock(&s->q_mu);
     struct q_bucket *b = qb_find(s, bucket);
-    if (b) { add_signed(&b->bytes, db); add_signed(&b->objects, dobj); }
+    if (b) { add_signed(&b->bytes, db); add_signed(&b->objects, dobj); b->gen++; }
     pthread_mutex_unlock(&s->q_mu);
 }
 
@@ -5061,16 +5075,270 @@ s3_err_t store_user_usage(s3_store_t *s, const char *user, s3_quota_usage_t *out
 
 s3_err_t store_quota_recount(s3_store_t *s, s3_str_t bucket, int64_t *drift_bytes) {
     if (!s || !valid_bucket_name(bucket)) return S3_ERR_INVALID_BUCKET_NAME;
+    if (drift_bytes) *drift_bytes = 0;
     char bn[64];
     snprintf(bn, sizeof(bn), S3_STR_FMT, S3_STR_ARG(bucket));
-    uint64_t b = 0, o = 0;
-    q_walk_bucket(s, bn, &b, &o);
     pthread_mutex_lock(&s->q_mu);
     struct q_bucket *qb = qb_find(s, bn);
-    if (qb) {
+    uint64_t gen0 = qb ? qb->gen : 0;
+    pthread_mutex_unlock(&s->q_mu);
+    if (!qb) return S3_ERR_NO_SUCH_BUCKET;
+    uint64_t b = 0, o = 0;
+    q_walk_bucket(s, bn, &b, &o);
+    s3_err_t e = S3_OK;
+    pthread_mutex_lock(&s->q_mu);
+    qb = qb_find(s, bn);
+    if (!qb) e = S3_ERR_NO_SUCH_BUCKET;
+    else if (qb->gen != gen0) e = S3_ERR_SLOW_DOWN;     /* written meanwhile: walk is stale */
+    else {
         if (drift_bytes) *drift_bytes = (int64_t)qb->bytes - (int64_t)b;
         qb->bytes = b; qb->objects = o;
     }
     pthread_mutex_unlock(&s->q_mu);
-    return qb ? S3_OK : S3_ERR_NO_SUCH_BUCKET;
+    return e;
+}
+
+/* ===================================================================== */
+/* Integrity scrub support (round 2, item 3)                              */
+/* ===================================================================== */
+
+/* Known-corrupt versions (--scrub-fail-reads): identified by inode and
+ * header mtime, so the mark follows a version through link-aside and a
+ * reused inode number does not inherit it. */
+typedef struct { uint64_t dev, ino, mtime_ms; } corrupt_id_t;
+static pthread_mutex_t g_corrupt_mu = PTHREAD_MUTEX_INITIALIZER;
+static corrupt_id_t   *g_corrupt;
+static size_t          g_corrupt_n, g_corrupt_cap;
+static int             g_corrupt_fail_reads;
+
+void store_scrub_fail_reads(int on) { g_corrupt_fail_reads = on; }
+
+void store_scrub_mark_corrupt(uint64_t dev, uint64_t ino, uint64_t mtime_ms) {
+    pthread_mutex_lock(&g_corrupt_mu);
+    for (size_t i = 0; i < g_corrupt_n; i++)
+        if (g_corrupt[i].dev == dev && g_corrupt[i].ino == ino && g_corrupt[i].mtime_ms == mtime_ms) {
+            pthread_mutex_unlock(&g_corrupt_mu);
+            return;
+        }
+    if (g_corrupt_n == g_corrupt_cap) {
+        size_t nc = g_corrupt_cap ? g_corrupt_cap * 2 : 16;
+        corrupt_id_t *n = realloc(g_corrupt, nc * sizeof(*n));
+        if (!n) { pthread_mutex_unlock(&g_corrupt_mu); return; }
+        g_corrupt = n; g_corrupt_cap = nc;
+    }
+    g_corrupt[g_corrupt_n++] = (corrupt_id_t){ dev, ino, mtime_ms };
+    pthread_mutex_unlock(&g_corrupt_mu);
+}
+
+static int fd_is_known_corrupt(int fd, uint64_t mtime_ms) {
+    if (!g_corrupt_fail_reads || !g_corrupt_n) return 0;
+    struct stat st;
+    if (fstat(fd, &st) < 0) return 0;
+    int hit = 0;
+    pthread_mutex_lock(&g_corrupt_mu);
+    for (size_t i = 0; i < g_corrupt_n && !hit; i++)
+        hit = g_corrupt[i].dev == (uint64_t)st.st_dev && g_corrupt[i].ino == (uint64_t)st.st_ino
+           && g_corrupt[i].mtime_ms == mtime_ms;
+    pthread_mutex_unlock(&g_corrupt_mu);
+    return hit;
+}
+
+const char *store_root(const s3_store_t *s) { return s->root; }
+
+/* Read [off, off+len) of fd through the hashes, calling throttle(ctx, n)
+ * after each chunk. -1 on read error or short file. */
+static int scrub_read(int fd, uint64_t off, uint64_t len, EVP_MD_CTX *md, cksum_ctx_t *k1,
+                      cksum_ctx_t *k2, void (*throttle)(void *, uint64_t), void *tctx,
+                      uint64_t *read_total) {
+    char buf[128 * 1024];
+    while (len) {
+        size_t want = len < sizeof(buf) ? (size_t)len : sizeof(buf);
+        ssize_t r = pread(fd, buf, want, (off_t)off);
+        if (r < 0 && errno == EINTR) continue;
+        if (r <= 0) return -1;
+        if (md) EVP_DigestUpdate(md, buf, (size_t)r);
+        if (k1 && k1->algo) cksum_update(k1, buf, (size_t)r);
+        if (k2 && k2->algo) cksum_update(k2, buf, (size_t)r);
+        off += (uint64_t)r; len -= (uint64_t)r;
+        *read_total += (uint64_t)r;
+        if (throttle) throttle(tctx, (uint64_t)r);
+    }
+    return 0;
+}
+
+static void hex16(const uint8_t *b, size_t n, char *out) {
+    static const char H[] = "0123456789abcdef";
+    for (size_t i = 0; i < n; i++) { out[2*i] = H[b[i] >> 4]; out[2*i+1] = H[b[i] & 15]; }
+    out[2*n] = '\0';
+}
+
+static void scrub_object_fd(int fd, const struct stat *st, store_scrub_result_t *r,
+                            void (*throttle)(void *, uint64_t), void *tctx) {
+    obj_header_t h;
+    obj_ext_v3_t x;
+    obj_ext_v4_t x4;
+    uint32_t ct_off = 0, tlv_off = 0;
+    if (obj_read_hdr4(fd, &h, &x, &x4, &ct_off, &tlv_off) != S3_OK) {
+        r->verdict = SCRUB_CORRUPT;
+        snprintf(r->reason, sizeof(r->reason), "bad header");
+        /* Say "size" when the fixed header is intact but the file is
+         * shorter/longer than it claims (truncation). */
+        obj_header_t raw;
+        if (pread(fd, &raw, sizeof(raw), 0) == (ssize_t)sizeof(raw)
+            && !memcmp(raw.magic, OBJ_MAGIC, OBJ_MAGIC_LEN)
+            && (raw.schema == OBJ_SCHEMA_V2 || raw.schema == OBJ_SCHEMA_V3)
+            && (uint64_t)st->st_size != (uint64_t)raw.header_size + raw.data_size) {
+            snprintf(r->reason, sizeof(r->reason), "size");
+        } else if (pread(fd, &raw, sizeof(raw), 0) == (ssize_t)sizeof(raw)
+                   && !memcmp(raw.magic, OBJ_MAGIC, OBJ_MAGIC_LEN) && raw.schema == OBJ_SCHEMA) {
+            obj_ext_v4_t rx4;
+            if (pread(fd, &rx4, sizeof(rx4), sizeof(raw) + sizeof(obj_ext_v3_t)) == (ssize_t)sizeof(rx4)
+                && (uint64_t)st->st_size != (uint64_t)raw.header_size + rx4.stored_size) {
+                snprintf(r->reason, sizeof(r->reason), "size");
+                snprintf(r->expected, sizeof(r->expected), "%llu",
+                         (unsigned long long)raw.header_size + rx4.stored_size);
+                snprintf(r->actual, sizeof(r->actual), "%llu", (unsigned long long)st->st_size);
+            }
+        }
+        return;
+    }
+    r->mtime_ms = h.mtime_ms;
+    r->logical_size = h.data_size;
+    memcpy(r->version_id, x.version_id, 16);
+    if (h.key_len && h.key_len < sizeof(r->key)
+        && pread(fd, r->key, h.key_len, (off_t)ct_off + h.ct_len) == (ssize_t)h.key_len)
+        r->key[h.key_len] = '\0';
+    uint64_t stored = h.schema == OBJ_SCHEMA ? x4.stored_size : h.data_size;
+    if ((uint64_t)st->st_size != (uint64_t)h.header_size + stored) {
+        r->verdict = SCRUB_CORRUPT;
+        snprintf(r->reason, sizeof(r->reason), "size");
+        snprintf(r->expected, sizeof(r->expected), "%llu",
+                 (unsigned long long)h.header_size + stored);
+        snprintf(r->actual, sizeof(r->actual), "%llu", (unsigned long long)st->st_size);
+        return;
+    }
+    int transformed = (x.flags & (S3_OBJF_SSEC | S3_OBJF_ZSTD)) != 0;
+    int use_crc = (x.flags & S3_OBJF_PAYLOAD_CRC) != 0;
+    int use_md5 = !use_crc && h.part_count == 0 && !transformed
+                  && !(x.flags & S3_OBJF_DELETE_MARKER);
+    int use_ck  = !use_crc && !use_md5 && !transformed && x.cksum_algo
+                  && x.cksum_type == S3_CKSUM_TYPE_FULL_OBJECT;
+    if (x.flags & S3_OBJF_DELETE_MARKER) { r->verdict = stored ? SCRUB_CORRUPT : SCRUB_OK;
+        if (stored) snprintf(r->reason, sizeof(r->reason), "delete marker with payload");
+        return; }
+    if (!use_crc && !use_md5 && !use_ck) { r->verdict = SCRUB_UNVERIFIABLE; return; }
+    EVP_MD_CTX *md = use_md5 ? EVP_MD_CTX_new() : NULL;
+    cksum_ctx_t kc, kf;
+    memset(&kc, 0, sizeof(kc)); memset(&kf, 0, sizeof(kf));
+    if (use_md5 && (!md || EVP_DigestInit_ex(md, EVP_md5(), NULL) != 1)) {
+        EVP_MD_CTX_free(md); r->verdict = SCRUB_UNVERIFIABLE; return;
+    }
+    if (use_crc) cksum_begin(&kc, S3_CKSUM_CRC64NVME);
+    if (use_ck)  cksum_begin(&kf, x.cksum_algo);
+    if (scrub_read(fd, h.header_size, stored, md, &kc, &kf, throttle, tctx, &r->bytes_read) < 0) {
+        r->verdict = SCRUB_CORRUPT;
+        snprintf(r->reason, sizeof(r->reason), "short read");
+    } else if (use_crc) {
+        uint8_t d[CKSUM_MAX_DIGEST]; size_t dn = 0;
+        cksum_final(&kc, d, &dn);
+        r->verdict = (dn == 8 && !memcmp(d, x4.payload_crc64, 8)) ? SCRUB_OK : SCRUB_CORRUPT;
+        snprintf(r->reason, sizeof(r->reason), "payload crc64");
+        hex16(x4.payload_crc64, 8, r->expected);
+        hex16(d, dn < 8 ? dn : 8, r->actual);
+    } else if (use_md5) {
+        uint8_t d[16]; unsigned dn = 16;
+        EVP_DigestFinal_ex(md, d, &dn);
+        r->verdict = !memcmp(d, h.etag, 16) ? SCRUB_OK : SCRUB_CORRUPT;
+        snprintf(r->reason, sizeof(r->reason), "md5");
+        hex16(h.etag, 16, r->expected);
+        hex16(d, 16, r->actual);
+    } else {
+        uint8_t d[CKSUM_MAX_DIGEST]; size_t dn = 0;
+        cksum_final(&kf, d, &dn);
+        r->verdict = (dn && !memcmp(d, x.cksum, dn)) ? SCRUB_OK : SCRUB_CORRUPT;
+        snprintf(r->reason, sizeof(r->reason), "checksum %s", cksum_upper_name(x.cksum_algo));
+        hex16(x.cksum, dn > 16 ? 16 : dn, r->expected);
+        hex16(d, dn > 16 ? 16 : dn, r->actual);
+    }
+    if (r->verdict == SCRUB_OK) { r->reason[0] = r->expected[0] = r->actual[0] = '\0'; }
+    EVP_MD_CTX_free(md);
+    cksum_free(&kc);
+    cksum_free(&kf);
+}
+
+static void scrub_part_fd(int fd, const char *path, const struct stat *st,
+                          store_scrub_result_t *r, void (*throttle)(void *, uint64_t), void *tctx) {
+    part_rec_t rec;
+    int rr = part_rec_read(path, &rec);
+    r->logical_size = (uint64_t)st->st_size;
+    r->mtime_ms = (uint64_t)st->st_mtim.tv_sec * 1000 + (uint64_t)st->st_mtim.tv_nsec / 1000000;
+    if (rr == 1) { r->verdict = SCRUB_UNVERIFIABLE; return; }
+    if (rr < 0) { r->verdict = SCRUB_CORRUPT; snprintf(r->reason, sizeof(r->reason), "bad part record"); return; }
+    if ((uint64_t)st->st_size != rec.size) {
+        r->verdict = SCRUB_CORRUPT;
+        snprintf(r->reason, sizeof(r->reason), "size");
+        snprintf(r->expected, sizeof(r->expected), "%llu", (unsigned long long)rec.size);
+        snprintf(r->actual, sizeof(r->actual), "%llu", (unsigned long long)st->st_size);
+        return;
+    }
+    EVP_MD_CTX *md = EVP_MD_CTX_new();
+    if (!md || EVP_DigestInit_ex(md, EVP_md5(), NULL) != 1) {
+        EVP_MD_CTX_free(md); r->verdict = SCRUB_UNVERIFIABLE; return;
+    }
+    if (scrub_read(fd, 0, rec.size, md, NULL, NULL, throttle, tctx, &r->bytes_read) < 0) {
+        r->verdict = SCRUB_CORRUPT;
+        snprintf(r->reason, sizeof(r->reason), "short read");
+    } else {
+        uint8_t d[16]; unsigned dn = 16;
+        EVP_DigestFinal_ex(md, d, &dn);
+        r->verdict = !memcmp(d, rec.md5, 16) ? SCRUB_OK : SCRUB_CORRUPT;
+        if (r->verdict != SCRUB_OK) {
+            snprintf(r->reason, sizeof(r->reason), "part md5");
+            hex16(rec.md5, 16, r->expected);
+            hex16(d, 16, r->actual);
+        }
+    }
+    EVP_MD_CTX_free(md);
+}
+
+s3_err_t store_scrub_file(s3_store_t *s, const char *path, int kind, const char *lock_hex,
+                          void (*throttle)(void *, uint64_t), void *tctx,
+                          store_scrub_result_t *r) {
+    memset(r, 0, sizeof(*r));
+    pthread_mutex_t *km = lock_hex ? key_lock(s, lock_hex) : NULL;
+    if (km) pthread_mutex_lock(km);
+    int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0) {
+        r->verdict = SCRUB_GONE;            /* replaced or deleted: not corruption */
+        if (km) pthread_mutex_unlock(km);
+        return S3_OK;
+    }
+    struct stat st;
+    if (fstat(fd, &st) < 0 || !S_ISREG(st.st_mode)) {
+        close(fd);
+        r->verdict = SCRUB_GONE;
+        if (km) pthread_mutex_unlock(km);
+        return S3_OK;
+    }
+    r->dev = (uint64_t)st.st_dev;
+    r->ino = (uint64_t)st.st_ino;
+    r->nlink = (uint64_t)st.st_nlink;
+    if (kind == STORE_SCRUB_PART) {
+        scrub_part_fd(fd, path, &st, r, throttle, tctx);
+    } else if (kind == STORE_SCRUB_LOCK) {
+        /* An unparseable lock record already fails closed (the version
+         * cannot be deleted); report it so the admin can fix it. */
+        s3_lock_t l;
+        r->bytes_read = (uint64_t)st.st_size;
+        r->verdict = lock_parse_file(path, &l) == 0 ? SCRUB_OK : SCRUB_CORRUPT;
+        if (r->verdict != SCRUB_OK) snprintf(r->reason, sizeof(r->reason), "unparseable lock record");
+    } else {
+        scrub_object_fd(fd, &st, r, throttle, tctx);
+    }
+#ifdef POSIX_FADV_DONTNEED
+    (void)posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);   /* don't evict the page cache */
+#endif
+    close(fd);
+    if (km) pthread_mutex_unlock(km);
+    return S3_OK;
 }

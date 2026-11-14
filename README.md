@@ -318,6 +318,24 @@ What's working end-to-end:
   disk after a crash. Prometheus: `fs3_bucket_bytes`,
   `fs3_bucket_quota_bytes`, `fs3_quota_rejections_total`.
 
+- **Integrity scrub** — a background pass (every `--scrub-interval-days`,
+  default 30; `--scrub-now`; admin API `POST /v1/scrub`, progress at
+  `GET /v1/scrub`) re-reads every object, noncurrent version and
+  in-flight part and checks it against its payload CRC64, else its MD5
+  ETag, else a stored full-object checksum (multipart objects written
+  before schema 4 are "unverifiable"); lock records are checked for
+  parseability. It runs on an I/O worker at idle I/O priority, throttled
+  by `--scrub-rate` (default 20 MiB/s), backs off while requests are
+  queued, drops what it read from the page cache, and resumes where it
+  stopped after a restart. Corruption is never repaired or deleted: it
+  goes to `scrub/corrupt.log`, the audit log and
+  `fs3_scrub_corrupt_total`; with `--scrub-fail-reads` a GET of a
+  corrupt version answers 500 instead of returning bad bytes. Each pass
+  also reconciles quota usage with the disk. On a Btrfs volume with data
+  checksums, DSM's own data scrubbing covers the same failure and can
+  repair from RAID parity where fs3 can only detect; fs3's scrub matters
+  on ext4 and for logical damage (truncated files, bad headers).
+
 - **Listing** — ListObjectsV2 (`continuation-token`, `start-after`,
   `fetch-owner`, `KeyCount`), `encoding-type=url` on both list versions,
   and ListMultipartUploads pagination (`key-marker`, `upload-id-marker`,
@@ -331,7 +349,7 @@ What's working end-to-end:
 
 What's *not* yet wired:
 
-- Background integrity scrub, key expiry /
+- Key expiry /
   disable, SSE-C, seccomp, `FS_IMMUTABLE_FL` for COMPLIANCE versions.
 - Tag-based lifecycle filters, transitions, website routing rules (all
   refused with 501 rather than ignored).

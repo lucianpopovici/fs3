@@ -536,12 +536,41 @@ s3_err_t store_user_quota_set(s3_store_t *s, const char *user,
 s3_err_t store_user_quota_clear(s3_store_t *s, const char *user);
 s3_err_t store_user_usage(s3_store_t *s, const char *user, s3_quota_usage_t *out);
 uint64_t store_quota_rejections(s3_store_t *s);
-/* Recompute a bucket's usage from disk (scrub); *drift = old - new. */
+/* Recompute a bucket's usage from disk (scrub); *drift = old - new.
+ * S3_ERR_SLOW_DOWN: the bucket was written during the walk, nothing
+ * changed (try again on the next pass). */
 s3_err_t store_quota_recount(s3_store_t *s, s3_str_t bucket, int64_t *drift_bytes);
 /* Reserve quota for a body of n bytes (declared length) before it
  * streams; writes past it reserve as they go. */
 s3_err_t store_put_expect(s3_writer_t *w, uint64_t n);
 int      store_valid_identity(const char *u);
+
+/* ---- Integrity scrub (round 2, item 3) ----
+ *
+ * store_scrub_file verifies one file without any lock (object files are
+ * immutable once renamed in; a vanished file is SCRUB_GONE, never
+ * corruption). Pass lock_hex (the key's path hash) to re-confirm a
+ * failure under the key's stripe lock. Objects: header, size, then the
+ * payload CRC64, else the MD5 ETag (single-part, untransformed), else a
+ * full-object checksum, else unverifiable. Parts: against their record. */
+enum { SCRUB_OK = 0, SCRUB_UNVERIFIABLE, SCRUB_CORRUPT, SCRUB_GONE };
+enum { STORE_SCRUB_OBJECT = 0, STORE_SCRUB_PART = 1, STORE_SCRUB_LOCK = 2 };
+typedef struct {
+    int      verdict;
+    uint64_t bytes_read, logical_size, mtime_ms;
+    uint64_t dev, ino, nlink;
+    uint8_t  version_id[16];
+    char     key[1025];
+    char     reason[64];
+    char     expected[40], actual[40];
+} store_scrub_result_t;
+s3_err_t store_scrub_file(s3_store_t *s, const char *path, int kind, const char *lock_hex,
+                          void (*throttle)(void *ctx, uint64_t bytes), void *tctx,
+                          store_scrub_result_t *r);
+/* --scrub-fail-reads: GET of a marked version answers InternalError. */
+void     store_scrub_fail_reads(int on);
+void     store_scrub_mark_corrupt(uint64_t dev, uint64_t ino, uint64_t mtime_ms);
+const char *store_root(const s3_store_t *s);
 
 /* ---- Multipart GC ----
  *

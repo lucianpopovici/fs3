@@ -94,6 +94,11 @@ typedef struct {
     uint64_t               mpu_min_part_size;   /* Complete: EntityTooSmall below */
     uint64_t               default_bucket_quota; /* bytes, 0 = unlimited */
     uint64_t               default_user_quota;
+    /* Integrity scrub (round 2, item 3). */
+    int                    scrub_interval_days;   /* 0 = off */
+    int                    scrub_now;
+    uint64_t               scrub_rate;            /* bytes/s, 0 = unthrottled */
+    int                    scrub_fail_reads;
 
     /* Admin API (item 11): /v1 on the metrics listener needs this bearer
      * token (NULL = disabled there); admin_socket adds a Unix-socket

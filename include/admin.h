@@ -30,6 +30,7 @@
 #include <stddef.h>
 
 struct s3_store;
+struct scrub;
 
 typedef struct {
     struct s3_store *store;
@@ -37,6 +38,7 @@ typedef struct {
     const char      *cred_file;    /* NULL = key endpoints unavailable */
     int            (*reload)(void *user);   /* 0 = ok */
     void            *reload_user;
+    struct scrub    *scrub;        /* POST/GET /v1/scrub (item 3) */
 } admin_cfg_t;
 
 typedef struct admin_ctx admin_ctx_t;

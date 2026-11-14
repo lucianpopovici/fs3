@@ -15,6 +15,9 @@
   `--default-user-quota`), `403 QuotaExceeded`, Prometheus gauges, quota
   column in the DSM console. New files: `buckets/<b>/quota`,
   `buckets/<b>/usage`, `users/<hex>.quota`, `<root>/.fs3-running`.
+- Background integrity scrub (`--scrub-interval-days`, `--scrub-rate`,
+  `--scrub-now`, `--scrub-fail-reads`, admin `POST/GET /v1/scrub`, new
+  `scrub/` dir with `state` and `corrupt.log`, `fs3_scrub_*` metrics).
 - Audit log lines carry the S3 error code (`"error":"…"`).
 - Fix: a request refused before `100 Continue` now closes the connection
   (botocore stalled 60 s on the next request).
