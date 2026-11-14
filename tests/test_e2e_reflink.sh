@@ -208,4 +208,35 @@ dedup_phase owner
 dedup_phase global --dedup-verify
 grep -q "verified" "$LOG" || { echo "FAIL: --dedup-verify not active"; exit 1; }
 rm -rf "$DATA.sock"
+
+# ---- 7a: filesystem compression --------------------------------------------------
+compress_phase() {   # $1 = auto|all
+    rm -rf "$DATA"; : >"$LOG"
+    start --fs-compress "$1"
+    grep -q "fs-compress: " "$LOG" || { echo "FAIL: fs-compress not enabled"; exit 1; }
+    python3 -c "print('compressible text line\n' * 300000, end='')" > "$DATA.txt"
+    curl -s -X PUT "$URL/czz" -o /dev/null
+    curl -s -X PUT --data-binary @"$DATA.txt" "$URL/czz/doc.txt" -o /dev/null
+    curl -s -X PUT --data-binary @"$DATA.txt" -H 'Content-Type: image/jpeg' "$URL/czz/photo.jpg" -o /dev/null
+    head -c 100 "$DATA.txt" | curl -s -X PUT --data-binary @- "$URL/czz/tiny.txt" -o /dev/null
+    sync
+    flag() { lsattr "$(grep -l "$1" "$DATA"/data/czz/*/*/* | head -1)" | cut -c9; }
+    [ "$(flag doc.txt)" = "c" ] || { echo "FAIL: $1: doc.txt not flagged for compression"; exit 1; }
+    f=$(grep -l doc.txt "$DATA"/data/czz/*/*/* | head -1)
+    filefrag -v "$f" | grep -q encoded || { echo "FAIL: $1: doc.txt extents not compressed"; exit 1; }
+    if [ "$1" = auto ]; then
+        [ "$(flag photo.jpg)" = "-" ] || { echo "FAIL: auto compressed a JPEG"; exit 1; }
+        [ "$(flag tiny.txt)" = "-" ] || { echo "FAIL: auto compressed a 100-byte object"; exit 1; }
+    else
+        [ "$(flag photo.jpg)" = "c" ] || { echo "FAIL: all: JPEG not flagged"; exit 1; }
+    fi
+    curl -s "$URL/czz/doc.txt" | cmp -s - "$DATA.txt" || { echo "FAIL: $1: GET differs"; exit 1; }
+    [ "$(curl -s -r 1000-1021 "$URL/czz/doc.txt")" = "$(tail -c +1001 "$DATA.txt" | head -c 22)" ] \
+        || { echo "FAIL: $1: Range on a compressed object"; exit 1; }
+    echo "fs-compress $1 ok"
+    rm -f "$DATA.txt"
+    kill "$SP"; wait "$SP" 2>/dev/null || true
+}
+compress_phase auto
+compress_phase all
 echo "===== reflink e2e: done ====="

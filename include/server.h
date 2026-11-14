@@ -105,6 +105,7 @@ typedef struct {
     int                    dedup_mode;            /* STORE_DEDUP_* */
     uint64_t               dedup_min;
     int                    dedup_verify;
+    int                    fs_compress;           /* STORE_COMPRESS_* */
 
     /* Admin API (item 11): /v1 on the metrics listener needs this bearer
      * token (NULL = disabled there); admin_socket adds a Unix-socket

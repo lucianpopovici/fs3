@@ -26,6 +26,7 @@
 - Reflink fast paths on Btrfs for multipart Complete, CopyObject and
   UploadPartCopy (`--reflink auto|off`, `fs3_reflink_clones_total`).
 - Opt-in whole-object dedup on Btrfs (`--dedup owner|global`, new `cas/` pool dir).
+- Btrfs transparent compression of objects (`--fs-compress auto|all`).
 - Audit log lines carry the S3 error code (`"error":"…"`).
 - Fix: a request refused before `100 Continue` now closes the connection
   (botocore stalled 60 s on the next request).

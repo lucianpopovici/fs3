@@ -1256,6 +1256,7 @@ static int handle_object_put_begin(conn_t *c, s3_str_t bucket, s3_str_t key) {
     o.content_type = ct_buf;
     o.tlv = tlv;
     o.tlv_len = tlv_n;
+    o.size_hint = declared_body_len(c);
     s3_writer_t *w;
     e = store_put_begin_opts(c->store, bucket, key, &o, &w);
     free(tlv);
@@ -1741,6 +1742,7 @@ static int handle_object_copy(conn_t *c, s3_str_t dst_bucket, s3_str_t dst_key) 
         po.content_type = ct;
         po.tlv = tlv;
         po.tlv_len = tlv_n;
+        po.size_hint = src_meta.size;
         e = store_put_begin_opts(c->store, dst_bucket, dst_key, &po, &writer);
     }
     free(tlv);

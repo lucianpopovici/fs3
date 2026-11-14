@@ -167,6 +167,7 @@ struct s3_store {
     int      dedup_mode;     /* STORE_DEDUP_* */
     uint64_t dedup_min;
     int      dedup_verify;
+    int      fs_compress;    /* STORE_COMPRESS_*; 0 if the probe failed */
 
     int  (*mpu_gc_filter)(void *user, s3_str_t bucket, s3_str_t key);
     void  *mpu_gc_filter_user;
@@ -973,6 +974,49 @@ static int probe_reflink(const s3_store_t *s) {
  * length may be unaligned only when it runs to the source's EOF. */
 #define CLONE_BLK 4096u
 
+/* Filesystem compression (round 2, item 7a): FS_COMPR_FL on the temp
+ * file before the first write; Btrfs then compresses extents itself, so
+ * sendfile, Range, reflinks and the on-disk format are untouched. */
+static int set_compr_flag(int fd) {
+    int fl = 0;
+    if (ioctl(fd, FS_IOC_GETFLAGS, &fl) < 0) return -1;
+    fl |= FS_COMPR_FL;
+    return ioctl(fd, FS_IOC_SETFLAGS, &fl);
+}
+
+int store_set_fs_compress(s3_store_t *s, int mode) {
+    if (mode == STORE_COMPRESS_OFF) { s->fs_compress = 0; return 0; }
+    char p[4200];
+    snprintf(p, sizeof(p), "%s/compr.XXXXXX", s->tmp_dir);
+    int fd = mkstemp(p);
+    int ok = fd >= 0 && set_compr_flag(fd) == 0;
+    if (fd >= 0) { close(fd); unlink(p); }
+    s->fs_compress = ok ? mode : 0;
+    return ok ? 0 : -1;
+}
+
+/* auto: skip what is already compressed, and tiny objects. */
+static int compress_worth_it(const s3_store_t *s, const char *ct, const char *key, size_t key_n,
+                             uint64_t size_hint) {
+    if (s->fs_compress == STORE_COMPRESS_ALL) return 1;
+    if (s->fs_compress != STORE_COMPRESS_AUTO) return 0;
+    if (size_hint && size_hint < 4096) return 0;
+    static const char *ct_skip[] = { "image/jpeg", "image/png", "image/gif", "image/webp",
+        "image/avif", "image/heic", "video/", "audio/", "application/zip", "application/gzip",
+        "application/x-gzip", "application/zstd", "application/x-7z", "application/x-xz",
+        "application/x-bzip2", "application/x-rar", "application/pdf", NULL };
+    for (int i = 0; ct && ct_skip[i]; i++)
+        if (!strncasecmp(ct, ct_skip[i], strlen(ct_skip[i]))) return 0;
+    static const char *sfx[] = { ".jpg", ".jpeg", ".png", ".gif", ".webp", ".heic", ".avif",
+        ".mp4", ".mkv", ".mov", ".avi", ".mp3", ".aac", ".flac", ".ogg", ".opus", ".zip", ".gz",
+        ".tgz", ".zst", ".xz", ".bz2", ".7z", ".rar", ".pdf", ".jar", ".apk", NULL };
+    for (int i = 0; key && sfx[i]; i++) {
+        size_t n = strlen(sfx[i]);
+        if (key_n >= n && !strncasecmp(key + key_n - n, sfx[i], n)) return 0;
+    }
+    return 1;
+}
+
 /* Tests force the clone paths off (pure copy) or keep the probe result. */
 int store_set_reflink(s3_store_t *s, int on) {
     int old = s->reflink;
@@ -1617,6 +1661,8 @@ s3_err_t store_put_begin_opts(s3_store_t *s, s3_str_t bucket, s3_str_t key,
         writer_free(w);
         return e;
     }
+    if (s->fs_compress && compress_worth_it(s, w->content_type_dup, w->key_dup, key.n, opts->size_hint))
+        (void)set_compr_flag(w->fd);
 
     /* Reserve header space by writing the (incomplete) header, then the
      * variable-length content_type and key bytes. We'll pwrite the final
@@ -2856,6 +2902,7 @@ s3_err_t store_mpu_part_begin(s3_store_t *s, s3_str_t bucket, s3_str_t key,
         writer_free(w);
         return e;
     }
+    if (s->fs_compress && compress_worth_it(s, NULL, key.p, key.n, 0)) (void)set_compr_flag(w->fd);
 
     w->md5_ctx = EVP_MD_CTX_new();
     if (!w->md5_ctx
@@ -3235,6 +3282,8 @@ s3_err_t store_mpu_complete2(s3_store_t *s, s3_str_t bucket, s3_str_t key,
     }
     snprintf(tmp_path, sizeof(tmp_path), "%s/mpu.XXXXXX", s->tmp_dir);
     tfd = mkstemp(tmp_path);
+    if (tfd >= 0 && s->fs_compress && compress_worth_it(s, stored_ct, key.p, key.n, 0))
+        (void)set_compr_flag(tfd);
     if (tfd < 0) { tmp_path[0] = '\0'; e = map_io_err(errno); goto out; }
 
     /* 3. Assemble: prefix, then the snapshotted part bytes. */

@@ -505,6 +505,13 @@ server_t *server_create(const server_cfg_t *cfg) {
     store_set_mpu_min_part_size(s->store, cfg->mpu_min_part_size);
     store_set_default_quotas(s->store, cfg->default_bucket_quota, cfg->default_user_quota);
     if (cfg->reflink_off) { store_set_reflink(s->store, 0); LOG_I("reflink: off (--reflink off)"); }
+    if (cfg->fs_compress) {
+        if (store_set_fs_compress(s->store, cfg->fs_compress) < 0)
+            LOG_W("fs-compress: the filesystem refused FS_COMPR_FL (ext4?); running uncompressed");
+        else
+            LOG_I("fs-compress: %s (Btrfs transparent compression)",
+                  cfg->fs_compress == STORE_COMPRESS_ALL ? "all objects" : "auto");
+    }
     if (cfg->dedup_mode) {
         if (!store_reflink_capable(s->store) || cfg->reflink_off)
             LOG_W("dedup: needs a reflink-capable filesystem (Btrfs/XFS); disabled");

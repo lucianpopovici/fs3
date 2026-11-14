@@ -82,6 +82,8 @@ static void usage(const char *argv0) {
         "      --allow-public-write   also allow public policies that grant writes\n"
         "      --trusted-proxy <ip>   honour X-Forwarded-For/-Proto from this proxy\n"
         "                             (repeatable; e.g. 127.0.0.1 behind DSM)\n"
+        "");
+    fprintf(stderr,
         "      --tls-port <num>       native TLS listener (make TLS=1 builds); plain and\n"
         "                             TLS listeners can run together\n"
         "      --tls-addr <ip>        TLS bind address (default: --addr)\n"
@@ -94,6 +96,7 @@ static void usage(const char *argv0) {
         "                             lets users learn that someone stores a file: single-tenant only)\n"
         "      --dedup-min-size N     only objects of at least N bytes (default 1M)\n"
         "      --dedup-verify         byte-compare before sharing\n"
+        "      --fs-compress off|auto|all  Btrfs transparent compression of objects (default off)\n"
         "      --scrub-interval-days N  integrity scrub every N days (default 30; 0 = only on demand)\n"
         "      --scrub-now            start a scrub pass right after startup\n"
         "      --scrub-rate N         scrub read rate in bytes/s (default 20M; 0 = unthrottled)\n"
@@ -412,6 +415,7 @@ enum {
     OPT_SECCOMP,
     OPT_REFLINK,
     OPT_DEDUP,
+    OPT_FS_COMPRESS,
     OPT_DEDUP_MIN,
     OPT_DEDUP_VERIFY,
     OPT_SECCOMP_LIST,
@@ -494,7 +498,7 @@ int main(int argc, char **argv) {
     int key_max_age_days = 0;
     int seccomp_mode = SANDBOX_ENFORCE;
     int reflink_off = 0;
-    int dedup_mode = 0, dedup_verify = 0;
+    int dedup_mode = 0, dedup_verify = 0, fs_compress = 0;
     uint64_t dedup_min = 1024 * 1024;
     uint64_t scrub_rate = 20ULL * 1024 * 1024;           /* 20 MiB/s */
     int tls_port = 0, require_tls = 0, require_signed_payload = 0, tls_max_per_ip = 32;
@@ -551,6 +555,7 @@ int main(int argc, char **argv) {
         { "seccomp",          required_argument, NULL, OPT_SECCOMP },
         { "reflink",          required_argument, NULL, OPT_REFLINK },
         { "dedup",            required_argument, NULL, OPT_DEDUP },
+        { "fs-compress",      required_argument, NULL, OPT_FS_COMPRESS },
         { "dedup-min-size",   required_argument, NULL, OPT_DEDUP_MIN },
         { "dedup-verify",     no_argument,       NULL, OPT_DEDUP_VERIFY },
         { "seccomp-list",     no_argument,       NULL, OPT_SECCOMP_LIST },
@@ -793,6 +798,12 @@ int main(int argc, char **argv) {
                 }
                 break;
             case OPT_DEDUP_VERIFY: dedup_verify = 1; break;
+            case OPT_FS_COMPRESS:
+                if (!strcmp(optarg, "off")) fs_compress = STORE_COMPRESS_OFF;
+                else if (!strcmp(optarg, "auto")) fs_compress = STORE_COMPRESS_AUTO;
+                else if (!strcmp(optarg, "all")) fs_compress = STORE_COMPRESS_ALL;
+                else { fprintf(stderr, "--fs-compress must be off, auto or all\n"); return 2; }
+                break;
             case OPT_SECCOMP_LIST:
                 sandbox_print_allowlist();
                 return 0;
@@ -963,6 +974,7 @@ int main(int argc, char **argv) {
         .dedup_mode = dedup_mode,
         .dedup_min = dedup_min,
         .dedup_verify = dedup_verify,
+        .fs_compress = fs_compress,
         .tls_port        = (uint16_t)tls_port,
         .tls_addr        = tls_addr,
         .tls_cert        = tls_cert,

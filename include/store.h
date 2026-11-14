@@ -106,6 +106,7 @@ typedef struct {
     const uint8_t *tlv;
     size_t      tlv_len;
     int         no_dedup;      /* never pool this object (SSE-C) */
+    uint64_t    size_hint;     /* declared body length, 0 = unknown */
 } store_put_opts_t;
 
 /* ---- Lifecycle ---- */
@@ -129,6 +130,12 @@ int      store_reflink_capable(const s3_store_t *s);
  * supports them (1). Returns the previous setting. Tests use it to run
  * the pure-copy paths on Btrfs. */
 int      store_set_reflink(s3_store_t *s, int on);
+/* Filesystem compression (item 7a): FS_COMPR_FL on new object/part
+ * files. AUTO skips already-compressed content types / suffixes and
+ * objects under 4 KiB. Returns -1 (and stays off) if the filesystem
+ * refuses the flag. */
+enum { STORE_COMPRESS_OFF = 0, STORE_COMPRESS_AUTO = 1, STORE_COMPRESS_ALL = 2 };
+int      store_set_fs_compress(s3_store_t *s, int mode);
 /* Whole-object dedup (item 6b, needs reflink): objects of at least
  * min_size share extents through <root>/cas/<scope>/…; scope is per
  * bucket owner (STORE_DEDUP_OWNER) or global. verify byte-compares on a

@@ -369,6 +369,17 @@ What's working end-to-end:
   charge logical bytes. `--dedup-verify` byte-compares before sharing.
   Metrics `fs3_dedup_hits_total`, `fs3_dedup_pool_adds_total`.
 
+- **Filesystem compression** — `--fs-compress auto|all` sets Btrfs's
+  `FS_COMPR_FL` on each new object file before the first write, so the
+  filesystem compresses extents transparently: sendfile, Range, reflinks
+  and the on-disk format are untouched. `auto` skips already-compressed
+  content types and suffixes (JPEG, PNG, video, audio, zip, gz, zst, 7z,
+  PDF, …) and objects under 4 KiB. On ext4 (or a Btrfs that refuses the
+  flag) fs3 logs a warning and stores uncompressed. Btrfs reports
+  uncompressed sizes to `stat`/`du`; use `compsize <data dir>` to see the
+  savings. On DSM, the shared folder's own compression setting may be the
+  simpler switch. Application-level zstd (for ext4) is not implemented.
+
 - **Integrity scrub** — a background pass (every `--scrub-interval-days`,
   default 30; `--scrub-now`; admin API `POST /v1/scrub`, progress at
   `GET /v1/scrub`) re-reads every object, noncurrent version and
@@ -400,7 +411,7 @@ What's working end-to-end:
 
 What's *not* yet wired:
 
-- SSE-C, compression, `FS_IMMUTABLE_FL` for
+- SSE-C, application-level compression (ext4), `FS_IMMUTABLE_FL` for
   COMPLIANCE versions.
 - Tag-based lifecycle filters, transitions, website routing rules (all
   refused with 501 rather than ignored).
