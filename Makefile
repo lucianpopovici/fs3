@@ -134,7 +134,7 @@ test: check-test-deps $(TEST_BINS) fs3 fs3-lockd
 	@echo "=== test_sigv4 ==="
 	@./tests/test_sigv4
 	@echo "=== test_credfile ==="
-	@./tests/test_credfile
+	@./tests/test_credfile 50000
 	@echo "=== test_e2e (HTTP integration) ==="
 	@./tests/test_e2e.sh
 	@echo "=== test_e2e_auth (SigV4 integration) ==="

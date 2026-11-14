@@ -10,6 +10,8 @@
 
 #include "sigv4.h"
 
+#include <fcntl.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -261,7 +263,47 @@ static void t_attrs_legacy_lines_unchanged(void) {
     cleanup_file();
 }
 
-int main(void) {
+/* Fuzz the line parser (round 2): random and mutated lines must never
+ * crash, and every accepted line must round-trip through the verifier. */
+static uint64_t frng = 0x1234567887654321ull;
+static unsigned frand(void) { frng ^= frng << 13; frng ^= frng >> 7; frng ^= frng << 17; return (unsigned)frng; }
+
+static void t_fuzz_lines(long iters) {
+    static const char *seeds[] = {
+        "AKIAFUZZ00000001:secretvalue:alice:created=1763107200,expires=1794643200,ro,disabled",
+        "AKIAFUZZ00000001:secretvalue::ro", "AKIAFUZZ00000001:secretvalue:bob", NULL };
+    static const char alpha[] = "AKI:,=0123456789roexpiscdabl \t#";
+    char line[160];
+    for (long i = 0; i < iters; i++) {
+        size_t n;
+        if (frand() & 1) {
+            const char *sd = seeds[frand() % 3];
+            n = strlen(sd);
+            memcpy(line, sd, n);
+            for (int m = 0, k = 1 + (int)(frand() % 4); m < k; m++)
+                line[frand() % n] = (frand() & 3) ? alpha[frand() % (sizeof(alpha) - 1)] : (char)(frand() & 0xff);
+            if (frand() % 4 == 0) n = frand() % (n + 1);
+        } else {
+            n = frand() % (sizeof(line) - 1);
+            for (size_t k = 0; k < n; k++) line[k] = alpha[frand() % (sizeof(alpha) - 1)];
+        }
+        line[n] = '\0';
+        sigv4_verifier_t *v = sigv4_create();
+        (void)main_test_parse_and_add_cred(v, line);
+        sigv4_destroy(v);
+    }
+    g_pass++;
+}
+
+int main(int argc, char **argv) {
+    /* The parser explains every refused line on stderr: mute it for the
+     * fuzz run, then restore. */
+    fflush(stderr);
+    int saved = dup(2), dn = open("/dev/null", O_WRONLY);
+    if (dn >= 0) { dup2(dn, 2); close(dn); }
+    t_fuzz_lines(argc > 1 ? atol(argv[1]) : 2000);
+    fflush(stderr);
+    if (saved >= 0) { dup2(saved, 2); close(saved); }
     t_attrs_parsed();
     t_attrs_empty_user_defaults();
     t_attrs_strict();
