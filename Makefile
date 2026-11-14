@@ -79,6 +79,17 @@ fs3-tls: $(ALL_C_SRCS) $(wildcard include/*.h)
 	$(CC) -std=c11 -g -D_GNU_SOURCE -DFS3_TLS -pthread $(TLS_SAN) $(INCLUDES) \
 	    $(ALL_C_SRCS) -o $@ -lssl -lcrypto -pthread
 
+# TLS binary for the Synology package / NAS testing: libssl + libcrypto
+# linked statically (DSM's own libssl is a different version), glibc
+# dynamic like fs3-static. Point C_INCLUDE_PATH / LIBRARY_PATH at a
+# static OpenSSL build when the host has none (see
+# docs/AGENT-BUILD-AND-DS1515-TEST.md).
+fs3-tls-static: $(ALL_C_SRCS) $(wildcard include/*.h)
+	$(CC) -std=c11 -O2 -g -D_GNU_SOURCE -DFS3_TLS -pthread -fPIE -fstack-protector-strong \
+	    -D_FORTIFY_SOURCE=2 $(INCLUDES) $(ALL_C_SRCS) -o $@ -pie -Wl,-z,relro,-z,now \
+	    -Wl,-z,noexecstack -Wl,-Bstatic -l:libssl.a -l:libcrypto.a -Wl,-Bdynamic -lpthread -ldl
+	strip $@
+
 # Our code: strict warnings
 src/%.o: src/%.c
 	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
@@ -264,7 +275,7 @@ tests/test_credfile: tests/test_credfile.c src/main.c src/sigv4.c src/log.c src/
 	    $(LDFLAGS) -o $@
 
 clean:
-	rm -f fs3 fs3-tls fs3-lockd $(OBJS) $(OBJS:.o=.d) $(TEST_BINS) tests/*.d
+	rm -f fs3 fs3-tls fs3-static fs3-tls-static fs3-lockd $(OBJS) $(OBJS:.o=.d) $(TEST_BINS) tests/*.d
 
 # Auto-include compiler-generated dependency files so header changes
 # correctly invalidate object files. Created via -MMD -MP above.

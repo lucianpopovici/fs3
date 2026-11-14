@@ -66,7 +66,10 @@ static const sb_call_t ALLOW[] = {
     /* I/O */
     C(read), C(write), C(pread64), C(pwrite64), C(readv), C(writev), C(sendfile),
     C(lseek), C(close), C(fsync), C(fdatasync), C(fadvise64), C(ftruncate), C(fallocate),
-    C(copy_file_range), C(dup), C(dup3), C(fcntl),
+    C(dup), C(dup3), C(fcntl),
+#ifdef __NR_copy_file_range          /* kernel 4.5; absent from 3.10 headers */
+    C(copy_file_range),
+#endif
 #ifdef __NR_dup2
     C(dup2),
 #endif
@@ -109,7 +112,10 @@ static const sb_call_t ALLOW[] = {
     C(gettid), C(getpid), C(getppid), C(getuid), C(geteuid), C(getgid), C(getegid),
     C(clock_gettime), C(clock_getres), C(clock_nanosleep), C(nanosleep), C(gettimeofday),
     C(prctl), C(ioprio_get), C(ioprio_set), C(getrlimit), C(prlimit64), C(sysinfo),
-    C(uname), C(getrandom),
+    C(uname),
+#ifdef __NR_getrandom               /* kernel 3.17; OpenSSL falls back to /dev/urandom */
+    C(getrandom),
+#endif
 #ifdef __NR_time
     C(time),
 #endif

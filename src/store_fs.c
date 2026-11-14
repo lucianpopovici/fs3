@@ -43,6 +43,23 @@
 #include <dirent.h>
 #include <ftw.h>
 #include <linux/fs.h>
+#include <linux/types.h>
+/* Kernel 3.10 headers (the DSM 7 toolchain for the DS1515+) predate the
+ * generic clone ioctls (4.5). Their numbers and argument layout are
+ * Btrfs's BTRFS_IOC_CLONE / BTRFS_IOC_CLONE_RANGE, which 3.10 Btrfs
+ * implements, so define them here when the headers don't. */
+#ifndef FICLONE
+#define FICLONE _IOW(0x94, 9, int)
+#endif
+#ifndef FICLONERANGE
+struct file_clone_range {
+    __s64 src_fd;
+    __u64 src_offset;
+    __u64 src_length;
+    __u64 dest_offset;
+};
+#define FICLONERANGE _IOW(0x94, 13, struct file_clone_range)
+#endif
 #include <sys/ioctl.h>
 #include <errno.h>
 #include <fcntl.h>
