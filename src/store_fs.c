@@ -517,16 +517,20 @@ static s3_err_t quota_check(const s3_store_t *s) {
 static int random_hex_id(char *out, size_t out_n);
 
 /* Write `owner`/`id` as dir/meta, atomically (tmp + fsync + rename). */
-static s3_err_t write_bucket_meta(const char *dir, const char *id,
-                                  const char *owner) {
+static s3_err_t write_bucket_meta_full(const char *dir,
+                                       const s3_bucket_meta_t *m) {
     char tmp[4200], final[4200];
     snprintf(tmp, sizeof(tmp), "%s/meta.tmp", dir);
     snprintf(final, sizeof(final), "%s/meta", dir);
     int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
     if (fd < 0) return map_io_err(errno);
-    char buf[256];
-    int n = snprintf(buf, sizeof(buf), "id=%s\nowner=%s\n", id,
-                     owner ? owner : "");
+    char buf[512];
+    int n = snprintf(buf, sizeof(buf), "id=%s\nowner=%s\n", m->id, m->owner);
+    if (m->versioning && n > 0 && (size_t)n < sizeof(buf))
+        n += snprintf(buf + n, sizeof(buf) - (size_t)n, "versioning=%s\n",
+                      m->versioning == S3_VERSIONING_ENABLED ? "Enabled" : "Suspended");
+    if (m->object_lock && n > 0 && (size_t)n < sizeof(buf))
+        n += snprintf(buf + n, sizeof(buf) - (size_t)n, "object_lock=1\n");
     if (n < 0 || (size_t)n >= sizeof(buf)
         || xwrite(fd, buf, (size_t)n) != n || xfsync(fd) < 0) {
         s3_err_t e = (n < 0 || (size_t)n >= sizeof(buf))
@@ -558,8 +562,16 @@ static void read_bucket_meta(const char *bucket_dir, s3_bucket_meta_t *out) {
             snprintf(out->id, sizeof(out->id), "%.32s", line + 3);
         else if (strncmp(line, "owner=", 6) == 0)
             snprintf(out->owner, sizeof(out->owner), "%.128s", line + 6);
+        else if (strcmp(line, "versioning=Enabled") == 0)
+            out->versioning = S3_VERSIONING_ENABLED;
+        else if (strcmp(line, "versioning=Suspended") == 0)
+            out->versioning = S3_VERSIONING_SUSPENDED;
+        else if (strcmp(line, "object_lock=1") == 0)
+            out->object_lock = 1;
     }
     fclose(fp);
+    /* Lock implies versioning, whatever the file says (fail safe). */
+    if (out->object_lock) out->versioning = S3_VERSIONING_ENABLED;
 }
 
 s3_err_t store_bucket_create(s3_store_t *s, s3_str_t name) {
@@ -569,8 +581,55 @@ s3_err_t store_bucket_create(s3_store_t *s, s3_str_t name) {
 /* The bucket dir and its meta are assembled under tmp/ and renamed into
  * buckets/ in one step, so a bucket never exists without its owner
  * (a crash leaves only a tmp/ dir, swept at startup). */
+static s3_err_t bucket_create(s3_store_t *s, s3_str_t name,
+                              const char *owner, int locked);
+
 s3_err_t store_bucket_create_owned(s3_store_t *s, s3_str_t name,
                                    const char *owner) {
+    return bucket_create(s, name, owner, 0);
+}
+
+s3_err_t store_bucket_create_locked(s3_store_t *s, s3_str_t name,
+                                    const char *owner) {
+    return bucket_create(s, name, owner, 1);
+}
+
+s3_err_t store_bucket_set_versioning(s3_store_t *s, s3_str_t name, int state) {
+    if (!s || state < 0 || state > 2) return S3_ERR_INVALID_ARGUMENT;
+    char bp[4096];
+    if (bucket_path(s, name, bp, sizeof(bp)) < 0) return S3_ERR_INTERNAL;
+    pthread_mutex_lock(&s->ns_mu);
+    s3_err_t e = S3_ERR_NO_SUCH_BUCKET;
+    if (store_bucket_exists(s, name)) {
+        s3_bucket_meta_t m;
+        read_bucket_meta(bp, &m);
+        if ((m.versioning && state == S3_VERSIONING_UNSET)
+            || (m.object_lock && state != S3_VERSIONING_ENABLED)) {
+            e = S3_ERR_INVALID_REQUEST;
+        } else {
+            if (!m.id[0]) random_hex_id(m.id, sizeof(m.id));
+            m.versioning = state;
+            e = write_bucket_meta_full(bp, &m);
+        }
+    }
+    pthread_mutex_unlock(&s->ns_mu);
+    return e;
+}
+
+const char *store_bucket_versioning(s3_store_t *s, s3_str_t name) {
+    s3_bucket_meta_t m;
+    if (store_bucket_meta(s, name, &m) != S3_OK) return "";
+    return m.versioning == S3_VERSIONING_ENABLED ? "Enabled"
+         : m.versioning == S3_VERSIONING_SUSPENDED ? "Suspended" : "Unset";
+}
+
+int store_bucket_object_lock(s3_store_t *s, s3_str_t name) {
+    s3_bucket_meta_t m;
+    return store_bucket_meta(s, name, &m) == S3_OK && m.object_lock;
+}
+
+static s3_err_t bucket_create(s3_store_t *s, s3_str_t name,
+                              const char *owner, int locked) {
     if (!s) return S3_ERR_INVALID_ARGUMENT;
     if (!valid_bucket_name(name)) return S3_ERR_INVALID_BUCKET_NAME;
 
@@ -581,7 +640,12 @@ s3_err_t store_bucket_create_owned(s3_store_t *s, s3_str_t name,
     snprintf(stage, sizeof(stage), "%s/bucket.XXXXXX", s->tmp_dir);
     if (random_hex_id(id, sizeof(id)) < 0) return S3_ERR_INTERNAL;
     if (!mkdtemp(stage)) return map_io_err(errno);
-    s3_err_t e = write_bucket_meta(stage, id, owner);
+    s3_bucket_meta_t nm;
+    memset(&nm, 0, sizeof(nm));
+    snprintf(nm.id, sizeof(nm.id), "%s", id);
+    snprintf(nm.owner, sizeof(nm.owner), "%s", owner ? owner : "");
+    if (locked) { nm.object_lock = 1; nm.versioning = S3_VERSIONING_ENABLED; }
+    s3_err_t e = write_bucket_meta_full(stage, &nm);
     if (e != S3_OK) { rm_rf(stage); return e; }
 
     /* ns_mu: the exists check and the rename are one step. rename() would
@@ -630,10 +694,12 @@ s3_err_t store_bucket_set_owner(s3_store_t *s, s3_str_t name,
         /* A pre-isolation bucket gets its id now; any upload still
          * streaming into it (captured id "") will then fail its commit
          * rather than land in a bucket that changed hands. */
-        if (!m.id[0] && random_hex_id(m.id, sizeof(m.id)) < 0)
+        if (!m.id[0] && random_hex_id(m.id, sizeof(m.id)) < 0) {
             e = S3_ERR_INTERNAL;
-        else
-            e = write_bucket_meta(bp, m.id, owner);
+        } else {
+            snprintf(m.owner, sizeof(m.owner), "%s", owner);
+            e = write_bucket_meta_full(bp, &m);
+        }
     }
     pthread_mutex_unlock(&s->ns_mu);
     return e;

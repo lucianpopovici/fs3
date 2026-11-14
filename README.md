@@ -403,6 +403,33 @@ tick "Expose on the LAN" in the install wizard or set
 `FS3_BIND=0.0.0.0` in `fs3.conf` and restart the package. Only do this
 on a network where you trust every host.
 
+### Admin API
+
+`/v1` JSON endpoints for scripting keys, buckets and grants (one write
+path for the DSM console and your scripts):
+
+| method + path | what |
+|---|---|
+| `GET /v1/keys` | access keys and their users (never secrets) |
+| `POST /v1/keys` `{"user":"bob"}` | new key, generated server-side; the secret is returned once |
+| `DELETE /v1/keys/<ak>` | delete a key (the last one is refused) |
+| `GET /v1/buckets` | buckets with owner, object count, bytes |
+| `GET /v1/buckets/<b>` | plus id, grants, versioning, lock and config flags |
+| `PUT /v1/buckets/<b>/owner` `{"owner":"bob"}` | change owner |
+| `PUT /v1/buckets/<b>/grants/<user>` `{"perms":"rw"}` / `DELETE` | grants |
+
+Prefer the Unix socket (`--admin-socket /var/run/fs3/admin.sock`: mode
+0600, peer uid checked with `SO_PEERCRED`) — every local user and
+container on the NAS can reach loopback. On the localhost metrics port
+the API needs `Authorization: Bearer <token>` from `--admin-token-file`
+(regular file, mode 0600, owned by the service user, else fs3 refuses to
+start); requests with an `Origin` header or a non-loopback `Host` are
+refused (DNS rebinding / CSRF), and failed tokens back off exponentially.
+Key changes rewrite `--credentials-file` atomically and run the same
+build-then-swap reload as SIGHUP, so a new key works on the next request
+and a deleted one is refused immediately. User names are restricted to
+`[A-Za-z0-9._@-]`.
+
 ### Monitoring
 
 The SPK starts fs3 with an admin listener on `127.0.0.1:9101`

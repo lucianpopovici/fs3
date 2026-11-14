@@ -77,6 +77,16 @@ typedef struct {
      * policies) may be stored. Default 0. */
     int                    allow_public;
 
+    /* Admin API (item 11): /v1 on the metrics listener needs this bearer
+     * token (NULL = disabled there); admin_socket adds a Unix-socket
+     * listener (mode 0600, peer uid checked). Key endpoints rewrite
+     * admin_cred_file and call admin_reload. */
+    const char            *admin_token;
+    const char            *admin_socket;
+    const char            *admin_cred_file;
+    int                  (*admin_reload)(void *user);
+    void                  *admin_reload_user;
+
     /* Optional tick callback, invoked from the event loop at most once
      * per second, between event batches (so never concurrently with a
      * request). main.c uses it to act on signal flags — e.g. the SIGHUP

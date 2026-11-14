@@ -12,6 +12,7 @@
 #include "server.h"
 #include "action.h"
 #include "lifecycle.h"
+#include "admin.h"
 #include "conn.h"
 #include "iopool.h"
 #include "log.h"
@@ -26,8 +27,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/epoll.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/un.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -38,6 +42,8 @@ struct server {
     int           listen_fd;
     int           web_fd;       /* website listener, -1 if off */
     int           admin_fd;     /* -1 unless cfg.metrics_port > 0 */
+    int           admin_uds_fd; /* -1 unless cfg.admin_socket */
+    admin_ctx_t  *admin;
     int           epoll_fd;
     fs3_metrics_t metrics;      /* plain counters; single-threaded loop */
     volatile int  stop;
@@ -158,51 +164,101 @@ static int admin_render_buckets(struct s3_store *store,
     return rc < 0 ? -1 : (int)off;
 }
 
-static void admin_handle(server_t *s) {
+/* Read one admin request: headers, then Content-Length body (≤ 16 KiB).
+ * Sockets have short timeouts; this is a localhost control channel. */
+static ssize_t admin_read_request(int fd, char *req, size_t cap) {
+    size_t n = 0;
     for (;;) {
-        int fd = accept4(s->admin_fd, NULL, NULL, SOCK_CLOEXEC);
+        if (n + 1 >= cap) return -1;
+        ssize_t r = read(fd, req + n, cap - 1 - n);
+        if (r <= 0) return n ? (ssize_t)n : -1;
+        n += (size_t)r;
+        req[n] = '\0';
+        char *end = strstr(req, "\r\n\r\n");
+        if (!end) continue;
+        size_t clen = 0;
+        for (char *h = req; h && h < end; h = strstr(h, "\r\n")) {
+            if (*h == '\r') h += 2;
+            if (strncasecmp(h, "content-length:", 15) == 0) {
+                clen = strtoul(h + 15, NULL, 10);
+                break;
+            }
+        }
+        if (clen > 16 * 1024) return -1;
+        if (n >= (size_t)(end + 4 - req) + clen) return (ssize_t)n;
+    }
+}
+
+static void admin_serve_fd(server_t *s, int fd, int via_uds) {
+    struct timeval tv = { .tv_usec = 200 * 1000 };
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+    static char req[20 * 1024];
+    ssize_t r = admin_read_request(fd, req, sizeof(req));
+    if (r <= 0) return;
+
+    if (strncmp(req, "GET /v1/", 8) == 0 || strncmp(req, "POST /v1/", 9) == 0
+        || strncmp(req, "PUT /v1/", 8) == 0 || strncmp(req, "DELETE /v1/", 11) == 0) {
+        size_t rn = 0;
+        char *resp = s->admin ? admin_handle_v1(s->admin, req, (size_t)r, via_uds, &rn) : NULL;
+        if (resp) {
+            (void)!write(fd, resp, rn);
+            free(resp);
+        }
+        return;
+    }
+    if (via_uds) {
+        admin_respond(fd, "404 Not Found", "text/plain", "not found\n", 10);
+        return;
+    }
+    if (strncmp(req, "GET /healthz", 12) == 0
+        || strncmp(req, "HEAD /healthz", 13) == 0) {
+        admin_respond(fd, "200 OK", "text/plain", "ok\n", 3);
+    } else if (strncmp(req, "GET /buckets", 12) == 0) {
+        static char body[64 * 1024];
+        int blen = admin_render_buckets(s->store, body, sizeof(body));
+        if (blen < 0) {
+            admin_respond(fd, "500 Internal Server Error",
+                          "text/plain", "render overflow\n", 16);
+        } else {
+            admin_respond(fd, "200 OK", "text/plain", body, (size_t)blen);
+        }
+    } else if (strncmp(req, "GET /metrics", 12) == 0) {
+        static char body[64 * 1024];
+        int blen = metrics_render(&s->metrics, s->store, body, sizeof(body));
+        if (blen < 0) {
+            admin_respond(fd, "500 Internal Server Error",
+                          "text/plain", "render overflow\n", 16);
+        } else {
+            admin_respond(fd, "200 OK", "text/plain; version=0.0.4",
+                          body, (size_t)blen);
+        }
+    } else {
+        admin_respond(fd, "404 Not Found", "text/plain", "not found\n", 10);
+    }
+}
+
+static void admin_handle(server_t *s, int lfd, int via_uds) {
+    for (;;) {
+        int fd = accept4(lfd, NULL, NULL, SOCK_CLOEXEC);
         if (fd < 0) {
             if (errno == EINTR) continue;
             return;  /* EAGAIN — drained */
         }
-        struct timeval tv = { .tv_usec = 200 * 1000 };
-        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-
-        char req[2048];
-        ssize_t r = read(fd, req, sizeof(req) - 1);
-        if (r <= 0) { close(fd); continue; }
-        req[r] = '\0';
-
-        if (strncmp(req, "GET /healthz", 12) == 0
-            || strncmp(req, "HEAD /healthz", 13) == 0) {
-            admin_respond(fd, "200 OK", "text/plain", "ok\n", 3);
-        } else if (strncmp(req, "GET /buckets", 12) == 0) {
-            static char body[64 * 1024];
-            int blen = admin_render_buckets(s->store, body, sizeof(body));
-            if (blen < 0) {
-                admin_respond(fd, "500 Internal Server Error",
-                              "text/plain", "render overflow\n", 16);
-            } else {
-                admin_respond(fd, "200 OK", "text/plain",
-                              body, (size_t)blen);
+        if (via_uds) {
+            /* S10: only our own uid (or root) may use the socket, on top
+             * of its 0600 mode. */
+            struct ucred cr;
+            socklen_t cl = sizeof(cr);
+            if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &cr, &cl) < 0
+                || (cr.uid != geteuid() && cr.uid != 0)) {
+                LOG_W("admin socket: refused peer uid");
+                close(fd);
+                continue;
             }
-        } else if (strncmp(req, "GET /metrics", 12) == 0) {
-            static char body[32 * 1024];
-            int blen = metrics_render(&s->metrics, s->store,
-                                      body, sizeof(body));
-            if (blen < 0) {
-                admin_respond(fd, "500 Internal Server Error",
-                              "text/plain", "render overflow\n", 16);
-            } else {
-                admin_respond(fd, "200 OK",
-                              "text/plain; version=0.0.4",
-                              body, (size_t)blen);
-            }
-        } else {
-            admin_respond(fd, "404 Not Found", "text/plain",
-                          "not found\n", 10);
         }
+        admin_serve_fd(s, fd, via_uds);
         close(fd);
     }
 }
@@ -217,6 +273,7 @@ server_t *server_create(const server_cfg_t *cfg) {
     s->cfg = *cfg;
     s->listen_fd = -1;
     s->web_fd = -1;
+    s->admin_uds_fd = -1;
     s->admin_fd = -1;
     s->epoll_fd = -1;
 
@@ -298,6 +355,45 @@ server_t *server_create(const server_cfg_t *cfg) {
         }
     }
 
+    /* Admin API (item 11). */
+    {
+        admin_cfg_t ac = {
+            .store = s->store, .token = cfg->admin_token,
+            .cred_file = cfg->admin_cred_file,
+            .reload = cfg->admin_reload, .reload_user = cfg->admin_reload_user,
+        };
+        s->admin = admin_create(&ac);
+        if (!s->admin) goto fail;
+    }
+    if (cfg->admin_socket) {
+        struct sockaddr_un su = { .sun_family = AF_UNIX };
+        if (strlen(cfg->admin_socket) >= sizeof(su.sun_path)) {
+            LOG_E("--admin-socket path too long");
+            goto fail;
+        }
+        snprintf(su.sun_path, sizeof(su.sun_path), "%s", cfg->admin_socket);
+        struct stat lst;
+        if (lstat(su.sun_path, &lst) == 0) {
+            if (!S_ISSOCK(lst.st_mode)) {
+                LOG_E("--admin-socket %s exists and is not a socket", su.sun_path);
+                goto fail;
+            }
+            unlink(su.sun_path);
+        }
+        s->admin_uds_fd = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+        mode_t old = umask(0177);          /* socket file created 0600 */
+        int br = s->admin_uds_fd < 0 ? -1
+               : bind(s->admin_uds_fd, (struct sockaddr *)&su, sizeof(su));
+        umask(old);
+        if (br < 0 || chmod(su.sun_path, 0600) < 0 || listen(s->admin_uds_fd, 16) < 0) {
+            LOG_E("admin socket %s: %s", su.sun_path, strerror(errno));
+            goto fail;
+        }
+        struct epoll_event uev = { .events = EPOLLIN, .data.ptr = &s->admin_uds_fd };
+        if (epoll_ctl(s->epoll_fd, EPOLL_CTL_ADD, s->admin_uds_fd, &uev) < 0) goto fail;
+        LOG_I("admin API on unix:%s", su.sun_path);
+    }
+
     /* Website listener (item 6). */
     if (cfg->web_port > 0) {
         s->web_fd = listen_socket(cfg->web_addr ? cfg->web_addr : "127.0.0.1",
@@ -364,6 +460,11 @@ void server_destroy(server_t *s) {
     iopool_destroy(s->pool);
     if (s->listen_fd >= 0) close(s->listen_fd);
     if (s->web_fd >= 0) close(s->web_fd);
+    if (s->admin_uds_fd >= 0) {
+        close(s->admin_uds_fd);
+        if (s->cfg.admin_socket) unlink(s->cfg.admin_socket);
+    }
+    admin_destroy(s->admin);
     if (s->admin_fd  >= 0) close(s->admin_fd);
     if (s->epoll_fd  >= 0) close(s->epoll_fd);
     if (s->store) store_close(s->store);
@@ -585,7 +686,11 @@ int server_run(server_t *s) {
 
             /* Admin/metrics listener (marker: the server pointer). */
             if (e->data.ptr == (void *)s) {
-                if (e->events & EPOLLIN) admin_handle(s);
+                if (e->events & EPOLLIN) admin_handle(s, s->admin_fd, 0);
+                continue;
+            }
+            if (e->data.ptr == (void *)&s->admin_uds_fd) {
+                if (e->events & EPOLLIN) admin_handle(s, s->admin_uds_fd, 1);
                 continue;
             }
 

@@ -133,9 +133,15 @@ s3_err_t store_bucket_create(s3_store_t *s, s3_str_t name);   /* ownerless */
  * Each bucket records the identity that owns it and a random id that
  * distinguishes it from any earlier bucket of the same name. Buckets
  * from before ownership existed read as ownerless with an empty id. */
+#define S3_VERSIONING_UNSET     0
+#define S3_VERSIONING_ENABLED   1
+#define S3_VERSIONING_SUSPENDED 2
+
 typedef struct {
     char owner[129];   /* "" = ownerless */
     char id[33];       /* 32 hex, or "" for a pre-ownership bucket */
+    int  versioning;   /* S3_VERSIONING_* (item 8) */
+    int  object_lock;  /* object lock enabled at creation (item 10) */
 } s3_bucket_meta_t;
 
 /* Create a bucket owned by `owner` (NULL/"" = ownerless). Returns
@@ -148,6 +154,17 @@ s3_err_t store_bucket_meta(s3_store_t *s, s3_str_t name,
 /* Replace a bucket's owner (keeps its id; gives a pre-ownership bucket one). */
 s3_err_t store_bucket_set_owner(s3_store_t *s, s3_str_t name,
                                 const char *owner);
+/* Versioning state (item 8). Once Enabled, a bucket can never go back to
+ * Unset: S3_VERSIONING_UNSET is refused after that. Buckets with object
+ * lock stay Enabled. */
+s3_err_t store_bucket_set_versioning(s3_store_t *s, s3_str_t name, int state);
+/* "Unset" / "Enabled" / "Suspended" ("" if no such bucket). */
+const char *store_bucket_versioning(s3_store_t *s, s3_str_t name);
+int      store_bucket_object_lock(s3_store_t *s, s3_str_t name);
+/* Create with object lock enabled (forces versioning Enabled). */
+s3_err_t store_bucket_create_locked(s3_store_t *s, s3_str_t name,
+                                    const char *owner);
+
 /* Give every ownerless bucket to `owner`. Returns how many, or -1. */
 int      store_assign_legacy_owner(s3_store_t *s, const char *owner);
 s3_err_t store_bucket_delete(s3_store_t *s, s3_str_t name); /* empty buckets only */

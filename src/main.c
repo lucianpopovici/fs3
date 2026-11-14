@@ -4,7 +4,11 @@
 #include "server.h"
 #include "sigv4.h"
 
+#include <errno.h>
+#include <fcntl.h>
 #include <getopt.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -69,6 +73,9 @@ static void usage(const char *argv0) {
         "      --web-addr <ip>        website listener address (default 127.0.0.1)\n"
         "      --web-root-domain <d>  websites at <bucket>.<d> (else Host = bucket name)\n"
         "      --allow-public         allow website configs / public bucket policies\n"
+        "      --admin-token-file <f> bearer token for the /v1 admin API on the metrics\n"
+        "                             port; file must be mode 0600 and owned by us\n"
+        "      --admin-socket <path>  serve the /v1 admin API on a unix socket (0600)\n"
         "                             (block-public-access is on by default)\n"
         "  -v, --verbose              debug logging\n"
         "  -h, --help                 this help\n",
@@ -183,35 +190,44 @@ typedef struct {
     int               n_auth_specs;
 } reload_ctx_t;
 
+static int do_reload(void *user);
+
 static void reload_tick(void *user) {
     if (!g_reload) return;
     g_reload = 0;
+    (void)do_reload(user);
+}
+
+/* Build-then-swap credential reload; also called by the admin API after
+ * it rewrites the credentials file. 0 on success. */
+static int do_reload(void *user) {
     reload_ctx_t *r = user;
     if (!r->live || !r->cred_file) {
         LOG_W("SIGHUP: credential reload needs --credentials-file; ignored");
-        return;
+        return -1;
     }
     sigv4_verifier_t *scratch = sigv4_create();
     if (!scratch) {
         LOG_E("SIGHUP reload: out of memory; keeping old credentials");
-        return;
+        return -1;
     }
     for (int i = 0; i < r->n_auth_specs; i++) {
         if (parse_and_add_cred(scratch, r->auth_specs[i]) < 0) {
             LOG_E("SIGHUP reload: bad --auth spec; keeping old credentials");
             sigv4_destroy(scratch);
-            return;
+            return -1;
         }
     }
     if (load_credentials_file(scratch, r->cred_file) < 0) {
         LOG_E("SIGHUP reload: cannot load %s; keeping old credentials",
               r->cred_file);
         sigv4_destroy(scratch);
-        return;
+        return -1;
     }
     sigv4_swap_creds(r->live, scratch);
     sigv4_destroy(scratch);  /* now holds (and zeroes) the old list */
     LOG_I("SIGHUP: credentials reloaded from %s", r->cred_file);
+    return 0;
 }
 
 enum {
@@ -239,9 +255,39 @@ enum {
     OPT_WEB_PORT,
     OPT_WEB_ROOT_DOMAIN,
     OPT_ALLOW_PUBLIC,
+    OPT_ADMIN_TOKEN_FILE,
+    OPT_ADMIN_SOCKET,
 };
 
 #ifndef FS3_MAIN_TESTING
+/* Read a secret (first line, trimmed) from a file that must be a
+ * regular file, mode 0600 (no group/other bits), owned by our euid —
+ * else refuse to start (S8/S10). */
+static int read_secret_file(const char *path, char *out, size_t cap) {
+    int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    struct stat st;
+    if (fd < 0 || fstat(fd, &st) < 0) {
+        fprintf(stderr, "%s: cannot open: %s\n", path, strerror(errno));
+        if (fd >= 0) close(fd);
+        return -1;
+    }
+    if (!S_ISREG(st.st_mode) || (st.st_mode & 077) || st.st_uid != geteuid()) {
+        fprintf(stderr, "%s: must be a regular file, mode 0600, owned by the "
+                        "service user\n", path);
+        close(fd);
+        return -1;
+    }
+    ssize_t n = read(fd, out, cap - 1);
+    close(fd);
+    if (n <= 0) { fprintf(stderr, "%s: empty\n", path); return -1; }
+    out[n] = '\0';
+    out[strcspn(out, "\r\n")] = '\0';
+    size_t len = strlen(out);
+    while (len && (out[len-1] == ' ' || out[len-1] == '\t')) out[--len] = '\0';
+    if (len < 16) { fprintf(stderr, "%s: secret must be at least 16 characters\n", path); return -1; }
+    return 0;
+}
+
 int main(int argc, char **argv) {
     const char *addr = "127.0.0.1";
     const char *data_root = "/tmp/fs3-data";
@@ -274,6 +320,8 @@ int main(int argc, char **argv) {
     long lifecycle_time_offset = 0;
     const char *web_addr = "127.0.0.1", *web_root_domain = NULL;
     int web_port = 0, allow_public = 0;
+    char admin_token[256] = "";
+    const char *admin_socket = NULL;
     sigv4_verifier_t *auth = NULL;
     reload_ctx_t reload_ctx = {0};
 
@@ -305,6 +353,8 @@ int main(int argc, char **argv) {
         { "web-port",         required_argument, NULL, OPT_WEB_PORT },
         { "web-root-domain",  required_argument, NULL, OPT_WEB_ROOT_DOMAIN },
         { "allow-public",     no_argument,       NULL, OPT_ALLOW_PUBLIC },
+        { "admin-token-file", required_argument, NULL, OPT_ADMIN_TOKEN_FILE },
+        { "admin-socket",     required_argument, NULL, OPT_ADMIN_SOCKET },
         { "verbose",          no_argument,       NULL, 'v' },
         { "help",             no_argument,       NULL, 'h' },
         { 0 },
@@ -486,6 +536,11 @@ int main(int argc, char **argv) {
                 break;
             }
             case OPT_ALLOW_PUBLIC: allow_public = 1; break;
+            case OPT_ADMIN_SOCKET: admin_socket = optarg; break;
+            case OPT_ADMIN_TOKEN_FILE:
+                if (read_secret_file(optarg, admin_token, sizeof(admin_token)) < 0)
+                    return 2;
+                break;
             default:  usage(argv[0]); return 2;
         }
     }
@@ -548,6 +603,11 @@ int main(int argc, char **argv) {
         .web_port        = (uint16_t)web_port,
         .web_root_domain = web_root_domain,
         .allow_public    = allow_public,
+        .admin_token     = admin_token[0] ? admin_token : NULL,
+        .admin_socket    = admin_socket,
+        .admin_cred_file = reload_ctx.cred_file,
+        .admin_reload    = do_reload,
+        .admin_reload_user = &reload_ctx,
         .tick_cb        = reload_tick,
         .tick_user      = &reload_ctx,
     };
