@@ -22,6 +22,9 @@
   of a credentials line, `PATCH /v1/keys/<ak>`, `--key-max-age-days`,
   `keys.state`). **No downgrade** once a credentials line carries
   attributes: an older fs3 refuses the file (`:` in the user field).
+- seccomp-BPF syscall filter, on by default (`--seccomp=off|log|enforce|require`).
+- Reflink fast paths on Btrfs for multipart Complete, CopyObject and
+  UploadPartCopy (`--reflink auto|off`, `fs3_reflink_clones_total`).
 - Audit log lines carry the S3 error code (`"error":"…"`).
 - Fix: a request refused before `100 Continue` now closes the connection
   (botocore stalled 60 s on the next request).

@@ -128,6 +128,10 @@ int metrics_render(const fs3_metrics_t *m, struct s3_store *store,
          "fs3_storage_free_bytes %llu\n",
          (unsigned long long)st.volume_free_bytes);
 
+    EMIT("# HELP fs3_reflink_clones_total Extent clones done instead of byte copies (reflink).\n"
+         "# TYPE fs3_reflink_clones_total counter\n"
+         "fs3_reflink_clones_total %llu\n",
+         (unsigned long long)__atomic_load_n(&g_store_clone_count, __ATOMIC_RELAXED));
     EMIT("# HELP fs3_quota_rejections_total Writes refused because a bucket or user quota was reached.\n"
          "# TYPE fs3_quota_rejections_total counter\n"
          "fs3_quota_rejections_total %llu\n",

@@ -124,6 +124,17 @@ void     store_set_min_free_bytes(s3_store_t *s, uint64_t min_free_bytes);
 int      store_set_header_pad(s3_store_t *s, int on);
 /* 1 if store_open found the filesystem reflink-capable. */
 int      store_reflink_capable(const s3_store_t *s);
+/* Turn the reflink fast paths off (0) or back on if the filesystem
+ * supports them (1). Returns the previous setting. Tests use it to run
+ * the pure-copy paths on Btrfs. */
+int      store_set_reflink(s3_store_t *s, int on);
+/* Number of extent clones done since start (atomic; tests, metrics). */
+extern uint64_t g_store_clone_count;
+/* Reflink copy of the reader's remaining payload into the writer (both
+ * schema-4 padded or a part file); the bytes are still read once for the
+ * writer's hashes and `extra`. S3_ERR_NOT_IMPLEMENTED: copy instead. */
+s3_err_t store_writer_clone(s3_writer_t *w, s3_reader_t *r,
+                            void (*extra)(void *ctx, const void *p, size_t n), void *ctx);
 
 /* Point-in-time stats for the metrics endpoint: bucket count, in-flight
  * multipart uploads, and data-volume usage from statvfs. Cheap (two

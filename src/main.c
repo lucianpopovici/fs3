@@ -3,6 +3,7 @@
 #include "log.h"
 #include "server.h"
 #include "sigv4.h"
+#include "sandbox.h"
 #include "audit.h"
 
 #include <errno.h>
@@ -86,6 +87,8 @@ static void usage(const char *argv0) {
         "      --tls-cert <pem>       certificate chain; --tls-key <pem> key (mode 0600)\n"
         "                             SIGHUP re-reads both (a bad file keeps the old ones)\n"
         "      --key-max-age-days N   keys created by the admin API expire after N days (0 = never)\n"
+        "      --seccomp MODE         syscall filter: off, log, enforce (default), require\n"
+        "      --reflink auto|off     extent cloning on Btrfs/XFS (default auto)\n"
         "      --scrub-interval-days N  integrity scrub every N days (default 30; 0 = only on demand)\n"
         "      --scrub-now            start a scrub pass right after startup\n"
         "      --scrub-rate N         scrub read rate in bytes/s (default 20M; 0 = unthrottled)\n"
@@ -401,6 +404,9 @@ enum {
     OPT_DEFAULT_BUCKET_QUOTA,
     OPT_SCRUB_INTERVAL_DAYS,
     OPT_KEY_MAX_AGE_DAYS,
+    OPT_SECCOMP,
+    OPT_REFLINK,
+    OPT_SECCOMP_LIST,
     OPT_SCRUB_NOW,
     OPT_SCRUB_RATE,
     OPT_SCRUB_FAIL_READS,
@@ -478,6 +484,8 @@ int main(int argc, char **argv) {
     uint64_t def_bucket_quota = 0, def_user_quota = 0;   /* 0 = unlimited */
     int scrub_interval_days = 30, scrub_now = 0, scrub_fail_reads = 0;
     int key_max_age_days = 0;
+    int seccomp_mode = SANDBOX_ENFORCE;
+    int reflink_off = 0;
     uint64_t scrub_rate = 20ULL * 1024 * 1024;           /* 20 MiB/s */
     int tls_port = 0, require_tls = 0, require_signed_payload = 0, tls_max_per_ip = 32;
     const char *tls_addr = NULL, *tls_cert = NULL, *tls_key = NULL;
@@ -530,6 +538,9 @@ int main(int argc, char **argv) {
         { "default-bucket-quota", required_argument, NULL, OPT_DEFAULT_BUCKET_QUOTA },
         { "scrub-interval-days", required_argument, NULL, OPT_SCRUB_INTERVAL_DAYS },
         { "key-max-age-days", required_argument, NULL, OPT_KEY_MAX_AGE_DAYS },
+        { "seccomp",          required_argument, NULL, OPT_SECCOMP },
+        { "reflink",          required_argument, NULL, OPT_REFLINK },
+        { "seccomp-list",     no_argument,       NULL, OPT_SECCOMP_LIST },
         { "scrub-now",        no_argument,       NULL, OPT_SCRUB_NOW },
         { "scrub-rate",       required_argument, NULL, OPT_SCRUB_RATE },
         { "scrub-fail-reads", no_argument,       NULL, OPT_SCRUB_FAIL_READS },
@@ -741,6 +752,23 @@ int main(int argc, char **argv) {
                 }
                 break;
             case OPT_SCRUB_NOW:        scrub_now = 1; break;
+            case OPT_SECCOMP:
+                seccomp_mode = sandbox_parse_mode(optarg);
+                if (seccomp_mode < 0) {
+                    fprintf(stderr, "--seccomp must be off, log, enforce or require\n");
+                    return 2;
+                }
+                break;
+            case OPT_REFLINK:
+                if (strcmp(optarg, "off") && strcmp(optarg, "auto")) {
+                    fprintf(stderr, "--reflink must be auto or off\n");
+                    return 2;
+                }
+                reflink_off = !strcmp(optarg, "off");
+                break;
+            case OPT_SECCOMP_LIST:
+                sandbox_print_allowlist();
+                return 0;
             case OPT_KEY_MAX_AGE_DAYS:
                 key_max_age_days = atoi(optarg);
                 if (key_max_age_days < 0 || key_max_age_days > 36500) {
@@ -903,6 +931,8 @@ int main(int argc, char **argv) {
         .scrub_rate = scrub_rate,
         .scrub_fail_reads = scrub_fail_reads,
         .key_max_age_days = key_max_age_days,
+        .seccomp_mode = seccomp_mode,
+        .reflink_off = reflink_off,
         .tls_port        = (uint16_t)tls_port,
         .tls_addr        = tls_addr,
         .tls_cert        = tls_cert,

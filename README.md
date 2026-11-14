@@ -336,6 +336,28 @@ What's working end-to-end:
   `fs3_keys_unused_90d`; both in the DSM console, which keeps a key's
   attributes when its secret is replaced.
 
+- **seccomp** — after startup (listeners bound, TLS and credentials
+  loaded, store recovered, logs open) and before the I/O workers exist,
+  fs3 installs a hand-written seccomp-BPF allowlist that every thread
+  inherits (no libseccomp; works on kernel 3.10, which has no TSYNC).
+  `clone` is allowed for threads only, `socket` for AF_UNIX/INET/INET6,
+  `ioctl` for the request numbers in use; `execve`, `fork`, `ptrace`
+  and everything else kill the process. `--seccomp=off|log|enforce|require`
+  (default `enforce`; `log` prints the blocked syscall number and exits
+  with 159; `require` refuses to start without seccomp). Sanitizer builds
+  compile it out. `make seccomp-profile` runs the e2e suites under
+  `strace -f` and diffs the syscalls used against the compiled-in table
+  (`fs3 --seccomp-list`); rerun it on the Synology static binary after a
+  toolchain change.
+
+- **Reflink fast paths** — on Btrfs/XFS (probed at startup; `--reflink
+  off` to disable) multipart Complete clones each part's extents into the
+  object instead of copying (no double disk space, ETag and CRC come from
+  the part records), and CopyObject / UploadPartCopy clone the source
+  extent when both payloads are block-aligned; anything misaligned falls
+  back to a copy. `fs3_reflink_clones_total` counts clones. Whole-object
+  dedup is not implemented yet.
+
 - **Integrity scrub** — a background pass (every `--scrub-interval-days`,
   default 30; `--scrub-now`; admin API `POST /v1/scrub`, progress at
   `GET /v1/scrub`) re-reads every object, noncurrent version and
@@ -367,7 +389,8 @@ What's working end-to-end:
 
 What's *not* yet wired:
 
-- SSE-C, seccomp, `FS_IMMUTABLE_FL` for COMPLIANCE versions.
+- SSE-C, whole-object dedup, compression, `FS_IMMUTABLE_FL` for
+  COMPLIANCE versions.
 - Tag-based lifecycle filters, transitions, website routing rules (all
   refused with 501 rather than ignored).
 - Replication, server-side encryption, STS.

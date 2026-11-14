@@ -16,7 +16,7 @@ AK=AKIACHECKSUM0001
 SK=checksumSecret0123456789012345678901234567
 
 cleanup() {
-    [ -n "${SP:-}" ] && { kill "$SP" 2>/dev/null; wait "$SP" 2>/dev/null; } || true
+    [ -n "${SP:-}" ] && { kill "$SP" 2>/dev/null; wait "$SP" 2>/dev/null; [ $? -ne 159 ] || echo "FAIL: server died with SIGSYS (seccomp blocked a syscall; see --seccomp=log)" >&2; } || true
     [ -n "${SP2:-}" ] && kill "$SP2" 2>/dev/null || true
     rm -rf "$DATA" "$DATA-open" "$LOG" "$T".*
 }
@@ -26,7 +26,7 @@ BUILD_FLAGS=""
 [ "${DEBUG:-0}" = "1" ] && BUILD_FLAGS="DEBUG=1"
 (cd "$ROOT" && make $BUILD_FLAGS fs3 >/dev/null 2>&1)
 
-"$ROOT/fs3" -p "$PORT" -d "$DATA" --auth "$AK:$SK" --require-auth >"$LOG" 2>&1 &
+${FS3_WRAP:-} "$ROOT/fs3" -p "$PORT" -d "$DATA" --auth "$AK:$SK" --require-auth >"$LOG" 2>&1 &
 SP=$!
 sleep 0.4
 kill -0 "$SP" 2>/dev/null || { echo "server did not start" >&2; cat "$LOG" >&2; exit 1; }
@@ -211,7 +211,7 @@ check_eq "GET without checksum-mode: no checksum" "$(sed -n 2p "$T.rng")" "False
 
 # ---- Open mode: aws-chunked framing is still decoded ----------------------
 OPORT=$((PORT + 1))
-"$ROOT/fs3" -p "$OPORT" -d "$DATA-open" >"$LOG.open" 2>&1 &
+${FS3_WRAP:-} "$ROOT/fs3" -p "$OPORT" -d "$DATA-open" >"$LOG.open" 2>&1 &
 SP2=$!
 sleep 0.4
 curl -s -X PUT "http://127.0.0.1:$OPORT/openb" >/dev/null

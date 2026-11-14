@@ -19,7 +19,7 @@ AK=AKIAADMINTEST001
 SK=adminTestSecret01234567890123456789012345
 
 cleanup() {
-    [ -n "${SP:-}" ] && { kill "$SP" 2>/dev/null; wait "$SP" 2>/dev/null; } || true
+    [ -n "${SP:-}" ] && { kill "$SP" 2>/dev/null; wait "$SP" 2>/dev/null; [ $? -ne 159 ] || echo "FAIL: server died with SIGSYS (seccomp blocked a syscall; see --seccomp=log)" >&2; } || true
     rm -rf "$DATA" "$LOG" "$T".*
 }
 trap cleanup EXIT
@@ -40,14 +40,14 @@ check_eq() {
 
 # Token file permissions are enforced.
 chmod 0644 "$T.token"
-if "$ROOT/fs3" -p "$PORT" -d "$DATA" --credentials-file "$T.creds" \
+if ${FS3_WRAP:-} "$ROOT/fs3" -p "$PORT" -d "$DATA" --credentials-file "$T.creds" \
        --metrics-port "$MPORT" --admin-token-file "$T.token" >"$LOG" 2>&1 & then
     sleep 0.4
 fi
 check_eq "0644 token file refused" "$(grep -c 'mode 0600' "$LOG" || true)" "1"
 chmod 0600 "$T.token"
 
-"$ROOT/fs3" -p "$PORT" -d "$DATA" --credentials-file "$T.creds" --require-auth \
+${FS3_WRAP:-} "$ROOT/fs3" -p "$PORT" -d "$DATA" --credentials-file "$T.creds" --require-auth \
     --metrics-port "$MPORT" --admin-token-file "$T.token" --admin-socket "$SOCK" >"$LOG" 2>&1 &
 SP=$!
 sleep 0.4

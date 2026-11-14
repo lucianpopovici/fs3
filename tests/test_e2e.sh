@@ -34,6 +34,7 @@ cleanup() {
     if [ -n "$SERVER_PID" ]; then
         kill $SERVER_PID 2>/dev/null
         wait $SERVER_PID 2>/dev/null
+        [ $? -ne 159 ] || echo "FAIL: server died with SIGSYS (seccomp blocked a syscall; see --seccomp=log)" >&2
     fi
     rm -rf "$DATA" "$LOG"
 }
@@ -47,7 +48,7 @@ trap cleanup EXIT
     exit 1
 }
 
-"$ROOT/fs3" -p $PORT -d "$DATA" >"$LOG" 2>&1 &
+${FS3_WRAP:-} "$ROOT/fs3" -p $PORT -d "$DATA" >"$LOG" 2>&1 &
 SERVER_PID=$!
 
 # Wait for server to be reachable
@@ -114,7 +115,7 @@ run_test() {
 # subshell that doesn't propagate variables to the parent.
 BODY_FILE=/tmp/fs3-body.$$
 HEADERS_FILE=/tmp/fs3-headers.$$
-trap 'rm -f $BODY_FILE $HEADERS_FILE' EXIT
+trap 'rm -f $BODY_FILE $HEADERS_FILE; cleanup' EXIT   # keep stopping the server
 
 http_get() {
     curl -sS -m 5 -o "$BODY_FILE" -w "%{http_code}" "$URL$1"

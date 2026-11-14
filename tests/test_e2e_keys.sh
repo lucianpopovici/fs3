@@ -17,7 +17,7 @@ A=AKIAKEYSALICE001; AS=keysAliceSecret01234567890123456789012
 R=AKIAKEYSREAD0001; RS=keysReadSecret012345678901234567890123
 
 cleanup() {
-    [ -n "${SP:-}" ] && { kill "$SP" 2>/dev/null; wait "$SP" 2>/dev/null; } || true
+    [ -n "${SP:-}" ] && { kill "$SP" 2>/dev/null; wait "$SP" 2>/dev/null; [ $? -ne 159 ] || echo "FAIL: server died with SIGSYS (seccomp blocked a syscall; see --seccomp=log)" >&2; } || true
     rm -rf "$DATA" "$T".*
 }
 trap cleanup EXIT
@@ -30,7 +30,7 @@ printf '%s:%s:alice\n%s:%s:alice:created=1763107200,ro\n' "$A" "$AS" "$R" "$RS" 
 chmod 600 "$T.creds"
 
 start() {
-    "$ROOT/fs3" -p "$PORT" -d "$DATA" --credentials-file "$T.creds" --require-auth \
+    ${FS3_WRAP:-} "$ROOT/fs3" -p "$PORT" -d "$DATA" --credentials-file "$T.creds" --require-auth \
         --metrics-port "$MPORT" --admin-socket "$SOCK" --audit-log "$T.audit" "$@" >>"$LOG" 2>&1 &
     SP=$!
     for _ in $(seq 50); do [ -S "$SOCK" ] && curl -s -o /dev/null "$URL/" && break; sleep 0.1; done

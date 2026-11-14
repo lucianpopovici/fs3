@@ -58,7 +58,7 @@ check_lacks() { # name haystack needle
 
 start_server() {
     mkdir -p "$DATA"
-    "$ROOT/fs3" -p "$PORT" -d "$DATA" "$@" >"$LOG" 2>&1 &
+    ${FS3_WRAP:-} "$ROOT/fs3" -p "$PORT" -d "$DATA" "$@" >"$LOG" 2>&1 &
     SP=$!
     sleep 0.4
     if ! kill -0 "$SP" 2>/dev/null; then

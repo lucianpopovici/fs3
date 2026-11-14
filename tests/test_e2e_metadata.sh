@@ -15,7 +15,7 @@ WURL="http://127.0.0.1:$WPORT"
 A=AKIAMETAALICE001; AS=metaAliceSecret01234567890123456789012
 
 cleanup() {
-    [ -n "${SP:-}" ] && { kill "$SP" 2>/dev/null; wait "$SP" 2>/dev/null; } || true
+    [ -n "${SP:-}" ] && { kill "$SP" 2>/dev/null; wait "$SP" 2>/dev/null; [ $? -ne 159 ] || echo "FAIL: server died with SIGSYS (seccomp blocked a syscall; see --seccomp=log)" >&2; } || true
     rm -rf "$DATA" "$LOG"
 }
 trap cleanup EXIT
@@ -24,7 +24,7 @@ BUILD_FLAGS=""
 [ "${DEBUG:-0}" = "1" ] && BUILD_FLAGS="DEBUG=1"
 (cd "$ROOT" && make $BUILD_FLAGS fs3 >/dev/null 2>&1)
 
-"$ROOT/fs3" -p "$PORT" -d "$DATA" --auth "$A:$AS:alice" --mpu-min-part-size 0 \
+${FS3_WRAP:-} "$ROOT/fs3" -p "$PORT" -d "$DATA" --auth "$A:$AS:alice" --mpu-min-part-size 0 \
     --allow-public --web-port "$WPORT" --web-root-domain web.example.lan >"$LOG" 2>&1 &
 SP=$!
 sleep 0.4

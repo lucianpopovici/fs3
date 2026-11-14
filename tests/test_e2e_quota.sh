@@ -16,7 +16,7 @@ A=AKIAQUOTAALICE01; AS=quotaAliceSecret0123456789012345678901
 B=AKIAQUOTABOB0001; BS=quotaBobSecret012345678901234567890123
 
 cleanup() {
-    [ -n "${SP:-}" ] && { kill "$SP" 2>/dev/null; wait "$SP" 2>/dev/null; } || true
+    [ -n "${SP:-}" ] && { kill "$SP" 2>/dev/null; wait "$SP" 2>/dev/null; [ $? -ne 159 ] || echo "FAIL: server died with SIGSYS (seccomp blocked a syscall; see --seccomp=log)" >&2; } || true
     rm -rf "$DATA" "$T".*
 }
 trap cleanup EXIT
@@ -28,7 +28,7 @@ BUILD_FLAGS=""
 printf '%s:%s:alice\n%s:%s:bob\n' "$A" "$AS" "$B" "$BS" > "$T.creds"
 
 start() {
-    "$ROOT/fs3" -p "$PORT" -d "$DATA" --credentials-file "$T.creds" --allow-public --allow-public-write \
+    ${FS3_WRAP:-} "$ROOT/fs3" -p "$PORT" -d "$DATA" --credentials-file "$T.creds" --allow-public --allow-public-write \
         --metrics-port "$MPORT" --admin-socket "$SOCK" --mpu-min-part-size 0 \
         --audit-log "$T.audit" "$@" >>"$LOG" 2>&1 &
     SP=$!

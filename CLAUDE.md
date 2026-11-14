@@ -63,8 +63,16 @@ Load-bearing rules added on the way:
 Round 2 (Nov 2026) added part records, ListParts, UploadPartCopy,
 user metadata, ListObjectsV2, quotas (`q_*` in store_fs.c) and the
 integrity scrub (`src/scrub.c`, `store_scrub_file`) and key hygiene
-(`sigv4_cred_attrs_t`, read-only check at the top of `authz()`). Not
-done yet: SSE-C, `FS_IMMUTABLE_FL` hardening, seccomp.
+(`sigv4_cred_attrs_t`, read-only check at the top of `authz()`),
+seccomp (`src/sandbox.c`) and reflink fast paths (`clone_range`,
+`store_writer_clone`). Not done yet: dedup, compression, SSE-C,
+`FS_IMMUTABLE_FL` hardening.
+
+- **seccomp is on by default.** A new syscall in a runtime path (not
+  startup) kills the server with SIGSYS; the test harness says so. Add it
+  to `ALLOW[]` in `src/sandbox.c` and rerun `make seccomp-profile`.
+  The worker pool is created *after* the filter is installed, at the end
+  of `server_create`; keep it last.
 
 ## First five minutes on a fresh box
 

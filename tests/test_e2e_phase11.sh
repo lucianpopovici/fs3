@@ -48,7 +48,7 @@ sign() {
 
 start_server() {
     rm -rf "$DATA"; mkdir -p "$DATA"
-    "$ROOT/fs3" -p "$PORT" -d "$DATA" "$@" >"$LOG" 2>&1 &
+    ${FS3_WRAP:-} "$ROOT/fs3" -p "$PORT" -d "$DATA" "$@" >"$LOG" 2>&1 &
     SP=$!
     sleep 0.4
     if ! kill -0 "$SP" 2>/dev/null; then
@@ -149,7 +149,7 @@ EOF
 
 PORT2=$(( PORT + 1 ))
 rm -rf "$DATA"; mkdir -p "$DATA"
-"$ROOT/fs3" -p "$PORT2" -d "$DATA" \
+${FS3_WRAP:-} "$ROOT/fs3" -p "$PORT2" -d "$DATA" \
     --credentials-file "$CRED_FILE" \
     --auth "$BOB_AK:$BOB_SK" \
     --require-auth >"$LOG" 2>&1 &

@@ -158,6 +158,8 @@ scrub_t *scrub_create(const scrub_cfg_t *cfg) {
     return sc;
 }
 
+void scrub_set_pool(scrub_t *sc, struct iopool *pool) { if (sc) sc->cfg.pool = pool; }
+
 void scrub_stop(scrub_t *sc) { if (sc) __atomic_store_n(&sc->stop, 1, __ATOMIC_RELAXED); }
 
 void scrub_destroy(scrub_t *sc) {

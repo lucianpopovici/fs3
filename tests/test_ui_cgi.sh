@@ -243,7 +243,7 @@ kill "$HUPPID" 2>/dev/null || true; HUPPID=
 # 4. Live bucket stats via a real fs3 admin listener
 # ===================================================================
 mkdir -p "$DATA"
-"$ROOT/fs3" -p "$PORT" -d "$DATA" --metrics-port "$MPORT" >"$LOG" 2>&1 &
+${FS3_WRAP:-} "$ROOT/fs3" -p "$PORT" -d "$DATA" --metrics-port "$MPORT" >"$LOG" 2>&1 &
 SP=$!
 sleep 0.4
 kill -0 "$SP" 2>/dev/null || { echo "fs3 did not start" >&2; cat "$LOG" >&2; exit 1; }

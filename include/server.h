@@ -100,6 +100,8 @@ typedef struct {
     uint64_t               scrub_rate;            /* bytes/s, 0 = unthrottled */
     int                    scrub_fail_reads;
     int                    key_max_age_days;      /* default expiry of admin-created keys */
+    int                    seccomp_mode;          /* sandbox_mode_t */
+    int                    reflink_off;           /* --reflink off */
 
     /* Admin API (item 11): /v1 on the metrics listener needs this bearer
      * token (NULL = disabled there); admin_socket adds a Unix-socket

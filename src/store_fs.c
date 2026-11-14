@@ -961,6 +961,40 @@ static int probe_reflink(const s3_store_t *s) {
     return ok;
 }
 
+/* Reflink fast paths (round 2, item 6a). Btrfs/XFS clone ioctls need a
+ * block-aligned source offset, destination offset and length; the
+ * length may be unaligned only when it runs to the source's EOF. */
+#define CLONE_BLK 4096u
+
+/* Tests force the clone paths off (pure copy) or keep the probe result. */
+int store_set_reflink(s3_store_t *s, int on) {
+    int old = s->reflink;
+    s->reflink = on ? s->reflink || probe_reflink(s) : 0;
+    return old;
+}
+
+uint64_t g_store_clone_count;      /* clones done (tests / metrics), atomic */
+
+/* 0 cloned, -1 not possible here (caller copies instead). */
+static int clone_range(int dst, uint64_t doff, int src, uint64_t soff, uint64_t len) {
+#ifdef FICLONERANGE
+    if (len == 0) return 0;
+    struct stat st;
+    if (fstat(src, &st) < 0) return -1;
+    int to_eof = soff + len == (uint64_t)st.st_size;
+    if (doff % CLONE_BLK || soff % CLONE_BLK || (len % CLONE_BLK && !to_eof)) return -1;
+    struct file_clone_range r = { .src_fd = src, .src_offset = soff,
+                                  .src_length = to_eof ? 0 : len,   /* 0 = to EOF */
+                                  .dest_offset = doff };
+    if (ioctl(dst, FICLONERANGE, &r) < 0) return -1;
+    __atomic_fetch_add(&g_store_clone_count, 1, __ATOMIC_RELAXED);
+    return 0;
+#else
+    (void)dst; (void)doff; (void)src; (void)soff; (void)len;
+    return -1;
+#endif
+}
+
 /* ===================================================================== */
 /* Bucket config sidecars + parsed-config cache                           */
 /* ===================================================================== */
@@ -3173,18 +3207,35 @@ s3_err_t store_mpu_complete2(s3_store_t *s, s3_str_t bucket, s3_str_t key,
                          key.p, key.n, mpu_tlv, mpu_tlv_n) < 0) {
         e = map_io_err(errno); goto out;
     }
+    /* Reflink fast path (item 6a): clone each part's extents into the
+     * padded object file — no bytes copied, no double disk space. A part
+     * that can't be cloned (misaligned, ioctl refused) is copied. Bytes
+     * are read only when a full-object checksum needs them. */
+    off_t data_off = lseek(tfd, 0, SEEK_CUR);
+    uint64_t doff = data_off < 0 ? 0 : (uint64_t)data_off;
+    int try_clone = s->reflink && data_off >= 0 && doff % CLONE_BLK == 0;
     for (size_t i = 0; i < n_parts && e == S3_OK; i++) {
         char buf[64 * 1024];
+        int cloned = try_clone && (i + 1 == n_parts || ps[i].rec.size % CLONE_BLK == 0)
+                     && clone_range(tfd, doff, ps[i].fd, 0, ps[i].rec.size) == 0;
+        if (!cloned) try_clone = 0;            /* keep the rest sequential */
         off_t off = 0;
-        for (;;) {
-            ssize_t r = pread(ps[i].fd, buf, sizeof(buf), off);
-            if (r == 0) break;
-            if (r < 0) { if (errno == EINTR) continue; e = S3_ERR_INTERNAL; break; }
-            if (full.algo) cksum_update(&full, buf, (size_t)r);
-            if (xwrite(tfd, buf, (size_t)r) != r) { e = map_io_err(errno); break; }
-            off += r;
+        if (!cloned || full.algo) {
+            for (;;) {
+                ssize_t r = pread(ps[i].fd, buf, sizeof(buf), off);
+                if (r == 0) break;
+                if (r < 0) { if (errno == EINTR) continue; e = S3_ERR_INTERNAL; break; }
+                if (full.algo) cksum_update(&full, buf, (size_t)r);
+                if (!cloned && pwrite(tfd, buf, (size_t)r, (off_t)(doff + (uint64_t)off)) != r) {
+                    e = map_io_err(errno); break;
+                }
+                off += r;
+            }
+        } else {
+            off = (off_t)ps[i].rec.size;
         }
         if (e == S3_OK && (uint64_t)off != ps[i].rec.size) e = S3_ERR_INVALID_PART;
+        doff += ps[i].rec.size;
     }
     if (e != S3_OK) goto out;
 
@@ -5342,3 +5393,39 @@ s3_err_t store_scrub_file(s3_store_t *s, const char *path, int kind, const char 
     if (km) pthread_mutex_unlock(km);
     return S3_OK;
 }
+
+/* Reflink copy (item 6a): clone the reader's remaining payload into the
+ * writer's payload and feed the same bytes through the writer's hashes
+ * (and `extra`, e.g. a part checksum) without writing them. The source
+ * fd stays open, so a concurrent overwrite can't change what is cloned.
+ * S3_ERR_NOT_IMPLEMENTED: not possible here — nothing was done, stream
+ * the bytes instead. */
+s3_err_t store_writer_clone(s3_writer_t *w, s3_reader_t *r,
+                            void (*extra)(void *ctx, const void *p, size_t n), void *ctx) {
+    if (!w || !r || w->finalized) return S3_ERR_INVALID_ARGUMENT;
+    if (!w->store->reflink) return S3_ERR_NOT_IMPLEMENTED;
+    uint64_t len = r->pos < r->data_size ? r->data_size - r->pos : 0;
+    uint64_t soff = r->data_off + r->pos;
+    uint64_t doff = (w->is_part ? 0 : w->hdr.header_size) + w->data_written;
+    if (len == 0) return S3_OK;
+    if (writer_reserve_to(w, w->data_written + len) != S3_OK) return S3_ERR_QUOTA_EXCEEDED;
+    /* The writer's fd position must follow (later writes append). */
+    if (clone_range(w->fd, doff, r->fd, soff, len) < 0) return S3_ERR_NOT_IMPLEMENTED;
+    if (lseek(w->fd, (off_t)(doff + len), SEEK_SET) < 0) return map_io_err(errno);
+    char buf[128 * 1024];
+    uint64_t done = 0;
+    while (done < len) {
+        size_t want = len - done < sizeof(buf) ? (size_t)(len - done) : sizeof(buf);
+        ssize_t n = pread(r->fd, buf, want, (off_t)(soff + done));
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) return S3_ERR_INTERNAL;
+        EVP_DigestUpdate(w->md5_ctx, buf, (size_t)n);
+        if (w->pcrc.algo) cksum_update(&w->pcrc, buf, (size_t)n);
+        if (extra) extra(ctx, buf, (size_t)n);
+        done += (uint64_t)n;
+    }
+    w->data_written += len;
+    r->pos += len;
+    return S3_OK;
+}
+

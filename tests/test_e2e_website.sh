@@ -16,7 +16,7 @@ AK=AKIAWEBSITE00001
 SK=websiteSecret0123456789012345678901234567890
 
 cleanup() {
-    [ -n "${SP:-}" ] && { kill "$SP" 2>/dev/null; wait "$SP" 2>/dev/null; } || true
+    [ -n "${SP:-}" ] && { kill "$SP" 2>/dev/null; wait "$SP" 2>/dev/null; [ $? -ne 159 ] || echo "FAIL: server died with SIGSYS (seccomp blocked a syscall; see --seccomp=log)" >&2; } || true
     rm -rf "$DATA" "$LOG"
 }
 trap cleanup EXIT
@@ -26,7 +26,7 @@ BUILD_FLAGS=""
 (cd "$ROOT" && make $BUILD_FLAGS fs3 >/dev/null 2>&1)
 
 start() {
-    "$ROOT/fs3" -p "$PORT" -d "$DATA" --auth "$AK:$SK" --require-auth \
+    ${FS3_WRAP:-} "$ROOT/fs3" -p "$PORT" -d "$DATA" --auth "$AK:$SK" --require-auth \
         --web-port "$WPORT" --web-root-domain web.example.lan "$@" >"$LOG" 2>&1 &
     SP=$!
     sleep 0.4

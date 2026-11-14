@@ -17,7 +17,7 @@ AK2=AKIAPRESIGNADMIN
 SK2=presignAdminSecret0123456789012345678901234
 
 cleanup() {
-    [ -n "${SP:-}" ] && { kill "$SP" 2>/dev/null; wait "$SP" 2>/dev/null; } || true
+    [ -n "${SP:-}" ] && { kill "$SP" 2>/dev/null; wait "$SP" 2>/dev/null; [ $? -ne 159 ] || echo "FAIL: server died with SIGSYS (seccomp blocked a syscall; see --seccomp=log)" >&2; } || true
     rm -rf "$DATA" "$LOG" "$T".*
 }
 trap cleanup EXIT
@@ -26,7 +26,7 @@ BUILD_FLAGS=""
 [ "${DEBUG:-0}" = "1" ] && BUILD_FLAGS="DEBUG=1"
 (cd "$ROOT" && make $BUILD_FLAGS fs3 >/dev/null 2>&1)
 
-"$ROOT/fs3" -p "$PORT" -d "$DATA" --auth "$AK:$SK:alice" --auth "$AK2:$SK2:root" \
+${FS3_WRAP:-} "$ROOT/fs3" -p "$PORT" -d "$DATA" --auth "$AK:$SK:alice" --auth "$AK2:$SK2:root" \
     --admin root --no-presign-admin --presign-max-expires 7200 >"$LOG" 2>&1 &
 SP=$!
 sleep 0.4

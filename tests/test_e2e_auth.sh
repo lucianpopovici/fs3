@@ -18,7 +18,7 @@ AK=AKIATESTAUTH123
 SK=secretValue1234567890123456789012345678901
 
 cleanup() {
-    [ -n "${SP:-}" ] && { kill "$SP" 2>/dev/null; wait "$SP" 2>/dev/null; } || true
+    [ -n "${SP:-}" ] && { kill "$SP" 2>/dev/null; wait "$SP" 2>/dev/null; [ $? -ne 159 ] || echo "FAIL: server died with SIGSYS (seccomp blocked a syscall; see --seccomp=log)" >&2; } || true
     rm -rf "$DATA"
     rm -f /tmp/fs3-auth-body.$$ /tmp/fs3-auth-out.$$
 }
@@ -34,7 +34,7 @@ BUILD_FLAGS=""
 }
 
 # Start with --auth and --require-auth
-"$ROOT/fs3" -p "$PORT" -d "$DATA" \
+${FS3_WRAP:-} "$ROOT/fs3" -p "$PORT" -d "$DATA" \
     --auth "$AK:$SK" \
     --require-auth \
     >"$LOG" 2>&1 &

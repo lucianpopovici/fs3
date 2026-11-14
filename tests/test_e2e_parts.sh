@@ -14,7 +14,7 @@ A=AKIAPARTSALICE01; AS=partsAliceSecret0123456789012345678901
 B=AKIAPARTSBOB0001; BS=partsBobSecret012345678901234567890123
 
 cleanup() {
-    [ -n "${SP:-}" ] && { kill "$SP" 2>/dev/null; wait "$SP" 2>/dev/null; } || true
+    [ -n "${SP:-}" ] && { kill "$SP" 2>/dev/null; wait "$SP" 2>/dev/null; [ $? -ne 159 ] || echo "FAIL: server died with SIGSYS (seccomp blocked a syscall; see --seccomp=log)" >&2; } || true
     rm -rf "$DATA" "$LOG"
 }
 trap cleanup EXIT
@@ -24,7 +24,7 @@ BUILD_FLAGS=""
 (cd "$ROOT" && make $BUILD_FLAGS fs3 >/dev/null 2>&1)
 
 # 1 KiB minimum part size keeps the payloads small.
-"$ROOT/fs3" -p "$PORT" -d "$DATA" --auth "$A:$AS:alice" --auth "$B:$BS:bob" \
+${FS3_WRAP:-} "$ROOT/fs3" -p "$PORT" -d "$DATA" --auth "$A:$AS:alice" --auth "$B:$BS:bob" \
     --require-auth --mpu-min-part-size 1024 >"$LOG" 2>&1 &
 SP=$!
 sleep 0.4
@@ -248,7 +248,7 @@ rm -f "$DATA.big" "$DATA.back" "$CLICFG"
 ORPHAN=$(cat "$DATA.orphan")
 [ -f "$ORPHAN" ] || { echo "FAIL: orphan record missing before restart"; exit 1; }
 kill "$SP"; wait "$SP" 2>/dev/null || true
-"$ROOT/fs3" -p "$PORT" -d "$DATA" --auth "$A:$AS:alice" --require-auth >"$LOG" 2>&1 &
+${FS3_WRAP:-} "$ROOT/fs3" -p "$PORT" -d "$DATA" --auth "$A:$AS:alice" --require-auth >"$LOG" 2>&1 &
 SP=$!
 sleep 0.4
 if [ -f "$ORPHAN" ]; then echo "FAIL: orphan record survived restart"; exit 1; fi

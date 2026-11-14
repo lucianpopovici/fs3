@@ -13,6 +13,7 @@
 #include "action.h"
 #include "lifecycle.h"
 #include "scrub.h"
+#include "sandbox.h"
 #include "sigv4.h"
 #include "admin.h"
 #include "objlock.h"
@@ -366,15 +367,6 @@ server_t *server_create(const server_cfg_t *cfg) {
                   ownerless);
     }
 
-    if (cfg->io_threads > 0) {
-        s->pool = iopool_create(cfg->io_threads);
-        if (!s->pool) {
-            LOG_E("iopool_create(%d) failed", cfg->io_threads);
-            goto fail;
-        }
-        LOG_I("io pool: %d worker thread(s)", cfg->io_threads);
-    }
-
     s->listen_fd = listen_socket(cfg->bind_addr, cfg->port, cfg->backlog);
     if (s->listen_fd < 0) goto fail;
 
@@ -394,18 +386,6 @@ server_t *server_create(const server_cfg_t *cfg) {
     }
 
     LOG_I("listening on %s:%u", cfg->bind_addr, cfg->port);
-
-    if (s->pool) {
-        struct epoll_event pev = {
-            .events = EPOLLIN,
-            .data.ptr = s->pool,    /* pool ptr = job-completion marker */
-        };
-        if (epoll_ctl(s->epoll_fd, EPOLL_CTL_ADD, iopool_fd(s->pool),
-                      &pev) < 0) {
-            LOG_E("epoll_ctl ADD iopool: %s", strerror(errno));
-            goto fail;
-        }
-    }
 
     /* Native TLS listener (item 7). */
     if (cfg->tls_port > 0) {
@@ -524,6 +504,30 @@ server_t *server_create(const server_cfg_t *cfg) {
     store_set_version_guard(s->store, olock_guard, s->store);
     store_set_mpu_min_part_size(s->store, cfg->mpu_min_part_size);
     store_set_default_quotas(s->store, cfg->default_bucket_quota, cfg->default_user_quota);
+    if (cfg->reflink_off) { store_set_reflink(s->store, 0); LOG_I("reflink: off (--reflink off)"); }
+
+    /* Seccomp (round 2, item 5): everything privileged is done —
+     * listeners bound, TLS loaded, store opened and recovered — and no
+     * worker thread exists yet, so all of them inherit the filter. */
+    if (sandbox_install((sandbox_mode_t)cfg->seccomp_mode) < 0) goto fail;
+
+    if (cfg->io_threads > 0) {
+        s->pool = iopool_create(cfg->io_threads);
+        if (!s->pool) {
+            LOG_E("iopool_create(%d) failed", cfg->io_threads);
+            goto fail;
+        }
+        LOG_I("io pool: %d worker thread(s)", cfg->io_threads);
+        struct epoll_event pev = {
+            .events = EPOLLIN,
+            .data.ptr = s->pool,    /* pool ptr = job-completion marker */
+        };
+        if (epoll_ctl(s->epoll_fd, EPOLL_CTL_ADD, iopool_fd(s->pool), &pev) < 0) {
+            LOG_E("epoll_ctl ADD iopool: %s", strerror(errno));
+            goto fail;
+        }
+        scrub_set_pool(s->scrub, s->pool);
+    }
     return s;
 
 fail:

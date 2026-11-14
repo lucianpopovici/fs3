@@ -31,6 +31,8 @@ typedef struct scrub scrub_t;
 scrub_t *scrub_create(const scrub_cfg_t *cfg);
 /* Event loop, once a second: start a due or interrupted pass. */
 void     scrub_tick(scrub_t *sc, time_t now);
+/* The worker pool, once created (it is created after seccomp). */
+void     scrub_set_pool(scrub_t *sc, struct iopool *pool);
 /* Admin API: start a pass now. 0 started, 1 already running, -1 no pool. */
 int      scrub_request(scrub_t *sc);
 /* Progress / last result as a JSON object (NUL-terminated). */

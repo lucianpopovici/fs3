@@ -1442,6 +1442,10 @@ typedef struct {
     uint64_t       mtime_ms;
 } copy_job_t;
 
+static void copy_ck_update(void *ctx, const void *p, size_t n) {
+    cksum_update((cksum_ctx_t *)ctx, p, n);
+}
+
 static void copy_run(iojob_t *j) {
     copy_job_t *cj = (copy_job_t *)j;
     char xbuf[64 * 1024];
@@ -1450,6 +1454,11 @@ static void copy_run(iojob_t *j) {
     memset(&k, 0, sizeof(k));
     if (cj->ck_algo && cksum_begin(&k, cj->ck_algo) < 0) stream_ok = 0;
     s3_err_t werr = S3_ERR_INTERNAL;
+    /* Reflink first (item 6a); stream on S3_ERR_NOT_IMPLEMENTED. */
+    if (stream_ok) {
+        s3_err_t ce = store_writer_clone(cj->w, cj->r, cj->ck_algo ? copy_ck_update : NULL, &k);
+        if (ce != S3_OK && ce != S3_ERR_NOT_IMPLEMENTED) { werr = ce; stream_ok = 0; }
+    }
     while (stream_ok) {
         ssize_t n = store_get_read(cj->r, xbuf, sizeof(xbuf));
         if (n == 0) break;
