@@ -86,8 +86,8 @@ check_eq "bucket PUT ?versioning malformed → 400" "$(code -X PUT --data-binary
 check_eq "bucket survives" "$(code -I "$URL/subb")" "200"
 body_is_original "bucket-level probes"
 
-# GET ?uploadId (ListParts) is not implemented and must not return the object.
-check_eq "GET ?uploadId → 501" "$(code "$URL/subb/k?uploadId=0123456789abcdef0123456789abcdef")" "501"
+# GET ?uploadId is ListParts and must not return the object.
+check_eq "GET ?uploadId (unknown) → 404 NoSuchUpload" "$(code "$URL/subb/k?uploadId=0123456789abcdef0123456789abcdef")" "404"
 # GetObject ?partNumber=2 would be wrong bytes; =1 is the whole object.
 check_eq "GET ?partNumber=2 → 501" "$(code "$URL/subb/k?partNumber=2")" "501"
 check_eq "GET ?partNumber=1 → 200" "$(code "$URL/subb/k?partNumber=1")" "200"

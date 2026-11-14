@@ -1697,6 +1697,41 @@ static int handle_mpu_complete_finish(conn_t *c, s3_str_t bucket, s3_str_t key,
     return job_submit(c, &mj->base);
 }
 
+/* GET /bucket/key?uploadId=ID — ListParts. */
+static int handle_mpu_list_parts(conn_t *c, s3_str_t bucket, s3_str_t key,
+                                 const char *upload_id) {
+    s3_str_t mv = q_val(c, "part-number-marker");
+    uint32_t marker = 0;
+    for (size_t i = 0; i < mv.n; i++) {
+        if (mv.p[i] < '0' || mv.p[i] > '9' || marker > 10000)
+            return rsp_build_s3_error(c, S3_ERR_INVALID_ARGUMENT, c->req.path, NULL);
+        marker = marker * 10 + (uint32_t)(mv.p[i] - '0');
+    }
+    s3_str_t xv = q_val(c, "max-parts");
+    size_t max = 1000;
+    if (xv.p) {
+        max = 0;
+        for (size_t i = 0; i < xv.n; i++) {
+            if (xv.p[i] < '0' || xv.p[i] > '9')
+                return rsp_build_s3_error(c, S3_ERR_INVALID_ARGUMENT, c->req.path, NULL);
+            max = max * 10 + (size_t)(xv.p[i] - '0');
+            if (max > 1000) max = 1000;
+        }
+        if (max == 0) max = 1000;
+    }
+    s3_part_info_t *parts = NULL;
+    size_t n = 0;
+    int trunc = 0;
+    uint8_t algo = 0, type = 0;
+    s3_err_t e = store_mpu_list_parts(c->store, bucket, key, upload_id, marker, max,
+                                      &parts, &n, &trunc, &algo, &type);
+    if (e != S3_OK) return rsp_build_s3_error(c, e, c->req.path, NULL);
+    int rc = rsp_build_list_parts(c, bucket, key, upload_id, marker, max,
+                                  parts, n, trunc, algo, type);
+    free(parts);
+    return rc;
+}
+
 /* DELETE /bucket/key?uploadId=ID */
 static int handle_mpu_abort(conn_t *c, s3_str_t bucket, s3_str_t key,
                              const char *upload_id) {
@@ -2174,7 +2209,7 @@ static s3_action_t classify_object(const conn_t *c, s3_err_t *err) {
         }
         if (post && !has_part) return ACT_MPU_COMPLETE;
         if (del && !has_part)  return ACT_MPU_ABORT;
-        if (get && !has_part)  { *err = S3_ERR_NOT_IMPLEMENTED; return ACT_NONE; }
+        if (get && !has_part)  return ACT_MPU_LIST_PARTS;
         *err = S3_ERR_INVALID_REQUEST; return ACT_NONE;
     } else if (has_part) {
         /* GetObject/HeadObject ?partNumber=N: only part 1 of a
@@ -2279,8 +2314,10 @@ int route_dispatch_headers(conn_t *c) {
     case ACT_MPU_COMPLETE:
     case ACT_MPU_ABORT:
     case ACT_MPU_UPLOAD_PART:
+    case ACT_MPU_LIST_PARTS:
         if (parse_upload_id(c, upload_id_buf) < 0)
             return rsp_build_s3_error(c, S3_ERR_NO_SUCH_UPLOAD, c->req.path, NULL);
+        if (act == ACT_MPU_LIST_PARTS) return handle_mpu_list_parts(c, bucket, key, upload_id_buf);
         if (act == ACT_MPU_ABORT)
             return handle_mpu_abort(c, bucket, key, upload_id_buf);
         if (act == ACT_MPU_COMPLETE) {

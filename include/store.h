@@ -485,6 +485,23 @@ s3_err_t store_list_mpu_uploads(s3_store_t *s, s3_str_t bucket,
                                 s3_mpu_info_t **out, size_t *n_out);
 void     store_mpu_uploads_free(s3_mpu_info_t *list, size_t n);
 
+/* ListParts: parts of one upload with number > marker, sorted, at most
+ * max (cap 1000). Reads the part records; *truncated set when more
+ * remain. The key must match the upload's (NoSuchUpload otherwise).
+ * algo/type report the upload's checksum algorithm. Caller free()s. */
+typedef struct {
+    uint32_t part_number;
+    uint64_t size;
+    uint64_t mtime_ms;
+    char     etag[33];                 /* lowercase hex MD5, NUL */
+    uint8_t  ck_algo, ck_n;
+    uint8_t  ck[32];
+} s3_part_info_t;
+s3_err_t store_mpu_list_parts(s3_store_t *s, s3_str_t bucket, s3_str_t key,
+                              const char *upload_id, uint32_t marker, size_t max,
+                              s3_part_info_t **out, size_t *n_out, int *truncated,
+                              uint8_t *algo_out, uint8_t *type_out);
+
 /* ---- Multipart GC ----
  *
  * Sweep the MPU staging area and remove any upload whose ctime_ms is

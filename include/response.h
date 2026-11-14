@@ -103,6 +103,10 @@ int rsp_build_list_all_my_buckets(conn_t *c,
                                    size_t n_buckets);
 
 /* Build a ListMultipartUploadsResult XML body, 200 OK. */
+int rsp_build_list_parts(conn_t *c, s3_str_t bucket, s3_str_t key,
+                         const char *upload_id, uint32_t marker, size_t max,
+                         const s3_part_info_t *parts, size_t n, int truncated,
+                         uint8_t algo, uint8_t type);
 int rsp_build_list_mpu_uploads(conn_t *c, s3_str_t bucket, s3_str_t prefix,
                                 const s3_mpu_info_t *uploads,
                                 size_t n_uploads);

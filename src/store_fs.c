@@ -397,6 +397,7 @@ static void recover_tmp_dir(const s3_store_t *s) {
 
 static void cfg_cache_clear(s3_store_t *s);
 static void recover_version_links(const s3_store_t *s);
+static void recover_mpu_orphans(const s3_store_t *s);
 static int probe_reflink(const s3_store_t *s);
 
 /* Startup: half-written object-lock sidecars (locks/.../<vid>.tmp.XXXXXX). */
@@ -484,6 +485,7 @@ s3_err_t store_open(s3_store_t **out, const char *root) {
     recover_sidecar_tmp(s);
     recover_version_links(s);
     recover_lock_tmp(s);
+    recover_mpu_orphans(s);
     s->reflink = probe_reflink(s);
     s->pad_headers = s->reflink;
     LOG_I("store: reflink %s", s->reflink ? "supported (headers padded to 4 KiB)"
@@ -3164,6 +3166,150 @@ out:
 /* ===================================================================== */
 /* List in-flight multipart uploads                                       */
 /* ===================================================================== */
+
+/* ---- ListParts (round 2, item 1b) ----------------------------------- */
+
+static int part_info_cmp(const void *a, const void *b) {
+    const s3_part_info_t *x = a, *y = b;
+    return x->part_number < y->part_number ? -1 : x->part_number > y->part_number;
+}
+
+s3_err_t store_mpu_list_parts(s3_store_t *s, s3_str_t bucket, s3_str_t key,
+                              const char *upload_id, uint32_t marker, size_t max,
+                              s3_part_info_t **out, size_t *n_out, int *truncated,
+                              uint8_t *algo_out, uint8_t *type_out) {
+    if (!s || !out || !n_out || !truncated || !upload_id) return S3_ERR_INVALID_ARGUMENT;
+    *out = NULL; *n_out = 0; *truncated = 0;
+    if (!valid_bucket_name(bucket)) return S3_ERR_INVALID_BUCKET_NAME;
+    if (!store_bucket_exists(s, bucket)) return S3_ERR_NO_SUCH_BUCKET;
+    if (strlen(upload_id) != S3_MULTIPART_UPLOAD_ID_LEN) return S3_ERR_NO_SUCH_UPLOAD;
+    if (max == 0 || max > 1000) max = 1000;
+
+    char *stored_key = NULL; size_t stored_key_n = 0;
+    uint8_t algo = 0, type = 0;
+    s3_err_t err = mpu_read_meta(s, bucket, upload_id, &stored_key, &stored_key_n,
+                                 NULL, &algo, &type);
+    if (err != S3_OK) { free(stored_key); return err; }
+    int key_ok = stored_key && stored_key_n == key.n && memcmp(stored_key, key.p, key.n) == 0;
+    free(stored_key);
+    if (!key_ok) return S3_ERR_NO_SUCH_UPLOAD;
+    if (algo_out) *algo_out = algo;
+    if (type_out) *type_out = type;
+
+    char dir[4096];
+    if (snprintf(dir, sizeof(dir), "%s/" S3_STR_FMT "/%s", s->mpu_dir,
+                 S3_STR_ARG(bucket), upload_id) >= (int)sizeof(dir))
+        return S3_ERR_INTERNAL;
+    DIR *d = opendir(dir);
+    if (!d) return errno == ENOENT ? S3_ERR_NO_SUCH_UPLOAD : S3_ERR_INTERNAL;
+
+    size_t cap = 16, n = 0;
+    s3_part_info_t *arr = malloc(cap * sizeof(*arr));
+    if (!arr) { closedir(d); return S3_ERR_INTERNAL; }
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        /* Exactly "part-NNNNN": skips .rec, .ck and anything foreign. */
+        if (strlen(e->d_name) != 10 || strncmp(e->d_name, "part-", 5) != 0) continue;
+        uint32_t pn = 0; int ok = 1;
+        for (int i = 5; i < 10; i++) {
+            if (e->d_name[i] < '0' || e->d_name[i] > '9') { ok = 0; break; }
+            pn = pn * 10 + (uint32_t)(e->d_name[i] - '0');
+        }
+        if (!ok || pn < 1 || pn > 10000 || pn <= marker) continue;
+        char pp[4200];
+        snprintf(pp, sizeof(pp), "%s/%s", dir, e->d_name);
+
+        /* Record + bytes under ns_mu, as at Complete. */
+        part_snap_t ps;
+        memset(&ps, 0, sizeof(ps));
+        pthread_mutex_lock(&s->ns_mu);
+        int rr = part_rec_read(pp, &ps.rec);
+        ps.fd = rr < 0 ? -1 : open(pp, O_RDONLY | O_CLOEXEC);
+        pthread_mutex_unlock(&s->ns_mu);
+        if (ps.fd < 0) continue;            /* corrupt record or gone */
+        struct stat st;
+        if (fstat(ps.fd, &st) < 0) { close(ps.fd); continue; }
+        if (rr == 1) {
+            /* Pre-upgrade part: hash it (ListParts on a legacy upload is
+             * rare; it dies with its upload). */
+            if (legacy_part_hash(&ps) != S3_OK) { close(ps.fd); continue; }
+            ps.rec.mtime_ms = (uint64_t)st.st_mtim.tv_sec * 1000
+                            + (uint64_t)st.st_mtim.tv_nsec / 1000000;
+            if (algo) {
+                int cn = read_part_cksum(pp, algo, ps.rec.ck);
+                if (cn > 0) { ps.rec.ck_algo = algo; ps.rec.ck_n = (uint8_t)cn; }
+            }
+        } else if ((uint64_t)st.st_size != ps.rec.size) {
+            close(ps.fd); continue;         /* mid re-upload */
+        }
+        close(ps.fd);
+        if (n == cap) {
+            s3_part_info_t *na = realloc(arr, cap * 2 * sizeof(*na));
+            if (!na) { free(arr); closedir(d); return S3_ERR_INTERNAL; }
+            arr = na; cap *= 2;
+        }
+        s3_part_info_t *pi = &arr[n++];
+        memset(pi, 0, sizeof(*pi));
+        pi->part_number = pn;
+        pi->size = ps.rec.size;
+        pi->mtime_ms = ps.rec.mtime_ms;
+        static const char hx[] = "0123456789abcdef";
+        for (int i = 0; i < 16; i++) {
+            pi->etag[2*i] = hx[ps.rec.md5[i] >> 4];
+            pi->etag[2*i+1] = hx[ps.rec.md5[i] & 15];
+        }
+        if (ps.rec.ck_algo == algo && ps.rec.ck_n) {
+            pi->ck_algo = ps.rec.ck_algo;
+            pi->ck_n = ps.rec.ck_n;
+            memcpy(pi->ck, ps.rec.ck, ps.rec.ck_n);
+        }
+    }
+    closedir(d);
+    qsort(arr, n, sizeof(*arr), part_info_cmp);
+    if (n > max) { *truncated = 1; n = max; }
+    *out = arr; *n_out = n;
+    return S3_OK;
+}
+
+/* Startup: a record without its part is left by a crash between the two
+ * renames of a part commit (record first). Remove it so a later upload
+ * of the same number can't be confused by it. */
+static void recover_mpu_orphans(const s3_store_t *s) {
+    DIR *bd = opendir(s->mpu_dir);
+    if (!bd) return;
+    int n = 0;
+    struct dirent *b;
+    while ((b = readdir(bd)) != NULL) {
+        if (b->d_name[0] == '.') continue;
+        char bp[4096];
+        if (snprintf(bp, sizeof(bp), "%s/%s", s->mpu_dir, b->d_name) >= (int)sizeof(bp)) continue;
+        DIR *ud = opendir(bp);
+        if (!ud) continue;
+        struct dirent *u;
+        while ((u = readdir(ud)) != NULL) {
+            if (strlen(u->d_name) != S3_MULTIPART_UPLOAD_ID_LEN) continue;
+            char up[4200];
+            snprintf(up, sizeof(up), "%s/%s", bp, u->d_name);
+            DIR *pd = opendir(up);
+            if (!pd) continue;
+            struct dirent *f;
+            while ((f = readdir(pd)) != NULL) {
+                size_t fl = strlen(f->d_name);
+                if (fl != 14 || strncmp(f->d_name, "part-", 5) != 0
+                    || strcmp(f->d_name + 10, ".rec") != 0) continue;
+                char rp[4400], pp[4400];
+                snprintf(rp, sizeof(rp), "%s/%s", up, f->d_name);
+                snprintf(pp, sizeof(pp), "%s/%.10s", up, f->d_name);
+                struct stat st;
+                if (stat(pp, &st) < 0 && errno == ENOENT && unlink(rp) == 0) n++;
+            }
+            closedir(pd);
+        }
+        closedir(ud);
+    }
+    closedir(bd);
+    if (n > 0) LOG_I("recover: removed %d orphan part record(s)", n);
+}
 
 s3_err_t store_list_mpu_uploads(s3_store_t *s, s3_str_t bucket,
                                 s3_str_t key_prefix,

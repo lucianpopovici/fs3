@@ -881,6 +881,64 @@ int rsp_build_list_mpu_uploads(conn_t *c, s3_str_t bucket, s3_str_t prefix,
     return ship_xml_200(c, body, blen);
 }
 
+int rsp_build_list_parts(conn_t *c, s3_str_t bucket, s3_str_t key,
+                         const char *upload_id, uint32_t marker, size_t max,
+                         const s3_part_info_t *parts, size_t n, int truncated,
+                         uint8_t algo, uint8_t type) {
+    XMLNode *root = create_node("ListPartsResult");
+    if (!root) return -1;
+    if (add_attr(root, "xmlns", "http://s3.amazonaws.com/doc/2006-03-01/") < 0) {
+        free_tree(root); return -1;
+    }
+    char num[32];
+    xml_text_child_n(root, "Bucket", bucket.p, bucket.n);
+    xml_text_child_n(root, "Key", key.p, key.n);
+    xml_text_child(root, "UploadId", upload_id);
+    for (int who = 0; who < 2; who++) {
+        XMLNode *o = create_node(who ? "Owner" : "Initiator");
+        if (!o || add_child(root, o) < 0) { free_tree(o); free_tree(root); return -1; }
+        xml_text_child(o, "ID", "fs3");
+        xml_text_child(o, "DisplayName", "fs3");
+    }
+    xml_text_child(root, "StorageClass", "STANDARD");
+    snprintf(num, sizeof(num), "%u", marker);
+    xml_text_child(root, "PartNumberMarker", num);
+    snprintf(num, sizeof(num), "%u", n ? parts[n - 1].part_number : marker);
+    xml_text_child(root, "NextPartNumberMarker", num);
+    snprintf(num, sizeof(num), "%zu", max);
+    xml_text_child(root, "MaxParts", num);
+    xml_text_child(root, "IsTruncated", truncated ? "true" : "false");
+    if (algo) {
+        xml_text_child(root, "ChecksumAlgorithm", cksum_upper_name(algo));
+        xml_text_child(root, "ChecksumType", type == S3_CKSUM_TYPE_COMPOSITE
+                                             ? "COMPOSITE" : "FULL_OBJECT");
+    }
+    for (size_t i = 0; i < n; i++) {
+        XMLNode *pe = create_node("Part");
+        if (!pe || add_child(root, pe) < 0) { free_tree(pe); free_tree(root); return -1; }
+        snprintf(num, sizeof(num), "%u", parts[i].part_number);
+        xml_text_child(pe, "PartNumber", num);
+        char ts[32];
+        rsp_format_iso8601(parts[i].mtime_ms, ts);
+        xml_text_child(pe, "LastModified", ts);
+        char et[40];
+        snprintf(et, sizeof(et), "\"%s\"", parts[i].etag);
+        xml_text_child(pe, "ETag", et);
+        snprintf(num, sizeof(num), "%llu", (unsigned long long)parts[i].size);
+        xml_text_child(pe, "Size", num);
+        if (parts[i].ck_algo && parts[i].ck_n) {
+            char b64[64];
+            base64_encode(parts[i].ck, parts[i].ck_n, b64);
+            xml_text_child(pe, cksum_xml_name(parts[i].ck_algo), b64);
+        }
+    }
+    size_t blen = 0;
+    char *body = xml_render_with_decl(root, &blen);
+    free_tree(root);
+    if (!body) return -1;
+    return ship_xml_200(c, body, blen);
+}
+
 int rsp_build_list_versions(conn_t *c, s3_str_t bucket,
                             const s3_version_list_opts_t *o,
                             const s3_version_info_t *v, size_t n,

@@ -30,7 +30,7 @@ SP=$!
 sleep 0.4
 kill -0 "$SP" 2>/dev/null || { echo "server did not start" >&2; cat "$LOG" >&2; exit 1; }
 
-python3 -u - "$URL" "$A" "$AS" "$B" "$BS" "$DATA" <<'PY'
+ORPHAN_OUT="$DATA.orphan" python3 -u - "$URL" "$A" "$AS" "$B" "$BS" "$DATA" <<'PY'
 import sys, os, glob, hashlib, boto3, botocore
 url, a, asec, b, bsec, data = sys.argv[1:7]
 mk = lambda ak, sk: boto3.client("s3", endpoint_url=url, aws_access_key_id=ak,
@@ -105,7 +105,68 @@ check("legacy part, wrong ETag → InvalidPart", code(lambda: complete("legacy",
 check("legacy parts complete", code(lambda: complete("legacy", uid, [(1, g1), (2, g2)])), "ok")
 check("legacy bytes", s3.get_object(Bucket="partb", Key="legacy")["Body"].read(), p1 + p3)
 
+# --- 1b: ListParts ---------------------------------------------------------
+uid = start("lp")
+bodies = {n: os.urandom(1024 + n) for n in range(1, 8)}
+for n in (3, 1, 7, 2, 5, 4, 6):
+    up("lp", uid, n, bodies[n])
+r = s3.list_parts(Bucket="partb", Key="lp", UploadId=uid)
+check("ListParts all, sorted", [p["PartNumber"] for p in r["Parts"]], list(range(1, 8)))
+check("ListParts ETag", r["Parts"][0]["ETag"].strip('"'), hashlib.md5(bodies[1]).hexdigest())
+check("ListParts Size", r["Parts"][6]["Size"], 1031)
+check("ListParts not truncated", r["IsTruncated"], False)
+r = s3.list_parts(Bucket="partb", Key="lp", UploadId=uid, MaxParts=3)
+check("MaxParts=3", ([p["PartNumber"] for p in r["Parts"]], r["IsTruncated"], r["NextPartNumberMarker"]),
+      ([1, 2, 3], True, 3))
+r = s3.list_parts(Bucket="partb", Key="lp", UploadId=uid, MaxParts=3, PartNumberMarker=3)
+check("marker=3", [p["PartNumber"] for p in r["Parts"]], [4, 5, 6])
+pag = s3.get_paginator("list_parts")
+seen = [p["PartNumber"] for pg in pag.paginate(Bucket="partb", Key="lp", UploadId=uid,
+                                               PaginationConfig={"PageSize": 2}) for p in pg.get("Parts", [])]
+check("paginator walks all parts", seen, list(range(1, 8)))
+check("wrong key → NoSuchUpload", code(lambda: s3.list_parts(Bucket="partb", Key="other", UploadId=uid)), "NoSuchUpload")
+check("unknown upload → NoSuchUpload",
+      code(lambda: s3.list_parts(Bucket="partb", Key="lp", UploadId="0" * 32)), "NoSuchUpload")
+check("other user → AccessDenied", code(lambda: bob.list_parts(Bucket="partb", Key="lp", UploadId=uid)), "AccessDenied")
+# ETags from ListParts complete the upload (what resuming clients do).
+parts = [(p["PartNumber"], p["ETag"]) for p in s3.list_parts(Bucket="partb", Key="lp", UploadId=uid)["Parts"]]
+check("Complete from ListParts ETags", code(lambda: complete("lp", uid, parts)), "ok")
+check("lp bytes", s3.get_object(Bucket="partb", Key="lp")["Body"].read(), b"".join(bodies[n] for n in range(1, 8)))
+
+# Checksums appear per part.
+uid = s3.create_multipart_upload(Bucket="partb", Key="ck", ChecksumAlgorithm="SHA256")["UploadId"]
+s3.upload_part(Bucket="partb", Key="ck", UploadId=uid, PartNumber=1, Body=p1, ChecksumAlgorithm="SHA256")
+r = s3.list_parts(Bucket="partb", Key="ck", UploadId=uid)
+import base64
+check("ListParts ChecksumAlgorithm", r.get("ChecksumAlgorithm"), "SHA256")
+check("ListParts ChecksumSHA256", r["Parts"][0].get("ChecksumSHA256"),
+      base64.b64encode(hashlib.sha256(p1).digest()).decode())
+
+# Legacy part (no record) is listed too.
+uid = start("lg2")
+up("lg2", uid, 1, p2)
+for f in glob.glob(f"{data}/mpu/partb/{uid}/*.rec"):
+    os.unlink(f)
+r = s3.list_parts(Bucket="partb", Key="lg2", UploadId=uid)
+check("legacy part listed", (r["Parts"][0]["ETag"].strip('"'), r["Parts"][0]["Size"]),
+      (hashlib.md5(p2).hexdigest(), len(p2)))
+# An orphan record (no part) is not a part.
+open(f"{data}/mpu/partb/{uid}/part-00009.rec", "wb").write(b"x" * 88)
+check("orphan record ignored", [p["PartNumber"] for p in s3.list_parts(Bucket="partb", Key="lg2", UploadId=uid)["Parts"]], [1])
+with open(os.environ.get("ORPHAN_OUT", "/dev/null"), "w") as f:
+    f.write(f"{data}/mpu/partb/{uid}/part-00009.rec")
+
 print(f"\nPYPASS={PASS} PYFAIL={FAIL}")
 sys.exit(1 if FAIL else 0)
 PY
+# Startup recovery removes the orphan record left above.
+ORPHAN=$(cat "$DATA.orphan")
+[ -f "$ORPHAN" ] || { echo "FAIL: orphan record missing before restart"; exit 1; }
+kill "$SP"; wait "$SP" 2>/dev/null || true
+"$ROOT/fs3" -p "$PORT" -d "$DATA" --auth "$A:$AS:alice" --require-auth >"$LOG" 2>&1 &
+SP=$!
+sleep 0.4
+if [ -f "$ORPHAN" ]; then echo "FAIL: orphan record survived restart"; exit 1; fi
+grep -q "orphan part record" "$LOG" || { echo "FAIL: no recovery log line"; exit 1; }
+rm -f "$DATA.orphan"
 echo "===== parts e2e: done ====="
