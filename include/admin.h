@@ -30,6 +30,8 @@
 #include <stddef.h>
 
 struct s3_store;
+struct scrub;
+struct sigv4_verifier;
 
 typedef struct {
     struct s3_store *store;
@@ -37,6 +39,9 @@ typedef struct {
     const char      *cred_file;    /* NULL = key endpoints unavailable */
     int            (*reload)(void *user);   /* 0 = ok */
     void            *reload_user;
+    struct scrub    *scrub;        /* POST/GET /v1/scrub (item 3) */
+    const struct sigv4_verifier *auth;   /* live keys: last-used times (item 4) */
+    int              key_max_age_days;   /* default expiry of new keys, 0 = none */
 } admin_cfg_t;
 
 typedef struct admin_ctx admin_ctx_t;

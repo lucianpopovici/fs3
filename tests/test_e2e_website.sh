@@ -16,7 +16,7 @@ AK=AKIAWEBSITE00001
 SK=websiteSecret0123456789012345678901234567890
 
 cleanup() {
-    [ -n "${SP:-}" ] && kill "$SP" 2>/dev/null || true
+    [ -n "${SP:-}" ] && { kill "$SP" 2>/dev/null; wait "$SP" 2>/dev/null; [ $? -ne 159 ] || echo "FAIL: server died with SIGSYS (seccomp blocked a syscall; see --seccomp=log)" >&2; } || true
     rm -rf "$DATA" "$LOG"
 }
 trap cleanup EXIT
@@ -26,7 +26,7 @@ BUILD_FLAGS=""
 (cd "$ROOT" && make $BUILD_FLAGS fs3 >/dev/null 2>&1)
 
 start() {
-    "$ROOT/fs3" -p "$PORT" -d "$DATA" --auth "$AK:$SK" --require-auth \
+    ${FS3_WRAP:-} "$ROOT/fs3" -p "$PORT" -d "$DATA" --auth "$AK:$SK" --require-auth \
         --web-port "$WPORT" --web-root-domain web.example.lan "$@" >"$LOG" 2>&1 &
     SP=$!
     sleep 0.4
@@ -103,6 +103,7 @@ check_eq "//evil.example/docs → no protocol-relative redirect" \
 check_eq "file with content type" \
     "$(curl -sS -o /dev/null -w '%{content_type}' -H "Host: $H" "$WURL/app.js")" "application/javascript"
 check_eq "Range works" "$(wget $H /big.bin -H 'Range: bytes=2-4')" "234"
+check_eq "multi-range → whole object" "$(wcode $H /big.bin -H 'Range: bytes=0-1,3-4')" "200"
 check_eq "missing → custom 404 status" "$(wcode $H /nope)" "404"
 check_eq "missing → custom 404 body" "$(wget $H /nope)" "<h1>custom 404</h1>"
 check_eq "HEAD ok" "$(curl -sS -o /dev/null -w '%{http_code}' -I -H "Host: $H" "$WURL/")" "200"

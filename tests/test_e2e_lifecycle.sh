@@ -15,7 +15,7 @@ AK=AKIALIFECYCLE001
 SK=lifecycleSecret0123456789012345678901234567
 
 cleanup() {
-    [ -n "${SP:-}" ] && kill "$SP" 2>/dev/null || true
+    [ -n "${SP:-}" ] && { kill "$SP" 2>/dev/null; wait "$SP" 2>/dev/null; [ $? -ne 159 ] || echo "FAIL: server died with SIGSYS (seccomp blocked a syscall; see --seccomp=log)" >&2; } || true
     rm -rf "$DATA" "$LOG"
 }
 trap cleanup EXIT
@@ -26,7 +26,7 @@ BUILD_FLAGS=""
 
 start() {
     : > "$LOG"
-    "$ROOT/fs3" -p "$PORT" -d "$DATA" --auth "$AK:$SK" --require-auth \
+    ${FS3_WRAP:-} "$ROOT/fs3" -p "$PORT" -d "$DATA" --auth "$AK:$SK" --require-auth \
         --metrics-port "$MPORT" "$@" >"$LOG" 2>&1 &
     SP=$!
     sleep 0.4

@@ -16,7 +16,7 @@ A=AKIAOBJLOCKUSER1; AS=objlockUserSecret0123456789012345678901
 R=AKIAOBJLOCKROOT1; RS=objlockRootSecret0123456789012345678901
 
 cleanup() {
-    [ -n "${SP:-}" ] && kill "$SP" 2>/dev/null || true
+    [ -n "${SP:-}" ] && { kill "$SP" 2>/dev/null; wait "$SP" 2>/dev/null; [ $? -ne 159 ] || echo "FAIL: server died with SIGSYS (seccomp blocked a syscall; see --seccomp=log)" >&2; } || true
     rm -rf "$DATA" "$LOG"
 }
 trap cleanup EXIT
@@ -26,7 +26,7 @@ BUILD_FLAGS=""
 (cd "$ROOT" && make $BUILD_FLAGS fs3 >/dev/null 2>&1)
 
 start() {
-    "$ROOT/fs3" -p "$PORT" -d "$DATA" --auth "$A:$AS:alice" --auth "$R:$RS:root" \
+    ${FS3_WRAP:-} "$ROOT/fs3" -p "$PORT" -d "$DATA" --auth "$A:$AS:alice" --auth "$R:$RS:root" \
         --admin root --require-auth --max-retention-days 30 "$@" >>"$LOG" 2>&1 &
     SP=$!
     sleep 0.4

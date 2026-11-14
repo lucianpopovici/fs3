@@ -13,7 +13,7 @@ LOG=/tmp/fs3-p10-e2e-$$.log
 URL="http://127.0.0.1:$PORT"
 
 cleanup() {
-    [ -n "${SP:-}" ] && kill "$SP" 2>/dev/null || true
+    [ -n "${SP:-}" ] && { kill "$SP" 2>/dev/null; wait "$SP" 2>/dev/null; [ $? -ne 159 ] || echo "FAIL: server died with SIGSYS (seccomp blocked a syscall; see --seccomp=log)" >&2; } || true
     rm -rf "$DATA"
     rm -f /tmp/fs3-p10-$$.*
 }
@@ -23,7 +23,7 @@ BUILD_FLAGS=""
 [ "${DEBUG:-0}" = "1" ] && BUILD_FLAGS="DEBUG=1"
 (cd "$ROOT" && make $BUILD_FLAGS fs3 >/dev/null 2>&1)
 
-"$ROOT/fs3" -p "$PORT" -d "$DATA" >"$LOG" 2>&1 &
+${FS3_WRAP:-} "$ROOT/fs3" -p "$PORT" -d "$DATA" >"$LOG" 2>&1 &
 SP=$!
 sleep 0.4
 if ! kill -0 "$SP" 2>/dev/null; then
@@ -117,9 +117,14 @@ code=$(curl -sS -X PUT "$URL/nosuchbucket/key" \
 check_eq "copy missing dest bucket → 404" "$code" "404"
 
 # ---------- Self-copy (same bucket, same key) --------------------------------
+# Without REPLACE S3 refuses it (400 InvalidRequest); with REPLACE it is
+# how metadata is edited.
 code=$(curl -sS -X PUT "$URL/src/hello" \
        -H "x-amz-copy-source: /src/hello" -o /dev/null -w "%{http_code}")
-check_eq "self-copy → 200" "$code" "200"
+check_eq "self-copy → 400" "$code" "400"
+code=$(curl -sS -X PUT "$URL/src/hello" -H "x-amz-metadata-directive: REPLACE" \
+       -H "x-amz-copy-source: /src/hello" -o /dev/null -w "%{http_code}")
+check_eq "self-copy with REPLACE → 200" "$code" "200"
 
 body=$(curl -sS "$URL/src/hello")
 check_eq "self-copy body unchanged" "$body" "Hello, World!"

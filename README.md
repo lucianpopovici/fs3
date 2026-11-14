@@ -209,12 +209,36 @@ What's working end-to-end:
   the current key without a version id still works (it adds a version or
   marker). Setting retention needs the owner/`o` permission, not just
   `w`, and is capped by `--max-retention-days` (default 3650) so writers
-  can't fill the volume with undeletable data. A missing lock record
+  can't fill the volume with undeletable data. Locked versions count
+  toward quotas and cannot be deleted to get back under one: that is
+  intended. A missing lock record
   falls back to the bucket default; an unreadable one fails closed.
   Retention trusts the system clock; a backwards jump of more than an
-  hour is logged. This is API-level WORM only: root on the NAS can still
-  delete files (`FS_IMMUTABLE_FL` hardening is not implemented — it
-  conflicts with the hard-link version scheme).
+  hour is logged. By default this is API-level WORM: root, or another
+  account with write access to the share, can still delete files.
+
+- **Filesystem immutability** (opt-in) — buckets created with Object
+  Lock use *layout 2*: every version, the current one included, is a file
+  in `versions/`, and `data/<b>/…/<hex>` is a relative symlink to the
+  current one (re-pointed atomically), so no write ever links or renames
+  a locked inode. Reads follow such a link only if it points exactly into
+  that key's own version directory. With `--lock-immutable
+  --lockd-socket PATH`, COMPLIANCE and legal-hold versions are made
+  `FS_IMMUTABLE_FL` by **`fs3-lockd`**, a separate ~300-line root-run
+  helper and the only holder of `CAP_LINUX_IMMUTABLE` (fs3 runs without
+  it). The helper keeps its own root-only, append-only journal
+  (inode → retain-until, hold), only ever extends retention, releases a
+  hold only on an explicit `HOLD_OFF`, and refuses to clear the flag
+  early whatever fs3 asks, so neither other share users, fs3 bugs nor a
+  compromised fs3 can delete such a version. A permanent delete asks it
+  to clear the flag first (lifecycle expiry works the same way).
+  GOVERNANCE versions stay bypassable and are not made immutable. With
+  `--lock-immutable`, fs3 refuses to start if the helper is unreachable or
+  the filesystem refuses the flag. Root can still clear the flag, and
+  retention still trusts the clock. Existing lock buckets keep layout 1
+  (API-level WORM). Start the helper as root:
+  `fs3-lockd --root <data dir> --socket <path> --journal <file>
+  [--peer-uid <fs3 uid>]`; on DSM see the SPK notes.
 
 - **Static website hosting** (Garage's model) — `PUT/GET/DELETE
   /bucket?website` with `IndexDocument/Suffix`, `ErrorDocument/Key` or
@@ -283,17 +307,161 @@ What's working end-to-end:
   reaches the store, so a client that thinks it is setting tags or
   retention cannot overwrite or delete the object by accident.
 
+- **Multipart, round 2** — every part gets a record (MD5, size,
+  checksum, CRC64) and Complete verifies the client's ETag list against
+  it (`InvalidPart`, `InvalidPartOrder`, `EntityTooSmall` below
+  `--mpu-min-part-size`, default 5 MiB). `ListParts` and UploadPartCopy
+  (with `x-amz-copy-source-range` and the `x-amz-copy-source-if-*`
+  conditionals, also honoured by CopyObject) are implemented.
+
+- **User metadata and standard headers** — `x-amz-meta-*` (≤ 2 KiB,
+  name + value bytes, else `MetadataTooLarge`), `Cache-Control`,
+  `Content-Disposition`, `Content-Encoding` (minus `aws-chunked`),
+  `Content-Language` and `Expires` are stored with the object (PUT and
+  multipart) and returned on GET/HEAD. Values with CR, LF, NUL or other
+  control bytes are refused, and re-validated when read back.
+  CopyObject honours `x-amz-metadata-directive: COPY|REPLACE`; a
+  self-copy needs `REPLACE`. `response-*` query overrides work on signed
+  and presigned GET/HEAD and answer `400 InvalidRequest` on anonymous
+  ones. The website listener serves the caching/encoding headers only.
+
+- **Quotas** — hard limits on logical bytes and object count per bucket
+  and per user (summed over the buckets the user owns). Current objects,
+  noncurrent versions, delete markers and in-flight multipart parts all
+  count, charged to the bucket owner whoever wrote them. Set them with
+  the admin API (`GET/PUT/DELETE /v1/buckets/<b>/quota`,
+  `/v1/users/<u>/quota`, body `{"max_bytes":N,"max_objects":N}`, 0 =
+  unlimited) or defaults `--default-bucket-quota` /
+  `--default-user-quota`. A write that would cross a limit is refused
+  with `403 QuotaExceeded` before any byte is stored (declared length,
+  or as a chunked body streams); an overwrite is checked against its full
+  size. Lowering a quota below usage blocks writes and never deletes data.
+  Usage is kept in memory, written at clean shutdown and rebuilt from
+  disk after a crash. Prometheus: `fs3_bucket_bytes`,
+  `fs3_bucket_quota_bytes`, `fs3_quota_rejections_total`.
+
+- **Key hygiene** — a credentials line may carry a fourth field of
+  attributes: `AKIA…:secret:alice:created=1763107200,expires=1794643200,ro,disabled`
+  (strict: an unknown attribute refuses the file and keeps the live
+  keys). A disabled or expired key gets exactly the answer an unknown key
+  gets, after the same HMAC work; the audit log records the real reason
+  (`"deny":"key_disabled"`, `key_expired`, `unknown_key`,
+  `presign_outlives_key`). Presigned URLs die with their key and may not
+  be signed to outlive it. `ro` keys can read and list (including bucket
+  config) but never write, delete, create buckets or change config, even
+  for an admin user. Last-used times are kept in `<data>/keys.state`
+  (flushed every 5 minutes and at shutdown, carried across SIGHUP), never
+  in the credentials file. Admin API: `POST /v1/keys` takes `expires` and
+  `read_only` (default expiry `--key-max-age-days`), `PATCH /v1/keys/<ak>`
+  sets `disabled`/`expires`/`read_only` at once, `GET /v1/keys` shows
+  them with `last_used`. Metrics `fs3_keys_expiring_soon`,
+  `fs3_keys_unused_90d`; both in the DSM console, which keeps a key's
+  attributes when its secret is replaced.
+
+- **seccomp** — after startup (listeners bound, TLS and credentials
+  loaded, store recovered, logs open) and before the I/O workers exist,
+  fs3 installs a hand-written seccomp-BPF allowlist that every thread
+  inherits (no libseccomp; works on kernel 3.10, which has no TSYNC).
+  `clone` is allowed for threads only, `socket` for AF_UNIX/INET/INET6,
+  `ioctl` for the request numbers in use; `execve`, `fork`, `ptrace`
+  and everything else kill the process. `--seccomp=off|log|enforce|require`
+  (default `enforce`; `log` prints the blocked syscall number and exits
+  with 159; `require` refuses to start without seccomp). Sanitizer builds
+  compile it out. `make seccomp-profile` runs the e2e suites under
+  `strace -f` and diffs the syscalls used against the compiled-in table
+  (`fs3 --seccomp-list`); rerun it on the Synology static binary after a
+  toolchain change.
+
+- **Reflink fast paths** — on Btrfs/XFS (probed at startup; `--reflink
+  off` to disable) multipart Complete clones each part's extents into the
+  object instead of copying (no double disk space, ETag and CRC come from
+  the part records), and CopyObject / UploadPartCopy clone the source
+  extent when both payloads are block-aligned; anything misaligned falls
+  back to a copy. `fs3_reflink_clones_total` counts clones.
+  `tests/test_e2e_reflink.sh` needs a Btrfs/XFS directory in
+  `FS3_REFLINK_DIR` (a loopback image works) and skips without one; CI
+  should provide one, or run with `FS3_TEST_STRICT=1`.
+
+- **Whole-object dedup** (opt-in, needs reflink) — `--dedup owner|global`
+  hashes PUT bodies (SHA-256, stored as a `CONTENT_SHA256` TLV) and
+  shares the extents of identical objects of at least `--dedup-min-size`
+  (default 1 MiB) through `<data>/cas/<scope>/…`. Every object file stays
+  complete: wiping `cas/` only loses future dedup, never data, and there
+  are no refcounts to repair after a crash. The scrub removes pool
+  entries no object references. **Scope:** `owner` (per bucket owner) is
+  the safe default; `global` lets one user confirm that another stores a
+  given file, so use it only on single-tenant NAS installs. Quotas still
+  charge logical bytes. `--dedup-verify` byte-compares before sharing.
+  Metrics `fs3_dedup_hits_total`, `fs3_dedup_pool_adds_total`.
+
+- **Filesystem compression** — `--fs-compress auto|all` sets Btrfs's
+  `FS_COMPR_FL` on each new object file before the first write, so the
+  filesystem compresses extents transparently: sendfile, Range, reflinks
+  and the on-disk format are untouched. `auto` skips already-compressed
+  content types and suffixes (JPEG, PNG, video, audio, zip, gz, zst, 7z,
+  PDF, …) and objects under 4 KiB. On ext4 (or a Btrfs that refuses the
+  flag) fs3 logs a warning and stores uncompressed. Btrfs reports
+  uncompressed sizes to `stat`/`du`; use `compsize <data dir>` to see the
+  savings. On DSM, the shared folder's own compression setting may be the
+  simpler switch. Application-level zstd (for ext4) is not implemented.
+
+- **SSE-C** (customer-provided keys) — `x-amz-server-side-encryption-customer-*`
+  on PUT, GET, HEAD, CreateMultipartUpload, UploadPart, CopyObject and
+  UploadPartCopy (with the copy-source variants: re-keying and
+  decrypt-on-copy work). Only over native TLS or a trusted proxy that says
+  https (`400 InvalidRequest` otherwise), and the three headers must be
+  signed. The key is never stored: per object, a random salt gives
+  `k_obj = HKDF-SHA256(key, salt, "fs3-ssec-v1")`, and the payload is
+  sealed in 64 KiB AES-256-GCM segments (nonce = part number ‖ segment
+  index, AAD = bucket id ‖ final flag) so ranges decrypt only the
+  segments they touch and truncation, reordering or splicing fail
+  authentication. A key check value (HMAC, not the key MD5) refuses a
+  wrong key (`403`) before any data is read; a missing key is `400`.
+  ETags are MD5s of the ciphertext, and client checksums are verified over
+  the plaintext but not stored. SSE-C objects are never deduplicated,
+  compressed or served by the website listener; the scrub verifies their
+  ciphertext without the key. The audit log marks them `"ssec":true` and
+  never holds key material.
+
+- **Integrity scrub** — a background pass (every `--scrub-interval-days`,
+  default 30; `--scrub-now`; admin API `POST /v1/scrub`, progress at
+  `GET /v1/scrub`) re-reads every object, noncurrent version and
+  in-flight part and checks it against its payload CRC64, else its MD5
+  ETag, else a stored full-object checksum (multipart objects written
+  before schema 4 are "unverifiable"); lock records are checked for
+  parseability. It runs on an I/O worker at idle I/O priority, throttled
+  by `--scrub-rate` (default 20 MiB/s), backs off while requests are
+  queued, drops what it read from the page cache, and resumes where it
+  stopped after a restart. Corruption is never repaired or deleted: it
+  goes to `scrub/corrupt.log`, the audit log and
+  `fs3_scrub_corrupt_total`; with `--scrub-fail-reads` a GET of a
+  corrupt version answers 500 instead of returning bad bytes. Each pass
+  also reconciles quota usage with the disk. On a Btrfs volume with data
+  checksums, DSM's own data scrubbing covers the same failure and can
+  repair from RAID parity where fs3 can only detect; fs3's scrub matters
+  on ext4 and for logical damage (truncated files, bad headers).
+
+- **Listing** — ListObjectsV2 (`continuation-token`, `start-after`,
+  `fetch-owner`, `KeyCount`), `encoding-type=url` on both list versions,
+  and ListMultipartUploads pagination (`key-marker`, `upload-id-marker`,
+  `max-uploads`). A delimiter listing never repeats a CommonPrefix
+  across pages.
+
+- **Range requests** follow S3 and RFC 9110: one `bytes=` range → 206;
+  multi-range requests (`bytes=0-1,5-9`) return the full object with 200,
+  as S3 does; an invalid header (unknown unit, last < first) is ignored;
+  an unsatisfiable one → 416 with `Content-Range: bytes */size`.
+
 What's *not* yet wired:
 
-- `ListParts` (`GET /bucket/key?uploadId=`) and UploadPartCopy answer 501.
-- Multi-range `Range:` (`bytes=A-B,C-D`).
-- Per-bucket / per-user quotas, background integrity scrub, key expiry /
-  disable, SSE-C, seccomp, `FS_IMMUTABLE_FL` for COMPLIANCE versions.
+- Application-level compression (ext4); an offline converter from
+  layout 1 to layout 2 for existing object-lock buckets.
 - Tag-based lifecycle filters, transitions, website routing rules (all
   refused with 501 rather than ignored).
 - Replication, server-side encryption, STS.
 
-**Upgrading:** the object header (schema 3), version and lock trees are
+**Upgrading:** the object header (schema 4 since round 2), layout-2
+object-lock buckets, credential attributes, version and lock trees are
 one-way migrations — an older fs3 cannot read data written by this one.
 See `packaging/synology/CHANGELOG.md`.
 
@@ -395,6 +563,14 @@ With that in place, `aws s3 cp` of files large enough to trigger
 multipart upload (default >8 MB) round-trips byte-for-byte against fs3.
 
 ## Tests
+
+Test dependencies: `pip install -r tests/requirements.txt` (boto3 ≥ 1.36,
+`botocore[crt]` for CRC32C/CRC64NVME, AWS CLI) plus `curl` and
+`openssl`. `make test` checks for them first (`make check-test-deps`) and
+prints the install line instead of failing deep inside a suite. Without
+`awscrt`, `test_e2e_checksum.sh` skips the boto3 CRC32C/CRC64NVME cases
+and says so in its summary; `FS3_TEST_STRICT=1` turns those skips into
+failures (use it in CI).
 
 | target                   | what it covers                                                |
 |--------------------------|---------------------------------------------------------------|

@@ -57,6 +57,13 @@ const char *cksum_xml_name(int algo);
 int  cksum_oneshot(int algo, const void *p, size_t n,
                    uint8_t out[CKSUM_MAX_DIGEST], size_t *len);
 
+/* CRC64NVME of A‖B from crc(A), crc(B) and len(B), without the data —
+ * multipart Complete combines per-part payload CRCs this way. Values are
+ * final (post-xorout) CRCs as integers. */
+uint64_t crc64nvme_combine(uint64_t crc_a, uint64_t crc_b, uint64_t len_b);
+uint64_t crc64nvme_from_be(const uint8_t d[8]);
+void     crc64nvme_to_be(uint64_t v, uint8_t d[8]);
+
 /* Standard base64 (with padding). base64_encode writes a NUL-terminated
  * string (out needs 4*ceil(n/3)+1 bytes) and returns its length.
  * base64_decode returns decoded length or -1 if invalid / too long. */

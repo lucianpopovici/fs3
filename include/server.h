@@ -91,6 +91,22 @@ typedef struct {
     int                    require_signed_payload;  /* S2 */
     /* Longest retention a client may set (S9), days; 0 = default 3650. */
     int                    max_retention_days;
+    uint64_t               mpu_min_part_size;   /* Complete: EntityTooSmall below */
+    uint64_t               default_bucket_quota; /* bytes, 0 = unlimited */
+    uint64_t               default_user_quota;
+    /* Integrity scrub (round 2, item 3). */
+    int                    scrub_interval_days;   /* 0 = off */
+    int                    scrub_now;
+    uint64_t               scrub_rate;            /* bytes/s, 0 = unthrottled */
+    int                    scrub_fail_reads;
+    int                    key_max_age_days;      /* default expiry of admin-created keys */
+    int                    seccomp_mode;          /* sandbox_mode_t */
+    int                    reflink_off;           /* --reflink off */
+    int                    dedup_mode;            /* STORE_DEDUP_* */
+    uint64_t               dedup_min;
+    int                    dedup_verify;
+    int                    fs_compress;           /* STORE_COMPRESS_* */
+    const char            *lockd_socket;          /* --lock-immutable (item 9) */
 
     /* Admin API (item 11): /v1 on the metrics listener needs this bearer
      * token (NULL = disabled there); admin_socket adds a Unix-socket

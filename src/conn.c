@@ -25,6 +25,7 @@
  */
 
 #include "conn.h"
+#include <openssl/crypto.h>
 #include "action.h"
 #include "iopool.h"
 #include "log.h"
@@ -101,6 +102,8 @@ void conn_destroy(conn_t *c) {
     /* A job still running on the pool owns its writer/reader; detach it
      * so its done() cleans up without touching this (freed) conn. */
     if (c->job) c->job->conn = NULL;
+    OPENSSL_cleanse(c->ssec_key, sizeof(c->ssec_key));
+    OPENSSL_cleanse(c->ssec_src_key, sizeof(c->ssec_src_key));
     /* Release any handler-owned state (request was abandoned mid-flight). */
     if (c->put_writer) store_put_abort(c->put_writer);
     if (c->get_reader) store_get_close(c->get_reader);
@@ -207,6 +210,7 @@ static void request_reset(conn_t *c) {
     c->cfg_key = (s3_str_t){0};
     c->lock_pending = 0;
     c->copy_pending = 0;
+    c->copy_part = 0;
     c->copy_bucket = (s3_str_t){0};
     c->copy_key = (s3_str_t){0};
     c->body_limit_hit = 0;
@@ -216,6 +220,12 @@ static void request_reset(conn_t *c) {
     c->req_start_ns = 0;
     c->bytes_out_body = 0;
     c->metrics_flushed = 0;
+    c->last_err = 0;
+    c->expect_pending = 0;
+    c->deny_reason = NULL;
+    OPENSSL_cleanse(c->ssec_key, sizeof(c->ssec_key));
+    OPENSSL_cleanse(c->ssec_src_key, sizeof(c->ssec_src_key));
+    c->ssec_on = c->ssec_src_on = 0;
 
     /* Belt-and-suspenders: by the time we reset, route_dispatch_complete
      * (PUT path) or route_dispatch_send_body (GET path) should have
@@ -256,6 +266,16 @@ static ssize_t conn_io_write(conn_t *c, const void *buf, size_t n) {
 
 ssize_t conn_io_send_body(conn_t *c, struct s3_reader *r, size_t max) {
     if (c->ssl) return tls_send_body(c, r, max);
+    if (store_reader_transformed(r)) {
+        /* SSE-C behind a trusted https proxy: decrypt, then write; bytes
+         * the socket didn't take are re-read on the next call. */
+        char buf[16 * 1024];
+        ssize_t n = store_get_read(r, buf, max && max < sizeof(buf) ? max : sizeof(buf));
+        if (n <= 0) return n;
+        ssize_t w = write(c->fd, buf, (size_t)n);
+        if (w < n) store_get_rewind(r, (uint64_t)(n - (w > 0 ? w : 0)));
+        return w;
+    }
     return store_get_sendfile(r, c->fd, max);
 }
 
@@ -582,10 +602,11 @@ static int cb_on_headers_complete(llhttp_t *p) {
 
     /* llhttp tracks Content-Length and chunked flag for us. */
     c->req.content_length_hint = p->content_length;
-    c->req.chunked = (p->flags & 0x08) ? 1 : 0;  /* F_CHUNKED = 0x08 */
+    c->req.chunked = (p->flags & F_CHUNKED) ? 1 : 0;
 
-    /* Keep-alive: llhttp's flag F_CONNECTION_CLOSE = 0x04 */
-    int conn_close = (p->flags & 0x04) ? 1 : 0;
+    /* Keep-alive: "Connection: close" (F_CONNECTION_CLOSE is 0x02; this
+     * used to test 0x04, F_CONNECTION_UPGRADE, so close was ignored). */
+    int conn_close = (p->flags & F_CONNECTION_CLOSE) ? 1 : 0;
     int http11 = (p->http_major == 1 && p->http_minor == 1);
     c->req.keep_alive = http11 && !conn_close;
 
@@ -648,6 +669,7 @@ static int cb_on_headers_complete(llhttp_t *p) {
             else if (e == S3_OK)
                 throttle_ok(c->client_ip);
             if (e != S3_OK) {
+                c->deny_reason = sigv4_last_deny_reason();   /* audit log only */
                 LOG_D("sigv4 verify failed (err=%d) on %s",
                       (int)e, c->peer);
                 if (route_build_error(c, e) < 0) return -1;
@@ -713,6 +735,11 @@ static int cb_on_headers_complete(llhttp_t *p) {
     /* Dispatch to the router. For PUT this opens a writer (so on_body
      * can stream into it); for GET/HEAD/DELETE/list, this builds the
      * full response now and transitions to CST_WRITE_RESPONSE. */
+    {
+        const s3_str_t *exh = find_hdr(c, "expect");
+        c->expect_pending = exh && exh->n == 12 && strncasecmp(exh->p, "100-continue", 12) == 0
+                            && (c->req.chunked || c->req.content_length_hint > 0);
+    }
     if (route_dispatch_headers(c) < 0) {
         return -1;
     }
@@ -729,6 +756,7 @@ static int cb_on_headers_complete(llhttp_t *p) {
     if (ex && ex->n == 12 && strncasecmp(ex->p, "100-continue", 12) == 0) {
         static const char cont[] = "HTTP/1.1 100 Continue\r\n\r\n";
         (void)!conn_io_write(c, cont, sizeof(cont) - 1);
+        c->expect_pending = 0;
     }
 
     /* Additional checksums (x-amz-checksum-* header or trailer,
@@ -736,7 +764,7 @@ static int cb_on_headers_complete(llhttp_t *p) {
     s3_err_t ce = checksum_setup(c);
     if (ce != S3_OK) {
         abort_writer(c);
-        c->mpu_complete_pending = c->delete_pending = c->copy_pending = 0;
+        c->mpu_complete_pending = c->delete_pending = c->copy_pending = c->copy_part = 0;
         c->cfg_act = 0;
         if (route_build_error(c, ce) < 0) return -1;
         return 0;
@@ -804,7 +832,7 @@ static int cb_on_body(llhttp_t *p, const char *at, size_t len) {
         }
         c->mpu_complete_pending = 0;
         c->delete_pending = 0;
-        c->copy_pending = 0;
+        c->copy_pending = c->copy_part = 0;
         c->cfg_act = 0;
         if (route_build_error(c, S3_ERR_ENTITY_TOO_LARGE) < 0) return -1;
         return 0;
@@ -820,7 +848,7 @@ static int cb_on_body(llhttp_t *p, const char *at, size_t len) {
             abort_writer(c);
             sigv4_chunk_free(c->chunk_decoder);
             c->chunk_decoder = NULL;
-            c->mpu_complete_pending = c->delete_pending = c->copy_pending = 0;
+            c->mpu_complete_pending = c->delete_pending = c->copy_pending = c->copy_part = 0;
             c->cfg_act = 0;
             s3_err_t fe = c->sig_verified ? S3_ERR_SIGNATURE_DOES_NOT_MATCH
                                           : S3_ERR_INVALID_REQUEST;
@@ -872,7 +900,7 @@ static int cb_on_message_complete(llhttp_t *p) {
         if (!ok) {
             LOG_D("chunk finish failed on %s", c->peer);
             abort_writer(c);
-            c->mpu_complete_pending = c->delete_pending = c->copy_pending = 0;
+            c->mpu_complete_pending = c->delete_pending = c->copy_pending = c->copy_part = 0;
             c->cfg_act = 0;
             if (route_build_error(c, fe) < 0) {
                 return -1;
@@ -910,7 +938,7 @@ static int cb_on_message_complete(llhttp_t *p) {
         if (ce != S3_OK) {
             LOG_D("checksum mismatch on %s", c->peer);
             abort_writer(c);
-            c->mpu_complete_pending = c->delete_pending = c->copy_pending = 0;
+            c->mpu_complete_pending = c->delete_pending = c->copy_pending = c->copy_part = 0;
             c->cfg_act = 0;
             if (route_build_error(c, ce) < 0) return -1;
             c->request_dispatched = 1;

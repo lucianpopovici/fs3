@@ -5,6 +5,7 @@
 #include "conn.h"
 #include "json.h"
 #include "log.h"
+#include "response.h"
 
 #include <fcntl.h>
 #include <stdio.h>
@@ -73,13 +74,22 @@ void audit_request(const conn_t *c, int status, uint64_t bytes_in,
     json_put_str(line, sizeof(line), &o, action_name((s3_action_t)c->req.act));
     o += (size_t)snprintf(line + o, sizeof(line) - o, ",\"path\":");
     json_put_str(line, sizeof(line), &o, path);
+    if (c->last_err > 0 && c->last_err < S3_ERR_MAX && o + 100 < sizeof(line)) {
+        o += (size_t)snprintf(line + o, sizeof(line) - o, ",\"error\":");
+        json_put_str(line, sizeof(line), &o, s3_err_name((s3_err_t)c->last_err));
+    }
+    if (c->deny_reason && o + 100 < sizeof(line)) {
+        o += (size_t)snprintf(line + o, sizeof(line) - o, ",\"deny\":");
+        json_put_str(line, sizeof(line), &o, c->deny_reason);
+    }
     if (o + 200 < sizeof(line))
         o += (size_t)snprintf(line + o, sizeof(line) - o,
             ",\"status\":%d,\"bytes_in\":%llu,\"bytes_out\":%llu,\"ms\":%.1f,"
-            "\"presigned\":%s,\"tls\":%s,\"web\":%s}\n",
+            "\"presigned\":%s,\"tls\":%s,\"web\":%s%s}\n",
             status, (unsigned long long)bytes_in, (unsigned long long)bytes_out,
             dur_s >= 0 ? dur_s * 1000 : -1.0, c->id.presigned ? "true" : "false",
-            c->secure ? "true" : "false", c->is_web ? "true" : "false");
+            c->secure ? "true" : "false", c->is_web ? "true" : "false",
+            (c->ssec_on || c->ssec_src_on) ? ",\"ssec\":true" : "");
     emit(line, o);
 }
 

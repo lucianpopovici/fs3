@@ -148,3 +148,11 @@ int iopool_reap(iopool_t *p,
     }
     return reaped;
 }
+
+int iopool_pending(iopool_t *p) {
+    if (!p) return 0;
+    pthread_mutex_lock(&p->mu);
+    int busy = p->q_head != NULL;
+    pthread_mutex_unlock(&p->mu);
+    return busy;
+}

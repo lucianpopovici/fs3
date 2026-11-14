@@ -50,11 +50,27 @@ def _crc32c(data):
     return crc ^ 0xFFFFFFFF
 
 
+def _crc64nvme(data):
+    poly = 0x9A6C9329AC4BC9B5            # reflected CRC-64/NVME
+    table = []
+    for i in range(256):
+        c = i
+        for _ in range(8):
+            c = (c >> 1) ^ (poly if c & 1 else 0)
+        table.append(c)
+    crc = 0xFFFFFFFFFFFFFFFF
+    for b in data:
+        crc = (crc >> 8) ^ table[(crc ^ b) & 0xFF]
+    return crc ^ 0xFFFFFFFFFFFFFFFF
+
+
 def checksum(algo, data):
     if algo == "crc32":
         return (zlib.crc32(data) & 0xFFFFFFFF).to_bytes(4, "big")
     if algo == "crc32c":
         return _crc32c(data).to_bytes(4, "big")
+    if algo == "crc64nvme":
+        return _crc64nvme(data).to_bytes(8, "big")
     if algo == "sha256":
         return hashlib.sha256(data).digest()
     if algo == "sha1":

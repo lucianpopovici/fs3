@@ -17,7 +17,7 @@ AK=AKIAVERSIONING01
 SK=versioningSecret012345678901234567890123456
 
 cleanup() {
-    [ -n "${SP:-}" ] && kill "$SP" 2>/dev/null || true
+    [ -n "${SP:-}" ] && { kill "$SP" 2>/dev/null; wait "$SP" 2>/dev/null; [ $? -ne 159 ] || echo "FAIL: server died with SIGSYS (seccomp blocked a syscall; see --seccomp=log)" >&2; } || true
     rm -rf "$DATA" "$LOG"
 }
 trap cleanup EXIT
@@ -27,7 +27,7 @@ BUILD_FLAGS=""
 (cd "$ROOT" && make $BUILD_FLAGS fs3 >/dev/null 2>&1)
 
 start() {
-    "$ROOT/fs3" -p "$PORT" -d "$DATA" --auth "$AK:$SK" --require-auth >>"$LOG" 2>&1 &
+    ${FS3_WRAP:-} "$ROOT/fs3" -p "$PORT" -d "$DATA" --auth "$AK:$SK" --require-auth >>"$LOG" 2>&1 &
     SP=$!
     sleep 0.4
     kill -0 "$SP" 2>/dev/null || { echo "server did not start" >&2; cat "$LOG" >&2; exit 1; }
@@ -68,6 +68,10 @@ check("current is v2", body(Bucket="verb", Key="k"), b"two")
 check("GET v1", body(Bucket="verb", Key="k", VersionId=v1), b"one")
 check("GET null", body(Bucket="verb", Key="k", VersionId="null"), b"null-version")
 check("HEAD carries version id", s3.head_object(Bucket="verb", Key="k")["VersionId"], v2)
+_v0 = s3.list_object_versions(Bucket="verb", Prefix="k")["Versions"][-1]
+check("versioned read: multi-range → full object",
+      len(s3.get_object(Bucket="verb", Key="k", VersionId=_v0["VersionId"], Range="bytes=0-0,2-2")["Body"].read()),
+      _v0["Size"])
 check("bad version id", code(lambda: s3.get_object(Bucket="verb", Key="k", VersionId="../../etc")), "InvalidArgument")
 check("unknown version", code(lambda: s3.get_object(Bucket="verb", Key="k", VersionId="0"*31 + "1")), "NoSuchVersion")
 

@@ -7,7 +7,7 @@
  *
  * Query string matters for some bucket ops:
  *   GET /<bucket>?location            → location subresource (TODO)
- *   GET /<bucket>?list-type=2&...     → ListObjectsV2 (treated as list)
+ *   GET /<bucket>?list-type=2&...     → ListObjectsV2
  *   GET /<bucket>?prefix=&delimiter=  → ListObjectsV1
  *
  * For simplicity right now we treat any GET on /<bucket> (with or
@@ -22,6 +22,10 @@
 #include "website.h"
 #include "policy.h"
 #include "objlock.h"
+#include "objmeta.h"
+#include "ssec.h"
+#include "lockc.h"
+#include "sigv4.h"
 #include "xml_parser.h"
 #include "conn.h"
 #include "iopool.h"
@@ -30,10 +34,14 @@
 #include "store.h"
 
 #include <ctype.h>
+#include <openssl/crypto.h>
+#include <openssl/evp.h>
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
+#include <stdint.h>
 #include <sys/sendfile.h>
 #include <time.h>
 #include <unistd.h>
@@ -253,6 +261,15 @@ s3_err_t authz(conn_t *c, s3_str_t bucket, s3_str_t key, s3_action_t act) {
     if (!ai) return S3_ERR_ACCESS_DENIED;          /* default deny */
     if (!c->auth) return S3_OK;                    /* open mode */
     int anon = !c->id.user[0];
+    /* Read-only key (item 4): before grants and policies, and for admin
+     * users too. Writes, bucket creation and config changes are refused;
+     * reads, listings and config reads are not. */
+    if (!anon && c->id.read_only) {
+        int read_method = s3_str_eq_lit(c->req.method, "GET") || s3_str_eq_lit(c->req.method, "HEAD");
+        if ((ai->perm & PERM_W) || act == ACT_CREATE_BUCKET || act == ACT_DELETE_BUCKET
+            || (!read_method && (ai->perm & PERM_O)))
+            return S3_ERR_ACCESS_DENIED;
+    }
     if (act == ACT_LIST_BUCKETS || act == ACT_CREATE_BUCKET)
         return anon ? S3_ERR_ACCESS_DENIED : S3_OK;
     s3_bucket_meta_t m;
@@ -836,6 +853,12 @@ static int max_keys_param(const conn_t *c, const char *name) {
     return mk;
 }
 
+static int mpu_info_cmp(const void *a, const void *b) {
+    const s3_mpu_info_t *x = a, *y = b;
+    int c = strcmp(x->key, y->key);
+    return c ? c : strcmp(x->upload_id, y->upload_id);
+}
+
 static int handle_bucket(conn_t *c, s3_str_t bucket, s3_action_t act) {
     switch (act) {
     case ACT_GET_BUCKET_ACL:
@@ -912,21 +935,72 @@ static int handle_bucket(conn_t *c, s3_str_t bucket, s3_action_t act) {
         s3_err_t e = store_list_mpu_uploads(c->store, bucket, prefix,
                                             &ups, &n_ups);
         if (e != S3_OK) return rsp_build_s3_error(c, e, c->req.path, NULL);
-        int rc = rsp_build_list_mpu_uploads(c, bucket, prefix, ups, n_ups);
+        /* Pagination: sorted by (key, upload id); entries after
+         * (key-marker, upload-id-marker), at most max-uploads (≤ 1000). */
+        qsort(ups, n_ups, sizeof(*ups), mpu_info_cmp);
+        rsp_mpu_page_t pg = { 0 };
+        pg.key_marker = q_val(c, "key-marker");
+        pg.upload_id_marker = q_val(c, "upload-id-marker");
+        pg.max = max_keys_param(c, "max-uploads");
+        if (pg.max <= 0) pg.max = 1000;
+        size_t first = 0;
+        while (first < n_ups) {
+            const s3_mpu_info_t *u = &ups[first];
+            size_t kn = strlen(u->key);
+            int ck = memcmp(u->key, pg.key_marker.p ? pg.key_marker.p : "",
+                            kn < pg.key_marker.n ? kn : pg.key_marker.n);
+            if (ck == 0) ck = kn < pg.key_marker.n ? -1 : kn > pg.key_marker.n;
+            if (ck > 0) break;
+            if (ck == 0 && pg.upload_id_marker.n
+                && strncmp(u->upload_id, pg.upload_id_marker.p, pg.upload_id_marker.n) > 0)
+                break;
+            first++;
+        }
+        size_t cnt = n_ups - first;
+        if (cnt > (size_t)pg.max) { cnt = (size_t)pg.max; pg.truncated = 1; }
+        int rc = rsp_build_list_mpu_uploads2(c, bucket, prefix, ups + first, cnt, &pg);
         store_mpu_uploads_free(ups, n_ups);
         return rc;
     }
 
     case ACT_LIST_OBJECTS: {
         s3_list_opts_t opts = { 0 };
+        rsp_list_ext_t x = { 0 };
         opts.prefix    = q_val(c, "prefix");
         opts.delimiter = q_val(c, "delimiter");
-        opts.marker    = q_val(c, "marker");
         opts.max_keys  = max_keys_param(c, "max-keys");
+        s3_str_t lt = q_val(c, "list-type"), et = q_val(c, "encoding-type");
+        if (lt.p && !s3_str_eq_lit(lt, "2"))
+            return rsp_build_s3_error(c, S3_ERR_INVALID_ARGUMENT, c->req.path, NULL);
+        if (et.p && !s3_str_eq_lit(et, "url"))
+            return rsp_build_s3_error(c, S3_ERR_INVALID_ARGUMENT, c->req.path, NULL);
+        x.url_encode = et.p != NULL;
+        x.v2 = lt.p != NULL;
+        if (x.v2) {
+            /* ListObjectsV2: the continuation token (base64 of the last
+             * key/prefix of the previous page) wins over start-after. */
+            x.start_after = q_val(c, "start-after");
+            x.cont_token  = q_val(c, "continuation-token");
+            s3_str_t fo = q_val(c, "fetch-owner");
+            x.fetch_owner = fo.p && s3_str_eq_lit(fo, "true");
+            opts.marker = x.start_after;
+            if (x.cont_token.p) {
+                char *dec = scratch_alloc(c, 1025);
+                int dn = dec ? base64_decode(x.cont_token.p, x.cont_token.n,
+                                             (uint8_t *)dec, 1024) : -1;
+                if (dn <= 0)
+                    return rsp_build_s3_error(c, S3_ERR_INVALID_ARGUMENT, c->req.path, NULL);
+                opts.marker = (s3_str_t){ dec, (size_t)dn };
+            }
+        } else {
+            opts.marker = q_val(c, "marker");
+        }
+        s3_bucket_meta_t bm;
+        if (store_bucket_meta(c->store, bucket, &bm) == S3_OK) x.owner = bm.owner;
         s3_lister_t *l;
         s3_err_t e = store_list_begin(c->store, bucket, &opts, &l);
         if (e != S3_OK) return rsp_build_s3_error(c, e, c->req.path, NULL);
-        return rsp_build_list_bucket(c, bucket, &opts, l);
+        return rsp_build_list_bucket_ex(c, bucket, &opts, l, &x);
     }
 
     default: {
@@ -1000,6 +1074,33 @@ static void commit_run(iojob_t *j) {
     else             cj->err = store_put_commit(cj->w, &cj->meta);
 }
 
+/* Item 9: with --lock-immutable, a layout-2 version under COMPLIANCE
+ * retention or a legal hold is made immutable by fs3-lockd (which only
+ * ever extends retention); a released hold is reported with HOLD_OFF.
+ * Failures are logged: the API-level guard still holds. */
+static void immutable_sync(conn_t *c, s3_str_t bucket, s3_str_t key, const uint8_t vid[16]) {
+    if (!c->lockd_sock) return;
+    char path[4600];
+    if (store_version_file(c->store, bucket, key, vid, path, sizeof(path)) < 0) return;
+    s3_reader_t *r = NULL;
+    s3_obj_meta_t m;
+    if (store_get_open_version(c->store, bucket, key, vid, &r, &m) != S3_OK) return;
+    store_get_close(r);
+    s3_lock_t l;
+    if (!olock_effective(c->store, bucket, key, &m, &l)) return;
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    uint64_t now = (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
+    int compliance = l.mode == S3_LOCK_COMPLIANCE && l.until_ms > now;
+    int rc = 0;
+    if (compliance || l.legal_hold)
+        rc = lockc_set(c->lockd_sock, path, compliance ? l.until_ms : 0, l.legal_hold);
+    else if (lockc_is_immutable(path))
+        rc = lockc_hold_off(c->lockd_sock, path);
+    if (rc != 0) LOG_W("lock-immutable: fs3-lockd did not apply %s (%s)", path,
+                       rc < 0 ? "unreachable" : "refused");
+}
+
 static void commit_done(iojob_t *j) {
     commit_job_t *cj = (commit_job_t *)j;
     conn_t *c = job_finish(j);
@@ -1035,6 +1136,16 @@ static void commit_done(iojob_t *j) {
                                              cj->meta.version_id, &c->lock_new);
                         }
                     }
+                    if (c->lockd_sock) {
+                        const char *sl = memchr(c->req.path.p + 1, '/', c->req.path.n - 1);
+                        size_t off = sl ? (size_t)(sl - c->req.path.p) + 1 : c->req.path.n;
+                        char *kb = scratch_alloc(c, c->req.path.n);
+                        if (kb && c->req.path.n > off) {
+                            memcpy(kb, c->req.path.p + off, c->req.path.n - off);
+                            size_t kn = pct_decode(kb, c->req.path.n - off);
+                            immutable_sync(c, bk, (s3_str_t){ kb, kn }, cj->meta.version_id);
+                        }
+                    }
                 }
             }
             rc = rsp_build_status_with_headers(c, 200, "OK", extra);
@@ -1062,17 +1173,195 @@ static int submit_commit(conn_t *c, int is_part) {
     return job_submit(c, &cj->base);
 }
 
-static int handle_object_put_begin(conn_t *c, s3_str_t bucket, s3_str_t key) {
-    const s3_str_t *ct_hdr = hdr_get(c, "content-type");
-    char ct_buf[128] = {0};
-    if (ct_hdr) {
-        size_t n = ct_hdr->n;
-        if (n >= sizeof(ct_buf)) n = sizeof(ct_buf) - 1;
-        memcpy(ct_buf, ct_hdr->p, n);
-    }
+/* ===================================================================== */
+/* SSE-C request headers (round 2, item 8)                                */
+/* ===================================================================== */
 
+/* Parse one SSE-C header set ("x-amz-server-side-encryption-customer-"
+ * or the copy-source variant). *on = 0 when none of the three is sent.
+ * All three are required together, only over TLS (native, or a trusted
+ * proxy that says https), and each must be signed. */
+static s3_err_t parse_ssec_set(conn_t *c, const char *prefix, uint8_t key[32], int *on,
+                               char md5_b64[32]) {
+    char na[128], nk[128], nm[128];
+    snprintf(na, sizeof(na), "%salgorithm", prefix);
+    snprintf(nk, sizeof(nk), "%skey", prefix);
+    snprintf(nm, sizeof(nm), "%skey-md5", prefix);
+    const s3_str_t *ha = hdr_get(c, na), *hk = hdr_get(c, nk), *hm = hdr_get(c, nm);
+    *on = 0;
+    if (!ha && !hk && !hm) return S3_OK;
+    if (!ha || !hk || !hm || !s3_str_eq_lit(*ha, "AES256")) return S3_ERR_INVALID_ARGUMENT;
+    /* A key sent in clear over the LAN is worse than no encryption. */
+    if (!c->secure) return S3_ERR_INVALID_REQUEST;
+    if (c->auth && c->sig_verified
+        && (!sigv4_header_signed(c, na) || !sigv4_header_signed(c, nk) || !sigv4_header_signed(c, nm)))
+        return S3_ERR_ACCESS_DENIED;
+    uint8_t md5[16], got[16];
+    if (base64_decode(hk->p, hk->n, key, 32) != 32
+        || base64_decode(hm->p, hm->n, md5, sizeof(md5)) != 16) {
+        OPENSSL_cleanse(key, 32);
+        return S3_ERR_INVALID_ARGUMENT;
+    }
+    unsigned int gl = 16;
+    EVP_Digest(key, 32, got, &gl, EVP_md5(), NULL);
+    if (CRYPTO_memcmp(got, md5, 16) != 0) { OPENSSL_cleanse(key, 32); return S3_ERR_INVALID_ARGUMENT; }
+    if (md5_b64) {
+        if (hm->n >= 32) { OPENSSL_cleanse(key, 32); return S3_ERR_INVALID_ARGUMENT; }
+        memcpy(md5_b64, hm->p, hm->n);
+        md5_b64[hm->n] = '\0';
+    }
+    *on = 1;
+    return S3_OK;
+}
+
+#define SSEC_HDR "x-amz-server-side-encryption-customer-"
+#define SSEC_SRC_HDR "x-amz-copy-source-server-side-encryption-customer-"
+
+static s3_err_t req_ssec(conn_t *c) {
+    return parse_ssec_set(c, SSEC_HDR, c->ssec_key, &c->ssec_on, c->ssec_md5);
+}
+
+static void echo_ssec(conn_t *c) {
+    if (!c->ssec_on) return;
+    conn_add_header(c, "x-amz-server-side-encryption-customer-algorithm", "AES256");
+    conn_add_header(c, "x-amz-server-side-encryption-customer-key-MD5", c->ssec_md5);
+}
+
+/* ===================================================================== */
+/* User metadata and standard object headers (round 2, item 1e)           */
+/* ===================================================================== */
+
+_Static_assert(sizeof(objmeta_hdr_t) == sizeof(conn_header_t),
+               "objmeta_hdr_t mirrors conn_header_t");
+
+/* Request Content-Type, validated as a header value and ≤ 1024 bytes
+ * (refused, never truncated). out: NUL-terminated, "" if absent. */
+static s3_err_t req_content_type(const conn_t *c, char out[1025], int *present) {
+    const s3_str_t *h = hdr_get(c, "content-type");
+    out[0] = '\0';
+    if (present) *present = h != NULL;
+    if (!h) return S3_OK;
+    if (h->n > 1024 || !objmeta_valid_value(h->p, h->n)) return S3_ERR_INVALID_ARGUMENT;
+    memcpy(out, h->p, h->n);
+    out[h->n] = '\0';
+    return S3_OK;
+}
+
+static s3_err_t req_meta_tlv(const conn_t *c, uint8_t **tlv, size_t *n) {
+    return objmeta_from_headers((const objmeta_hdr_t *)c->req.headers, c->req.n_headers,
+                                tlv, n);
+}
+
+/* response-* query overrides on GET/HEAD. */
+static const struct { const char *q; int std_id; } RSP_OVR[] = {
+    { "response-content-type",        0 },
+    { "response-cache-control",       OBJMETA_CACHE_CONTROL },
+    { "response-content-disposition", OBJMETA_CONTENT_DISPOSITION },
+    { "response-content-encoding",    OBJMETA_CONTENT_ENCODING },
+    { "response-content-language",    OBJMETA_CONTENT_LANGUAGE },
+    { "response-expires",             OBJMETA_EXPIRES },
+};
+#define N_RSP_OVR (sizeof(RSP_OVR) / sizeof(RSP_OVR[0]))
+
+/* 0 none, 1 some present and valid, or an error. Anonymous requests
+ * under auth may not use them (S3: InvalidRequest), otherwise a public
+ * object could be made to render as HTML from someone's link. */
+static s3_err_t rsp_overrides_check(const conn_t *c, int *any) {
+    *any = 0;
+    for (size_t i = 0; i < N_RSP_OVR; i++) {
+        const conn_qparam_t *p = conn_query_get(c, RSP_OVR[i].q);
+        if (!p) continue;
+        *any = 1;
+        if (p->v.n > OBJMETA_MAX_STD || !objmeta_valid_value(p->v.p, p->v.n))
+            return S3_ERR_INVALID_ARGUMENT;
+    }
+    if (*any && c->auth && !c->sig_verified) return S3_ERR_INVALID_REQUEST;
+    return S3_OK;
+}
+
+typedef struct { conn_t *c; unsigned skip_mask; } meta_emit_t;
+
+static int meta_emit_cb(void *ctx, int std_id, const char *name, const char *value) {
+    meta_emit_t *me = ctx;
+    if (std_id && (me->skip_mask & (1u << std_id))) return 0;
+    conn_add_header(me->c, name, value);
+    return 0;
+}
+
+/* Stored metadata (and response-* overrides) as response headers, and
+ * response-content-type into m. The website listener gets only the
+ * caching/encoding headers and ignores response-*. */
+static void emit_object_meta(conn_t *c, s3_reader_t *r, s3_obj_meta_t *m, int overrides) {
+    meta_emit_t me = { c, 0 };
+    if (overrides) {
+        for (size_t i = 0; i < N_RSP_OVR; i++)
+            if (RSP_OVR[i].std_id && conn_query_get(c, RSP_OVR[i].q))
+                me.skip_mask |= 1u << RSP_OVR[i].std_id;
+    }
+    uint8_t *tlv = NULL;
+    size_t n = 0;
+    if (m->tlv_len && store_reader_tlv(r, &tlv, &n) == S3_OK && tlv) {
+        unsigned mask = c->is_web
+            ? (1u << OBJMETA_CACHE_CONTROL | 1u << OBJMETA_CONTENT_ENCODING
+               | 1u << OBJMETA_CONTENT_LANGUAGE | 1u << OBJMETA_EXPIRES)
+            : ~0u;
+        if (objmeta_walk(tlv, n, !c->is_web, mask, meta_emit_cb, &me) < 0)
+            LOG_W("object metadata area failed validation; not emitted");
+        free(tlv);
+    }
+    if (!overrides) return;
+    for (size_t i = 0; i < N_RSP_OVR; i++) {
+        const conn_qparam_t *p = conn_query_get(c, RSP_OVR[i].q);
+        if (!p) continue;
+        char v[OBJMETA_MAX_STD + 1];
+        memcpy(v, p->v.p, p->v.n);
+        v[p->v.n] = '\0';
+        if (RSP_OVR[i].std_id == 0) {
+            if (p->v.n < sizeof(m->content_type)) memcpy(m->content_type, v, p->v.n + 1);
+        } else {
+            conn_add_header(c, objmeta_std_name(RSP_OVR[i].std_id), v);
+        }
+    }
+}
+
+/* The body length a client declared: x-amz-decoded-content-length for
+ * aws-chunked, else Content-Length (0 when unknown, e.g. chunked
+ * transfer encoding). Quota reserves it before any byte is stored. */
+static uint64_t declared_body_len(const conn_t *c) {
+    const s3_str_t *d = hdr_get(c, "x-amz-decoded-content-length");
+    if (d) {
+        uint64_t v = 0;
+        for (size_t i = 0; i < d->n && i < 19; i++) {
+            if (d->p[i] < '0' || d->p[i] > '9') return 0;
+            v = v * 10 + (uint64_t)(d->p[i] - '0');
+        }
+        return v;
+    }
+    return c->req.chunked ? 0 : c->req.content_length_hint;
+}
+
+static int handle_object_put_begin(conn_t *c, s3_str_t bucket, s3_str_t key) {
+    char ct_buf[1025];
+    s3_err_t e = req_content_type(c, ct_buf, NULL);
+    uint8_t *tlv = NULL;
+    size_t tlv_n = 0;
+    if (e == S3_OK) e = req_meta_tlv(c, &tlv, &tlv_n);
+    if (e != S3_OK) return rsp_build_s3_error(c, e, c->req.path, NULL);
+
+    if (e == S3_OK) e = req_ssec(c);
+    if (e != S3_OK) { free(tlv); return rsp_build_s3_error(c, e, c->req.path, NULL); }
+    store_put_opts_t o = { 0 };
+    o.content_type = ct_buf;
+    o.tlv = tlv;
+    o.tlv_len = tlv_n;
+    o.size_hint = declared_body_len(c);
+    o.ssec_key = c->ssec_on ? c->ssec_key : NULL;
+    echo_ssec(c);
     s3_writer_t *w;
-    s3_err_t e = store_put_begin(c->store, bucket, key, ct_buf, &w);
+    e = store_put_begin_opts(c->store, bucket, key, &o, &w);
+    free(tlv);
+    if (e == S3_OK && (e = store_put_expect(w, declared_body_len(c))) != S3_OK)
+        store_put_abort(w);
     if (e != S3_OK) {
         return rsp_build_s3_error(c, e, c->req.path, NULL);
     }
@@ -1085,70 +1374,63 @@ static int handle_object_put_complete(conn_t *c) {
     return submit_commit(c, 0);
 }
 
-/* Parse an HTTP Range header value of the form "bytes=A-B", "bytes=A-",
- * or "bytes=-N". Returns 1 if a satisfiable range was decoded and written
- * to first_out/last_out, 0 if the header is absent or uses an
- * unrecognized unit (treat as full GET), or -1 if the range is syntactically
- * invalid or outside the object (send 416). */
+/* Decimal digits → u64, saturating at UINT64_MAX (no wrap on long
+ * strings). -1 if empty or not all digits. */
+static int range_u64(const char *p, size_t n, uint64_t *out) {
+    if (n == 0) return -1;
+    uint64_t v = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (p[i] < '0' || p[i] > '9') return -1;
+        unsigned d = (unsigned)(p[i] - '0');
+        v = (v > (UINT64_MAX - d) / 10) ? UINT64_MAX : v * 10 + d;
+    }
+    *out = v;
+    return 0;
+}
+
+/* Parse an HTTP Range header (RFC 9110 §14) as S3 does. Returns
+ *   1  one satisfiable range, written to first_out/last_out;
+ *   0  no usable range: absent, unknown unit, syntactically invalid
+ *      (incl. last < first), or a multi-range set ("bytes=0-1,5-9" —
+ *      S3 ignores those and serves the whole object with 200);
+ *  -1  valid but unsatisfiable (416 with Content-Range: bytes * /size). */
 static int parse_byte_range(const s3_str_t *hdr, uint64_t obj_size,
                              uint64_t *first_out, uint64_t *last_out) {
     if (!hdr || hdr->n == 0) return 0;
     static const char prefix[] = "bytes=";
     const size_t prefix_n = sizeof(prefix) - 1;
-    if (hdr->n < prefix_n || memcmp(hdr->p, prefix, prefix_n) != 0) return 0;
+    if (hdr->n < prefix_n || strncasecmp(hdr->p, prefix, prefix_n) != 0) return 0;
 
     const char *spec  = hdr->p + prefix_n;
     size_t      spec_n = hdr->n - prefix_n;
+    while (spec_n && (*spec == ' ' || *spec == '\t')) { spec++; spec_n--; }
+    while (spec_n && (spec[spec_n - 1] == ' ' || spec[spec_n - 1] == '\t')) spec_n--;
+    if (memchr(spec, ',', spec_n)) return 0;          /* multi-range */
 
     const char *dash = memchr(spec, '-', spec_n);
-    if (!dash) return 0;  /* no '-' → unrecognized form */
-
+    if (!dash) return 0;
     size_t before_n = (size_t)(dash - spec);
     size_t after_n  = spec_n - before_n - 1;
-
-    if (before_n == 0 && after_n == 0) return -1;  /* "bytes=-" is invalid */
-
-    if (obj_size == 0) return -1;  /* no valid range on empty object */
+    uint64_t a = 0, b = 0;
+    if (before_n && range_u64(spec, before_n, &a) < 0) return 0;
+    if (after_n && range_u64(dash + 1, after_n, &b) < 0) return 0;
 
     uint64_t first, last;
     if (before_n == 0) {
-        /* "bytes=-N" — last N bytes */
-        uint64_t suffix = 0;
-        for (size_t i = 0; i < after_n; i++) {
-            char ch = dash[1 + i];
-            if (ch < '0' || ch > '9') return -1;
-            suffix = suffix * 10 + (uint64_t)(ch - '0');
-        }
-        if (suffix == 0) return -1;
-        first = (suffix >= obj_size) ? 0 : obj_size - suffix;
+        if (after_n == 0) return 0;                   /* "bytes=-" */
+        /* "bytes=-N": last N bytes; N = 0 or an empty object can't be served. */
+        if (b == 0 || obj_size == 0) return -1;
+        first = b >= obj_size ? 0 : obj_size - b;
         last  = obj_size - 1;
     } else if (after_n == 0) {
-        /* "bytes=A-" — from A to end */
-        first = 0;
-        for (size_t i = 0; i < before_n; i++) {
-            char ch = spec[i];
-            if (ch < '0' || ch > '9') return -1;
-            first = first * 10 + (uint64_t)(ch - '0');
-        }
-        if (first >= obj_size) return -1;
-        last = obj_size - 1;
+        if (a >= obj_size) return -1;                 /* "bytes=A-" */
+        first = a;
+        last  = obj_size - 1;
     } else {
-        /* "bytes=A-B" */
-        first = 0;
-        for (size_t i = 0; i < before_n; i++) {
-            char ch = spec[i];
-            if (ch < '0' || ch > '9') return -1;
-            first = first * 10 + (uint64_t)(ch - '0');
-        }
-        last = 0;
-        for (size_t i = 0; i < after_n; i++) {
-            char ch = dash[1 + i];
-            if (ch < '0' || ch > '9') return -1;
-            last = last * 10 + (uint64_t)(ch - '0');
-        }
-        if (first > last) return -1;
-        if (first >= obj_size) return -1;
-        if (last >= obj_size) last = obj_size - 1;  /* clamp per RFC 9110 */
+        if (b < a) return 0;                          /* invalid, not unsatisfiable */
+        if (a >= obj_size) return -1;
+        first = a;
+        last  = b >= obj_size ? obj_size - 1 : b;     /* clamp per RFC 9110 */
     }
     *first_out = first;
     *last_out  = last;
@@ -1162,6 +1444,11 @@ static int handle_object_get(conn_t *c, s3_str_t bucket, s3_str_t key,
     uint8_t vid[16];
     int hv = c->is_web ? 0 : version_param(c, vid);
     if (hv < 0) return rsp_build_s3_error(c, S3_ERR_INVALID_ARGUMENT, c->req.path, NULL);
+    int ovr = 0;
+    if (!c->is_web) {
+        s3_err_t oe = rsp_overrides_check(c, &ovr);
+        if (oe != S3_OK) return rsp_build_s3_error(c, oe, c->req.path, NULL);
+    }
     s3_err_t e = store_get_open_version(c->store, bucket, key, hv ? vid : NULL, &r, &m);
     if (e != S3_OK) {
         if (m.flags & S3_OBJF_DELETE_MARKER) {
@@ -1176,6 +1463,24 @@ static int handle_object_get(conn_t *c, s3_str_t bucket, s3_str_t key,
      * must not run as an active page on this origin. */
     if (!c->is_web && (!c->id.user[0] || c->id.presigned))
         conn_add_header(c, "Content-Security-Policy", "sandbox");
+    /* SSE-C (item 8). */
+    {
+        int is_ssec = (m.flags & S3_OBJF_SSEC) != 0;
+        if (is_ssec && c->is_web) {           /* never served on the website */
+            store_get_close(r);
+            return rsp_build_s3_error(c, S3_ERR_NO_SUCH_KEY, c->req.path, NULL);
+        }
+        s3_err_t se = c->is_web ? S3_OK : req_ssec(c);
+        if (se == S3_OK && is_ssec && !c->ssec_on) se = S3_ERR_INVALID_REQUEST;
+        if (se == S3_OK && !is_ssec && c->ssec_on) se = S3_ERR_INVALID_REQUEST;
+        if (se == S3_OK && is_ssec) se = store_reader_ssec(c->store, bucket, r, c->ssec_key);
+        if (se != S3_OK) {
+            store_get_close(r);
+            return rsp_build_s3_error(c, se, c->req.path, NULL);
+        }
+        echo_ssec(c);
+    }
+    emit_object_meta(c, r, &m, ovr);
 
     /* Parse optional Range header. */
     const s3_str_t *range_hdr = hdr_get(c, "range");
@@ -1246,39 +1551,179 @@ typedef struct {
     s3_writer_t   *w;
     s3_err_t       err;
     s3_obj_meta_t  meta;
+    /* UploadPartCopy */
+    int            part;
+    uint8_t        ck_algo, ck_type;
+    uint8_t        ck[CKSUM_MAX_DIGEST];
+    size_t         ck_n;
+    char           etag[33];
+    uint64_t       mtime_ms;
 } copy_job_t;
+
+static void copy_ck_update(void *ctx, const void *p, size_t n) {
+    cksum_update((cksum_ctx_t *)ctx, p, n);
+}
 
 static void copy_run(iojob_t *j) {
     copy_job_t *cj = (copy_job_t *)j;
     char xbuf[64 * 1024];
     int stream_ok = 1;
-    for (;;) {
+    cksum_ctx_t k;
+    memset(&k, 0, sizeof(k));
+    if (cj->ck_algo && cksum_begin(&k, cj->ck_algo) < 0) stream_ok = 0;
+    s3_err_t werr = S3_ERR_INTERNAL;
+    /* Reflink first (item 6a); stream on S3_ERR_NOT_IMPLEMENTED. */
+    if (stream_ok) {
+        s3_err_t ce = store_writer_clone(cj->w, cj->r, cj->ck_algo ? copy_ck_update : NULL, &k);
+        if (ce != S3_OK && ce != S3_ERR_NOT_IMPLEMENTED) { werr = ce; stream_ok = 0; }
+    }
+    while (stream_ok) {
         ssize_t n = store_get_read(cj->r, xbuf, sizeof(xbuf));
         if (n == 0) break;
-        if (n < 0 || store_put_write(cj->w, xbuf, (size_t)n) != S3_OK) {
+        if (n > 0 && cj->ck_algo) cksum_update(&k, xbuf, (size_t)n);
+        s3_err_t we = n < 0 ? S3_ERR_INTERNAL
+                    : cj->part ? store_mpu_part_write(cj->w, xbuf, (size_t)n)
+                               : store_put_write(cj->w, xbuf, (size_t)n);
+        if (we != S3_OK) {
+            werr = we;
             stream_ok = 0;
             break;
         }
     }
     store_get_close(cj->r);
+    if (stream_ok && cj->ck_algo) {
+        /* The copy computed the part checksum itself: the upload's
+         * algorithm requires one on every part. */
+        if (cksum_final(&k, cj->ck, &cj->ck_n) != 0
+            || store_put_set_checksum(cj->w, cj->ck_algo, S3_CKSUM_TYPE_FULL_OBJECT, 0,
+                                      cj->ck, cj->ck_n) != S3_OK)
+            stream_ok = 0;
+    }
+    cksum_free(&k);
     if (!stream_ok) {
-        store_put_abort(cj->w);
-        cj->err = S3_ERR_INTERNAL;
+        if (cj->part) store_mpu_part_abort(cj->w);
+        else          store_put_abort(cj->w);
+        cj->err = werr;
         return;
     }
-    cj->err = store_put_commit(cj->w, &cj->meta);
+    if (cj->part) {
+        cj->err = store_mpu_part_commit(cj->w, cj->etag);
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        cj->mtime_ms = (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
+    } else {
+        cj->err = store_put_commit(cj->w, &cj->meta);
+    }
 }
 
 static void copy_done(iojob_t *j) {
     copy_job_t *cj = (copy_job_t *)j;
     conn_t *c = job_finish(j);
     if (c) {
-        if (cj->err == S3_OK) add_version_header(c, c->copy_bucket, cj->meta.version_id);
+        if (cj->err == S3_OK && !cj->part) {
+            add_version_header(c, c->copy_bucket, cj->meta.version_id);
+            immutable_sync(c, c->copy_bucket, c->copy_key, cj->meta.version_id);
+        }
         job_respond(c, cj->err != S3_OK
             ? rsp_build_s3_error(c, cj->err, c->req.path, NULL)
-            : rsp_build_copy_object(c, &cj->meta));
+            : cj->part ? rsp_build_copy_part(c, cj->etag, cj->mtime_ms, cj->ck_algo,
+                                             cj->ck, cj->ck_n)
+                       : rsp_build_copy_object(c, &cj->meta));
     }
     free(cj);
+}
+
+/* RFC 7231 HTTP-date ("Wed, 21 Oct 2015 07:28:00 GMT") or ISO 8601 →
+ * epoch ms. -1 if unparseable. */
+static int64_t parse_http_date_ms(const s3_str_t *v) {
+    char buf[64];
+    if (!v || v->n == 0 || v->n >= sizeof(buf)) return -1;
+    memcpy(buf, v->p, v->n);
+    buf[v->n] = '\0';
+    struct tm tm;
+    static const char *fmts[] = { "%a, %d %b %Y %H:%M:%S GMT", "%Y-%m-%dT%H:%M:%S",
+                                  "%A, %d-%b-%y %H:%M:%S GMT", NULL };
+    for (int i = 0; fmts[i]; i++) {
+        memset(&tm, 0, sizeof(tm));
+        const char *end = strptime(buf, fmts[i], &tm);
+        if (end && (*end == '\0' || *end == 'Z' || *end == '.'))
+            return (int64_t)timegm(&tm) * 1000;
+    }
+    return -1;
+}
+
+/* ETag list match for If-Match / If-None-Match: "*" or comma-separated,
+ * quoted or not. etag is the formatted (quoted) ETag. */
+static int etag_list_matches(const s3_str_t *v, const char *etag) {
+    size_t en = strlen(etag);
+    const char *bare = etag; size_t bn = en;
+    if (bn >= 2 && bare[0] == '"') { bare++; bn -= 2; }
+    size_t i = 0;
+    while (i < v->n) {
+        while (i < v->n && (v->p[i] == ' ' || v->p[i] == ',')) i++;
+        size_t st = i;
+        while (i < v->n && v->p[i] != ',') i++;
+        size_t e = i;
+        while (e > st && v->p[e - 1] == ' ') e--;
+        const char *t = v->p + st; size_t tn = e - st;
+        if (tn >= 2 && t[0] == 'W' && t[1] == '/') { t += 2; tn -= 2; }
+        if (tn >= 2 && t[0] == '"' && t[tn - 1] == '"') { t++; tn -= 2; }
+        if (tn == 1 && t[0] == '*') return 1;
+        if (tn == bn && memcmp(t, bare, bn) == 0) return 1;
+    }
+    return 0;
+}
+
+/* x-amz-copy-source-if-{match,none-match,unmodified-since,modified-since}
+ * against the source (RFC 7232 precedence: a passing If-Match overrides
+ * If-Unmodified-Since; a failing If-None-Match overrides
+ * If-Modified-Since). */
+static s3_err_t copy_source_conditions(conn_t *c, const s3_obj_meta_t *m) {
+    char etag[41];
+    rsp_format_etag_with_parts(m->etag, m->part_count, etag);
+    const s3_str_t *im  = hdr_get(c, "x-amz-copy-source-if-match");
+    const s3_str_t *inm = hdr_get(c, "x-amz-copy-source-if-none-match");
+    const s3_str_t *ius = hdr_get(c, "x-amz-copy-source-if-unmodified-since");
+    const s3_str_t *ims = hdr_get(c, "x-amz-copy-source-if-modified-since");
+    int64_t mt = (int64_t)(m->mtime_ms / 1000) * 1000;   /* HTTP dates: seconds */
+    if (im) {
+        if (!etag_list_matches(im, etag)) return S3_ERR_PRECONDITION_FAILED;
+    } else if (ius) {
+        int64_t t = parse_http_date_ms(ius);
+        if (t >= 0 && mt > t) return S3_ERR_PRECONDITION_FAILED;
+    }
+    if (inm) {
+        if (etag_list_matches(inm, etag)) return S3_ERR_PRECONDITION_FAILED;
+    } else if (ims) {
+        int64_t t = parse_http_date_ms(ims);
+        if (t >= 0 && mt <= t) return S3_ERR_PRECONDITION_FAILED;
+    }
+    return S3_OK;
+}
+
+/* x-amz-copy-source-range: exactly "bytes=A-B", A <= B < size. */
+static s3_err_t copy_source_range(const s3_str_t *h, uint64_t size,
+                                  uint64_t *first, uint64_t *last) {
+    if (h->n < 9 || memcmp(h->p, "bytes=", 6) != 0) return S3_ERR_INVALID_ARGUMENT;
+    uint64_t v[2] = { 0, 0 };
+    size_t i = 6;
+    for (int k = 0; k < 2; k++) {
+        size_t st = i;
+        while (i < h->n && h->p[i] >= '0' && h->p[i] <= '9') {
+            if (i - st >= 19) return S3_ERR_INVALID_ARGUMENT;
+            v[k] = v[k] * 10 + (uint64_t)(h->p[i] - '0');
+            i++;
+        }
+        if (i == st) return S3_ERR_INVALID_ARGUMENT;
+        if (k == 0) {
+            if (i >= h->n || h->p[i] != '-') return S3_ERR_INVALID_ARGUMENT;
+            i++;
+        }
+    }
+    if (i != h->n || v[0] > v[1]) return S3_ERR_INVALID_ARGUMENT;
+    if (v[1] >= size) return S3_ERR_INVALID_RANGE;
+    *first = v[0]; *last = v[1];
+    return S3_OK;
 }
 
 /* Validate and open both ends on the loop (cheap, and errors answer
@@ -1350,10 +1795,104 @@ static int handle_object_copy(conn_t *c, s3_str_t dst_bucket, s3_str_t dst_key) 
         free(src_buf);
         return rsp_build_s3_error(c, e, c->req.path, NULL);
     }
+    /* SSE-C (item 8): the source is decrypted with the copy-source key,
+     * the destination sealed with its own (re-keying), either optional. */
+    {
+        int src_ssec = (src_meta.flags & S3_OBJF_SSEC) != 0;
+        e = parse_ssec_set(c, SSEC_SRC_HDR, c->ssec_src_key, &c->ssec_src_on, NULL);
+        if (e == S3_OK) e = req_ssec(c);
+        if (e == S3_OK && src_ssec != c->ssec_src_on) e = S3_ERR_INVALID_REQUEST;
+        if (e == S3_OK && src_ssec)
+            e = store_reader_ssec(c->store, src_bucket, reader, c->ssec_src_key);
+        if (e != S3_OK) {
+            store_get_close(reader);
+            free(src_buf);
+            return rsp_build_s3_error(c, e, c->req.path, NULL);
+        }
+        echo_ssec(c);
+    }
 
-    /* Open dest writer with source content-type. */
+    e = copy_source_conditions(c, &src_meta);
+    int part = c->copy_part;
+    c->copy_part = 0;
+    const s3_str_t *rh = part ? hdr_get(c, "x-amz-copy-source-range") : NULL;
+    if (e == S3_OK && rh) {
+        uint64_t first, last;
+        e = copy_source_range(rh, src_meta.size, &first, &last);
+        if (e == S3_OK) e = store_get_seek(reader, first, last);
+    }
+    uint8_t ck_algo = 0, ck_type = 0;
+    if (e == S3_OK && part)
+        e = store_mpu_checksum_info(c->store, dst_bucket, c->mpu_upload_id, &ck_algo, &ck_type);
+    if (e != S3_OK) {
+        store_get_close(reader);
+        free(src_buf);
+        return rsp_build_s3_error(c, e, c->req.path, NULL);
+    }
+
+    /* CopyObject metadata: x-amz-metadata-directive COPY (default) takes
+     * the source's TLVs (incl. unknown types), REPLACE the request's.
+     * Copying an object onto itself is only legal with REPLACE (that is
+     * how metadata is edited) or from a specific version. */
+    uint8_t *tlv = NULL;
+    size_t tlv_n = 0;
+    char ct_buf[1025];
+    const char *ct = src_meta.content_type;
+    if (!part) {
+        const s3_str_t *md = hdr_get(c, "x-amz-metadata-directive");
+        int replace = md && ieq_lit(*md, "REPLACE");
+        if (md && !replace && !ieq_lit(*md, "COPY")) e = S3_ERR_INVALID_ARGUMENT;
+        else if (hdr_get(c, "x-amz-tagging-directive")) e = S3_ERR_NOT_IMPLEMENTED;
+        else if (!replace && !has_src_vid && !c->ssec_on && !c->ssec_src_on
+                 && s3_str_eq(src_bucket, dst_bucket)
+                 && s3_str_eq(src_key, dst_key))
+            e = S3_ERR_INVALID_REQUEST;
+        else if (replace) {
+            int present = 0;
+            e = req_content_type(c, ct_buf, &present);
+            if (e == S3_OK) e = req_meta_tlv(c, &tlv, &tlv_n);
+            if (present) ct = ct_buf;
+        } else if (src_meta.tlv_len) {
+            uint8_t *st = NULL;
+            size_t sn = 0;
+            e = store_reader_tlv(reader, &st, &sn);
+            if (e == S3_OK && objmeta_copy_filter(st, sn, &tlv, &tlv_n) < 0)
+                e = S3_ERR_INTERNAL;
+            free(st);
+        }
+        if (e != S3_OK) {
+            free(tlv);
+            store_get_close(reader);
+            free(src_buf);
+            return rsp_build_s3_error(c, e, c->req.path, NULL);
+        }
+    }
+
+    /* Open dest writer: a part of the upload, or an object. */
     s3_writer_t *writer = NULL;
-    e = store_put_begin(c->store, dst_bucket, dst_key, src_meta.content_type, &writer);
+    if (part) {
+        e = store_mpu_part_begin_ssec(c->store, dst_bucket, dst_key, c->mpu_upload_id,
+                                      part, c->ssec_on ? c->ssec_key : NULL, &writer);
+    } else {
+        store_put_opts_t po = { 0 };
+        po.content_type = ct;
+        po.tlv = tlv;
+        po.tlv_len = tlv_n;
+        po.size_hint = src_meta.size;
+        po.ssec_key = c->ssec_on ? c->ssec_key : NULL;
+        e = store_put_begin_opts(c->store, dst_bucket, dst_key, &po, &writer);
+    }
+    free(tlv);
+    if (e == S3_OK) {
+        uint64_t rem = 0;
+        int rfd; off_t roff;
+        store_get_raw(reader, &rfd, &roff, &rem);
+        if ((e = store_put_expect(writer, rem)) != S3_OK) {
+            if (part) store_mpu_part_abort(writer);
+            else      store_put_abort(writer);
+            writer = NULL;
+        }
+    }
     if (e != S3_OK) {
         store_get_close(reader);
         free(src_buf);
@@ -1364,13 +1903,17 @@ static int handle_object_copy(conn_t *c, s3_str_t dst_bucket, s3_str_t dst_key) 
     copy_job_t *cj = calloc(1, sizeof(*cj));
     if (!cj) {
         store_get_close(reader);
-        store_put_abort(writer);
+        if (part) store_mpu_part_abort(writer);
+        else      store_put_abort(writer);
         return rsp_build_s3_error(c, S3_ERR_INTERNAL, c->req.path, NULL);
     }
     cj->base.run  = copy_run;
     cj->base.done = copy_done;
     cj->r = reader;
     cj->w = writer;
+    cj->part = part;
+    cj->ck_algo = ck_algo;
+    cj->ck_type = ck_type;
     return job_submit(c, &cj->base);
 }
 
@@ -1381,13 +1924,10 @@ static int handle_object_copy(conn_t *c, s3_str_t dst_bucket, s3_str_t dst_key) 
 /* POST /bucket/key?uploads — generate an upload ID and return
  * <InitiateMultipartUploadResult>. */
 static int handle_mpu_initiate(conn_t *c, s3_str_t bucket, s3_str_t key) {
-    const s3_str_t *ct_hdr = hdr_get(c, "content-type");
-    char ct_buf[128] = {0};
-    if (ct_hdr) {
-        size_t n = ct_hdr->n;
-        if (n >= sizeof(ct_buf)) n = sizeof(ct_buf) - 1;
-        memcpy(ct_buf, ct_hdr->p, n);
-    }
+    char ct_buf[1025];
+    int ct_present = 0;
+    s3_err_t me = req_content_type(c, ct_buf, &ct_present);
+    if (me != S3_OK) return rsp_build_s3_error(c, me, c->req.path, NULL);
 
     /* x-amz-checksum-algorithm / -type: COMPOSITE is the default except
      * for CRC64NVME, which only exists as a full-object checksum. */
@@ -1411,10 +1951,26 @@ static int handle_mpu_initiate(conn_t *c, s3_str_t bucket, s3_str_t key) {
             return rsp_build_s3_error(c, S3_ERR_INVALID_CHECKSUM, c->req.path, NULL);
     }
 
+    /* Metadata travels in the upload's meta file and is applied at
+     * Complete (the Complete request carries none). */
+    uint8_t *tlv = NULL;
+    size_t tlv_n = 0;
+    s3_err_t e = req_meta_tlv(c, &tlv, &tlv_n);
+    if (e == S3_OK) e = req_ssec(c);
+    if (e == S3_OK && c->ssec_on) {
+        /* The upload's salt and key check travel in its meta and end up
+         * in the object header at Complete. */
+        ssec_info_t si;
+        uint8_t *t2 = realloc(tlv, tlv_n + 6 + SSEC_TLV_PAYLOAD);
+        if (!t2 || ssec_info_new(c->ssec_key, &si) < 0) { e = S3_ERR_INTERNAL; if (t2) tlv = t2; }
+        else { tlv = t2; tlv_n += ssec_tlv_encode(&si, tlv + tlv_n); }
+    }
+    if (e != S3_OK) { free(tlv); return rsp_build_s3_error(c, e, c->req.path, NULL); }
+    echo_ssec(c);
     char upload_id[33];
-    s3_err_t e = store_mpu_create_opts(c->store, bucket, key,
-                                       ct_hdr ? ct_buf : NULL, algo, type,
-                                       upload_id);
+    e = store_mpu_create_tlv(c->store, bucket, key, ct_present ? ct_buf : NULL,
+                             algo, type, tlv, tlv_n, upload_id);
+    free(tlv);
     if (e != S3_OK) {
         return rsp_build_s3_error(c, e, c->req.path, NULL);
     }
@@ -1432,8 +1988,13 @@ static int handle_mpu_initiate(conn_t *c, s3_str_t bucket, s3_str_t key) {
 static int handle_mpu_upload_part_begin(conn_t *c, s3_str_t bucket, s3_str_t key,
                                          int part_number, const char *upload_id) {
     s3_writer_t *w;
-    s3_err_t e = store_mpu_part_begin(c->store, bucket, key,
-                                       upload_id, part_number, &w);
+    s3_err_t e = req_ssec(c);
+    if (e == S3_OK)
+        e = store_mpu_part_begin_ssec(c->store, bucket, key, upload_id, part_number,
+                                      c->ssec_on ? c->ssec_key : NULL, &w);
+    if (e == S3_OK) echo_ssec(c);
+    if (e == S3_OK && (e = store_put_expect(w, declared_body_len(c))) != S3_OK)
+        store_mpu_part_abort(w);
     if (e != S3_OK) {
         return rsp_build_s3_error(c, e, c->req.path, NULL);
     }
@@ -1609,6 +2170,7 @@ static void mpu_complete_done(iojob_t *j) {
     if (c) {
         /* c->mpu_bucket/mpu_key are still valid: the request isn't reset
          * until its response has been written. */
+        if (mj->err == S3_OK) immutable_sync(c, c->mpu_bucket, c->mpu_key, mj->meta.version_id);
         job_respond(c, mj->err != S3_OK
             ? rsp_build_s3_error(c, mj->err, c->req.path, NULL)
             : (add_checksum_headers(c, &mj->meta),
@@ -1695,6 +2257,41 @@ static int handle_mpu_complete_finish(conn_t *c, s3_str_t bucket, s3_str_t key,
         mj->full_n = (size_t)dn;
     }
     return job_submit(c, &mj->base);
+}
+
+/* GET /bucket/key?uploadId=ID — ListParts. */
+static int handle_mpu_list_parts(conn_t *c, s3_str_t bucket, s3_str_t key,
+                                 const char *upload_id) {
+    s3_str_t mv = q_val(c, "part-number-marker");
+    uint32_t marker = 0;
+    for (size_t i = 0; i < mv.n; i++) {
+        if (mv.p[i] < '0' || mv.p[i] > '9' || marker > 10000)
+            return rsp_build_s3_error(c, S3_ERR_INVALID_ARGUMENT, c->req.path, NULL);
+        marker = marker * 10 + (uint32_t)(mv.p[i] - '0');
+    }
+    s3_str_t xv = q_val(c, "max-parts");
+    size_t max = 1000;
+    if (xv.p) {
+        max = 0;
+        for (size_t i = 0; i < xv.n; i++) {
+            if (xv.p[i] < '0' || xv.p[i] > '9')
+                return rsp_build_s3_error(c, S3_ERR_INVALID_ARGUMENT, c->req.path, NULL);
+            max = max * 10 + (size_t)(xv.p[i] - '0');
+            if (max > 1000) max = 1000;
+        }
+        if (max == 0) max = 1000;
+    }
+    s3_part_info_t *parts = NULL;
+    size_t n = 0;
+    int trunc = 0;
+    uint8_t algo = 0, type = 0;
+    s3_err_t e = store_mpu_list_parts(c->store, bucket, key, upload_id, marker, max,
+                                      &parts, &n, &trunc, &algo, &type);
+    if (e != S3_OK) return rsp_build_s3_error(c, e, c->req.path, NULL);
+    int rc = rsp_build_list_parts(c, bucket, key, upload_id, marker, max,
+                                  parts, n, trunc, algo, type);
+    free(parts);
+    return rc;
 }
 
 /* DELETE /bucket/key?uploadId=ID */
@@ -1952,6 +2549,7 @@ static int lock_put_finish(conn_t *c, int legal) {
     }
     e = store_lock_write(c->store, c->cfg_bucket, c->cfg_key, m.version_id, &next);
     if (e != S3_OK) return rsp_build_s3_error(c, e, c->req.path, NULL);
+    immutable_sync(c, c->cfg_bucket, c->cfg_key, m.version_id);
     return rsp_build_status(c, 200, "OK");
 }
 
@@ -2164,17 +2762,10 @@ static s3_action_t classify_object(const conn_t *c, s3_err_t *err) {
     } else if (sub) {   /* uploads */
         if (post) return ACT_MPU_CREATE;
     } else if (has_upload_id) {
-        if (put && has_part) {
-            /* UploadPartCopy is not implemented: refuse rather than
-             * store the (empty) request body as the part. */
-            if (hdr_get(c, "x-amz-copy-source")) {
-                *err = S3_ERR_NOT_IMPLEMENTED; return ACT_NONE;
-            }
-            return ACT_MPU_UPLOAD_PART;
-        }
+        if (put && has_part) return ACT_MPU_UPLOAD_PART;   /* or UploadPartCopy */
         if (post && !has_part) return ACT_MPU_COMPLETE;
         if (del && !has_part)  return ACT_MPU_ABORT;
-        if (get && !has_part)  { *err = S3_ERR_NOT_IMPLEMENTED; return ACT_NONE; }
+        if (get && !has_part)  return ACT_MPU_LIST_PARTS;
         *err = S3_ERR_INVALID_REQUEST; return ACT_NONE;
     } else if (has_part) {
         /* GetObject/HeadObject ?partNumber=N: only part 1 of a
@@ -2279,8 +2870,10 @@ int route_dispatch_headers(conn_t *c) {
     case ACT_MPU_COMPLETE:
     case ACT_MPU_ABORT:
     case ACT_MPU_UPLOAD_PART:
+    case ACT_MPU_LIST_PARTS:
         if (parse_upload_id(c, upload_id_buf) < 0)
             return rsp_build_s3_error(c, S3_ERR_NO_SUCH_UPLOAD, c->req.path, NULL);
+        if (act == ACT_MPU_LIST_PARTS) return handle_mpu_list_parts(c, bucket, key, upload_id_buf);
         if (act == ACT_MPU_ABORT)
             return handle_mpu_abort(c, bucket, key, upload_id_buf);
         if (act == ACT_MPU_COMPLETE) {
@@ -2302,6 +2895,15 @@ int route_dispatch_headers(conn_t *c) {
             if (pn < 1)
                 return rsp_build_s3_error(c, S3_ERR_INVALID_ARGUMENT,
                                           c->req.path, NULL);
+            if (hdr_get(c, "x-amz-copy-source")) {
+                /* UploadPartCopy: runs at message-complete, like CopyObject. */
+                c->copy_pending = 1;
+                c->copy_part    = pn;
+                c->copy_bucket  = bucket;
+                c->copy_key     = key;
+                memcpy(c->mpu_upload_id, upload_id_buf, 33);
+                return 0;
+            }
             return handle_mpu_upload_part_begin(c, bucket, key, pn,
                                                 upload_id_buf);
         }

@@ -38,7 +38,7 @@ INCLUDES   := -Iinclude -I$(LLHTTP_DIR)/include -I$(XML_DIR)
 # Server objects
 SRV_SRCS := src/main.c src/server.c src/conn.c src/log.c src/store_fs.c \
             src/route.c src/response.c src/sigv4.c src/metrics.c \
-            src/iopool.c src/action.c src/checksum.c src/query.c src/cors.c src/lifecycle.c src/website.c src/json.c src/admin.c src/policy.c src/objlock.c src/tls.c src/audit.c
+            src/iopool.c src/action.c src/checksum.c src/query.c src/cors.c src/lifecycle.c src/website.c src/json.c src/admin.c src/policy.c src/objlock.c src/tls.c src/audit.c src/objmeta.c src/scrub.c src/sandbox.c src/ssec.c src/lockc.c
 SRV_OBJS := $(SRV_SRCS:.c=.o)
 
 LLHTTP_OBJS := $(LLHTTP_DIR)/src/api.o $(LLHTTP_DIR)/src/http.o \
@@ -55,7 +55,7 @@ ifeq ($(DEBUG),1)
                    -fsanitize=address,undefined -fno-omit-frame-pointer
 endif
 
-all: fs3
+all: fs3 fs3-lockd
 
 fs3: $(OBJS)
 	$(CC) $(OBJS) -o $@ $(LDFLAGS)
@@ -79,6 +79,17 @@ fs3-tls: $(ALL_C_SRCS) $(wildcard include/*.h)
 	$(CC) -std=c11 -g -D_GNU_SOURCE -DFS3_TLS -pthread $(TLS_SAN) $(INCLUDES) \
 	    $(ALL_C_SRCS) -o $@ -lssl -lcrypto -pthread
 
+# TLS binary for the Synology package / NAS testing: libssl + libcrypto
+# linked statically (DSM's own libssl is a different version), glibc
+# dynamic like fs3-static. Point C_INCLUDE_PATH / LIBRARY_PATH at a
+# static OpenSSL build when the host has none (see
+# docs/AGENT-BUILD-AND-DS1515-TEST.md).
+fs3-tls-static: $(ALL_C_SRCS) $(wildcard include/*.h)
+	$(CC) -std=c11 -O2 -g -D_GNU_SOURCE -DFS3_TLS -pthread -fPIE -fstack-protector-strong \
+	    -D_FORTIFY_SOURCE=2 $(INCLUDES) $(ALL_C_SRCS) -o $@ -pie -Wl,-z,relro,-z,now \
+	    -Wl,-z,noexecstack -Wl,-Bstatic -l:libssl.a -l:libcrypto.a -Wl,-Bdynamic -lpthread -ldl
+	strip $@
+
 # Our code: strict warnings
 src/%.o: src/%.c
 	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
@@ -93,9 +104,18 @@ $(XML_DIR)/%.o: $(XML_DIR)/%.c
 
 # ----- Tests --------------------------------------------------------
 
-TEST_BINS := tests/test_policy tests/test_json tests/test_config_fuzz tests/test_chunk_fuzz tests/test_checksum tests/test_store tests/test_conn tests/test_xml tests/test_xml_legacy tests/test_xml_fuzz tests/test_sigv4 tests/test_credfile
+TEST_BINS := tests/test_ssec tests/test_sandbox tests/test_objmeta tests/test_policy tests/test_json tests/test_config_fuzz tests/test_chunk_fuzz tests/test_checksum tests/test_store tests/test_conn tests/test_xml tests/test_xml_legacy tests/test_xml_fuzz tests/test_sigv4 tests/test_credfile
 
-test: $(TEST_BINS) fs3
+# Fail fast, with the install line, if a test dependency is missing —
+# otherwise e.g. a missing awscrt shows up as checksum "server bugs".
+check-test-deps:
+	@python3 -c "import botocore, boto3, awscrt" 2>/dev/null || { \
+	    echo "missing Python test deps: pip install -r tests/requirements.txt" >&2; exit 1; }
+	@for t in aws curl openssl; do command -v $$t >/dev/null || { \
+	    echo "missing tool '$$t' (aws: pip install -r tests/requirements.txt; curl/openssl: apt-get install curl openssl)" >&2; \
+	    exit 1; }; done
+
+test: check-test-deps $(TEST_BINS) fs3 fs3-lockd
 	@echo "=== test_policy (+50000 fuzz iterations) ==="
 	@./tests/test_policy 50000
 	@echo "=== test_json (+50000 fuzz iterations) ==="
@@ -104,6 +124,12 @@ test: $(TEST_BINS) fs3
 	@./tests/test_config_fuzz 50000
 	@echo "=== test_chunk_fuzz (50000 iterations) ==="
 	@./tests/test_chunk_fuzz 50000
+	@echo "=== test_ssec (+50000 fuzz iterations) ==="
+	@./tests/test_ssec 50000
+	@echo "=== test_sandbox (seccomp filter) ==="
+	@./tests/test_sandbox
+	@echo "=== test_objmeta (+50000 fuzz iterations) ==="
+	@./tests/test_objmeta 50000
 	@echo "=== test_checksum ==="
 	@./tests/test_checksum
 	@echo "=== test_store ==="
@@ -119,13 +145,31 @@ test: $(TEST_BINS) fs3
 	@echo "=== test_sigv4 ==="
 	@./tests/test_sigv4
 	@echo "=== test_credfile ==="
-	@./tests/test_credfile
+	@./tests/test_credfile 50000
 	@echo "=== test_e2e (HTTP integration) ==="
 	@./tests/test_e2e.sh
 	@echo "=== test_e2e_auth (SigV4 integration) ==="
 	@./tests/test_e2e_auth.sh
 	@echo "=== test_e2e_mpu (multipart integration) ==="
 	@./tests/test_e2e_mpu.sh
+	@echo "=== test_e2e_parts (round 2: part records, ListParts, UploadPartCopy) ==="
+	@./tests/test_e2e_parts.sh
+	@echo "=== test_e2e_metadata (round 2: user metadata, std headers, response-*) ==="
+	@./tests/test_e2e_metadata.sh
+	@echo "=== test_e2e_listing (round 2: ListObjectsV2 / ListMultipartUploads pagination) ==="
+	@./tests/test_e2e_listing.sh
+	@echo "=== test_e2e_quota (round 2: bucket/user quotas) ==="
+	@./tests/test_e2e_quota.sh
+	@echo "=== test_e2e_scrub (round 2: integrity scrub) ==="
+	@./tests/test_e2e_scrub.sh
+	@echo "=== test_e2e_keys (round 2: key expiry / disable / read-only / last-used) ==="
+	@./tests/test_e2e_keys.sh
+	@echo "=== test_e2e_reflink (round 2: reflink fast paths; needs FS3_REFLINK_DIR) ==="
+	@./tests/test_e2e_reflink.sh
+	@echo "=== test_e2e_ssec (round 2: SSE-C over TLS) ==="
+	@./tests/test_e2e_ssec.sh
+	@echo "=== test_e2e_immutable (round 2: layout 2 + fs3-lockd; needs root) ==="
+	@./tests/test_e2e_immutable.sh
 	@echo "=== test_e2e_phase9 (range / bulk-delete / bucket-subresources) ==="
 	@./tests/test_e2e_phase9.sh
 	@echo "=== test_e2e_phase10 (object copy / ?acl stub) ==="
@@ -163,7 +207,7 @@ test: $(TEST_BINS) fs3
 	@echo "=== test_ui_cgi (DSM tile admin console) ==="
 	@./tests/test_ui_cgi.sh
 
-FUZZ_CFG_OBJS := src/cors.o src/lifecycle.o src/website.o src/store_fs.o src/checksum.o src/log.o $(XML_OBJS)
+FUZZ_CFG_OBJS := src/cors.o src/lifecycle.o src/website.o src/store_fs.o src/ssec.o src/checksum.o src/log.o $(XML_OBJS)
 tests/test_config_fuzz: tests/test_config_fuzz.c tests/fuzz_targets.h $(FUZZ_CFG_OBJS)
 	$(CC) $(CFLAGS) $(INCLUDES) -Itests tests/test_config_fuzz.c $(FUZZ_CFG_OBJS) \
 	    $(LDFLAGS) -o $@
@@ -179,13 +223,22 @@ tests/test_chunk_fuzz: tests/test_chunk_fuzz.c src/sigv4.o src/query.o src/log.o
 	$(CC) $(CFLAGS) $(INCLUDES) tests/test_chunk_fuzz.c src/sigv4.o \
 	    src/query.o src/log.o $(LDFLAGS) -o $@
 
+tests/test_ssec: tests/test_ssec.c src/ssec.o
+	$(CC) $(CFLAGS) $(INCLUDES) tests/test_ssec.c src/ssec.o $(LDFLAGS) -o $@
+
+tests/test_sandbox: tests/test_sandbox.c src/sandbox.o src/log.o
+	$(CC) $(CFLAGS) $(INCLUDES) tests/test_sandbox.c src/sandbox.o src/log.o $(LDFLAGS) -lpthread -o $@
+
+tests/test_objmeta: tests/test_objmeta.c src/objmeta.o
+	$(CC) $(CFLAGS) $(INCLUDES) tests/test_objmeta.c src/objmeta.o $(LDFLAGS) -o $@
+
 tests/test_checksum: tests/test_checksum.c src/checksum.o
 	$(CC) $(CFLAGS) $(INCLUDES) tests/test_checksum.c src/checksum.o \
 	    $(LDFLAGS) -o $@
 
-tests/test_store: tests/test_store.c src/store_fs.o src/log.o src/checksum.o
+tests/test_store: tests/test_store.c src/store_fs.o src/ssec.o src/log.o src/checksum.o
 	$(CC) $(CFLAGS) $(INCLUDES) tests/test_store.c \
-	    src/store_fs.o src/log.o src/checksum.o $(LDFLAGS) -o $@
+	    src/store_fs.o src/ssec.o src/log.o src/checksum.o $(LDFLAGS) -o $@
 
 # Everything but main.o/server.o: conn.c pulls in routing, the store,
 # SigV4, responses and metrics.
@@ -216,13 +269,13 @@ tests/test_sigv4: tests/test_sigv4.c src/sigv4.c src/query.c
 # test_credfile needs the FS3_MAIN_TESTING macro to expose main.c's
 # credentials-file parser and exclude main()/on_signal, so it can supply
 # its own main() without pulling in server.c's dependency chain.
-tests/test_credfile: tests/test_credfile.c src/main.c src/sigv4.c src/log.c src/query.c
+tests/test_credfile: tests/test_credfile.c src/main.c src/sigv4.c src/log.c src/query.c src/sandbox.c src/ssec.c src/lockc.c
 	$(CC) $(CFLAGS) $(INCLUDES) -DFS3_MAIN_TESTING \
-	    tests/test_credfile.c src/main.c src/sigv4.c src/log.c src/query.c \
+	    tests/test_credfile.c src/main.c src/sigv4.c src/log.c src/query.c src/sandbox.c \
 	    $(LDFLAGS) -o $@
 
 clean:
-	rm -f fs3 fs3-tls $(OBJS) $(OBJS:.o=.d) $(TEST_BINS) tests/*.d
+	rm -f fs3 fs3-tls fs3-static fs3-tls-static fs3-lockd $(OBJS) $(OBJS:.o=.d) $(TEST_BINS) tests/*.d
 
 # Auto-include compiler-generated dependency files so header changes
 # correctly invalidate object files. Created via -MMD -MP above.
@@ -260,4 +313,17 @@ smoketest: fs3
 	    http://127.0.0.1:19000/b/k || true; \
 	kill `cat /tmp/fs3.pid` 2>/dev/null; rm -f /tmp/fs3.pid
 
-.PHONY: all clean test smoketest fetch-llhttp
+.PHONY: seccomp-profile all clean test check-test-deps smoketest fetch-llhttp
+
+# Syscall evidence for src/sandbox.c (round 2, item 5): run the e2e
+# suites under strace and diff against the compiled-in allowlist.
+seccomp-profile: fs3 fs3-tls
+	@./tests/tools/seccomp_profile.sh
+
+# Root-run immutability helper (round 2, item 9); no store dependency.
+fs3-lockd: src/lockd.c
+	$(CC) $(CFLAGS) src/lockd.c -o $@
+
+# Static helper for the Synology package (no libcrypto needed).
+fs3-lockd-static: src/lockd.c
+	$(CC) $(CFLAGS) -static src/lockd.c -o fs3-lockd

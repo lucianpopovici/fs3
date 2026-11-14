@@ -16,7 +16,7 @@ AK=AKIAAUDITTEST001
 SK=auditTestSecret01234567890123456789012345
 
 cleanup() {
-    [ -n "${SP:-}" ] && kill "$SP" 2>/dev/null || true
+    [ -n "${SP:-}" ] && { kill "$SP" 2>/dev/null; wait "$SP" 2>/dev/null; [ $? -ne 159 ] || echo "FAIL: server died with SIGSYS (seccomp blocked a syscall; see --seccomp=log)" >&2; } || true
     rm -rf "$DATA" "$LOG" "$AUD" "$AUD".1
 }
 trap cleanup EXIT
@@ -25,7 +25,7 @@ BUILD_FLAGS=""
 [ "${DEBUG:-0}" = "1" ] && BUILD_FLAGS="DEBUG=1"
 (cd "$ROOT" && make $BUILD_FLAGS fs3 >/dev/null 2>&1)
 
-"$ROOT/fs3" -p "$PORT" -d "$DATA" --auth "$AK:$SK:alice" --audit-log "$AUD" \
+${FS3_WRAP:-} "$ROOT/fs3" -p "$PORT" -d "$DATA" --auth "$AK:$SK:alice" --audit-log "$AUD" \
     --auth-fail-limit 3 --trusted-proxy 127.0.0.1 >"$LOG" 2>&1 &
 SP=$!
 sleep 0.4

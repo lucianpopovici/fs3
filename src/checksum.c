@@ -293,3 +293,51 @@ int base64_decode(const char *in, size_t n, uint8_t *out, size_t cap) {
     }
     return (int)o;
 }
+
+/* ===================================================================== */
+/* CRC64NVME combine (zlib's crc32_combine, widened to 64 bits)           */
+/* ===================================================================== */
+
+static uint64_t gf2_times(const uint64_t *mat, uint64_t vec) {
+    uint64_t sum = 0;
+    while (vec) {
+        if (vec & 1) sum ^= *mat;
+        vec >>= 1;
+        mat++;
+    }
+    return sum;
+}
+
+static void gf2_square(uint64_t *sq, const uint64_t *mat) {
+    for (int n = 0; n < 64; n++) sq[n] = gf2_times(mat, mat[n]);
+}
+
+uint64_t crc64nvme_combine(uint64_t crc1, uint64_t crc2, uint64_t len2) {
+    if (len2 == 0) return crc1;
+    uint64_t even[64], odd[64];
+    odd[0] = POLY_CRC64NVME;            /* operator for one zero bit */
+    uint64_t row = 1;
+    for (int n = 1; n < 64; n++) { odd[n] = row; row <<= 1; }
+    gf2_square(even, odd);              /* two zero bits */
+    gf2_square(odd, even);              /* four zero bits */
+    do {                                /* apply len2 zero bytes to crc1 */
+        gf2_square(even, odd);
+        if (len2 & 1) crc1 = gf2_times(even, crc1);
+        len2 >>= 1;
+        if (!len2) break;
+        gf2_square(odd, even);
+        if (len2 & 1) crc1 = gf2_times(odd, crc1);
+        len2 >>= 1;
+    } while (len2);
+    return crc1 ^ crc2;
+}
+
+uint64_t crc64nvme_from_be(const uint8_t d[8]) {
+    uint64_t v = 0;
+    for (int i = 0; i < 8; i++) v = (v << 8) | d[i];
+    return v;
+}
+
+void crc64nvme_to_be(uint64_t v, uint8_t d[8]) {
+    for (int i = 0; i < 8; i++) d[i] = (uint8_t)(v >> (56 - 8 * i));
+}

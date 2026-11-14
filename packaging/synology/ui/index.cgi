@@ -149,13 +149,21 @@ handle_post() {
                                                    print $3; exit }' \
                 "${CRED_FILE}")"
         fi
+        # A replaced key keeps its attributes (expiry, disabled, read-only):
+        # changing a secret must never silently re-enable a disabled key.
+        F_ATTRS=""
+        [ -f "${CRED_FILE}" ] && F_ATTRS="$(awk -F: -v k="${F_AK}" \
+            '!/^[ \t]*#/ && NF >= 4 && $1 == k { sub(/[ \t\r]+$/, "", $4); print $4; exit }' \
+            "${CRED_FILE}")"
         # Keep comments and other keys; same access key is replaced.
         {
             [ -f "${CRED_FILE}" ] && \
                 awk -F: -v k="${F_AK}" \
                     '/^[ \t]*#/ || NF < 2 { print; next } $1 != k' \
                     "${CRED_FILE}"
-            if [ -n "${F_USER}" ]; then
+            if [ -n "${F_ATTRS}" ]; then
+                printf '%s:%s:%s:%s\n' "${F_AK}" "${F_SK}" "${F_USER}" "${F_ATTRS}"
+            elif [ -n "${F_USER}" ]; then
                 printf '%s:%s:%s\n' "${F_AK}" "${F_SK}" "${F_USER}"
             else
                 printf '%s:%s\n' "${F_AK}" "${F_SK}"
@@ -268,7 +276,8 @@ the LAN instead, set <code>FS3_BIND=0.0.0.0</code> in <code>${CONF_FILE}</code>
 and restart the package.</p>"
 fi
 
-# Bucket stats from the admin listener: "<name> <objects> <bytes>" lines.
+# Bucket stats from the admin listener: "<name> <objects> <bytes> [<quota> <quota-used>]"
+# lines (quota 0 = none).
 BUCKETS_HTML=""
 if BUCKETS_TXT="$(fetch_admin /buckets)"; then
     if [ -n "${BUCKETS_TXT}" ]; then
@@ -283,7 +292,14 @@ if BUCKETS_TXT="$(fetch_admin /buckets)"; then
                 else if (b < 1048576)    hs = sprintf("%.1f KiB", b / 1024)
                 else if (b < 1073741824) hs = sprintf("%.1f MiB", b / 1048576)
                 else                     hs = sprintf("%.2f GiB", b / 1073741824)
-                printf "<tr><td><code>%s</code></td><td>%s</td><td>%s</td></tr>\n", name, $2, hs
+                q = $4 + 0; qu = $5 + 0
+                if (q > 0) {
+                    if      (q < 1048576)    qs = sprintf("%.1f KiB", q / 1024)
+                    else if (q < 1073741824) qs = sprintf("%.1f MiB", q / 1048576)
+                    else                     qs = sprintf("%.2f GiB", q / 1073741824)
+                    qs = sprintf("%d%% of %s", int(qu * 100 / q), qs)
+                } else qs = "&mdash;"
+                printf "<tr><td><code>%s</code></td><td>%s</td><td>%s</td><td>%s</td></tr>\n", name, $2, hs, qs
                 nb++; tobj += $2; tb += b
                 if      (tb < 1024)       ts = sprintf("%d B", tb)
                 else if (tb < 1048576)    ts = sprintf("%.1f KiB", tb / 1024)
@@ -292,10 +308,10 @@ if BUCKETS_TXT="$(fetch_admin /buckets)"; then
             }
             END {
                 if (nb > 1)
-                    printf "<tr class=\"tot\"><td>%d buckets</td><td>%s</td><td>%s</td></tr>\n", nb, tobj, ts
+                    printf "<tr class=\"tot\"><td>%d buckets</td><td>%s</td><td>%s</td><td></td></tr>\n", nb, tobj, ts
             }')"
         BUCKETS_HTML="<table>
-<tr><th>Bucket</th><th>Objects</th><th>Size</th></tr>
+<tr><th>Bucket</th><th>Objects</th><th>Size</th><th>Quota</th></tr>
 ${ROWS}
 </table>"
     else
@@ -332,11 +348,33 @@ else
             ak="${cline%%:*}"
             hak="$(html_escape "${ak}")"
             rest="${cline#*:}"
+            uf=""; attrs=""
             case "${rest}" in
-                *:*) huser="<code>$(html_escape "${rest#*:}")</code>" ;;
-                *)   huser="<span class=\"muted\">${hak} (the key itself)</span>" ;;
+                *:*) uf="${rest#*:}"
+                     case "${uf}" in *:*) attrs="${uf#*:}"; uf="${uf%%:*}" ;; esac ;;
             esac
-            KEYROWS="${KEYROWS}<tr><td><code>${hak}</code></td><td>${huser}</td><td>
+            if [ -n "${uf}" ]; then
+                huser="<code>$(html_escape "${uf}")</code>"
+            else
+                huser="<span class=\"muted\">${hak} (the key itself)</span>"
+            fi
+            # Status from the attributes field (fs3 refuses unknown ones).
+            hstat="$(printf '%s' "${attrs}" | awk -F, -v now="$(date +%s)" '{
+                d = 0; r = 0; x = ""
+                for (i = 1; i <= NF; i++) {
+                    if ($i == "disabled") d = 1
+                    else if ($i == "ro") r = 1
+                    else if ($i ~ /^expires=[0-9]+$/) {
+                        e = substr($i, 9) + 0
+                        x = (e <= now) ? "expired" : sprintf("expires in %d d", int((e - now) / 86400))
+                    }
+                }
+                s = (d ? "disabled " : "") (r ? "read-only " : "") x
+                sub(/ +$/, "", s)
+                if (s == "") s = "active"
+                print s }')"
+            [ -n "${hstat}" ] || hstat="active"
+            KEYROWS="${KEYROWS}<tr><td><code>${hak}</code></td><td>${huser}</td><td>$(html_escape "${hstat}")</td><td>
 <form method=\"post\" onsubmit=\"return confirm('Remove access key ${hak}?');\">
 <input type=\"hidden\" name=\"action\" value=\"delkey\">
 <input type=\"hidden\" name=\"tok\" value=\"${TOKEN}\">
@@ -345,7 +383,16 @@ else
         done < "${CRED_FILE}"
     fi
     if [ -n "${KEYROWS}" ]; then
-        CREDS_HTML="<table><tr><th>Access key</th><th>Owns buckets as user</th><th></th></tr>${KEYROWS}</table>"
+        CREDS_HTML="<table><tr><th>Access key</th><th>Owns buckets as user</th><th>Status</th><th></th></tr>${KEYROWS}</table>"
+        # Key hygiene counters from the admin listener's /metrics.
+        if KM="$(fetch_admin /metrics)"; then
+            KSOON="$(printf '%s\n' "${KM}" | awk '$1 == "fs3_keys_expiring_soon" { print $2 + 0 }')"
+            KUNUSED="$(printf '%s\n' "${KM}" | awk '$1 == "fs3_keys_unused_90d" { print $2 + 0 }')"
+            if [ -n "${KSOON}" ] || [ -n "${KUNUSED}" ]; then
+                CREDS_HTML="${CREDS_HTML}
+<p class=\"muted\">Keys expiring within 7 days: ${KSOON:-0} &middot; unused for 90 days: ${KUNUSED:-0}</p>"
+            fi
+        fi
     else
         CREDS_HTML="<p class=\"muted\">No credentials defined.</p>"
     fi

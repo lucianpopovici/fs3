@@ -49,6 +49,33 @@ int sigv4_add_cred_user(sigv4_verifier_t *v,
                         const char *secret_key,
                         const char *user);
 
+/* Key attributes (round 2, item 4): the optional fourth field of a
+ * credentials line, "created=…,expires=…,ro,disabled". */
+typedef struct {
+    int64_t created, expires;   /* epoch seconds, 0 = unset / never */
+    int     disabled;
+    int     read_only;
+} sigv4_cred_attrs_t;
+
+/* sigv4_add_cred_user with attributes (NULL = none). A disabled or
+ * expired key fails verification exactly like an unknown one. */
+int sigv4_add_cred_ex(sigv4_verifier_t *v, const char *access_key, const char *secret_key,
+                      const char *user, const sigv4_cred_attrs_t *attrs);
+
+/* Visit every credential (never the secret); last_used is epoch s, 0 =
+ * never. */
+typedef void (*sigv4_cred_cb)(void *ctx, const char *access_key, const char *user,
+                              const sigv4_cred_attrs_t *attrs, int64_t last_used);
+void sigv4_foreach_cred(const sigv4_verifier_t *v, sigv4_cred_cb cb, void *ctx);
+/* Restore a last-used time (keys.state at startup); keeps the later one. */
+void sigv4_set_last_used(sigv4_verifier_t *v, const char *access_key, int64_t t);
+/* The verifier's notion of now (sigv4_set_clock aware). */
+int64_t sigv4_now(const sigv4_verifier_t *v);
+/* After a refused sigv4_verify_id on this thread: "unknown_key",
+ * "key_disabled", "key_expired", "presign_outlives_key", or NULL when
+ * the refusal had another cause. For the audit log only. */
+const char *sigv4_last_deny_reason(void);
+
 /* Mark a user as admin: sees and may act on every bucket. Admins are not
  * affected by sigv4_swap_creds. Returns 0 on success. */
 int sigv4_add_admin(sigv4_verifier_t *v, const char *user);
@@ -102,7 +129,12 @@ typedef struct {
     char access_key[SIGV4_USER_MAX + 1];   /* for the audit log */
     int  is_admin;
     int  presigned;                        /* verified via query string */
+    int  read_only;                        /* key carries "ro" (item 4) */
 } sigv4_id_t;
+
+/* 1 if `lc_name` is among the request's SignedHeaders (header mode or
+ * presigned X-Amz-SignedHeaders). */
+int sigv4_header_signed(const struct conn *c, const char *lc_name);
 
 /* sigv4_verify, also filling *id_out (if non-NULL) on S3_OK. */
 s3_err_t sigv4_verify_id(const sigv4_verifier_t *v, const struct conn *c,

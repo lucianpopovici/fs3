@@ -12,6 +12,10 @@
 #include "server.h"
 #include "action.h"
 #include "lifecycle.h"
+#include "scrub.h"
+#include "sandbox.h"
+#include "lockc.h"
+#include "sigv4.h"
 #include "admin.h"
 #include "objlock.h"
 #include "tls.h"
@@ -60,6 +64,7 @@ struct server {
      * staging area and reap any upload older than gc_max_age_ms. */
     time_t        gc_last_run;       /* monotonic seconds */
     int           lc_running;        /* a sweep job is in flight */
+    scrub_t      *scrub;             /* integrity scrub (item 3) */
     int           lc_last_yday;      /* day of year of the last scheduled run */
     int           lc_pending_now;    /* run at the first tick (--lifecycle-now) */
     time_t        clock_wall_last;   /* clock-jump detection (item 10.6) */
@@ -147,6 +152,33 @@ static void admin_respond(int fd, const char *status, const char *ctype,
  *   <name> <objects> <bytes>\n
  * Easy to consume from shell (the DSM tile's CGI) and from scripts.
  * Returns bytes written, or -1 if cap was too small. */
+/* fs3_keys_expiring_soon (enabled keys expiring within 7 days) and
+ * fs3_keys_unused_90d (no verified request for 90 days — counted from
+ * the creation time when a key was never used). */
+typedef struct { int64_t now; uint64_t soon, unused; } key_stats_t;
+static void key_stats_cb(void *ctx, const char *ak, const char *user,
+                         const sigv4_cred_attrs_t *a, int64_t last_used) {
+    (void)ak; (void)user;
+    key_stats_t *k = ctx;
+    if (!a->disabled && a->expires && a->expires > k->now && a->expires - k->now <= 7 * 86400)
+        k->soon++;
+    int64_t ref = last_used ? last_used : a->created;
+    if (!a->disabled && ref && ref < k->now - 90 * 86400) k->unused++;
+}
+
+static int render_key_metrics(const sigv4_verifier_t *v, char *out, size_t cap) {
+    if (!v) return 0;
+    key_stats_t k = { sigv4_now(v), 0, 0 };
+    sigv4_foreach_cred(v, key_stats_cb, &k);
+    int n = snprintf(out, cap,
+        "# HELP fs3_keys_expiring_soon Enabled access keys expiring within 7 days.\n"
+        "# TYPE fs3_keys_expiring_soon gauge\nfs3_keys_expiring_soon %llu\n"
+        "# HELP fs3_keys_unused_90d Enabled access keys with no verified request for 90 days.\n"
+        "# TYPE fs3_keys_unused_90d gauge\nfs3_keys_unused_90d %llu\n",
+        (unsigned long long)k.soon, (unsigned long long)k.unused);
+    return n > 0 && (size_t)n < cap ? n : -1;
+}
+
 static int admin_render_buckets(struct s3_store *store,
                                 char *buf, size_t cap) {
     s3_bucket_info_t *list = NULL;
@@ -159,10 +191,16 @@ static int admin_render_buckets(struct s3_store *store,
         s3_bucket_stats_t bs;
         s3_str_t name = { list[i].name, strlen(list[i].name) };
         if (store_bucket_stats(store, name, &bs) != S3_OK) continue;
-        int w = snprintf(buf + off, cap - off, "%s %llu %llu\n",
+        /* 4th column: byte quota (0 = none) and 5th: quota usage
+         * (logical bytes incl. versions and in-flight parts). */
+        s3_quota_usage_t qu;
+        if (store_bucket_usage(store, name, &qu) != S3_OK) memset(&qu, 0, sizeof(qu));
+        int w = snprintf(buf + off, cap - off, "%s %llu %llu %llu %llu\n",
                          list[i].name,
                          (unsigned long long)bs.objects,
-                         (unsigned long long)bs.bytes);
+                         (unsigned long long)bs.bytes,
+                         (unsigned long long)qu.max_bytes,
+                         (unsigned long long)qu.bytes);
         if (w < 0 || (size_t)w >= cap - off) { rc = -1; break; }
         off += (size_t)w;
     }
@@ -205,7 +243,8 @@ static void admin_serve_fd(server_t *s, int fd, int via_uds) {
     if (r <= 0) return;
 
     if (strncmp(req, "GET /v1/", 8) == 0 || strncmp(req, "POST /v1/", 9) == 0
-        || strncmp(req, "PUT /v1/", 8) == 0 || strncmp(req, "DELETE /v1/", 11) == 0) {
+        || strncmp(req, "PUT /v1/", 8) == 0 || strncmp(req, "DELETE /v1/", 11) == 0
+        || strncmp(req, "PATCH /v1/", 10) == 0) {
         size_t rn = 0;
         char *resp = s->admin ? admin_handle_v1(s->admin, req, (size_t)r, via_uds, &rn) : NULL;
         if (resp) {
@@ -233,6 +272,14 @@ static void admin_serve_fd(server_t *s, int fd, int via_uds) {
     } else if (strncmp(req, "GET /metrics", 12) == 0) {
         static char body[64 * 1024];
         int blen = metrics_render(&s->metrics, s->store, body, sizeof(body));
+        if (blen >= 0) {
+            int sn = scrub_metrics(s->scrub, body + blen, sizeof(body) - (size_t)blen);
+            blen = sn < 0 ? -1 : blen + sn;
+        }
+        if (blen >= 0) {
+            int kn = render_key_metrics(s->cfg.auth, body + blen, sizeof(body) - (size_t)blen);
+            blen = kn < 0 ? -1 : blen + kn;
+        }
         if (blen < 0) {
             admin_respond(fd, "500 Internal Server Error",
                           "text/plain", "render overflow\n", 16);
@@ -269,6 +316,15 @@ static void admin_handle(server_t *s, int lfd, int via_uds) {
     }
 }
 
+/* Before a version file is unlinked: an immutable one must be cleared by
+ * fs3-lockd, which refuses while retention or a hold applies. */
+static int lockd_unlink_hook(void *user, const char *path) {
+    if (!lockc_is_immutable(path)) return 0;
+    int rc = lockc_clear((const char *)user, path);
+    if (rc != 0) LOG_W("lock-immutable: fs3-lockd refused to clear %s", path);
+    return rc == 0 ? 0 : -1;
+}
+
 server_t *server_create(const server_cfg_t *cfg) {
     if (action_selfcheck() != 0) {
         LOG_E("action table incomplete: refusing to start (default deny)");
@@ -299,6 +355,22 @@ server_t *server_create(const server_cfg_t *cfg) {
     }
     LOG_I("store opened at %s", cfg->data_root);
 
+    /* --lock-immutable (item 9): fail closed — probe fs3-lockd (set and
+     * clear on a scratch file) or refuse to start rather than silently
+     * fall back to API-level WORM. */
+    if (cfg->lockd_socket) {
+        char why[300], td[4200];
+        snprintf(td, sizeof(td), "%s/tmp", cfg->data_root);
+        if (lockc_probe(cfg->lockd_socket, td, why, sizeof(why)) < 0) {
+            LOG_E("--lock-immutable: %s; refusing to start", why);
+            goto fail;
+        }
+        store_set_version_unlink_hook(s->store, lockd_unlink_hook, (void *)cfg->lockd_socket);
+        LOG_I("lock-immutable: fs3-lockd at %s (COMPLIANCE / legal-hold versions in "
+              "object-lock buckets become FS_IMMUTABLE_FL)", cfg->lockd_socket);
+    }
+
+
     if (cfg->legacy_owner) {
         int n = store_assign_legacy_owner(s->store, cfg->legacy_owner);
         if (n < 0) {
@@ -321,15 +393,6 @@ server_t *server_create(const server_cfg_t *cfg) {
                   ownerless);
     }
 
-    if (cfg->io_threads > 0) {
-        s->pool = iopool_create(cfg->io_threads);
-        if (!s->pool) {
-            LOG_E("iopool_create(%d) failed", cfg->io_threads);
-            goto fail;
-        }
-        LOG_I("io pool: %d worker thread(s)", cfg->io_threads);
-    }
-
     s->listen_fd = listen_socket(cfg->bind_addr, cfg->port, cfg->backlog);
     if (s->listen_fd < 0) goto fail;
 
@@ -350,18 +413,6 @@ server_t *server_create(const server_cfg_t *cfg) {
 
     LOG_I("listening on %s:%u", cfg->bind_addr, cfg->port);
 
-    if (s->pool) {
-        struct epoll_event pev = {
-            .events = EPOLLIN,
-            .data.ptr = s->pool,    /* pool ptr = job-completion marker */
-        };
-        if (epoll_ctl(s->epoll_fd, EPOLL_CTL_ADD, iopool_fd(s->pool),
-                      &pev) < 0) {
-            LOG_E("epoll_ctl ADD iopool: %s", strerror(errno));
-            goto fail;
-        }
-    }
-
     /* Native TLS listener (item 7). */
     if (cfg->tls_port > 0) {
         if (!tls_available()) {
@@ -379,9 +430,23 @@ server_t *server_create(const server_cfg_t *cfg) {
               cfg->tls_port);
     }
 
+    /* Integrity scrub (round 2, item 3). */
+    {
+        scrub_cfg_t scfg = {
+            .store = s->store, .pool = s->pool,
+            .interval_days = cfg->scrub_interval_days, .start_now = cfg->scrub_now,
+            .rate = cfg->scrub_rate, .fail_reads = cfg->scrub_fail_reads,
+        };
+        s->scrub = scrub_create(&scfg);
+        if (!s->scrub) goto fail;
+    }
+
     /* Admin API (item 11). */
     {
         admin_cfg_t ac = {
+            .scrub = s->scrub,
+            .auth = cfg->auth,
+            .key_max_age_days = cfg->key_max_age_days,
             .store = s->store, .token = cfg->admin_token,
             .cred_file = cfg->admin_cred_file,
             .reload = cfg->admin_reload, .reload_user = cfg->admin_reload_user,
@@ -463,6 +528,49 @@ server_t *server_create(const server_cfg_t *cfg) {
     /* Object lock is enforced in the store: no path deletes a locked
      * version (item 10). */
     store_set_version_guard(s->store, olock_guard, s->store);
+    store_set_mpu_min_part_size(s->store, cfg->mpu_min_part_size);
+    store_set_default_quotas(s->store, cfg->default_bucket_quota, cfg->default_user_quota);
+    if (cfg->reflink_off) { store_set_reflink(s->store, 0); LOG_I("reflink: off (--reflink off)"); }
+    if (cfg->fs_compress) {
+        if (store_set_fs_compress(s->store, cfg->fs_compress) < 0)
+            LOG_W("fs-compress: the filesystem refused FS_COMPR_FL (ext4?); running uncompressed");
+        else
+            LOG_I("fs-compress: %s (Btrfs transparent compression)",
+                  cfg->fs_compress == STORE_COMPRESS_ALL ? "all objects" : "auto");
+    }
+    if (cfg->dedup_mode) {
+        if (!store_reflink_capable(s->store) || cfg->reflink_off)
+            LOG_W("dedup: needs a reflink-capable filesystem (Btrfs/XFS); disabled");
+        else {
+            store_set_dedup(s->store, cfg->dedup_mode, cfg->dedup_min, cfg->dedup_verify);
+            LOG_I("dedup: %s scope, objects >= %llu bytes%s",
+                  cfg->dedup_mode == STORE_DEDUP_GLOBAL ? "global" : "per-owner",
+                  (unsigned long long)cfg->dedup_min, cfg->dedup_verify ? ", verified" : "");
+        }
+    }
+
+    /* Seccomp (round 2, item 5): everything privileged is done —
+     * listeners bound, TLS loaded, store opened and recovered — and no
+     * worker thread exists yet, so all of them inherit the filter. */
+    if (sandbox_install((sandbox_mode_t)cfg->seccomp_mode) < 0) goto fail;
+
+    if (cfg->io_threads > 0) {
+        s->pool = iopool_create(cfg->io_threads);
+        if (!s->pool) {
+            LOG_E("iopool_create(%d) failed", cfg->io_threads);
+            goto fail;
+        }
+        LOG_I("io pool: %d worker thread(s)", cfg->io_threads);
+        struct epoll_event pev = {
+            .events = EPOLLIN,
+            .data.ptr = s->pool,    /* pool ptr = job-completion marker */
+        };
+        if (epoll_ctl(s->epoll_fd, EPOLL_CTL_ADD, iopool_fd(s->pool), &pev) < 0) {
+            LOG_E("epoll_ctl ADD iopool: %s", strerror(errno));
+            goto fail;
+        }
+        scrub_set_pool(s->scrub, s->pool);
+    }
     return s;
 
 fail:
@@ -483,8 +591,11 @@ void server_destroy(server_t *s) {
         conn_destroy(c);            /* orphans any job still in flight */
     }
     /* Workers finish what they hold (a client's fully-received PUT still
-     * gets committed) before the store they write into goes away. */
+     * gets committed) before the store they write into goes away. A
+     * scrub pass stops at its next file and resumes on the next start. */
+    scrub_stop(s->scrub);
     iopool_destroy(s->pool);
+    scrub_destroy(s->scrub);
     if (s->listen_fd >= 0) close(s->listen_fd);
     if (s->web_fd >= 0) close(s->web_fd);
     if (s->tls_fd >= 0) close(s->tls_fd);
@@ -629,6 +740,7 @@ static void accept_new(server_t *s, int lfd, int is_web) {
             conn_destroy(c);
             continue;
         }
+        c->lockd_sock = s->cfg.lockd_socket;
         c->max_retention_ms = (uint64_t)(s->cfg.max_retention_days > 0
                                          ? s->cfg.max_retention_days : 3650) * 86400000ULL;
 
@@ -745,6 +857,7 @@ int server_run(server_t *s) {
         }
 
         lc_maybe_start(s, now);
+        scrub_tick(s->scrub, now);
 
         /* Retention trusts the wall clock: warn if it jumps backwards by
          * more than an hour relative to the monotonic clock. */

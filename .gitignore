@@ -64,6 +64,14 @@ tests/test_xml_legacy
 tests/test_xml_fuzz
 tests/test_sigv4
 tests/test_credfile
+tests/test_checksum
+tests/test_chunk_fuzz
+tests/test_config_fuzz
+tests/test_json
+tests/test_objmeta
+tests/test_policy
+tests/test_sandbox
+tests/test_ssec
 
 # Python bytecode from test helpers
 __pycache__/
@@ -73,3 +81,5 @@ fs3-*.tar.gz
 fs3-static
 packaging/synology/*.spk
 fs3-tls
+fs3-tls-static
+fs3-lockd

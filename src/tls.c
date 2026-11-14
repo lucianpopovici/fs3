@@ -163,7 +163,7 @@ ssize_t tls_send_body(struct conn *c, struct s3_reader *r, size_t max) {
     off_t off;
     uint64_t remaining;
 #ifdef SSL_OP_ENABLE_KTLS
-    if (!c->tls_buf_len && BIO_get_ktls_send(SSL_get_wbio(c->ssl))) {
+    if (!c->tls_buf_len && !store_reader_transformed(r) && BIO_get_ktls_send(SSL_get_wbio(c->ssl))) {
         store_get_raw(r, &fd, &off, &remaining);
         if (!remaining) return 0;
         size_t want = remaining < max ? (size_t)remaining : max;

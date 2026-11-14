@@ -41,6 +41,12 @@ implemented on top of phase 12. Quick map of what it added:
 Load-bearing rules added on the way:
 - **Lock order:** a key stripe lock (`key_lock(hex)`) before `ns_mu`, never
   two stripe locks. Every multi-step mutation of one key holds its stripe.
+  `q_mu` (quota counters) is a leaf: take nothing while holding it.
+- **Quota accounting (round 2):** every key mutation measures
+  `key_usage()` before/after under its stripe and charges the delta; a
+  new path that adds or removes files in `data/`, `versions/` or `mpu/`
+  must do the same (or go through `delete_locked`/writer commit).
+  Writers own their reservation; `writer_free` releases it.
 - **Extra response headers** go through `conn_add_header()`; they are
   spliced into whatever head is built (`apply_extra_headers`). Don't add
   new parameters to the head builders.
@@ -54,8 +60,33 @@ Load-bearing rules added on the way:
   `grants`, `cors.xml`, `lifecycle.xml`, `website.xml`, `policy.json`,
   `object-lock.xml`; bucket `meta` gained `versioning=` / `object_lock=1`.
 
-Not done (see README): `ListParts`, UploadPartCopy, quotas, integrity
-scrub, key expiry/disable, SSE-C, `FS_IMMUTABLE_FL` hardening, seccomp.
+Round 2 (Nov 2026) added part records, ListParts, UploadPartCopy,
+user metadata, ListObjectsV2, quotas (`q_*` in store_fs.c) and the
+integrity scrub (`src/scrub.c`, `store_scrub_file`) and key hygiene
+(`sigv4_cred_attrs_t`, read-only check at the top of `authz()`),
+seccomp (`src/sandbox.c`) and reflink fast paths (`clone_range`,
+`store_writer_clone`), dedup (`dedup_commit`, `cas/`), Btrfs
+compression (`set_compr_flag`) and SSE-C (`src/ssec.c`, writer/reader
+transform in store_fs.c) and layout 2 + `fs3-lockd` (`src/lockd.c`,
+`src/lockc.c`, `l2_publish`/`l2_point`, `resolve_current`).
+
+- **Layout 2 (object-lock buckets):** `data/<hex>` is a symlink into
+  `versions/`. Open current objects with `open_cur()` (never plain
+  `open()` on a data path); `vdir_list()` leaves the current entry out so
+  "versions dir = noncurrent" holds in both layouts. Version files are
+  unlinked through `unlink_version_file()` (the fs3-lockd hook).
+
+- **Writer byte counts:** `data_written` is plaintext (quota, data_size),
+  `stored_written` is on disk (stored_size, part records). Any new path
+  that puts bytes into a writer must advance both (see `writer_feed`,
+  `store_writer_clone`). Run `tests/test_e2e_reflink.sh` with
+  `FS3_REFLINK_DIR` on a Btrfs loopback; it skips otherwise.
+
+- **seccomp is on by default.** A new syscall in a runtime path (not
+  startup) kills the server with SIGSYS; the test harness says so. Add it
+  to `ALLOW[]` in `src/sandbox.c` and rerun `make seccomp-profile`.
+  The worker pool is created *after* the filter is installed, at the end
+  of `server_create`; keep it last.
 
 ## First five minutes on a fresh box
 
@@ -65,7 +96,7 @@ the latest tarball under `/mnt/user-data/outputs/`. After
 
 ```sh
 apt-get install -y libssl-dev          # for openssl/evp.h
-pip install --break-system-packages botocore boto3 awscli "botocore[crt]"
+pip install --break-system-packages -r tests/requirements.txt
                                         # for tests/sign_request.py and aws cli
 chmod +x tests/*.sh                     # tar may not preserve +x in this env
 mkdir -p ~/.aws && cat > ~/.aws/config <<EOF

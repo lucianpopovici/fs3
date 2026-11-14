@@ -1064,7 +1064,7 @@ static void t_mpu_invalid_part_list(void) {
     parts[1].part_number = 1;
     CHECK(store_mpu_complete(s, S3_STR_LIT("buk"), S3_STR_LIT("k1"),
                               upload_id, parts, 2, etag, &meta)
-          == S3_ERR_INVALID_ARGUMENT, "mpu: out-of-order parts rejected");
+          == S3_ERR_INVALID_PART_ORDER, "mpu: out-of-order parts rejected");
 
     /* Cleanup */
     store_mpu_abort(s, S3_STR_LIT("buk"), S3_STR_LIT("k1"), upload_id);
@@ -1705,6 +1705,76 @@ static void t_expire_if_unchanged(void) {
     teardown_root();
 }
 
+/* ---- Round 2 G: schema 4 ------------------------------------------- */
+
+static void t_schema4(void) {
+    setup_root();
+    s3_store_t *s;
+    CHECK_EQ(store_open(&s, g_root), S3_OK, "open");
+    s3_str_t b = S3_STR_LIT("buk");
+    CHECK_EQ(store_bucket_create(s, b), S3_OK, "create");
+
+    /* v3 fixture still reads, with its v3 fields. */
+    install_fixture("buk", "legacy3.txt", "tests/fixtures/obj_v3.bin");
+    s3_obj_meta_t m;
+    s3_reader_t *r;
+    CHECK_EQ(store_get_open(s, b, S3_STR_LIT("legacy3.txt"), &r, &m), S3_OK, "v3 open");
+    char buf[64] = {0};
+    CHECK_EQ(store_get_read(r, buf, sizeof(buf)), 20, "v3 body");
+    store_get_close(r);
+    CHECK(!memcmp(buf, "hello from schema 3\n", 20), "v3 bytes");
+    CHECK(m.version_id[0] == 1 && m.version_id[15] == 16, "v3 version id");
+    CHECK(m.cksum_algo == S3_CKSUM_CRC32 && m.cksum[0] == 0xde, "v3 checksum");
+    CHECK_EQ(m.stored_size, 20, "v3 stored_size = size");
+    CHECK(!(m.flags & S3_OBJF_PAYLOAD_CRC), "v3 has no payload crc");
+
+    /* v4 write: TLV round-trip, forced 4 KiB padding, payload CRC64. */
+    store_set_header_pad(s, 1);
+    uint8_t tlv[6 + 5] = { S3_TLV_USER_META, 0, 5, 0, 0, 0, 'h', 'e', 'l', 'l', 'o' };
+    store_put_opts_t o = { .content_type = "a/b", .tlv = tlv, .tlv_len = sizeof(tlv) };
+    s3_writer_t *w;
+    CHECK_EQ(store_put_begin_opts(s, b, S3_STR_LIT("v4"), &o, &w), S3_OK, "v4 begin");
+    store_put_write(w, "123456789", 9);
+    CHECK_EQ(store_put_commit(w, &m), S3_OK, "v4 commit");
+    CHECK_EQ(m.header_size % 4096, 0, "header padded to 4096");
+    CHECK(m.flags & S3_OBJF_PAYLOAD_CRC, "payload crc flagged");
+    static const uint8_t want[8] = { 0xae,0x8b,0x14,0x86,0x0a,0x79,0x98,0x88 };
+    CHECK(!memcmp(m.payload_crc64, want, 8), "payload crc64 = check value");
+    CHECK_EQ(store_get_open(s, b, S3_STR_LIT("v4"), &r, &m), S3_OK, "v4 open");
+    uint8_t *t; size_t tn;
+    CHECK_EQ(store_reader_tlv(r, &t, &tn), S3_OK, "tlv read");
+    CHECK(tn == sizeof(tlv) && !memcmp(t, tlv, tn), "tlv round-trip");
+    free(t);
+    memset(buf, 0, sizeof(buf));
+    CHECK_EQ(store_get_read(r, buf, sizeof(buf)), 9, "v4 body after pad");
+    store_get_close(r);
+    CHECK(!memcmp(buf, "123456789", 9), "v4 bytes");
+
+    /* Malformed TLV (record longer than the area): refused by the writer,
+     * and by the reader if it shows up on disk anyway (untrusted). */
+    uint8_t bad[6] = { S3_TLV_USER_META, 0, 200, 0, 0, 0 };
+    o.tlv = bad; o.tlv_len = sizeof(bad);
+    CHECK(store_put_begin_opts(s, b, S3_STR_LIT("badtlv"), &o, &w) != S3_OK, "writer refuses bad TLV");
+    {
+        /* Corrupt the stored TLV length byte of object v4 on disk. */
+        char cmd[2048];
+        snprintf(cmd, sizeof(cmd),
+                 "f=$(find %s/data/buk -type f | xargs grep -l 123456789 | head -1); "
+                 "printf '\\377' | dd of=$f bs=1 seek=$((60+64+32+3+2+2)) conv=notrunc 2>/dev/null",
+                 g_root);
+        CHECK_EQ(system(cmd), 0, "corrupt tlv");
+        CHECK(store_get_open(s, b, S3_STR_LIT("v4"), &r, &m) != S3_OK, "reader refuses bad TLV");
+    }
+
+    /* Over-long content type is refused, not truncated. */
+    char ctl[1100];
+    memset(ctl, 'a', sizeof(ctl) - 1); ctl[sizeof(ctl) - 1] = 0;
+    store_put_opts_t o2 = { .content_type = ctl };
+    CHECK(store_put_begin_opts(s, b, S3_STR_LIT("ct"), &o2, &w) != S3_OK, "ct > 1024 refused");
+    store_close(s);
+    teardown_root();
+}
+
 int main(void) {
     log_init(LOG_WARN);  /* suppress info chatter during tests */
 
@@ -1755,6 +1825,7 @@ int main(void) {
     t_rejects_corrupt_header();
     t_bucket_grants();
     t_expire_if_unchanged();
+    t_schema4();
 
     if (failures == 0) { printf("ALL TESTS PASSED\n"); return 0; }
     printf("%d FAILURES\n", failures);

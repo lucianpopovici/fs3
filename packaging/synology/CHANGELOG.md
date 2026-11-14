@@ -1,6 +1,60 @@
 # fs3 SPK changelog
 
-## Unreleased
+## Unreleased (round 2)
+
+- Multipart: part records + ETag verification at Complete (InvalidPart,
+  InvalidPartOrder, EntityTooSmall below `--mpu-min-part-size`, default
+  5 MiB), ListParts, UploadPartCopy; `x-amz-copy-source-if-*` honoured.
+- Multi-range GETs return the whole object (200) as S3 does; invalid
+  Range headers are ignored.
+- User metadata and standard object headers are stored and returned;
+  `response-*` overrides; `x-amz-metadata-directive`. A self-copy
+  without `REPLACE` is now `400 InvalidRequest` (S3 behaviour).
+- Fix: `Connection: close` from a client was ignored (wrong llhttp flag).
+- Quotas per bucket and per user (admin API, `--default-bucket-quota`,
+  `--default-user-quota`), `403 QuotaExceeded`, Prometheus gauges, quota
+  column in the DSM console. New files: `buckets/<b>/quota`,
+  `buckets/<b>/usage`, `users/<hex>.quota`, `<root>/.fs3-running`.
+- Background integrity scrub (`--scrub-interval-days`, `--scrub-rate`,
+  `--scrub-now`, `--scrub-fail-reads`, admin `POST/GET /v1/scrub`, new
+  `scrub/` dir with `state` and `corrupt.log`, `fs3_scrub_*` metrics).
+- Key expiry, disable, read-only keys and last-used times (fourth field
+  of a credentials line, `PATCH /v1/keys/<ak>`, `--key-max-age-days`,
+  `keys.state`). **No downgrade** once a credentials line carries
+  attributes: an older fs3 refuses the file (`:` in the user field).
+- seccomp-BPF syscall filter, on by default (`--seccomp=off|log|enforce|require`).
+- Reflink fast paths on Btrfs for multipart Complete, CopyObject and
+  UploadPartCopy (`--reflink auto|off`, `fs3_reflink_clones_total`).
+- Opt-in whole-object dedup on Btrfs (`--dedup owner|global`, new `cas/` pool dir).
+- Btrfs transparent compression of objects (`--fs-compress auto|all`).
+- SSE-C (customer-provided keys; TLS only).
+- Object-lock buckets created from now on use **layout 2** (versions/ +
+  data/ symlinks); one-way: an older fs3 cannot read them. Existing
+  lock buckets are unchanged.
+- Optional `FS_IMMUTABLE_FL` for COMPLIANCE / legal-hold versions via the
+  new root helper `fs3-lockd` (`--lock-immutable --lockd-socket`). **Manual
+  opt-in on DSM:** DSM 7 runs packages as an unprivileged user and kernel
+  3.10 has no ambient capabilities, so the helper cannot run inside the
+  package. Start it as root yourself (e.g. a root "Triggered task" at boot
+  in Task Scheduler running
+  `/var/packages/fs3/target/bin/fs3-lockd --root <data dir> --socket
+  /var/packages/fs3/var/lockd.sock --journal /var/packages/fs3/var/lockd.journal`),
+  then add `--lock-immutable --lockd-socket /var/packages/fs3/var/lockd.sock`
+  to the service flags. Without it the status stays "API-level WORM".
+- Audit log lines carry the S3 error code (`"error":"…"`).
+- Fix: a request refused before `100 Continue` now closes the connection
+  (botocore stalled 60 s on the next request).
+- ListObjectsV2 pagination (was capped at the first 1000 keys),
+  `encoding-type=url`, ListMultipartUploads pagination; delimiter
+  listings no longer repeat a CommonPrefix on the next page.
+
+- Object files are now written in on-disk **schema 4** (adds stored size,
+  a CRC64NVME over the on-disk payload, a TLV area for metadata, and
+  4 KiB header padding on reflink-capable volumes). Schemas 2 and 3 are
+  still read. One-way: an older fs3 answers `InternalError` for schema-4
+  objects — **no downgrade after upgrade**.
+
+## Previous release
 
 **One-way on-disk migrations — no downgrade after upgrade.** Once this
 version has written data, an older fs3 package cannot read it. Back up

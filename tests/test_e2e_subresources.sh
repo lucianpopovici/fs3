@@ -14,7 +14,7 @@ LOG=/tmp/fs3-sub-e2e-$$.log
 URL="http://127.0.0.1:$PORT"
 
 cleanup() {
-    [ -n "${SP:-}" ] && kill "$SP" 2>/dev/null || true
+    [ -n "${SP:-}" ] && { kill "$SP" 2>/dev/null; wait "$SP" 2>/dev/null; [ $? -ne 159 ] || echo "FAIL: server died with SIGSYS (seccomp blocked a syscall; see --seccomp=log)" >&2; } || true
     rm -rf "$DATA" "$LOG"
 }
 trap cleanup EXIT
@@ -23,7 +23,7 @@ BUILD_FLAGS=""
 [ "${DEBUG:-0}" = "1" ] && BUILD_FLAGS="DEBUG=1"
 (cd "$ROOT" && make $BUILD_FLAGS fs3 >/dev/null 2>&1)
 
-"$ROOT/fs3" -p "$PORT" -d "$DATA" >"$LOG" 2>&1 &
+${FS3_WRAP:-} "$ROOT/fs3" -p "$PORT" -d "$DATA" >"$LOG" 2>&1 &
 SP=$!
 sleep 0.4
 kill -0 "$SP" 2>/dev/null || { echo "server did not start" >&2; cat "$LOG" >&2; exit 1; }
@@ -86,8 +86,8 @@ check_eq "bucket PUT ?versioning malformed → 400" "$(code -X PUT --data-binary
 check_eq "bucket survives" "$(code -I "$URL/subb")" "200"
 body_is_original "bucket-level probes"
 
-# GET ?uploadId (ListParts) is not implemented and must not return the object.
-check_eq "GET ?uploadId → 501" "$(code "$URL/subb/k?uploadId=0123456789abcdef0123456789abcdef")" "501"
+# GET ?uploadId is ListParts and must not return the object.
+check_eq "GET ?uploadId (unknown) → 404 NoSuchUpload" "$(code "$URL/subb/k?uploadId=0123456789abcdef0123456789abcdef")" "404"
 # GetObject ?partNumber=2 would be wrong bytes; =1 is the whole object.
 check_eq "GET ?partNumber=2 → 501" "$(code "$URL/subb/k?partNumber=2")" "501"
 check_eq "GET ?partNumber=1 → 200" "$(code "$URL/subb/k?partNumber=1")" "200"

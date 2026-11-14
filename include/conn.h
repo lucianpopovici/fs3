@@ -147,6 +147,14 @@ typedef struct conn {
     uint64_t           req_start_ns;
     uint64_t           bytes_out_body;
     int                metrics_flushed;
+    int                expect_pending; /* Expect: 100-continue not answered yet */
+    const char        *deny_reason;   /* sigv4 refusal reason (static string) */
+    const char        *lockd_sock;    /* --lock-immutable: fs3-lockd socket (item 9) */
+    int                last_err;
+    /* SSE-C keys for this request only (item 8): cleansed at request end. */
+    int                ssec_on, ssec_src_on;
+    uint8_t            ssec_key[32], ssec_src_key[32];
+    char               ssec_md5[32];      /* base64 key MD5, echoed */      /* s3_err_t of the error response, for the audit log */
 
     /* Read buffer: bytes are fed to llhttp via llhttp_execute() */
     char               rbuf[CONN_RBUF_SZ];
@@ -295,6 +303,7 @@ typedef struct conn {
     int                copy_pending;
     s3_str_t           copy_bucket;
     s3_str_t           copy_key;
+    int                copy_part;     /* UploadPartCopy: part number, 0 = CopyObject */
 
     /* Bucket config PUT (?cors, ?lifecycle, ?website, ?policy, ...):
      * body buffered into req_body_buf, handled at message-complete.

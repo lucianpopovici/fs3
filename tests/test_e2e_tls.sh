@@ -19,7 +19,7 @@ AK=AKIATLSTEST00001
 SK=tlsTestSecret0123456789012345678901234567
 
 cleanup() {
-    [ -n "${SP:-}" ] && kill "$SP" 2>/dev/null || true
+    [ -n "${SP:-}" ] && { kill "$SP" 2>/dev/null; wait "$SP" 2>/dev/null; [ $? -ne 159 ] || echo "FAIL: server died with SIGSYS (seccomp blocked a syscall; see --seccomp=log)" >&2; } || true
     rm -rf "$DATA" "$LOG" "$T".*
 }
 trap cleanup EXIT
@@ -50,12 +50,12 @@ check_eq() {
 }
 
 chmod 644 "$T.key"
-"$ROOT/fs3-tls" -p "$PORT" -d "$DATA" --tls-port "$TPORT" --tls-cert "$T.crt" --tls-key "$T.key" \
+${FS3_WRAP:-} "$ROOT/fs3-tls" -p "$PORT" -d "$DATA" --tls-port "$TPORT" --tls-cert "$T.crt" --tls-key "$T.key" \
     >"$LOG" 2>&1 && r=started || r=refused
 check_eq "world-readable key refused" "$r" "refused"
 chmod 600 "$T.key"
 
-"$ROOT/fs3-tls" -p "$PORT" -d "$DATA" --auth "$AK:$SK" --require-auth --require-tls \
+${FS3_WRAP:-} "$ROOT/fs3-tls" -p "$PORT" -d "$DATA" --auth "$AK:$SK" --require-auth --require-tls \
     --tls-port "$TPORT" --tls-cert "$T.crt" --tls-key "$T.key" --idle-timeout 2 \
     --tls-max-per-ip 256 >"$LOG" 2>&1 &
 SP=$!

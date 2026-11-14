@@ -47,8 +47,22 @@ typedef enum {
 #define S3_CKSUM_TYPE_FULL_OBJECT 0
 #define S3_CKSUM_TYPE_COMPOSITE   1
 
-/* Object flags (schema-3 header). */
+/* Object flags (schema-3/4 header). */
 #define S3_OBJF_DELETE_MARKER (1u << 0)
+#define S3_OBJF_PAYLOAD_CRC   (1u << 1)   /* payload_crc64 is valid */
+#define S3_OBJF_SSEC          (1u << 2)   /* payload is SSE-C sealed */
+#define S3_OBJF_ZSTD          (1u << 3)   /* payload is zstd-compressed */
+
+/* Schema-4 TLV record types ([u16 type][u32 len][bytes], LE). Values are
+ * stored on disk: never renumber. Unknown types are preserved on copy. */
+enum {
+    S3_TLV_USER_META      = 1,   /* repeated [u16 nlen][u16 vlen][name][value] */
+    S3_TLV_STD_HEADERS    = 2,   /* repeated [u8 id][u16 len][value] */
+    S3_TLV_CONTENT_SHA256 = 3,   /* 32 raw bytes */
+    S3_TLV_PART_TABLE     = 4,
+    S3_TLV_SSEC           = 5,
+    S3_TLV_ZSTD_SEEK      = 6,
+};
 
 typedef struct {
     uint64_t size;             /* body size in bytes */
@@ -57,7 +71,7 @@ typedef struct {
                                   multipart-of-MD5s (multipart upload) */
     uint16_t part_count;       /* 0 for single-PUT, >0 for multipart;
                                   formatters render as "hex-N" if >0 */
-    char     content_type[128];/* NUL-terminated; "" if not set */
+    char     content_type[1025];/* NUL-terminated; "" if not set */
 
     /* Schema 3 fields; zero for objects written by schema 2. */
     uint8_t  version_id[16];   /* all-zero = null version */
@@ -66,6 +80,12 @@ typedef struct {
     uint8_t  cksum_type;       /* S3_CKSUM_TYPE_* */
     uint16_t cksum_parts;      /* composite: number of parts */
     uint8_t  cksum[32];        /* raw digest, left-aligned */
+
+    /* Schema 4; zero for older objects (stored_size = size). */
+    uint64_t stored_size;      /* payload bytes on disk */
+    uint8_t  payload_crc64[8]; /* valid iff flags & S3_OBJF_PAYLOAD_CRC */
+    uint32_t header_size;      /* data offset in the object file */
+    uint32_t tlv_off, tlv_len; /* TLV area (read with store_reader_tlv) */
 } s3_obj_meta_t;
 
 /* Options for store_put_begin_opts. Zero-initialise and set what you
@@ -81,6 +101,13 @@ typedef struct {
     uint16_t    cksum_parts;
     int         have_cksum;
     uint8_t     cksum[32];
+    /* Schema-4 TLV area to store with the object (pre-built records,
+     * validated; ≤ 64 KiB). Copied at begin. */
+    const uint8_t *tlv;
+    size_t      tlv_len;
+    int         no_dedup;      /* never pool this object (SSE-C) */
+    uint64_t    size_hint;     /* declared body length, 0 = unknown */
+    const uint8_t *ssec_key;   /* SSE-C: 32-byte customer key, NULL = none */
 } store_put_opts_t;
 
 /* ---- Lifecycle ---- */
@@ -93,6 +120,42 @@ void     store_close(s3_store_t *s);
  * the filesystem has fewer than `min_free_bytes` available. Pass 0 to
  * disable the check (the default). */
 void     store_set_min_free_bytes(s3_store_t *s, uint64_t min_free_bytes);
+
+/* Pad object headers to 4096 so payloads are block-aligned (set at
+ * store_open when the filesystem supports reflinks; tests may force it).
+ * Returns the previous setting. */
+int      store_set_header_pad(s3_store_t *s, int on);
+/* 1 if store_open found the filesystem reflink-capable. */
+int      store_reflink_capable(const s3_store_t *s);
+/* Turn the reflink fast paths off (0) or back on if the filesystem
+ * supports them (1). Returns the previous setting. Tests use it to run
+ * the pure-copy paths on Btrfs. */
+int      store_set_reflink(s3_store_t *s, int on);
+/* Filesystem compression (item 7a): FS_COMPR_FL on new object/part
+ * files. AUTO skips already-compressed content types / suffixes and
+ * objects under 4 KiB. Returns -1 (and stays off) if the filesystem
+ * refuses the flag. */
+enum { STORE_COMPRESS_OFF = 0, STORE_COMPRESS_AUTO = 1, STORE_COMPRESS_ALL = 2 };
+int      store_set_fs_compress(s3_store_t *s, int mode);
+/* Whole-object dedup (item 6b, needs reflink): objects of at least
+ * min_size share extents through <root>/cas/<scope>/…; scope is per
+ * bucket owner (STORE_DEDUP_OWNER) or global. verify byte-compares on a
+ * hit. Counters are atomic. */
+enum { STORE_DEDUP_OFF = 0, STORE_DEDUP_OWNER = 1, STORE_DEDUP_GLOBAL = 2 };
+void     store_set_dedup(s3_store_t *s, int mode, uint64_t min_size, int verify);
+extern uint64_t g_store_dedup_hits, g_store_dedup_misses;
+/* Pool GC: drop entries not in the sorted digest array `keep` and older
+ * than `older_than`. Returns the number removed. */
+int      store_dedup_gc(s3_store_t *s, const uint8_t *keep, size_t n_keep, time_t older_than);
+/* An object file's CONTENT_SHA256 TLV (1 found, 0 none). */
+int      store_object_content_sha256(const char *path, uint8_t out[32]);
+/* Number of extent clones done since start (atomic; tests, metrics). */
+extern uint64_t g_store_clone_count;
+/* Reflink copy of the reader's remaining payload into the writer (both
+ * schema-4 padded or a part file); the bytes are still read once for the
+ * writer's hashes and `extra`. S3_ERR_NOT_IMPLEMENTED: copy instead. */
+s3_err_t store_writer_clone(s3_writer_t *w, s3_reader_t *r,
+                            void (*extra)(void *ctx, const void *p, size_t n), void *ctx);
 
 /* Point-in-time stats for the metrics endpoint: bucket count, in-flight
  * multipart uploads, and data-volume usage from statvfs. Cheap (two
@@ -144,6 +207,7 @@ typedef struct {
     char id[33];       /* 32 hex, or "" for a pre-ownership bucket */
     int  versioning;   /* S3_VERSIONING_* (item 8) */
     int  object_lock;  /* object lock enabled at creation (item 10) */
+    int  layout;       /* 2 = versions/ + data/ symlinks (round 2, item 9) */
 } s3_bucket_meta_t;
 
 /* Create a bucket owned by `owner` (NULL/"" = ownerless). Returns
@@ -283,10 +347,20 @@ ssize_t  store_get_sendfile(s3_reader_t *r, int out_fd, size_t max);
  * if the range falls outside the object body. */
 s3_err_t store_get_seek(s3_reader_t *r, uint64_t first, uint64_t last);
 void     store_get_close(s3_reader_t *r);
+/* SSE-C (item 8): switch an opened SSE-C object to decrypting reads with
+ * the customer key. S3_ERR_ACCESS_DENIED: wrong key; S3_ERR_INVALID_REQUEST:
+ * not an SSE-C object. Decrypting readers have no sendfile/raw access. */
+s3_err_t store_reader_ssec(s3_store_t *s, s3_str_t bucket, s3_reader_t *r, const uint8_t key[32]);
+int      store_reader_transformed(const s3_reader_t *r);
+/* The object's schema-4 TLV area (malloc'd copy, re-validated; NULL/0 if
+ * none). Caller frees. */
+s3_err_t store_reader_tlv(const s3_reader_t *r, uint8_t **out, size_t *n_out);
 /* For zero-copy senders (SSL_sendfile): the file, the absolute offset of
  * the next body byte and how many remain. store_get_advance consumes n. */
 void     store_get_raw(const s3_reader_t *r, int *fd, off_t *off, uint64_t *remaining);
 void     store_get_advance(s3_reader_t *r, uint64_t n);
+/* Step back n bytes (a socket took less than was read). */
+void     store_get_rewind(s3_reader_t *r, uint64_t n);
 
 /* ---- HEAD / DELETE ---- */
 
@@ -346,11 +420,26 @@ s3_err_t store_mpu_create_opts(s3_store_t *s, s3_str_t bucket, s3_str_t key,
                                uint8_t cksum_algo, uint8_t cksum_type,
                                char upload_id_out[S3_MULTIPART_UPLOAD_ID_LEN + 1]);
 
+/* store_mpu_create_opts plus a schema-4 TLV area (user metadata and
+ * standard headers, item 1e) recorded in the upload's meta and written
+ * into the object at Complete. */
+s3_err_t store_mpu_create_tlv(s3_store_t *s, s3_str_t bucket, s3_str_t key,
+                              const char *content_type,
+                              uint8_t cksum_algo, uint8_t cksum_type,
+                              const uint8_t *tlv, size_t tlv_n,
+                              char upload_id_out[S3_MULTIPART_UPLOAD_ID_LEN + 1]);
+
 /* Streaming part upload — same shape as the single-PUT writer. */
 s3_err_t store_mpu_part_begin(s3_store_t *s, s3_str_t bucket, s3_str_t key,
                               const char *upload_id, int part_number,
                               s3_writer_t **out);
 s3_err_t store_mpu_part_write(s3_writer_t *w, const void *buf, size_t n);
+/* SSE-C (item 8): parts of an SSE-C upload need its key (wrong key:
+ * S3_ERR_ACCESS_DENIED; missing, or a key for a plain upload:
+ * S3_ERR_INVALID_REQUEST). */
+s3_err_t store_mpu_part_begin_ssec(s3_store_t *s, s3_str_t bucket, s3_str_t key,
+                                   const char *upload_id, int part_number,
+                                   const uint8_t *ssec_key, s3_writer_t **out);
 /* On success, fills *etag_hex_out with 32 hex chars (NUL-terminated). */
 s3_err_t store_mpu_part_commit(s3_writer_t *w, char etag_hex_out[33]);
 void     store_mpu_part_abort(s3_writer_t *w);
@@ -379,6 +468,10 @@ s3_err_t store_mpu_complete2(s3_store_t *s, s3_str_t bucket, s3_str_t key,
 s3_err_t store_mpu_checksum_info(s3_store_t *s, s3_str_t bucket,
                                  const char *upload_id,
                                  uint8_t *algo, uint8_t *type);
+
+/* S3's rule: every part but the last must be at least this many bytes
+ * (Complete answers S3_ERR_ENTITY_TOO_SMALL). 0 = no minimum. */
+void     store_set_mpu_min_part_size(s3_store_t *s, uint64_t n);
 
 /* Abort: remove the staging dir and all part files. */
 s3_err_t store_mpu_abort(s3_store_t *s, s3_str_t bucket, s3_str_t key,
@@ -446,6 +539,94 @@ s3_err_t store_list_mpu_uploads(s3_store_t *s, s3_str_t bucket,
                                 s3_str_t key_prefix,
                                 s3_mpu_info_t **out, size_t *n_out);
 void     store_mpu_uploads_free(s3_mpu_info_t *list, size_t n);
+
+/* ListParts: parts of one upload with number > marker, sorted, at most
+ * max (cap 1000). Reads the part records; *truncated set when more
+ * remain. The key must match the upload's (NoSuchUpload otherwise).
+ * algo/type report the upload's checksum algorithm. Caller free()s. */
+typedef struct {
+    uint32_t part_number;
+    uint64_t size;
+    uint64_t mtime_ms;
+    char     etag[33];                 /* lowercase hex MD5, NUL */
+    uint8_t  ck_algo, ck_n;
+    uint8_t  ck[32];
+} s3_part_info_t;
+s3_err_t store_mpu_list_parts(s3_store_t *s, s3_str_t bucket, s3_str_t key,
+                              const char *upload_id, uint32_t marker, size_t max,
+                              s3_part_info_t **out, size_t *n_out, int *truncated,
+                              uint8_t *algo_out, uint8_t *type_out);
+
+/* ---- Quotas (round 2, item 2) ----
+ *
+ * Hard limits on logical bytes and object count per bucket (sidecar
+ * buckets/<b>/quota) and per user (sum over the buckets they own; file
+ * users/<hex(user)>.quota). 0 = unlimited. Without a bucket sidecar the
+ * --default-bucket-quota applies; without a user file the
+ * --default-user-quota. Writes over a limit fail with
+ * S3_ERR_QUOTA_EXCEEDED before bytes reach disk. Lowering a limit below
+ * current usage blocks new writes and never deletes data. */
+typedef struct {
+    uint64_t bytes, objects, reserved;
+    uint64_t max_bytes, max_objects;   /* effective limits */
+    int      has_cfg;                  /* explicit (not default) limit */
+    char     owner[129];
+} s3_quota_usage_t;
+void     store_set_default_quotas(s3_store_t *s, uint64_t bucket_bytes, uint64_t user_bytes);
+s3_err_t store_bucket_quota_set(s3_store_t *s, s3_str_t bucket,
+                                uint64_t max_bytes, uint64_t max_objects);
+s3_err_t store_bucket_quota_clear(s3_store_t *s, s3_str_t bucket);
+s3_err_t store_bucket_usage(s3_store_t *s, s3_str_t bucket, s3_quota_usage_t *out);
+s3_err_t store_user_quota_set(s3_store_t *s, const char *user,
+                              uint64_t max_bytes, uint64_t max_objects);
+s3_err_t store_user_quota_clear(s3_store_t *s, const char *user);
+s3_err_t store_user_usage(s3_store_t *s, const char *user, s3_quota_usage_t *out);
+uint64_t store_quota_rejections(s3_store_t *s);
+/* Recompute a bucket's usage from disk (scrub); *drift = old - new.
+ * S3_ERR_SLOW_DOWN: the bucket was written during the walk, nothing
+ * changed (try again on the next pass). */
+s3_err_t store_quota_recount(s3_store_t *s, s3_str_t bucket, int64_t *drift_bytes);
+/* Reserve quota for a body of n bytes (declared length) before it
+ * streams; writes past it reserve as they go. */
+s3_err_t store_put_expect(s3_writer_t *w, uint64_t n);
+int      store_valid_identity(const char *u);
+
+/* Called before a version file is permanently unlinked (item 9:
+ * fs3-lockd clears FS_IMMUTABLE_FL only when retention allows). Non-zero
+ * refuses the delete (S3_ERR_LOCKED). */
+void     store_set_version_unlink_hook(s3_store_t *s, int (*fn)(void *user, const char *path),
+                                       void *user);
+/* Path of a version's file (layout 2: every version, current included,
+ * has one in versions/). 0 ok, -1 not found / not layout 2. */
+int      store_version_file(s3_store_t *s, s3_str_t bucket, s3_str_t key, const uint8_t vid[16],
+                            char *out, size_t cap);
+
+/* ---- Integrity scrub (round 2, item 3) ----
+ *
+ * store_scrub_file verifies one file without any lock (object files are
+ * immutable once renamed in; a vanished file is SCRUB_GONE, never
+ * corruption). Pass lock_hex (the key's path hash) to re-confirm a
+ * failure under the key's stripe lock. Objects: header, size, then the
+ * payload CRC64, else the MD5 ETag (single-part, untransformed), else a
+ * full-object checksum, else unverifiable. Parts: against their record. */
+enum { SCRUB_OK = 0, SCRUB_UNVERIFIABLE, SCRUB_CORRUPT, SCRUB_GONE };
+enum { STORE_SCRUB_OBJECT = 0, STORE_SCRUB_PART = 1, STORE_SCRUB_LOCK = 2 };
+typedef struct {
+    int      verdict;
+    uint64_t bytes_read, logical_size, mtime_ms;
+    uint64_t dev, ino, nlink;
+    uint8_t  version_id[16];
+    char     key[1025];
+    char     reason[64];
+    char     expected[40], actual[40];
+} store_scrub_result_t;
+s3_err_t store_scrub_file(s3_store_t *s, const char *path, int kind, const char *lock_hex,
+                          void (*throttle)(void *ctx, uint64_t bytes), void *tctx,
+                          store_scrub_result_t *r);
+/* --scrub-fail-reads: GET of a marked version answers InternalError. */
+void     store_scrub_fail_reads(int on);
+void     store_scrub_mark_corrupt(uint64_t dev, uint64_t ino, uint64_t mtime_ms);
+const char *store_root(const s3_store_t *s);
 
 /* ---- Multipart GC ----
  *
