@@ -206,8 +206,9 @@ static void scratch_reset(conn_t *c) { c->req_scratch_used = 0; }
  * denial. Unclassified actions (no table entry) are always denied.
  *
  * Evaluation order (later items plug in here):
- *   owner or admin            → allow
- *   otherwise                 → deny
+ *   owner or admin                        → allow
+ *   per-user grant covering the action    → allow   (item 3)
+ *   otherwise                             → deny
  */
 s3_err_t authz(conn_t *c, s3_str_t bucket, s3_str_t key, s3_action_t act) {
     (void)key;
@@ -225,6 +226,14 @@ s3_err_t authz(conn_t *c, s3_str_t bucket, s3_str_t key, s3_action_t act) {
     if (!c->id.user[0]) return S3_ERR_ACCESS_DENIED;
     if (c->id.is_admin) return S3_OK;
     if (m.owner[0] && strcmp(m.owner, c->id.user) == 0) return S3_OK;
+    /* Grants: r → list/get, w → put/delete/MPU, o → config. Bucket
+     * delete and create are never grantable. */
+    if (act != ACT_DELETE_BUCKET) {
+        int g = store_bucket_grant_perms(c->store, bucket, c->id.user);
+        int need = ai->perm == PERM_R ? S3_GRANT_R
+                 : ai->perm == PERM_W ? S3_GRANT_W : S3_GRANT_O;
+        if (g & need) return S3_OK;
+    }
     return S3_ERR_ACCESS_DENIED;
 }
 
@@ -245,12 +254,15 @@ static int handle_service(conn_t *c) {
     if (e != S3_OK) {
         return rsp_build_s3_error(c, e, S3_STR_LIT("/"), NULL);
     }
-    /* Each user sees only their own buckets; admins see all. */
+    /* Each user sees their own buckets and those they hold any grant
+     * on; admins see all. */
     if (c->auth && !c->id.is_admin) {
         size_t kept = 0;
         for (size_t i = 0; i < n_buckets; i++) {
-            if (buckets[i].owner[0]
-                && strcmp(buckets[i].owner, c->id.user) == 0) {
+            s3_str_t bn = { buckets[i].name, strlen(buckets[i].name) };
+            if ((buckets[i].owner[0]
+                 && strcmp(buckets[i].owner, c->id.user) == 0)
+                || store_bucket_grant_perms(c->store, bn, c->id.user)) {
                 buckets[kept++] = buckets[i];
             } else {
                 free(buckets[i].name);

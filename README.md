@@ -127,8 +127,18 @@ What's working end-to-end:
   `--legacy-owner <user>` assigns them at startup. Anonymous requests
   (auth configured without `--require-auth`) own nothing and are refused.
   No auth configured means no identities and no isolation, as before.
-  This is ownership only — there are no policies, grants or shared
-  buckets.
+
+- **Per-user bucket grants** (Garage-style) — `buckets/<b>/grants` holds
+  one `user:perms` line per grantee, perms ⊆ `rwo`: `r` lists and reads,
+  `w` writes, deletes and runs multipart uploads, `o` reads and changes
+  bucket configuration. Deleting the bucket stays owner/admin-only.
+  Granted buckets appear in the grantee's `ListAllMyBuckets`. Edits take
+  effect on the next request (the parsed file is cached per bucket *id*
+  and re-validated against its inode/mtime), and deleting and re-creating
+  a bucket drops its grants. User names written by fs3 are restricted to
+  `[A-Za-z0-9._@-]`; malformed lines are ignored, never widened. Grants
+  are managed through the admin API (below) or by editing the file; S3
+  ACL calls remain stubs.
 
 - **`ListMultipartUploads`** (`GET /bucket?uploads`) — lists active
   multipart uploads in a bucket. Reads each upload's `meta` file

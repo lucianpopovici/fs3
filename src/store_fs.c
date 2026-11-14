@@ -121,6 +121,11 @@ struct s3_store {
      * mkdir_p + rename, and rm_rf of bucket/upload dirs — are serialized
      * here. Never held across data writes or fsync of object bytes. */
     pthread_mutex_t ns_mu;
+
+    /* Parsed bucket-config cache (store_sidecar_get). */
+    pthread_mutex_t cfg_mu;
+    struct store_cfg_ref *cfg_head;
+    size_t           cfg_count;
 };
 
 static char *xstrdup_join(const char *a, const char *b) {
@@ -336,12 +341,42 @@ static void recover_tmp_dir(const s3_store_t *s) {
     }
 }
 
+static void cfg_cache_clear(s3_store_t *s);
+
+/* Startup: remove half-written sidecars (buckets/<b>/<name>.tmp.XXXXXX
+ * and meta.tmp) left by a crash between write and rename. */
+static void recover_sidecar_tmp(const s3_store_t *s) {
+    DIR *d = opendir(s->buckets_dir);
+    if (!d) return;
+    struct dirent *e;
+    int n = 0;
+    while ((e = readdir(d)) != NULL) {
+        if (e->d_name[0] == '.') continue;
+        char bdir[4200];
+        snprintf(bdir, sizeof(bdir), "%s/%s", s->buckets_dir, e->d_name);
+        DIR *b = opendir(bdir);
+        if (!b) continue;
+        struct dirent *f;
+        while ((f = readdir(b)) != NULL) {
+            if (strstr(f->d_name, ".tmp.") || strcmp(f->d_name, "meta.tmp") == 0) {
+                char p[4500];
+                snprintf(p, sizeof(p), "%s/%s", bdir, f->d_name);
+                if (unlink(p) == 0) n++;
+            }
+        }
+        closedir(b);
+    }
+    closedir(d);
+    if (n) LOG_I("recovery: removed %d orphaned bucket sidecar temp file(s)", n);
+}
+
 s3_err_t store_open(s3_store_t **out, const char *root) {
     if (!out || !root) return S3_ERR_INVALID_ARGUMENT;
 
     s3_store_t *s = calloc(1, sizeof(*s));
     if (!s) return S3_ERR_INTERNAL;
     pthread_mutex_init(&s->ns_mu, NULL);
+    pthread_mutex_init(&s->cfg_mu, NULL);
 
     s->root        = strdup(root);
     s->data_dir    = xstrdup_join(root, "data");
@@ -364,6 +399,7 @@ s3_err_t store_open(s3_store_t **out, const char *root) {
     }
 
     recover_tmp_dir(s);
+    recover_sidecar_tmp(s);
 
     *out = s;
     return S3_OK;
@@ -377,6 +413,8 @@ void store_close(s3_store_t *s) {
     free(s->buckets_dir);
     free(s->mpu_dir);
     pthread_mutex_destroy(&s->ns_mu);
+    cfg_cache_clear(s);
+    pthread_mutex_destroy(&s->cfg_mu);
     free(s);
 }
 
@@ -670,16 +708,20 @@ static s3_err_t bucket_delete_locked(s3_store_t *s, s3_str_t name) {
 
     char bp[4096];
     if (bucket_path(s, name, bp, sizeof(bp)) < 0) return S3_ERR_INTERNAL;
-    char meta_p[4200];
-    snprintf(meta_p, sizeof(meta_p), "%s/meta", bp);
-    if (unlink(meta_p) < 0 && errno != ENOENT) {
-        LOG_W("bucket_delete unlink %s: %s", meta_p, strerror(errno));
+    /* The marker dir holds meta plus config sidecars (grants, cors.xml,
+     * ...). Move it out of buckets/ in one rename, so the bucket vanishes
+     * atomically (never ownerless-but-present after a crash), then remove
+     * it; a crash in between leaves only a tmp/bucket.* dir, swept at
+     * startup. */
+    char gone[4096];
+    snprintf(gone, sizeof(gone), "%s/bucket.XXXXXX", s->tmp_dir);
+    if (!mkdtemp(gone) || rename(bp, gone) < 0) {
+        LOG_W("bucket_delete move %s: %s", bp, strerror(errno));
+        rmdir(gone);
         return S3_ERR_INTERNAL;
     }
-    if (rmdir(bp) < 0) {
-        LOG_W("bucket_delete rmdir %s: %s", bp, strerror(errno));
-        return S3_ERR_INTERNAL;
-    }
+    fsync_dir(s->buckets_dir);
+    rm_rf(gone);
     return S3_OK;
 }
 
@@ -690,6 +732,320 @@ s3_err_t store_bucket_delete(s3_store_t *s, s3_str_t name) {
     pthread_mutex_lock(&s->ns_mu);
     s3_err_t e = bucket_delete_locked(s, name);
     pthread_mutex_unlock(&s->ns_mu);
+    return e;
+}
+
+/* ===================================================================== */
+/* Bucket config sidecars + parsed-config cache                           */
+/* ===================================================================== */
+
+struct store_cfg_ref {
+    char      key[33 + 1 + 64 + 1 + 32];  /* "<id or :name>/<sidecar>" */
+    dev_t     dev;
+    ino_t     ino;
+    int64_t   mtime_ns;
+    off_t     size;
+    void     *obj;
+    store_cfg_free_fn release;
+    int       refs;           /* holders, plus 1 while cached */
+    int       cached;
+    struct store_cfg_ref *next;
+};
+
+static int sidecar_path(s3_store_t *s, s3_str_t bucket, const char *name,
+                        char *out, size_t cap) {
+    if (!valid_bucket_name(bucket)) return -1;
+    int n = snprintf(out, cap, "%s/" S3_STR_FMT "/%s", s->buckets_dir,
+                     S3_STR_ARG(bucket), name);
+    return (n > 0 && (size_t)n < cap) ? 0 : -1;
+}
+
+s3_err_t store_bucket_sidecar_write(s3_store_t *s, s3_str_t bucket,
+                                    const char *name,
+                                    const void *data, size_t n) {
+    char final[4200], tmp[4300], dir[4200];
+    if (!s || sidecar_path(s, bucket, name, final, sizeof(final)) < 0)
+        return S3_ERR_INVALID_ARGUMENT;
+    if (!store_bucket_exists(s, bucket)) return S3_ERR_NO_SUCH_BUCKET;
+    snprintf(dir, sizeof(dir), "%s/" S3_STR_FMT, s->buckets_dir, S3_STR_ARG(bucket));
+    snprintf(tmp, sizeof(tmp), "%s.tmp.XXXXXX", final);
+    int fd = mkstemp(tmp);
+    if (fd < 0) return map_io_err(errno);
+    if ((n && xwrite(fd, data, n) != (ssize_t)n) || xfsync(fd) < 0) {
+        s3_err_t e = map_io_err(errno);
+        close(fd); unlink(tmp);
+        return e;
+    }
+    close(fd);
+    pthread_mutex_lock(&s->ns_mu);
+    int rc = store_bucket_exists(s, bucket) ? rename(tmp, final) : -1;
+    int err = errno;
+    pthread_mutex_unlock(&s->ns_mu);
+    if (rc < 0) {
+        unlink(tmp);
+        return store_bucket_exists(s, bucket) ? map_io_err(err)
+                                              : S3_ERR_NO_SUCH_BUCKET;
+    }
+    fsync_dir(dir);
+    return S3_OK;
+}
+
+s3_err_t store_bucket_sidecar_read(s3_store_t *s, s3_str_t bucket,
+                                   const char *name, size_t max,
+                                   char **out, size_t *n_out) {
+    char path[4200];
+    if (!s || sidecar_path(s, bucket, name, path, sizeof(path)) < 0)
+        return S3_ERR_INVALID_ARGUMENT;
+    if (!store_bucket_exists(s, bucket)) return S3_ERR_NO_SUCH_BUCKET;
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return errno == ENOENT ? S3_ERR_NO_SUCH_KEY : S3_ERR_INTERNAL;
+    struct stat st;
+    if (fstat(fd, &st) < 0 || !S_ISREG(st.st_mode)) { close(fd); return S3_ERR_INTERNAL; }
+    if ((uint64_t)st.st_size > max) { close(fd); return S3_ERR_ENTITY_TOO_LARGE; }
+    char *b = malloc((size_t)st.st_size + 1);
+    if (!b) { close(fd); return S3_ERR_INTERNAL; }
+    ssize_t got = pread(fd, b, (size_t)st.st_size, 0);
+    close(fd);
+    if (got != st.st_size) { free(b); return S3_ERR_INTERNAL; }
+    b[got] = '\0';
+    *out = b;
+    *n_out = (size_t)got;
+    return S3_OK;
+}
+
+s3_err_t store_bucket_sidecar_delete(s3_store_t *s, s3_str_t bucket,
+                                     const char *name) {
+    char path[4200], dir[4200];
+    if (!s || sidecar_path(s, bucket, name, path, sizeof(path)) < 0)
+        return S3_ERR_INVALID_ARGUMENT;
+    if (!store_bucket_exists(s, bucket)) return S3_ERR_NO_SUCH_BUCKET;
+    if (unlink(path) < 0 && errno != ENOENT) return map_io_err(errno);
+    snprintf(dir, sizeof(dir), "%s/" S3_STR_FMT, s->buckets_dir, S3_STR_ARG(bucket));
+    fsync_dir(dir);
+    return S3_OK;
+}
+
+static void cfg_unref_locked(struct store_cfg_ref *r) {
+    if (--r->refs == 0) {
+        if (r->obj) r->release(r->obj);
+        free(r);
+    }
+}
+
+void *store_cfg_obj(const store_cfg_ref_t *r) { return r ? r->obj : NULL; }
+
+static void cfg_cache_clear(s3_store_t *s) {
+    while (s->cfg_head) {
+        struct store_cfg_ref *n = s->cfg_head->next;
+        s->cfg_head->cached = 0;
+        cfg_unref_locked(s->cfg_head);
+        s->cfg_head = n;
+    }
+    s->cfg_count = 0;
+}
+
+void store_sidecar_put(s3_store_t *s, store_cfg_ref_t *r) {
+    if (!s || !r) return;
+    pthread_mutex_lock(&s->cfg_mu);
+    cfg_unref_locked(r);
+    pthread_mutex_unlock(&s->cfg_mu);
+}
+
+/* Drop a cache entry (caller holds cfg_mu). */
+static void cfg_evict_locked(s3_store_t *s, struct store_cfg_ref **pp) {
+    struct store_cfg_ref *r = *pp;
+    *pp = r->next;
+    r->cached = 0;
+    s->cfg_count--;
+    cfg_unref_locked(r);
+}
+
+store_cfg_ref_t *store_sidecar_get(s3_store_t *s, s3_str_t bucket,
+                                   const char *name, size_t max,
+                                   store_cfg_parse_fn parse,
+                                   store_cfg_free_fn release) {
+    char path[4200];
+    if (!s || sidecar_path(s, bucket, name, path, sizeof(path)) < 0) return NULL;
+    s3_bucket_meta_t bm;
+    if (store_bucket_meta(s, bucket, &bm) != S3_OK) return NULL;
+    char key[sizeof(((struct store_cfg_ref *)0)->key)];
+    if (bm.id[0])
+        snprintf(key, sizeof(key), "%s/%s", bm.id, name);
+    else
+        snprintf(key, sizeof(key), ":%.*s/%s", (int)bucket.n, bucket.p, name);
+
+    struct stat st;
+    int have = stat(path, &st) == 0 && S_ISREG(st.st_mode);
+    int64_t mns = have ? (int64_t)st.st_mtim.tv_sec * 1000000000LL + st.st_mtim.tv_nsec : 0;
+
+    pthread_mutex_lock(&s->cfg_mu);
+    struct store_cfg_ref **pp = &s->cfg_head;
+    while (*pp) {
+        struct store_cfg_ref *r = *pp;
+        if (strcmp(r->key, key) == 0) {
+            if (have && r->dev == st.st_dev && r->ino == st.st_ino
+                && r->mtime_ns == mns && r->size == st.st_size) {
+                r->refs++;
+                pthread_mutex_unlock(&s->cfg_mu);
+                return r->obj ? r : (store_sidecar_put(s, r), NULL);
+            }
+            cfg_evict_locked(s, pp);
+            continue;
+        }
+        pp = &r->next;
+    }
+    pthread_mutex_unlock(&s->cfg_mu);
+    if (!have) return NULL;
+
+    /* Parse outside the lock. */
+    char *data = NULL;
+    size_t n = 0;
+    if (store_bucket_sidecar_read(s, bucket, name, max, &data, &n) != S3_OK)
+        return NULL;
+    void *obj = parse(data, n);
+    free(data);
+    struct store_cfg_ref *r = calloc(1, sizeof(*r));
+    if (!r) { if (obj) release(obj); return NULL; }
+    snprintf(r->key, sizeof(r->key), "%s", key);
+    r->dev = st.st_dev; r->ino = st.st_ino; r->mtime_ns = mns; r->size = st.st_size;
+    r->obj = obj;
+    r->release = release;
+    r->refs = 2;               /* cache + caller */
+    r->cached = 1;
+
+    pthread_mutex_lock(&s->cfg_mu);
+    /* Bound the cache: drop the oldest entries beyond 1024. */
+    if (s->cfg_count >= 1024) {
+        struct store_cfg_ref **q = &s->cfg_head;
+        size_t i = 0;
+        while (*q && i < 512) { q = &(*q)->next; i++; }
+        while (*q) cfg_evict_locked(s, q);
+    }
+    r->next = s->cfg_head;
+    s->cfg_head = r;
+    s->cfg_count++;
+    pthread_mutex_unlock(&s->cfg_mu);
+    if (!obj) { store_sidecar_put(s, r); return NULL; }
+    return r;
+}
+
+/* ---- Grants ---------------------------------------------------------- */
+
+#define GRANTS_MAX_BYTES (64 * 1024)
+
+typedef struct { size_t n; s3_grant_t *g; } grant_list_t;
+
+int store_grant_parse_perms(const char *p, size_t n) {
+    int bits = 0;
+    for (size_t i = 0; i < n; i++) {
+        int b = p[i] == 'r' ? S3_GRANT_R : p[i] == 'w' ? S3_GRANT_W
+              : p[i] == 'o' ? S3_GRANT_O : -1;
+        if (b < 0 || (bits & b)) return -1;
+        bits |= b;
+    }
+    return bits;
+}
+
+static void grants_free(void *o) {
+    grant_list_t *l = o;
+    if (l) { free(l->g); free(l); }
+}
+
+/* Lines "user:perms". Malformed lines are skipped (logged once per parse):
+ * a bad line must never be read as a broader grant. */
+static void *grants_parse(const char *d, size_t n) {
+    grant_list_t *l = calloc(1, sizeof(*l));
+    if (!l) return NULL;
+    size_t cap = 0, i = 0;
+    while (i < n) {
+        size_t st = i;
+        while (i < n && d[i] != '\n') i++;
+        size_t e = i;
+        if (i < n) i++;
+        if (e == st || d[st] == '#') continue;
+        const char *colon = memchr(d + st, ':', e - st);
+        if (!colon) continue;
+        size_t un = (size_t)(colon - (d + st));
+        char user[129];
+        if (un == 0 || un > 128) continue;
+        memcpy(user, d + st, un);
+        user[un] = '\0';
+        int perms = store_grant_parse_perms(colon + 1, e - (size_t)(colon - d) - 1);
+        if (!s3_valid_ident_strict(user) || perms <= 0) {
+            LOG_W("grants: ignoring malformed line");
+            continue;
+        }
+        if (l->n == cap) {
+            size_t nc = cap ? cap * 2 : 8;
+            s3_grant_t *ng = realloc(l->g, nc * sizeof(*ng));
+            if (!ng) { grants_free(l); return NULL; }
+            l->g = ng; cap = nc;
+        }
+        snprintf(l->g[l->n].user, sizeof(l->g[l->n].user), "%s", user);
+        l->g[l->n].perms = perms;
+        l->n++;
+    }
+    return l;
+}
+
+int store_bucket_grant_perms(s3_store_t *s, s3_str_t bucket, const char *user) {
+    store_cfg_ref_t *r = store_sidecar_get(s, bucket, "grants", GRANTS_MAX_BYTES,
+                                           grants_parse, grants_free);
+    if (!r) return 0;
+    const grant_list_t *l = store_cfg_obj(r);
+    int perms = 0;
+    for (size_t i = 0; i < l->n; i++)
+        if (strcmp(l->g[i].user, user) == 0) perms |= l->g[i].perms;
+    store_sidecar_put(s, r);
+    return perms;
+}
+
+s3_err_t store_bucket_grants_get(s3_store_t *s, s3_str_t bucket,
+                                 s3_grant_t **out, size_t *n_out) {
+    *out = NULL;
+    *n_out = 0;
+    if (!store_bucket_exists(s, bucket)) return S3_ERR_NO_SUCH_BUCKET;
+    store_cfg_ref_t *r = store_sidecar_get(s, bucket, "grants", GRANTS_MAX_BYTES,
+                                           grants_parse, grants_free);
+    if (!r) return S3_OK;
+    const grant_list_t *l = store_cfg_obj(r);
+    if (l->n) {
+        *out = malloc(l->n * sizeof(**out));
+        if (!*out) { store_sidecar_put(s, r); return S3_ERR_INTERNAL; }
+        memcpy(*out, l->g, l->n * sizeof(**out));
+        *n_out = l->n;
+    }
+    store_sidecar_put(s, r);
+    return S3_OK;
+}
+
+s3_err_t store_bucket_grant_set(s3_store_t *s, s3_str_t bucket,
+                                const char *user, int perms) {
+    if (!user || !s3_valid_ident_strict(user) || perms < 0 || perms > 7)
+        return S3_ERR_INVALID_ARGUMENT;
+    s3_grant_t *g = NULL;
+    size_t n = 0;
+    s3_err_t e = store_bucket_grants_get(s, bucket, &g, &n);
+    if (e != S3_OK) return e;
+    size_t cap = (n + 1) * (128 + 8) + 1;
+    char *buf = malloc(cap);
+    if (!buf) { free(g); return S3_ERR_INTERNAL; }
+    size_t o = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (strcmp(g[i].user, user) == 0) continue;
+        o += (size_t)snprintf(buf + o, cap - o, "%s:%s%s%s\n", g[i].user,
+                              g[i].perms & S3_GRANT_R ? "r" : "",
+                              g[i].perms & S3_GRANT_W ? "w" : "",
+                              g[i].perms & S3_GRANT_O ? "o" : "");
+    }
+    if (perms)
+        o += (size_t)snprintf(buf + o, cap - o, "%s:%s%s%s\n", user,
+                              perms & S3_GRANT_R ? "r" : "",
+                              perms & S3_GRANT_W ? "w" : "",
+                              perms & S3_GRANT_O ? "o" : "");
+    free(g);
+    e = store_bucket_sidecar_write(s, bucket, "grants", buf, o);
+    free(buf);
     return e;
 }
 

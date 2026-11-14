@@ -63,4 +63,21 @@ static inline int s3_str_eq_lit(s3_str_t a, const char *lit) {
     return a.n == n && memcmp(a.p, lit, n) == 0;
 }
 
+/* Strict identity / access-key charset for every *write* path that puts a
+ * name into a line-based file (grants sidecar, credentials file via the
+ * admin API): [A-Za-z0-9._@-], 1..128. Rejects ':', CR, LF, NUL, spaces
+ * — anything that could split or forge a line (security review S3). */
+static inline int s3_valid_ident_strict(const char *u) {
+    size_t n = 0;
+    for (; u[n]; n++) {
+        char ch = u[n];
+        if (!((ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z')
+              || (ch >= '0' && ch <= '9') || ch == '.' || ch == '_'
+              || ch == '@' || ch == '-'))
+            return 0;
+        if (n >= 128) return 0;
+    }
+    return n > 0;
+}
+
 #endif /* FS3_S3_H */

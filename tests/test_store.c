@@ -1636,6 +1636,41 @@ static void t_rejects_corrupt_header(void) {
     teardown_root();
 }
 
+/* ---- Item 3: grants sidecar ---------------------------------------- */
+static void t_bucket_grants(void) {
+    setup_root();
+    s3_store_t *s;
+    CHECK_EQ(store_open(&s, g_root), S3_OK, "open");
+    s3_str_t b = S3_STR_LIT("gbk");
+    CHECK_EQ(store_bucket_create_owned(s, b, "alice"), S3_OK, "create");
+    CHECK_EQ(store_bucket_grant_perms(s, b, "bob"), 0, "no grant");
+    CHECK_EQ(store_bucket_grant_set(s, b, "bob", S3_GRANT_R | S3_GRANT_W), S3_OK, "set");
+    CHECK_EQ(store_bucket_grant_set(s, b, "carol", S3_GRANT_O), S3_OK, "set 2");
+    CHECK_EQ(store_bucket_grant_perms(s, b, "bob"), S3_GRANT_R | S3_GRANT_W, "bob rw");
+    CHECK_EQ(store_bucket_grant_set(s, b, "bob", S3_GRANT_R), S3_OK, "narrow");
+    CHECK_EQ(store_bucket_grant_perms(s, b, "bob"), S3_GRANT_R, "bob r");
+    CHECK_EQ(store_bucket_grant_perms(s, b, "carol"), S3_GRANT_O, "carol kept");
+    /* S3: names that could forge a line are refused at the write path. */
+    CHECK(store_bucket_grant_set(s, b, "evil\nroot", 7) != S3_OK, "newline user");
+    CHECK(store_bucket_grant_set(s, b, "a:b", 7) != S3_OK, "colon user");
+    CHECK(store_bucket_grant_set(s, b, "", 7) != S3_OK, "empty user");
+    CHECK_EQ(store_grant_parse_perms("rwo", 3), 7, "parse rwo");
+    CHECK_EQ(store_grant_parse_perms("rr", 2), -1, "parse dup");
+    CHECK_EQ(store_grant_parse_perms("x", 1), -1, "parse bad");
+    s3_grant_t *g; size_t n;
+    CHECK_EQ(store_bucket_grants_get(s, b, &g, &n), S3_OK, "list");
+    CHECK_EQ(n, 2, "two grants");
+    free(g);
+    CHECK_EQ(store_bucket_grant_set(s, b, "bob", 0), S3_OK, "remove");
+    CHECK_EQ(store_bucket_grant_perms(s, b, "bob"), 0, "removed");
+    /* Delete + re-create: new id, no grants. */
+    CHECK_EQ(store_bucket_delete(s, b), S3_OK, "delete with sidecars");
+    CHECK_EQ(store_bucket_create_owned(s, b, "alice"), S3_OK, "re-create");
+    CHECK_EQ(store_bucket_grant_perms(s, b, "carol"), 0, "grants gone");
+    store_close(s);
+    teardown_root();
+}
+
 int main(void) {
     log_init(LOG_WARN);  /* suppress info chatter during tests */
 
@@ -1684,6 +1719,7 @@ int main(void) {
     t_recover_leaves_fresh_mpu();
     t_reads_schema_v2_fixture();
     t_rejects_corrupt_header();
+    t_bucket_grants();
 
     if (failures == 0) { printf("ALL TESTS PASSED\n"); return 0; }
     printf("%d FAILURES\n", failures);

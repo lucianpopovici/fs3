@@ -151,6 +151,68 @@ s3_err_t store_bucket_set_owner(s3_store_t *s, s3_str_t name,
 /* Give every ownerless bucket to `owner`. Returns how many, or -1. */
 int      store_assign_legacy_owner(s3_store_t *s, const char *owner);
 s3_err_t store_bucket_delete(s3_store_t *s, s3_str_t name); /* empty buckets only */
+
+/* ---- Bucket config sidecars ----
+ *
+ * Small per-bucket files under buckets/<b>/ (grants, cors.xml,
+ * lifecycle.xml, website.xml, policy.json, ...). Writes are atomic
+ * (tmp + fsync + rename + fsync(dir)). `name` is a fixed identifier
+ * chosen by the caller, never user input. */
+s3_err_t store_bucket_sidecar_write(s3_store_t *s, s3_str_t bucket,
+                                    const char *name,
+                                    const void *data, size_t n);
+/* Heap copy of the file (NUL-terminated; *n_out excludes the NUL).
+ * S3_ERR_NO_SUCH_KEY if absent; S3_ERR_ENTITY_TOO_LARGE if > max. */
+s3_err_t store_bucket_sidecar_read(s3_store_t *s, s3_str_t bucket,
+                                   const char *name, size_t max,
+                                   char **out, size_t *n_out);
+s3_err_t store_bucket_sidecar_delete(s3_store_t *s, s3_str_t bucket,
+                                     const char *name);
+
+/* Parsed-config cache, keyed by bucket *id* + sidecar name and validated
+ * against the file's inode/mtime/size on every lookup. `parse` turns the
+ * file bytes into an object (NULL = unparseable, treated as absent);
+ * `release` frees it. store_sidecar_get returns a counted reference
+ * (NULL if the bucket or file is absent); drop it with store_sidecar_put.
+ * Thread-safe. */
+typedef struct store_cfg_ref store_cfg_ref_t;
+typedef void *(*store_cfg_parse_fn)(const char *data, size_t n);
+typedef void  (*store_cfg_free_fn)(void *obj);
+store_cfg_ref_t *store_sidecar_get(s3_store_t *s, s3_str_t bucket,
+                                   const char *name, size_t max,
+                                   store_cfg_parse_fn parse,
+                                   store_cfg_free_fn release);
+void            *store_cfg_obj(const store_cfg_ref_t *r);
+void             store_sidecar_put(s3_store_t *s, store_cfg_ref_t *r);
+
+/* ---- Per-user bucket grants (item 3) ----
+ *
+ * buckets/<b>/grants: one "user:perms" line each, perms ⊆ "rwo"
+ * (read, write, owner/config). Written tmp + fsync + rename + dirfsync.
+ * Reads go through an in-memory cache keyed by bucket id and validated
+ * against the file's mtime/size, so edits take effect immediately and a
+ * re-created bucket never inherits an old bucket's grants. */
+#define S3_GRANT_R 1
+#define S3_GRANT_W 2
+#define S3_GRANT_O 4
+
+typedef struct {
+    char user[129];
+    int  perms;     /* S3_GRANT_* bits */
+} s3_grant_t;
+
+/* Permission bits `user` holds on `bucket` (0 = none). */
+int      store_bucket_grant_perms(s3_store_t *s, s3_str_t bucket,
+                                  const char *user);
+/* All grants (heap array, caller frees). */
+s3_err_t store_bucket_grants_get(s3_store_t *s, s3_str_t bucket,
+                                 s3_grant_t **out, size_t *n_out);
+/* Set `user`'s perms (0 removes the grant). User must pass
+ * s3_valid_ident_strict. */
+s3_err_t store_bucket_grant_set(s3_store_t *s, s3_str_t bucket,
+                                const char *user, int perms);
+/* "rw" → bits; -1 if invalid. */
+int      store_grant_parse_perms(const char *p, size_t n);
 int      store_bucket_exists(s3_store_t *s, s3_str_t name);
 
 /* ---- Streaming PUT ----
