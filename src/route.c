@@ -15,6 +15,7 @@
  */
 
 #include "route.h"
+#include "action.h"
 #include "conn.h"
 #include "iopool.h"
 #include "log.h"
@@ -102,38 +103,15 @@ static int parse_path(s3_str_t path, char *scratch, size_t cap,
     return 0;
 }
 
-/* Extract a query parameter value. Returns 1 if found, 0 if not.
- * The returned span points into a caller-owned scratch buffer that
- * must hold at least query.n bytes; the value is percent-decoded. */
-static int query_param(s3_str_t query, const char *name,
-                       char *scratch, size_t cap, s3_str_t *out) {
-    size_t name_len = strlen(name);
-    size_t i = 0;
-    while (i < query.n) {
-        size_t j = i;
-        while (j < query.n && query.p[j] != '=' && query.p[j] != '&') j++;
-        size_t key_n = j - i;
-        if (key_n == name_len && memcmp(query.p + i, name, name_len) == 0) {
-            /* Match. Find value span. */
-            if (j < query.n && query.p[j] == '=') {
-                size_t v0 = j + 1;
-                size_t v1 = v0;
-                while (v1 < query.n && query.p[v1] != '&') v1++;
-                size_t vn = v1 - v0;
-                if (vn > cap) vn = cap;
-                memcpy(scratch, query.p + v0, vn);
-                vn = pct_decode(scratch, vn);
-                *out = (s3_str_t){ scratch, vn };
-            } else {
-                *out = S3_STR_NULL;
-            }
-            return 1;
-        }
-        i = j;
-        while (i < query.n && query.p[i] != '&') i++;
-        if (i < query.n) i++;  /* skip '&' */
-    }
-    return 0;
+/* Query helpers over the parsed, decoded parameters (conn_parse_query). */
+static int q_has(const conn_t *c, const char *name) {
+    return conn_query_get(c, name) != NULL;
+}
+
+/* Decoded value of `name`, or S3_STR_NULL. */
+static s3_str_t q_val(const conn_t *c, const char *name) {
+    const conn_qparam_t *p = conn_query_get(c, name);
+    return p ? p->v : S3_STR_NULL;
 }
 
 /* Find a header by lowercase name. */
@@ -185,27 +163,32 @@ static void scratch_reset(conn_t *c) { c->req_scratch_used = 0; }
  * unchanged.
  */
 
-/* S3_OK if this request may act on `bucket`. S3_ERR_NO_SUCH_BUCKET is
- * passed through for the handler to report its own way; anything else
- * is a denial. */
-static s3_err_t authz_bucket(conn_t *c, s3_str_t bucket) {
-    if (!c->auth) return S3_OK;
-    if (!c->id.user[0]) return S3_ERR_ACCESS_DENIED;
+/* Authorization decision for `act` on bucket/key (key may be empty for
+ * bucket-level actions). S3_OK = allowed. S3_ERR_NO_SUCH_BUCKET is passed
+ * through for the handler to report its own way; anything else is a
+ * denial. Unclassified actions (no table entry) are always denied.
+ *
+ * Evaluation order (later items plug in here):
+ *   owner or admin            → allow
+ *   otherwise                 → deny
+ */
+s3_err_t authz(conn_t *c, s3_str_t bucket, s3_str_t key, s3_action_t act) {
+    (void)key;
+    const s3_action_info_t *ai = action_info(act);
+    if (!ai) return S3_ERR_ACCESS_DENIED;          /* default deny */
+    if (!c->auth) return S3_OK;                    /* open mode */
+    if (act == ACT_LIST_BUCKETS || act == ACT_CREATE_BUCKET)
+        return c->id.user[0] ? S3_OK : S3_ERR_ACCESS_DENIED;
     s3_bucket_meta_t m;
     s3_err_t e = store_bucket_meta(c->store, bucket, &m);
-    if (e != S3_OK) return e;
+    if (e != S3_OK) {
+        /* Anonymous callers learn nothing about which buckets exist. */
+        return c->id.user[0] ? e : S3_ERR_ACCESS_DENIED;
+    }
+    if (!c->id.user[0]) return S3_ERR_ACCESS_DENIED;
     if (c->id.is_admin) return S3_OK;
     if (m.owner[0] && strcmp(m.owner, c->id.user) == 0) return S3_OK;
     return S3_ERR_ACCESS_DENIED;
-}
-
-/* Is this request "PUT /bucket" (create), as opposed to PUT /bucket?acl? */
-static int is_bucket_create(conn_t *c) {
-    if (!method_is(c, "PUT")) return 0;
-    if (c->req.query.n == 0) return 1;
-    char *qb = scratch_alloc(c, c->req.query.n + 1);
-    s3_str_t v;
-    return !(qb && query_param(c->req.query, "acl", qb, c->req.query.n, &v));
 }
 
 static int handle_service(conn_t *c) {
@@ -379,25 +362,34 @@ static int handle_bulk_delete_finish(conn_t *c, s3_str_t bucket) {
 /* Bucket-level (PATH = "/bucket" or "/bucket/")                          */
 /* ===================================================================== */
 
-static int handle_bucket(conn_t *c, s3_str_t bucket) {
-    /* ?acl — GET returns ACL XML; PUT accepts and discards the body. */
-    if (c->req.query.n > 0) {
-        char *qb = scratch_alloc(c, c->req.query.n + 1);
-        s3_str_t v;
-        if (qb && query_param(c->req.query, "acl", qb, c->req.query.n, &v)) {
-            if (!store_bucket_exists(c->store, bucket)) {
-                return rsp_build_s3_error(c, S3_ERR_NO_SUCH_BUCKET,
-                                          c->req.path, NULL);
-            }
-            if (method_is(c, "GET"))  return rsp_build_acl(c);
-            if (method_is(c, "PUT"))  return rsp_build_status(c, 200, "OK");
-            return rsp_build_s3_error(c, S3_ERR_METHOD_NOT_ALLOWED,
-                                      c->req.path, NULL);
-        }
+static int max_keys_param(const conn_t *c, const char *name) {
+    s3_str_t v = q_val(c, name);
+    int mk = 0;
+    for (size_t i = 0; i < v.n; i++) {
+        if (v.p[i] < '0' || v.p[i] > '9') { mk = 0; break; }
+        mk = mk * 10 + (v.p[i] - '0');
+        if (mk > 1000) { mk = 1000; break; }
     }
+    return mk;
+}
 
-    if (method_is(c, "PUT")) {
-        /* Create. With auth, the signer owns the new bucket. */
+static int handle_bucket(conn_t *c, s3_str_t bucket, s3_action_t act) {
+    switch (act) {
+    case ACT_GET_BUCKET_ACL:
+    case ACT_PUT_BUCKET_ACL:
+    case ACT_GET_BUCKET_LOCATION:
+    case ACT_GET_BUCKET_VERSIONING:
+    case ACT_HEAD_BUCKET:
+        if (!store_bucket_exists(c->store, bucket))
+            return rsp_build_s3_error(c, S3_ERR_NO_SUCH_BUCKET,
+                                      c->req.path, NULL);
+        if (act == ACT_GET_BUCKET_ACL)        return rsp_build_acl(c);
+        if (act == ACT_GET_BUCKET_LOCATION)   return rsp_build_bucket_location(c);
+        if (act == ACT_GET_BUCKET_VERSIONING) return rsp_build_bucket_versioning(c);
+        return rsp_build_status(c, 200, "OK");
+
+    case ACT_CREATE_BUCKET: {
+        /* With auth, the signer owns the new bucket. */
         const char *owner = NULL;
         if (c->auth) {
             if (!c->id.user[0])
@@ -408,135 +400,49 @@ static int handle_bucket(conn_t *c, s3_str_t bucket) {
         s3_err_t e = store_bucket_create_owned(c->store, bucket, owner);
         if (e == S3_OK) {
             char loc[1100];
-            int n = snprintf(loc, sizeof(loc),
-                             "Location: /" S3_STR_FMT "\r\n",
-                             S3_STR_ARG(bucket));
-            (void)n;
+            snprintf(loc, sizeof(loc), "Location: /" S3_STR_FMT "\r\n",
+                     S3_STR_ARG(bucket));
             return rsp_build_status_with_headers(c, 200, "OK", loc);
         }
         return rsp_build_s3_error(c, e, c->req.path, NULL);
     }
 
-    if (method_is(c, "DELETE")) {
+    case ACT_DELETE_BUCKET: {
         s3_err_t e = store_bucket_delete(c->store, bucket);
         if (e == S3_OK) return rsp_build_status(c, 204, "No Content");
         return rsp_build_s3_error(c, e, c->req.path, NULL);
     }
 
-    if (method_is(c, "HEAD")) {
-        if (!store_bucket_exists(c->store, bucket)) {
-            return rsp_build_s3_error(c, S3_ERR_NO_SUCH_BUCKET, c->req.path, NULL);
-        }
-        return rsp_build_status(c, 200, "OK");
+    case ACT_DELETE_OBJECTS:
+        return handle_bulk_delete_begin(c, bucket);
+
+    case ACT_LIST_MPU_UPLOADS: {
+        s3_str_t prefix = q_val(c, "prefix");
+        s3_mpu_info_t *ups = NULL;
+        size_t n_ups = 0;
+        s3_err_t e = store_list_mpu_uploads(c->store, bucket, prefix,
+                                            &ups, &n_ups);
+        if (e != S3_OK) return rsp_build_s3_error(c, e, c->req.path, NULL);
+        int rc = rsp_build_list_mpu_uploads(c, bucket, prefix, ups, n_ups);
+        store_mpu_uploads_free(ups, n_ups);
+        return rc;
     }
 
-    if (method_is(c, "POST")) {
-        if (c->req.query.n > 0) {
-            char *qb = scratch_alloc(c, c->req.query.n + 1);
-            s3_str_t v;
-            if (qb && query_param(c->req.query, "delete",
-                                  qb, c->req.query.n, &v)) {
-                return handle_bulk_delete_begin(c, bucket);
-            }
-        }
-        return rsp_build_s3_error(c, S3_ERR_METHOD_NOT_ALLOWED,
-                                  c->req.path, NULL);
-    }
-
-    if (method_is(c, "GET")) {
-        /* Check for bucket subresources before falling through to listing. */
-        if (c->req.query.n > 0) {
-            char *qb_loc = scratch_alloc(c, c->req.query.n + 1);
-            s3_str_t v_loc;
-            if (qb_loc && query_param(c->req.query, "location",
-                                      qb_loc, c->req.query.n, &v_loc)) {
-                if (!store_bucket_exists(c->store, bucket)) {
-                    return rsp_build_s3_error(c, S3_ERR_NO_SUCH_BUCKET,
-                                              c->req.path, NULL);
-                }
-                return rsp_build_bucket_location(c);
-            }
-            char *qb_ver = scratch_alloc(c, c->req.query.n + 1);
-            s3_str_t v_ver;
-            if (qb_ver && query_param(c->req.query, "versioning",
-                                      qb_ver, c->req.query.n, &v_ver)) {
-                if (!store_bucket_exists(c->store, bucket)) {
-                    return rsp_build_s3_error(c, S3_ERR_NO_SUCH_BUCKET,
-                                              c->req.path, NULL);
-                }
-                return rsp_build_bucket_versioning(c);
-            }
-        }
-
-        /* Detect "?uploads" — bucket-level subresource for
-         * ListMultipartUploads. */
-        if (c->req.query.n > 0) {
-            char *qb_u = scratch_alloc(c, c->req.query.n + 1);
-            s3_str_t v_u;
-            if (qb_u && query_param(c->req.query, "uploads",
-                                    qb_u, c->req.query.n, &v_u)) {
-                /* Optional prefix filter. */
-                s3_str_t prefix = S3_STR_NULL;
-                char *qb_p = scratch_alloc(c, c->req.query.n + 1);
-                if (qb_p) {
-                    s3_str_t pv;
-                    if (query_param(c->req.query, "prefix",
-                                    qb_p, c->req.query.n, &pv)) {
-                        prefix = pv;
-                    }
-                }
-                s3_mpu_info_t *ups = NULL;
-                size_t n_ups = 0;
-                s3_err_t e = store_list_mpu_uploads(c->store, bucket,
-                                                    prefix, &ups, &n_ups);
-                if (e != S3_OK) {
-                    return rsp_build_s3_error(c, e, c->req.path, NULL);
-                }
-                int rc = rsp_build_list_mpu_uploads(c, bucket, prefix,
-                                                    ups, n_ups);
-                store_mpu_uploads_free(ups, n_ups);
-                return rc;
-            }
-        }
-
-        /* List objects. Parse query parameters. */
+    case ACT_LIST_OBJECTS: {
         s3_list_opts_t opts = { 0 };
-        char *qb = scratch_alloc(c, c->req.query.n + 1);
-        if (qb && c->req.query.n > 0) {
-            s3_str_t v;
-            if (query_param(c->req.query, "prefix", qb, c->req.query.n, &v))
-                opts.prefix = v;
-            char *qb2 = scratch_alloc(c, c->req.query.n + 1);
-            if (qb2 && query_param(c->req.query, "delimiter",
-                                   qb2, c->req.query.n, &v))
-                opts.delimiter = v;
-            char *qb3 = scratch_alloc(c, c->req.query.n + 1);
-            if (qb3 && query_param(c->req.query, "marker",
-                                   qb3, c->req.query.n, &v))
-                opts.marker = v;
-            char *qb4 = scratch_alloc(c, c->req.query.n + 1);
-            if (qb4 && query_param(c->req.query, "max-keys",
-                                   qb4, c->req.query.n, &v)) {
-                /* parse integer */
-                int mk = 0;
-                for (size_t i = 0; i < v.n; i++) {
-                    if (v.p[i] < '0' || v.p[i] > '9') { mk = 0; break; }
-                    mk = mk * 10 + (v.p[i] - '0');
-                    if (mk > 1000) { mk = 1000; break; }
-                }
-                opts.max_keys = mk;
-            }
-        }
-
+        opts.prefix    = q_val(c, "prefix");
+        opts.delimiter = q_val(c, "delimiter");
+        opts.marker    = q_val(c, "marker");
+        opts.max_keys  = max_keys_param(c, "max-keys");
         s3_lister_t *l;
         s3_err_t e = store_list_begin(c->store, bucket, &opts, &l);
-        if (e != S3_OK) {
-            return rsp_build_s3_error(c, e, c->req.path, NULL);
-        }
+        if (e != S3_OK) return rsp_build_s3_error(c, e, c->req.path, NULL);
         return rsp_build_list_bucket(c, bucket, &opts, l);
     }
 
-    return rsp_build_s3_error(c, S3_ERR_METHOD_NOT_ALLOWED, c->req.path, NULL);
+    default:
+        return rsp_build_s3_error(c, S3_ERR_NOT_IMPLEMENTED, c->req.path, NULL);
+    }
 }
 
 /* ===================================================================== */
@@ -871,7 +777,7 @@ static int handle_object_copy(conn_t *c, s3_str_t dst_bucket, s3_str_t dst_key) 
 
     /* The destination was authorized at dispatch; the source is a second
      * bucket and needs its own check. */
-    s3_err_t ae = authz_bucket(c, src_bucket);
+    s3_err_t ae = authz(c, src_bucket, src_key, ACT_GET_OBJECT);
     if (ae != S3_OK && ae != S3_ERR_NO_SUCH_BUCKET) {
         free(src_buf);
         return rsp_build_s3_error(c, ae, c->req.path, NULL);
@@ -1181,6 +1087,193 @@ static int handle_mpu_abort(conn_t *c, s3_str_t bucket, s3_str_t key,
 /* Top-level dispatch                                                     */
 /* ===================================================================== */
 
+/* ---- Request classification (S0 + F2) -------------------------------
+ *
+ * Every request is mapped to exactly one S3 operation from its method,
+ * path shape and query *subresource*. Query parameters fall in three
+ * groups:
+ *
+ *   - subresources this server implements: they select the operation;
+ *   - modifiers of a plain operation (response-*, X-Amz-*, list params,
+ *     uploadId/partNumber, x-id): they never change which operation runs;
+ *   - every other recognised S3 subresource name: 501 NotImplemented.
+ *
+ * The last group is the S0 fix: before, "PUT /b/k?tagging" fell through
+ * to a plain PUT and overwrote the object with the XML body, and
+ * "DELETE /b/k?versionId=…" deleted the current object. Unknown
+ * parameters that are not S3 subresource names (cache busters and the
+ * like) are ignored, as S3 does. */
+
+static const char *const KNOWN_SUBRESOURCES[] = {
+    "accelerate", "acl", "analytics", "attributes", "cors", "delete",
+    "encryption", "intelligent-tiering", "inventory", "legal-hold",
+    "lifecycle", "location", "logging", "metrics", "notification",
+    "object-lock", "ownershipControls", "policy", "policyStatus",
+    "publicAccessBlock", "replication", "requestPayment", "restore",
+    "retention", "select", "select-type", "tagging", "torrent", "uploads",
+    "versioning", "versions", "website", "renameObject", "session",
+    "metadataTable", "partNumber", "uploadId", "versionId",
+};
+
+static int is_known_subresource(s3_str_t k) {
+    for (size_t i = 0; i < sizeof(KNOWN_SUBRESOURCES) / sizeof(*KNOWN_SUBRESOURCES); i++)
+        if (s3_str_eq_lit(k, KNOWN_SUBRESOURCES[i])) return 1;
+    return 0;
+}
+
+/* The single subresource present among `handled` (names this code path
+ * understands), or the first unhandled recognised subresource. Returns
+ * NULL if none at all. *unhandled_out is set when an unhandled one is
+ * present (which wins: an ambiguous combination is refused). */
+static const char *pick_subresource(const conn_t *c, const char *const *handled,
+                                    int *unhandled_out) {
+    const char *found = NULL;
+    *unhandled_out = 0;
+    for (size_t i = 0; i < c->req.n_qp; i++) {
+        s3_str_t k = c->req.qp[i].k;
+        if (!is_known_subresource(k)) continue;
+        int ok = 0;
+        for (size_t h = 0; handled[h]; h++) {
+            if (s3_str_eq_lit(k, handled[h])) {
+                ok = 1;
+                if (!found) found = handled[h];
+                else if (strcmp(found, handled[h]) != 0) *unhandled_out = 1;
+                break;
+            }
+        }
+        if (!ok) *unhandled_out = 1;
+    }
+    return found;
+}
+
+static s3_action_t classify_service(const conn_t *c, s3_err_t *err) {
+    if (method_is(c, "GET")) return ACT_LIST_BUCKETS;
+    *err = S3_ERR_METHOD_NOT_ALLOWED;
+    return ACT_NONE;
+}
+
+static s3_action_t classify_bucket(const conn_t *c, s3_err_t *err) {
+    static const char *const handled[] = {
+        "acl", "location", "versioning", "uploads", "delete", NULL
+    };
+    int unhandled;
+    const char *sub = pick_subresource(c, handled, &unhandled);
+    if (unhandled) { *err = S3_ERR_NOT_IMPLEMENTED; return ACT_NONE; }
+    int get = method_is(c, "GET"), put = method_is(c, "PUT");
+    int del = method_is(c, "DELETE"), post = method_is(c, "POST");
+    int head = method_is(c, "HEAD");
+
+    if (!sub) {
+        if (get)  return ACT_LIST_OBJECTS;
+        if (put)  return ACT_CREATE_BUCKET;
+        if (del)  return ACT_DELETE_BUCKET;
+        if (head) return ACT_HEAD_BUCKET;
+    } else if (!strcmp(sub, "acl")) {
+        if (get) return ACT_GET_BUCKET_ACL;
+        if (put) return ACT_PUT_BUCKET_ACL;
+    } else if (!strcmp(sub, "location")) {
+        if (get) return ACT_GET_BUCKET_LOCATION;
+    } else if (!strcmp(sub, "versioning")) {
+        if (get) return ACT_GET_BUCKET_VERSIONING;
+        if (put) { *err = S3_ERR_NOT_IMPLEMENTED; return ACT_NONE; }
+    } else if (!strcmp(sub, "uploads")) {
+        if (get) return ACT_LIST_MPU_UPLOADS;
+    } else if (!strcmp(sub, "delete")) {
+        if (post) return ACT_DELETE_OBJECTS;
+    }
+    *err = S3_ERR_METHOD_NOT_ALLOWED;
+    return ACT_NONE;
+}
+
+static s3_action_t classify_object(const conn_t *c, s3_err_t *err) {
+    static const char *const handled[] = {
+        "acl", "uploads", "uploadId", "partNumber", NULL
+    };
+    int get = method_is(c, "GET"), put = method_is(c, "PUT");
+    int del = method_is(c, "DELETE"), post = method_is(c, "POST");
+    int head = method_is(c, "HEAD");
+    int has_upload_id = q_has(c, "uploadId");
+    int has_part = q_has(c, "partNumber");
+
+    /* uploadId + partNumber is one subresource pair, not two. */
+    int unhandled = 0;
+    const char *sub = NULL;
+    for (size_t i = 0; i < c->req.n_qp; i++) {
+        s3_str_t k = c->req.qp[i].k;
+        if (!is_known_subresource(k)) continue;
+        if (s3_str_eq_lit(k, "uploadId") || s3_str_eq_lit(k, "partNumber"))
+            continue;
+        int ok = 0;
+        for (size_t h = 0; handled[h]; h++)
+            if (s3_str_eq_lit(k, handled[h])) { ok = 1; break; }
+        if (!ok || sub) { unhandled = 1; break; }
+        sub = s3_str_eq_lit(k, "acl") ? "acl" : "uploads";
+    }
+    if (unhandled) { *err = S3_ERR_NOT_IMPLEMENTED; return ACT_NONE; }
+
+    if (sub && (has_upload_id || has_part)) {
+        *err = S3_ERR_INVALID_REQUEST; return ACT_NONE;
+    }
+    if (sub && !strcmp(sub, "acl")) {
+        if (get) return ACT_GET_OBJECT_ACL;
+        if (put) return ACT_PUT_OBJECT_ACL;
+    } else if (sub) {   /* uploads */
+        if (post) return ACT_MPU_CREATE;
+    } else if (has_upload_id) {
+        if (put && has_part) {
+            /* UploadPartCopy is not implemented: refuse rather than
+             * store the (empty) request body as the part. */
+            if (hdr_get(c, "x-amz-copy-source")) {
+                *err = S3_ERR_NOT_IMPLEMENTED; return ACT_NONE;
+            }
+            return ACT_MPU_UPLOAD_PART;
+        }
+        if (post && !has_part) return ACT_MPU_COMPLETE;
+        if (del && !has_part)  return ACT_MPU_ABORT;
+        if (get && !has_part)  { *err = S3_ERR_NOT_IMPLEMENTED; return ACT_NONE; }
+        *err = S3_ERR_INVALID_REQUEST; return ACT_NONE;
+    } else if (has_part) {
+        /* GetObject/HeadObject ?partNumber=N: only part 1 of a
+         * single-part object is the whole object; anything else would
+         * silently return the wrong bytes. */
+        if ((get || head) && s3_str_eq_lit(q_val(c, "partNumber"), "1"))
+            return get ? ACT_GET_OBJECT : ACT_HEAD_OBJECT;
+        *err = (get || head) ? S3_ERR_NOT_IMPLEMENTED : S3_ERR_INVALID_REQUEST;
+        return ACT_NONE;
+    } else {
+        if (get)  return ACT_GET_OBJECT;
+        if (head) return ACT_HEAD_OBJECT;
+        if (put)  return hdr_get(c, "x-amz-copy-source") ? ACT_COPY_OBJECT
+                                                         : ACT_PUT_OBJECT;
+        if (del)  return ACT_DELETE_OBJECT;
+    }
+    *err = S3_ERR_METHOD_NOT_ALLOWED;
+    return ACT_NONE;
+}
+
+/* Classify the current request. Exposed for tests. */
+s3_action_t route_classify(const conn_t *c, s3_str_t bucket, s3_str_t key,
+                           s3_err_t *err) {
+    *err = S3_OK;
+    if (bucket.n == 0) return classify_service(c, err);
+    if (key.n == 0)    return classify_bucket(c, err);
+    return classify_object(c, err);
+}
+
+/* Parse ?uploadId into a 33-byte buffer. 0 ok, -1 malformed. */
+static int parse_upload_id(const conn_t *c, char out[33]) {
+    s3_str_t v = q_val(c, "uploadId");
+    if (v.n != 32) return -1;
+    for (size_t i = 0; i < 32; i++) {
+        char ch = v.p[i];
+        if (!((ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f')
+              || (ch >= 'A' && ch <= 'F'))) return -1;
+    }
+    memcpy(out, v.p, 32);
+    out[32] = '\0';
+    return 0;
+}
+
 int route_dispatch_headers(conn_t *c) {
     scratch_reset(c);
 
@@ -1202,141 +1295,78 @@ int route_dispatch_headers(conn_t *c) {
         return rsp_build_s3_error(c, S3_ERR_INVALID_REQUEST, c->req.path, NULL);
     }
 
-    /* Service-level: "/" */
-    if (bucket.n == 0) {
-        return handle_service(c);
-    }
+    s3_err_t ce;
+    s3_action_t act = route_classify(c, bucket, key, &ce);
+    c->req.act = (int)act;
+    if (act == ACT_NONE)
+        return rsp_build_s3_error(c, ce, c->req.path, NULL);
 
-    /* Everything below acts on an existing bucket, except creating one. */
-    if (!(key.n == 0 && is_bucket_create(c))) {
-        s3_err_t ae = authz_bucket(c, bucket);
-        if (ae != S3_OK && ae != S3_ERR_NO_SUCH_BUCKET) {
-            return rsp_build_s3_error(c, ae, c->req.path, NULL);
-        }
-    }
+    s3_err_t ae = authz(c, bucket, key, act);
+    if (ae != S3_OK && ae != S3_ERR_NO_SUCH_BUCKET)
+        return rsp_build_s3_error(c, ae, c->req.path, NULL);
 
-    /* Bucket-level: "/bucket" or "/bucket/" with no key */
-    if (key.n == 0) {
-        return handle_bucket(c, bucket);
-    }
+    if (bucket.n == 0) return handle_service(c);
+    if (key.n == 0)    return handle_bucket(c, bucket, act);
 
-    /* Object-level: "/bucket/key" */
-
-    /* Object-level ?acl: GET returns ACL XML; PUT accepts and ignores body.
-     * Both require the object to exist for GET. PUT is a no-op for fs3
-     * (no real ACL model). Must be checked before MPU params to short-circuit
-     * ambiguous query strings like "?acl&uploadId=...". */
-    if (c->req.query.n > 0) {
-        char *qb_acl = scratch_alloc(c, c->req.query.n + 1);
-        s3_str_t v_acl;
-        if (qb_acl && query_param(c->req.query, "acl",
-                                  qb_acl, c->req.query.n, &v_acl)) {
-            if (method_is(c, "GET")) {
-                s3_obj_meta_t m;
-                s3_err_t e = store_head(c->store, bucket, key, &m);
-                if (e != S3_OK)
-                    return rsp_build_s3_error(c, e, c->req.path, NULL);
-                return rsp_build_acl(c);
-            }
-            if (method_is(c, "PUT")) return rsp_build_status(c, 200, "OK");
-            return rsp_build_s3_error(c, S3_ERR_METHOD_NOT_ALLOWED,
-                                      c->req.path, NULL);
-        }
-    }
-
-    /* Multipart upload subresources are signalled by query parameters.
-     * Decode them once into a scratch buffer; query_param mutates in place
-     * during pct_decode, so each call needs a fresh buffer. */
-    s3_str_t v_uploads = S3_STR_NULL;
-    s3_str_t v_upload_id = S3_STR_NULL;
-    s3_str_t v_part_number = S3_STR_NULL;
-    int has_uploads = 0;       /* "?uploads" (no value) */
-    int has_upload_id = 0;
-    int has_part_number = 0;
-    if (c->req.query.n > 0) {
-        char *qb1 = scratch_alloc(c, c->req.query.n + 1);
-        char *qb2 = scratch_alloc(c, c->req.query.n + 1);
-        char *qb3 = scratch_alloc(c, c->req.query.n + 1);
-        if (qb1 && query_param(c->req.query, "uploads",
-                               qb1, c->req.query.n, &v_uploads)) {
-            has_uploads = 1;
-        }
-        if (qb2 && query_param(c->req.query, "uploadId",
-                               qb2, c->req.query.n, &v_upload_id)) {
-            has_upload_id = 1;
-        }
-        if (qb3 && query_param(c->req.query, "partNumber",
-                               qb3, c->req.query.n, &v_part_number)) {
-            has_part_number = 1;
-        }
-    }
-
-    /* Validate uploadId looks like 32 hex chars (matches what we generate). */
     char upload_id_buf[33] = {0};
-    if (has_upload_id) {
-        if (v_upload_id.n != 32) {
-            return rsp_build_s3_error(c, S3_ERR_NO_SUCH_UPLOAD,
-                                      c->req.path, NULL);
-        }
-        for (size_t i = 0; i < 32; i++) {
-            char ch = v_upload_id.p[i];
-            if (!((ch >= '0' && ch <= '9')
-                  || (ch >= 'a' && ch <= 'f')
-                  || (ch >= 'A' && ch <= 'F'))) {
-                return rsp_build_s3_error(c, S3_ERR_NO_SUCH_UPLOAD,
-                                          c->req.path, NULL);
-            }
-        }
-        memcpy(upload_id_buf, v_upload_id.p, 32);
+    switch (act) {
+    case ACT_GET_OBJECT_ACL: {
+        s3_obj_meta_t m;
+        s3_err_t e = store_head(c->store, bucket, key, &m);
+        if (e != S3_OK) return rsp_build_s3_error(c, e, c->req.path, NULL);
+        return rsp_build_acl(c);
     }
+    case ACT_PUT_OBJECT_ACL:
+        return rsp_build_status(c, 200, "OK");
 
-    if (method_is(c, "POST") && has_uploads) {
+    case ACT_MPU_CREATE:
         return handle_mpu_initiate(c, bucket, key);
-    }
-    if (method_is(c, "POST") && has_upload_id) {
-        c->mpu_complete_pending = 1;
-        c->mpu_bucket = bucket;          /* points into req_scratch */
-        c->mpu_key    = key;
-        memcpy(c->mpu_upload_id, upload_id_buf, 33);
-        return handle_mpu_complete_begin(c);
-    }
-    if (method_is(c, "PUT") && has_upload_id && has_part_number) {
-        /* Parse partNumber — must be a small positive integer. */
-        int pn = 0;
-        for (size_t i = 0; i < v_part_number.n; i++) {
-            char ch = v_part_number.p[i];
-            if (ch < '0' || ch > '9') { pn = 0; break; }
-            pn = pn * 10 + (ch - '0');
-            if (pn > 10000) { pn = 0; break; }
-        }
-        if (pn < 1) {
-            return rsp_build_s3_error(c, S3_ERR_INVALID_ARGUMENT,
-                                      c->req.path, NULL);
-        }
-        return handle_mpu_upload_part_begin(c, bucket, key,
-                                             pn, upload_id_buf);
-    }
-    if (method_is(c, "DELETE") && has_upload_id) {
-        return handle_mpu_abort(c, bucket, key, upload_id_buf);
-    }
 
-    if (method_is(c, "PUT")) {
-        /* Server-side copy: PUT with x-amz-copy-source header. */
-        if (hdr_get(c, "x-amz-copy-source")) {
-            /* Runs at message-complete (after any body is verified),
-             * like every other request that needs an iopool job. */
-            c->copy_pending = 1;
-            c->copy_bucket  = bucket;   /* points into req_scratch */
-            c->copy_key     = key;
-            return 0;
+    case ACT_MPU_COMPLETE:
+    case ACT_MPU_ABORT:
+    case ACT_MPU_UPLOAD_PART:
+        if (parse_upload_id(c, upload_id_buf) < 0)
+            return rsp_build_s3_error(c, S3_ERR_NO_SUCH_UPLOAD, c->req.path, NULL);
+        if (act == ACT_MPU_ABORT)
+            return handle_mpu_abort(c, bucket, key, upload_id_buf);
+        if (act == ACT_MPU_COMPLETE) {
+            c->mpu_complete_pending = 1;
+            c->mpu_bucket = bucket;          /* points into req_scratch */
+            c->mpu_key    = key;
+            memcpy(c->mpu_upload_id, upload_id_buf, 33);
+            return handle_mpu_complete_begin(c);
         }
-        /* Streaming PUT: open writer, then accept body via on_body. */
-        return handle_object_put_begin(c, bucket, key);
+        {
+            s3_str_t v = q_val(c, "partNumber");
+            int pn = 0;
+            for (size_t i = 0; i < v.n; i++) {
+                char ch = v.p[i];
+                if (ch < '0' || ch > '9') { pn = 0; break; }
+                pn = pn * 10 + (ch - '0');
+                if (pn > 10000) { pn = 0; break; }
+            }
+            if (pn < 1)
+                return rsp_build_s3_error(c, S3_ERR_INVALID_ARGUMENT,
+                                          c->req.path, NULL);
+            return handle_mpu_upload_part_begin(c, bucket, key, pn,
+                                                upload_id_buf);
+        }
+
+    case ACT_COPY_OBJECT:
+        /* Runs at message-complete (after any body is verified),
+         * like every other request that needs an iopool job. */
+        c->copy_pending = 1;
+        c->copy_bucket  = bucket;   /* points into req_scratch */
+        c->copy_key     = key;
+        return 0;
+
+    case ACT_PUT_OBJECT:    return handle_object_put_begin(c, bucket, key);
+    case ACT_GET_OBJECT:    return handle_object_get(c, bucket, key, 0);
+    case ACT_HEAD_OBJECT:   return handle_object_get(c, bucket, key, 1);
+    case ACT_DELETE_OBJECT: return handle_object_delete(c, bucket, key);
+    default:
+        return rsp_build_s3_error(c, S3_ERR_NOT_IMPLEMENTED, c->req.path, NULL);
     }
-    if (method_is(c, "GET"))    return handle_object_get(c, bucket, key, 0);
-    if (method_is(c, "HEAD"))   return handle_object_get(c, bucket, key, 1);
-    if (method_is(c, "DELETE")) return handle_object_delete(c, bucket, key);
-    return rsp_build_s3_error(c, S3_ERR_METHOD_NOT_ALLOWED, c->req.path, NULL);
 }
 
 int route_dispatch_body(conn_t *c, const char *data, size_t len) {

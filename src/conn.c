@@ -218,6 +218,74 @@ static void request_reset(conn_t *c) {
 }
 
 /* ------------------------------------------------------------------------- */
+/* Query parsing                                                             */
+/* ------------------------------------------------------------------------- */
+
+static int hexval(char ch) {
+    if (ch >= '0' && ch <= '9') return ch - '0';
+    if (ch >= 'a' && ch <= 'f') return ch - 'a' + 10;
+    if (ch >= 'A' && ch <= 'F') return ch - 'A' + 10;
+    return -1;
+}
+
+/* Percent-decode src[0..n) into dst; returns bytes written. */
+static size_t qdecode(const char *src, size_t n, char *dst) {
+    size_t w = 0;
+    for (size_t r = 0; r < n; r++) {
+        int hi, lo;
+        if (src[r] == '%' && r + 2 < n
+            && (hi = hexval(src[r+1])) >= 0 && (lo = hexval(src[r+2])) >= 0) {
+            dst[w++] = (char)((hi << 4) | lo);
+            r += 2;
+        } else {
+            dst[w++] = src[r];
+        }
+    }
+    return w;
+}
+
+int conn_parse_query(conn_t *c) {
+    c->req.n_qp = 0;
+    s3_str_t q = c->req.query;
+    if (q.n == 0) return 0;
+    if (q.n > sizeof(c->qbuf)) return -1;
+    size_t used = 0, i = 0;
+    while (i < q.n) {
+        size_t s = i;
+        while (i < q.n && q.p[i] != '&') i++;
+        size_t e = i;
+        if (i < q.n) i++;
+        if (e == s) continue;
+        if (c->req.n_qp >= CONN_MAX_QPARAMS) return -1;
+        size_t eq = s;
+        while (eq < e && q.p[eq] != '=') eq++;
+        conn_qparam_t *p = &c->req.qp[c->req.n_qp++];
+        size_t kn = qdecode(q.p + s, eq - s, c->qbuf + used);
+        p->k = (s3_str_t){ c->qbuf + used, kn };
+        used += kn;
+        p->has_eq = eq < e;
+        size_t vn = p->has_eq ? qdecode(q.p + eq + 1, e - eq - 1,
+                                         c->qbuf + used) : 0;
+        p->v = (s3_str_t){ c->qbuf + used, vn };
+        used += vn;
+    }
+    return 0;
+}
+
+const conn_qparam_t *conn_query_get(const conn_t *c, const char *name) {
+    for (size_t i = 0; i < c->req.n_qp; i++)
+        if (s3_str_eq_lit(c->req.qp[i].k, name)) return &c->req.qp[i];
+    return NULL;
+}
+
+int conn_query_count(const conn_t *c, const char *name) {
+    int n = 0;
+    for (size_t i = 0; i < c->req.n_qp; i++)
+        if (s3_str_eq_lit(c->req.qp[i].k, name)) n++;
+    return n;
+}
+
+/* ------------------------------------------------------------------------- */
 /* llhttp callbacks                                                          */
 /* ------------------------------------------------------------------------- */
 
@@ -345,6 +413,7 @@ static int cb_on_headers_complete(llhttp_t *p) {
         c->req.path  = t;
         c->req.query = S3_STR_NULL;
     }
+    int query_ok = (conn_parse_query(c) == 0);
 
     /* llhttp tracks Content-Length and chunked flag for us. */
     c->req.content_length_hint = p->content_length;
@@ -354,6 +423,11 @@ static int cb_on_headers_complete(llhttp_t *p) {
     int conn_close = (p->flags & 0x04) ? 1 : 0;
     int http11 = (p->http_major == 1 && p->http_minor == 1);
     c->req.keep_alive = http11 && !conn_close;
+
+    if (!query_ok) {
+        if (route_build_error(c, S3_ERR_INVALID_REQUEST) < 0) return -1;
+        return 0;
+    }
 
     /* Phase 2 hook: SigV4 verification.
      *

@@ -10,6 +10,7 @@
  */
 
 #include "server.h"
+#include "action.h"
 #include "conn.h"
 #include "iopool.h"
 #include "log.h"
@@ -202,6 +203,10 @@ static void admin_handle(server_t *s) {
 }
 
 server_t *server_create(const server_cfg_t *cfg) {
+    if (action_selfcheck() != 0) {
+        LOG_E("action table incomplete: refusing to start (default deny)");
+        return NULL;
+    }
     server_t *s = calloc(1, sizeof(*s));
     if (!s) return NULL;
     s->cfg = *cfg;

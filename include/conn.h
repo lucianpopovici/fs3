@@ -48,6 +48,16 @@ typedef struct {
     s3_str_t k, v;
 } conn_header_t;
 
+/* One decoded query parameter. `has_eq` distinguishes "?acl" from
+ * "?acl=". Both spans point into conn_t.qbuf. */
+typedef struct {
+    s3_str_t k, v;
+    int      has_eq;
+} conn_qparam_t;
+
+#define CONN_MAX_QPARAMS      48
+#define CONN_QBUF_SZ          (8 * 1024)
+
 typedef struct {
     s3_str_t       method;        /* "GET", "PUT", "POST", "DELETE", "HEAD" — static literal */
     s3_str_t       target;        /* raw request-target, points into hdr_scratch */
@@ -62,6 +72,12 @@ typedef struct {
     uint64_t       content_length_hint; /* parser->content_length at headers_complete */
 
     uint64_t       body_consumed; /* bytes seen via on_body so far */
+
+    /* Query string, split on '&' and percent-decoded once at
+     * headers-complete (conn_parse_query). */
+    conn_qparam_t  qp[CONN_MAX_QPARAMS];
+    size_t         n_qp;
+    int            act;           /* s3_action_t, set by the router */
 } conn_req_t;
 
 /* Header-accumulation state machine. Tracks whether the most recent
@@ -174,6 +190,9 @@ typedef struct conn {
     conn_req_t         req;
     int                request_dispatched;  /* response has been built */
 
+    /* Decoded query bytes (req.qp spans point here). */
+    char               qbuf[CONN_QBUF_SZ];
+
     /* Per-request bump arena, used by route.c for decoded path/query
      * spans. Reset at the start of each request. */
     char               req_scratch[CONN_REQ_SCRATCH_SZ];
@@ -252,5 +271,13 @@ int     conn_wants_write(const conn_t *c);
  * bytes, or unread socket data left behind by a read that yielded at
  * CONN_READ_BUDGET. */
 int     conn_hup_can_close(const conn_t *c);
+
+/* Split and percent-decode c->req.query into c->req.qp. '+' stays '+'.
+ * Returns 0, or -1 if the query has too many parameters or is too long. */
+int     conn_parse_query(conn_t *c);
+/* First parameter named `name` (exact, case-sensitive), or NULL. */
+const conn_qparam_t *conn_query_get(const conn_t *c, const char *name);
+/* Number of parameters named `name`. */
+int     conn_query_count(const conn_t *c, const char *name);
 
 #endif

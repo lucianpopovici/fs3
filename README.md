@@ -109,12 +109,15 @@ What's working end-to-end:
   sweep is conservative: staging dirs whose `meta` file is missing
   or has an unparseable `ctime_ms=` line are left alone.
 
+- **Strict subresource routing** — every request is classified into one
+  S3 operation from its method, path and query subresource. A recognised
+  S3 subresource fs3 does not implement (`?tagging`, `?retention`,
+  `?versionId=`, `?website`, …) answers `501 NotImplemented` and never
+  reaches the store, so a client that thinks it is setting tags or
+  retention cannot overwrite or delete the object by accident.
+
 What's *not* yet wired:
 
-- HTTP `Range:` requests on GET (the AWS CLI doesn't issue ranged
-  GETs by default — verified via `aws s3 cp` of a 16 MB file
-  round-tripping correctly — but explicit `--range` invocations
-  and other clients do need it).
 - Streaming chunked SigV4 with trailers (`STREAMING-...-TRAILER`,
   used when SDKs send `x-amz-checksum-sha256` after the body).
 - Bucket subresources: location, versioning, lifecycle, CORS, etc.

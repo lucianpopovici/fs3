@@ -30,7 +30,7 @@ INCLUDES   := -Iinclude -I$(LLHTTP_DIR)/include -I$(XML_DIR)
 # Server objects
 SRV_SRCS := src/main.c src/server.c src/conn.c src/log.c src/store_fs.c \
             src/route.c src/response.c src/sigv4.c src/metrics.c \
-            src/iopool.c
+            src/iopool.c src/action.c
 SRV_OBJS := $(SRV_SRCS:.c=.o)
 
 LLHTTP_OBJS := $(LLHTTP_DIR)/src/api.o $(LLHTTP_DIR)/src/http.o \
@@ -107,6 +107,8 @@ test: $(TEST_BINS) fs3
 	@./tests/test_e2e_phase12.sh
 	@echo "=== test_e2e_isolation (per-user bucket ownership) ==="
 	@./tests/test_e2e_isolation.sh
+	@echo "=== test_e2e_subresources (S0: unimplemented subresources → 501) ==="
+	@./tests/test_e2e_subresources.sh
 	@echo "=== test_ui_cgi (DSM tile admin console) ==="
 	@./tests/test_ui_cgi.sh
 

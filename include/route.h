@@ -11,6 +11,7 @@
 #define FS3_ROUTE_H
 
 #include "conn.h"
+#include "action.h"
 
 /* Called from on_headers_complete once headers are parsed.
  * Decides what handler to use and may build the response immediately
@@ -35,5 +36,14 @@ int route_dispatch_send_body(conn_t *c);
 /* Build an S3 error response for the current request (used by the auth
  * hook to short-circuit dispatch). Returns 0 on success, -1 on error. */
 int route_build_error(conn_t *c, s3_err_t err);
+
+/* Classify the request into one S3 operation (ACT_NONE with *err set if
+ * it is refused: 501 for unimplemented subresources, 405, 400). */
+s3_action_t route_classify(const conn_t *c, s3_str_t bucket, s3_str_t key,
+                           s3_err_t *err);
+
+/* Authorization decision for `act` on bucket/key. S3_OK = allowed;
+ * S3_ERR_NO_SUCH_BUCKET passes through; anything else is a denial. */
+s3_err_t authz(conn_t *c, s3_str_t bucket, s3_str_t key, s3_action_t act);
 
 #endif
