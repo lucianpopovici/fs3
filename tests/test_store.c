@@ -1541,6 +1541,101 @@ static void t_recover_leaves_fresh_mpu(void) {
 
 /* ---- Main --------------------------------------------------------- */
 
+/* ---- F1: schema 2 objects stay readable; new writes are schema 3 ---- */
+
+static void install_fixture(const char *bucket, const char *key,
+                            const char *fixture) {
+    /* data/<bucket>/<xx>/<yy>/<sha256(bucket\0key)> */
+    char cmd[8192];
+    snprintf(cmd, sizeof(cmd),
+             "h=$(printf '%%s\\0%%s' '%s' '%s' | sha256sum | cut -c1-64); "
+             "d=%s/data/%s/$(echo $h | cut -c1-2)/$(echo $h | cut -c3-4); "
+             "mkdir -p $d && cp %s $d/$h",
+             bucket, key, g_root, bucket, fixture);
+    CHECK_EQ(system(cmd), 0, "install fixture");
+}
+
+static void t_reads_schema_v2_fixture(void) {
+    setup_root();
+    s3_store_t *s;
+    CHECK_EQ(store_open(&s, g_root), S3_OK, "open");
+    CHECK_EQ(store_bucket_create(s, S3_STR_LIT("buk")), S3_OK, "create");
+    install_fixture("buk", "legacy.txt", "tests/fixtures/obj_v2_legacy.bin");
+
+    s3_obj_meta_t m;
+    s3_reader_t *r;
+    CHECK_EQ(store_get_open(s, S3_STR_LIT("buk"), S3_STR_LIT("legacy.txt"),
+                            &r, &m), S3_OK, "v2 open");
+    char buf[64] = {0};
+    ssize_t n = store_get_read(r, buf, sizeof(buf));
+    store_get_close(r);
+    CHECK_EQ(n, 20, "v2 body length");
+    CHECK(memcmp(buf, "hello from schema 2\n", 20) == 0, "v2 body");
+    CHECK(strcmp(m.content_type, "text/plain") == 0, "v2 content type");
+    CHECK_EQ(m.mtime_ms, 1700000000123ULL, "v2 mtime");
+    CHECK_EQ(m.cksum_algo, 0, "v2 has no checksum");
+
+    /* Listing sees it with its key. */
+    s3_list_opts_t lo = {0};
+    s3_lister_t *l;
+    CHECK_EQ(store_list_begin(s, S3_STR_LIT("buk"), &lo, &l), S3_OK, "list");
+    s3_str_t k; int isp;
+    CHECK_EQ(store_list_next(l, &k, &m, &isp), S3_OK, "list next");
+    CHECK(s3_str_eq_lit(k, "legacy.txt"), "list key");
+    store_list_close(l);
+
+    /* Overwrite → schema 3 with a stored checksum round-trips. */
+    store_put_opts_t o = { .content_type = "a/b", .cksum_algo = S3_CKSUM_CRC32,
+                           .have_cksum = 1, .cksum = { 1, 2, 3, 4 } };
+    s3_writer_t *w;
+    CHECK_EQ(store_put_begin_opts(s, S3_STR_LIT("buk"),
+                                  S3_STR_LIT("legacy.txt"), &o, &w),
+             S3_OK, "v3 begin");
+    store_put_write(w, "new", 3);
+    CHECK_EQ(store_put_commit(w, NULL), S3_OK, "v3 commit");
+    CHECK_EQ(store_head(s, S3_STR_LIT("buk"), S3_STR_LIT("legacy.txt"), &m),
+             S3_OK, "v3 head");
+    CHECK_EQ(m.size, 3, "v3 size");
+    CHECK_EQ(m.cksum_algo, S3_CKSUM_CRC32, "v3 cksum algo");
+    CHECK(m.cksum[0] == 1 && m.cksum[3] == 4, "v3 cksum bytes");
+    CHECK(strcmp(m.content_type, "a/b") == 0, "v3 ct");
+
+    store_close(s);
+    teardown_root();
+}
+
+/* S5: header fields are untrusted — a file whose header_size or
+ * data_size disagrees with its length is refused, not served. */
+static void t_rejects_corrupt_header(void) {
+    setup_root();
+    s3_store_t *s;
+    CHECK_EQ(store_open(&s, g_root), S3_OK, "open");
+    CHECK_EQ(store_bucket_create(s, S3_STR_LIT("buk")), S3_OK, "create");
+    const char *variants[][2] = {
+        /* offset, byte: header_size low byte, data_size low byte, schema */
+        { "12", "\\377" }, { "16", "\\177" }, { "8", "\\011" },
+    };
+    for (size_t i = 0; i < 3; i++) {
+        char fx[512];
+        snprintf(fx, sizeof(fx), "%s/corrupt.bin", g_root);
+        char cmd[2048];
+        snprintf(cmd, sizeof(cmd),
+                 "cp tests/fixtures/obj_v2_legacy.bin %s && "
+                 "printf '%s' | dd of=%s bs=1 seek=%s conv=notrunc 2>/dev/null",
+                 fx, variants[i][1], fx, variants[i][0]);
+        CHECK_EQ(system(cmd), 0, "make corrupt");
+        install_fixture("buk", "legacy.txt", fx);
+        s3_obj_meta_t m;
+        s3_reader_t *r = NULL;
+        s3_err_t e = store_get_open(s, S3_STR_LIT("buk"),
+                                    S3_STR_LIT("legacy.txt"), &r, &m);
+        CHECK(e != S3_OK, "corrupt header refused");
+        if (e == S3_OK) store_get_close(r);
+    }
+    store_close(s);
+    teardown_root();
+}
+
 int main(void) {
     log_init(LOG_WARN);  /* suppress info chatter during tests */
 
@@ -1587,6 +1682,8 @@ int main(void) {
     t_recover_clears_orphan_tmp();
     t_recover_preserves_committed();
     t_recover_leaves_fresh_mpu();
+    t_reads_schema_v2_fixture();
+    t_rejects_corrupt_header();
 
     if (failures == 0) { printf("ALL TESTS PASSED\n"); return 0; }
     printf("%d FAILURES\n", failures);

@@ -65,7 +65,8 @@
 
 #define OBJ_MAGIC    "YS3OBJ\0"
 #define OBJ_MAGIC_LEN 8         /* "YS3OBJ\0\0" — 6 chars + 2 NUL */
-#define OBJ_SCHEMA   2u         /* v2 added part_count */
+#define OBJ_SCHEMA_V2 2u        /* v2 added part_count */
+#define OBJ_SCHEMA   3u         /* v3 added obj_ext_v3_t (checksum, version id, flags) */
 
 typedef struct __attribute__((packed)) {
     char     magic[OBJ_MAGIC_LEN];   /* "YS3OBJ\0\0" */
@@ -81,6 +82,26 @@ typedef struct __attribute__((packed)) {
 } obj_header_t;
 
 _Static_assert(sizeof(obj_header_t) == 60, "obj_header_t layout");
+
+/* Schema 3: an extension block between the fixed header and the
+ * content-type/key bytes. v2 files have no extension (read as zeroes).
+ * header_size always covers everything before the data, so the data
+ * offset stays header-driven. One-way migration: a pre-v3 binary
+ * refuses v3 objects. */
+typedef struct __attribute__((packed)) {
+    uint8_t  version_id[16];   /* all-zero = "null" version */
+    uint32_t flags;            /* S3_OBJF_* */
+    uint8_t  cksum_algo;       /* s3_cksum_algo_t */
+    uint8_t  cksum_type;       /* 0 FULL_OBJECT, 1 COMPOSITE */
+    uint16_t cksum_parts;      /* composite part count */
+    uint8_t  cksum[32];        /* raw digest, left-aligned */
+    uint8_t  reserved[8];
+} obj_ext_v3_t;
+
+_Static_assert(sizeof(obj_ext_v3_t) == 64, "obj_ext_v3_t layout");
+
+/* Upper bound on content-type bytes we write (s3_obj_meta_t holds 127). */
+#define OBJ_MAX_CT_LEN 1024
 
 /* ===================================================================== */
 /* Path computation and small helpers                                    */
@@ -682,6 +703,7 @@ struct s3_writer {
     uint64_t    data_written;        /* bytes written to data region so far */
     EVP_MD_CTX *md5_ctx;             /* running MD5 */
     obj_header_t hdr;                /* accumulated header (filled in begin) */
+    obj_ext_v3_t ext;                /* schema-3 extension (checksum, ...) */
     char       *bucket_dup;
     char       *key_dup;             /* NOT NUL-terminated; key_len in hdr.key_len */
     char       *content_type_dup;    /* NUL-terminated */
@@ -714,7 +736,29 @@ static void writer_free(s3_writer_t *w) {
 
 s3_err_t store_put_begin(s3_store_t *s, s3_str_t bucket, s3_str_t key,
                          const char *content_type, s3_writer_t **out) {
-    if (!s || !out) return S3_ERR_INVALID_ARGUMENT;
+    store_put_opts_t o = { .content_type = content_type };
+    return store_put_begin_opts(s, bucket, key, &o, out);
+}
+
+s3_err_t store_put_set_checksum(s3_writer_t *w, uint8_t algo, uint8_t type,
+                                uint16_t parts, const uint8_t *digest,
+                                size_t n) {
+    if (!w || w->finalized || algo >= S3_CKSUM_MAX || n > sizeof(w->ext.cksum)
+        || type > S3_CKSUM_TYPE_COMPOSITE)
+        return S3_ERR_INVALID_ARGUMENT;
+    memset(w->ext.cksum, 0, sizeof(w->ext.cksum));
+    w->ext.cksum_algo  = algo;
+    w->ext.cksum_type  = type;
+    w->ext.cksum_parts = parts;
+    if (n) memcpy(w->ext.cksum, digest, n);
+    return S3_OK;
+}
+
+s3_err_t store_put_begin_opts(s3_store_t *s, s3_str_t bucket, s3_str_t key,
+                              const store_put_opts_t *opts,
+                              s3_writer_t **out) {
+    if (!s || !out || !opts) return S3_ERR_INVALID_ARGUMENT;
+    const char *content_type = opts->content_type;
     if (!valid_bucket_name(bucket)) return S3_ERR_INVALID_BUCKET_NAME;
     if (!valid_key(key))            return S3_ERR_INVALID_ARGUMENT;
     if (!store_bucket_exists(s, bucket)) return S3_ERR_NO_SUCH_BUCKET;
@@ -763,7 +807,14 @@ s3_err_t store_put_begin(s3_store_t *s, s3_str_t bucket, s3_str_t key,
     if (ct_n > UINT16_MAX)  { writer_free(w); return S3_ERR_INVALID_ARGUMENT; }
     memcpy(w->hdr.magic, OBJ_MAGIC, OBJ_MAGIC_LEN);
     w->hdr.schema      = OBJ_SCHEMA;
-    w->hdr.header_size = (uint32_t)(sizeof(obj_header_t) + ct_n + key.n);
+    w->hdr.header_size = (uint32_t)(sizeof(obj_header_t) + sizeof(obj_ext_v3_t)
+                                    + ct_n + key.n);
+    if (opts->have_cksum
+        && store_put_set_checksum(w, opts->cksum_algo, opts->cksum_type,
+                                  opts->cksum_parts, opts->cksum,
+                                  sizeof(opts->cksum)) != S3_OK) {
+        writer_free(w); return S3_ERR_INVALID_ARGUMENT;
+    }
     w->hdr.ct_len      = (uint16_t)ct_n;
     w->hdr.key_len     = (uint16_t)key.n;
     /* data_size, mtime_ms, etag filled at commit */
@@ -781,6 +832,7 @@ s3_err_t store_put_begin(s3_store_t *s, s3_str_t bucket, s3_str_t key,
      * variable-length content_type and key bytes. We'll pwrite the final
      * header back at offset 0 in commit. */
     if (xwrite(w->fd, &w->hdr, sizeof(w->hdr)) != (ssize_t)sizeof(w->hdr)
+        || xwrite(w->fd, &w->ext, sizeof(w->ext)) != (ssize_t)sizeof(w->ext)
         || (ct_n  && xwrite(w->fd, w->content_type_dup, ct_n) != (ssize_t)ct_n)
         || (key.n && xwrite(w->fd, w->key_dup, key.n)         != (ssize_t)key.n)) {
         LOG_E("write header: %s", strerror(errno));
@@ -826,7 +878,9 @@ s3_err_t store_put_commit(s3_writer_t *w, s3_obj_meta_t *meta_out) {
     w->hdr.data_size = w->data_written;
 
     /* Pwrite the finalized header back at offset 0. */
-    if (pwrite(w->fd, &w->hdr, sizeof(w->hdr), 0) != (ssize_t)sizeof(w->hdr)) {
+    if (pwrite(w->fd, &w->hdr, sizeof(w->hdr), 0) != (ssize_t)sizeof(w->hdr)
+        || pwrite(w->fd, &w->ext, sizeof(w->ext), sizeof(w->hdr))
+           != (ssize_t)sizeof(w->ext)) {
         LOG_E("pwrite header: %s", strerror(errno));
         s3_err_t e = map_io_err(errno);
         writer_free(w); return e;
@@ -898,6 +952,12 @@ s3_err_t store_put_commit(s3_writer_t *w, s3_obj_meta_t *meta_out) {
         if (ctn >= sizeof(meta_out->content_type)) ctn = sizeof(meta_out->content_type) - 1;
         memcpy(meta_out->content_type, w->content_type_dup, ctn);
         meta_out->content_type[ctn] = '\0';
+        memcpy(meta_out->version_id, w->ext.version_id, 16);
+        meta_out->flags       = w->ext.flags;
+        meta_out->cksum_algo  = w->ext.cksum_algo;
+        meta_out->cksum_type  = w->ext.cksum_type;
+        meta_out->cksum_parts = w->ext.cksum_parts;
+        memcpy(meta_out->cksum, w->ext.cksum, 32);
     }
 
     writer_free(w);
@@ -921,33 +981,81 @@ struct s3_reader {
     uint64_t pos;            /* bytes already returned to caller */
 };
 
-/* Read header from fd at offset 0; verify magic/schema; populate meta. */
+/* Read and validate an object file's header. The share holding the data
+ * root may be writable by other DSM users, so every length is treated as
+ * untrusted: header_size must equal exactly fixed + ext + ct + key, fit
+ * inside the file, and the data region must match the file size.
+ * Fills h, x (zeroes for schema 2) and *ct_off (offset of content-type
+ * bytes; the key follows them). */
+static s3_err_t obj_read_hdr(int fd, obj_header_t *h, obj_ext_v3_t *x,
+                             uint32_t *ct_off) {
+    ssize_t r = pread(fd, h, sizeof(*h), 0);
+    if (r != (ssize_t)sizeof(*h)) return S3_ERR_INTERNAL;
+    if (memcmp(h->magic, OBJ_MAGIC, OBJ_MAGIC_LEN) != 0) return S3_ERR_INTERNAL;
+    uint32_t fixed;
+    memset(x, 0, sizeof(*x));
+    if (h->schema == OBJ_SCHEMA_V2) {
+        fixed = (uint32_t)sizeof(*h);
+    } else if (h->schema == OBJ_SCHEMA) {
+        fixed = (uint32_t)(sizeof(*h) + sizeof(*x));
+        if (pread(fd, x, sizeof(*x), sizeof(*h)) != (ssize_t)sizeof(*x))
+            return S3_ERR_INTERNAL;
+        if (x->cksum_algo >= S3_CKSUM_MAX
+            || x->cksum_type > S3_CKSUM_TYPE_COMPOSITE
+            || (x->cksum_type == S3_CKSUM_TYPE_COMPOSITE
+                && (x->cksum_parts == 0 || x->cksum_parts > 10000)))
+            return S3_ERR_INTERNAL;
+    } else {
+        return S3_ERR_INTERNAL;
+    }
+    if (h->ct_len > OBJ_MAX_CT_LEN || h->key_len == 0 || h->key_len > 1024)
+        return S3_ERR_INTERNAL;
+    if ((uint64_t)h->header_size != (uint64_t)fixed + h->ct_len + h->key_len)
+        return S3_ERR_INTERNAL;
+    if (h->part_count > 10000) return S3_ERR_INTERNAL;
+    struct stat st;
+    if (fstat(fd, &st) < 0 || st.st_size < 0
+        || (uint64_t)st.st_size < h->header_size
+        || (uint64_t)st.st_size - h->header_size != h->data_size)
+        return S3_ERR_INTERNAL;
+    *ct_off = fixed;
+    return S3_OK;
+}
+
+/* Fill meta from a validated header (content-type read from fd). */
+static s3_err_t obj_fill_meta(int fd, const obj_header_t *h,
+                              const obj_ext_v3_t *x, uint32_t ct_off,
+                              s3_obj_meta_t *m) {
+    memset(m, 0, sizeof(*m));
+    m->size       = h->data_size;
+    m->mtime_ms   = h->mtime_ms;
+    m->part_count = h->part_count;
+    memcpy(m->etag, h->etag, 16);
+    memcpy(m->version_id, x->version_id, 16);
+    m->flags       = x->flags;
+    m->cksum_algo  = x->cksum_algo;
+    m->cksum_type  = x->cksum_type;
+    m->cksum_parts = x->cksum_parts;
+    memcpy(m->cksum, x->cksum, 32);
+    if (h->ct_len > 0) {
+        size_t ctn = h->ct_len;
+        if (ctn >= sizeof(m->content_type)) ctn = sizeof(m->content_type) - 1;
+        if (pread(fd, m->content_type, ctn, ct_off) != (ssize_t)ctn)
+            return S3_ERR_INTERNAL;
+        m->content_type[ctn] = '\0';
+    }
+    return S3_OK;
+}
+
+/* Read header from fd at offset 0; verify; populate meta. */
 static s3_err_t read_header(int fd, obj_header_t *hdr_out, s3_obj_meta_t *meta_out) {
     obj_header_t h;
-    ssize_t r = pread(fd, &h, sizeof(h), 0);
-    if (r != (ssize_t)sizeof(h)) return S3_ERR_INTERNAL;
-    if (memcmp(h.magic, OBJ_MAGIC, OBJ_MAGIC_LEN) != 0) return S3_ERR_INTERNAL;
-    if (h.schema != OBJ_SCHEMA) return S3_ERR_INTERNAL;
-
+    obj_ext_v3_t x;
+    uint32_t ct_off;
+    s3_err_t e = obj_read_hdr(fd, &h, &x, &ct_off);
+    if (e != S3_OK) return e;
     if (hdr_out) *hdr_out = h;
-
-    if (meta_out) {
-        memset(meta_out, 0, sizeof(*meta_out));
-        meta_out->size     = h.data_size;
-        meta_out->mtime_ms = h.mtime_ms;
-        meta_out->part_count = h.part_count;
-        memcpy(meta_out->etag, h.etag, 16);
-
-        if (h.ct_len > 0) {
-            size_t ctn = h.ct_len;
-            if (ctn >= sizeof(meta_out->content_type)) {
-                ctn = sizeof(meta_out->content_type) - 1;
-            }
-            ssize_t cr = pread(fd, meta_out->content_type, ctn, sizeof(h));
-            if (cr != (ssize_t)ctn) return S3_ERR_INTERNAL;
-            meta_out->content_type[ctn] = '\0';
-        }
-    }
+    if (meta_out) return obj_fill_meta(fd, &h, &x, ct_off, meta_out);
     return S3_OK;
 }
 
@@ -1121,36 +1229,19 @@ static int starts_with(const char *p, size_t n, s3_str_t pref) {
 static int load_entry(const char *path, list_entry_t *out) {
     int fd = open(path, O_RDONLY | O_CLOEXEC);
     if (fd < 0) return -1;
-
     obj_header_t h;
-    ssize_t r = pread(fd, &h, sizeof(h), 0);
-    if (r != (ssize_t)sizeof(h) || memcmp(h.magic, OBJ_MAGIC, OBJ_MAGIC_LEN) != 0) {
-        close(fd); return -1;
-    }
+    obj_ext_v3_t x;
+    uint32_t ct_off;
+    if (obj_read_hdr(fd, &h, &x, &ct_off) != S3_OK) { close(fd); return -1; }
     char *kbuf = malloc((size_t)h.key_len + 1);
     if (!kbuf) { close(fd); return -1; }
-    if (h.key_len > 0) {
-        if (pread(fd, kbuf, h.key_len, sizeof(h) + h.ct_len) != (ssize_t)h.key_len) {
-            free(kbuf); close(fd); return -1;
-        }
+    if (pread(fd, kbuf, h.key_len, (off_t)ct_off + h.ct_len) != (ssize_t)h.key_len
+        || obj_fill_meta(fd, &h, &x, ct_off, &out->meta) != S3_OK) {
+        free(kbuf); close(fd); return -1;
     }
     kbuf[h.key_len] = '\0';
-
     out->key = kbuf;
     out->key_len = h.key_len;
-    memset(&out->meta, 0, sizeof(out->meta));
-    out->meta.size = h.data_size;
-    out->meta.mtime_ms = h.mtime_ms;
-    out->meta.part_count = h.part_count;
-    memcpy(out->meta.etag, h.etag, 16);
-    if (h.ct_len > 0) {
-        size_t ctn = h.ct_len;
-        if (ctn >= sizeof(out->meta.content_type)) ctn = sizeof(out->meta.content_type) - 1;
-        if (pread(fd, out->meta.content_type, ctn, sizeof(h)) != (ssize_t)ctn) {
-            free(kbuf); close(fd); return -1;
-        }
-        out->meta.content_type[ctn] = '\0';
-    }
     close(fd);
     return 0;
 }
@@ -1447,11 +1538,11 @@ static void stats_count_file(const char *path, s3_bucket_stats_t *st) {
     int fd = open(path, O_RDONLY | O_CLOEXEC);
     if (fd < 0) return;
     obj_header_t h;
-    ssize_t r = pread(fd, &h, sizeof(h), 0);
+    obj_ext_v3_t x;
+    uint32_t ct_off;
+    s3_err_t e = obj_read_hdr(fd, &h, &x, &ct_off);
     close(fd);
-    if (r != (ssize_t)sizeof(h)
-        || memcmp(h.magic, OBJ_MAGIC, OBJ_MAGIC_LEN) != 0)
-        return;
+    if (e != S3_OK) return;
     st->objects++;
     st->bytes += h.data_size;
 }
@@ -2007,8 +2098,11 @@ s3_err_t store_mpu_complete(s3_store_t *s, s3_str_t bucket, s3_str_t key,
     hdr.ct_len = (uint16_t)ct_n;
     hdr.key_len = (uint16_t)key.n;
     hdr.part_count = (uint16_t)n_parts;
-    hdr.header_size = (uint32_t)(sizeof(hdr) + ct_n + key.n);
+    hdr.header_size = (uint32_t)(sizeof(hdr) + sizeof(obj_ext_v3_t)
+                                 + ct_n + key.n);
     hdr.data_size = total_size;
+    obj_ext_v3_t ext;
+    memset(&ext, 0, sizeof(ext));
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     uint64_t mtime_ms = (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
@@ -2016,6 +2110,7 @@ s3_err_t store_mpu_complete(s3_store_t *s, s3_str_t bucket, s3_str_t key,
     memcpy(hdr.etag, mp_md5, 16);
 
     if (xwrite(tfd, &hdr, sizeof(hdr)) != (ssize_t)sizeof(hdr)
+        || xwrite(tfd, &ext, sizeof(ext)) != (ssize_t)sizeof(ext)
         || (ct_n && xwrite(tfd, stored_ct, ct_n) != (ssize_t)ct_n)
         || (key.n && xwrite(tfd, key.p, key.n) != (ssize_t)key.n)) {
         s3_err_t e = map_io_err(errno);

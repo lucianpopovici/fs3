@@ -32,6 +32,24 @@ typedef struct s3_writer s3_writer_t;
 typedef struct s3_reader s3_reader_t;
 typedef struct s3_lister s3_lister_t;
 
+/* Additional (x-amz-checksum-*) checksum algorithms. Values are stored
+ * on disk: never renumber. */
+typedef enum {
+    S3_CKSUM_NONE      = 0,
+    S3_CKSUM_CRC32     = 1,
+    S3_CKSUM_CRC32C    = 2,
+    S3_CKSUM_SHA1      = 3,
+    S3_CKSUM_SHA256    = 4,
+    S3_CKSUM_CRC64NVME = 5,
+    S3_CKSUM_MAX
+} s3_cksum_algo_t;
+
+#define S3_CKSUM_TYPE_FULL_OBJECT 0
+#define S3_CKSUM_TYPE_COMPOSITE   1
+
+/* Object flags (schema-3 header). */
+#define S3_OBJF_DELETE_MARKER (1u << 0)
+
 typedef struct {
     uint64_t size;             /* body size in bytes */
     uint64_t mtime_ms;         /* ms since Unix epoch */
@@ -40,7 +58,30 @@ typedef struct {
     uint16_t part_count;       /* 0 for single-PUT, >0 for multipart;
                                   formatters render as "hex-N" if >0 */
     char     content_type[128];/* NUL-terminated; "" if not set */
+
+    /* Schema 3 fields; zero for objects written by schema 2. */
+    uint8_t  version_id[16];   /* all-zero = null version */
+    uint32_t flags;            /* S3_OBJF_* */
+    uint8_t  cksum_algo;       /* s3_cksum_algo_t, 0 = none stored */
+    uint8_t  cksum_type;       /* S3_CKSUM_TYPE_* */
+    uint16_t cksum_parts;      /* composite: number of parts */
+    uint8_t  cksum[32];        /* raw digest, left-aligned */
 } s3_obj_meta_t;
+
+/* Options for store_put_begin_opts. Zero-initialise and set what you
+ * need. */
+typedef struct {
+    const char *content_type;  /* NULL/"" = none */
+    /* Checksum to store with the object. If cksum_algo is set and
+     * have_cksum is 0, the caller must provide it before commit with
+     * store_put_set_checksum (the conn layer computes it while the body
+     * streams and verifies it against the client's value). */
+    uint8_t     cksum_algo;
+    uint8_t     cksum_type;
+    uint16_t    cksum_parts;
+    int         have_cksum;
+    uint8_t     cksum[32];
+} store_put_opts_t;
 
 /* ---- Lifecycle ---- */
 
@@ -124,6 +165,14 @@ int      store_bucket_exists(s3_store_t *s, s3_str_t name);
 s3_err_t store_put_begin(s3_store_t *s, s3_str_t bucket, s3_str_t key,
                          const char *content_type,
                          s3_writer_t **out);
+s3_err_t store_put_begin_opts(s3_store_t *s, s3_str_t bucket, s3_str_t key,
+                              const store_put_opts_t *opts,
+                              s3_writer_t **out);
+/* Record the object's additional checksum (raw digest, `n` ≤ 32 bytes).
+ * Must be called before commit. */
+s3_err_t store_put_set_checksum(s3_writer_t *w, uint8_t algo, uint8_t type,
+                                uint16_t parts, const uint8_t *digest,
+                                size_t n);
 s3_err_t store_put_write(s3_writer_t *w, const void *buf, size_t n);
 s3_err_t store_put_commit(s3_writer_t *w, s3_obj_meta_t *meta_out);
 void     store_put_abort(s3_writer_t *w);
