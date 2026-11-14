@@ -207,6 +207,7 @@ typedef struct {
     char id[33];       /* 32 hex, or "" for a pre-ownership bucket */
     int  versioning;   /* S3_VERSIONING_* (item 8) */
     int  object_lock;  /* object lock enabled at creation (item 10) */
+    int  layout;       /* 2 = versions/ + data/ symlinks (round 2, item 9) */
 } s3_bucket_meta_t;
 
 /* Create a bucket owned by `owner` (NULL/"" = ownerless). Returns
@@ -589,6 +590,16 @@ s3_err_t store_quota_recount(s3_store_t *s, s3_str_t bucket, int64_t *drift_byte
  * streams; writes past it reserve as they go. */
 s3_err_t store_put_expect(s3_writer_t *w, uint64_t n);
 int      store_valid_identity(const char *u);
+
+/* Called before a version file is permanently unlinked (item 9:
+ * fs3-lockd clears FS_IMMUTABLE_FL only when retention allows). Non-zero
+ * refuses the delete (S3_ERR_LOCKED). */
+void     store_set_version_unlink_hook(s3_store_t *s, int (*fn)(void *user, const char *path),
+                                       void *user);
+/* Path of a version's file (layout 2: every version, current included,
+ * has one in versions/). 0 ok, -1 not found / not layout 2. */
+int      store_version_file(s3_store_t *s, s3_str_t bucket, s3_str_t key, const uint8_t vid[16],
+                            char *out, size_t cap);
 
 /* ---- Integrity scrub (round 2, item 3) ----
  *

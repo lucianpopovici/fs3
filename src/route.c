@@ -24,6 +24,7 @@
 #include "objlock.h"
 #include "objmeta.h"
 #include "ssec.h"
+#include "lockc.h"
 #include "sigv4.h"
 #include "xml_parser.h"
 #include "conn.h"
@@ -1073,6 +1074,33 @@ static void commit_run(iojob_t *j) {
     else             cj->err = store_put_commit(cj->w, &cj->meta);
 }
 
+/* Item 9: with --lock-immutable, a layout-2 version under COMPLIANCE
+ * retention or a legal hold is made immutable by fs3-lockd (which only
+ * ever extends retention); a released hold is reported with HOLD_OFF.
+ * Failures are logged: the API-level guard still holds. */
+static void immutable_sync(conn_t *c, s3_str_t bucket, s3_str_t key, const uint8_t vid[16]) {
+    if (!c->lockd_sock) return;
+    char path[4600];
+    if (store_version_file(c->store, bucket, key, vid, path, sizeof(path)) < 0) return;
+    s3_reader_t *r = NULL;
+    s3_obj_meta_t m;
+    if (store_get_open_version(c->store, bucket, key, vid, &r, &m) != S3_OK) return;
+    store_get_close(r);
+    s3_lock_t l;
+    if (!olock_effective(c->store, bucket, key, &m, &l)) return;
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    uint64_t now = (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
+    int compliance = l.mode == S3_LOCK_COMPLIANCE && l.until_ms > now;
+    int rc = 0;
+    if (compliance || l.legal_hold)
+        rc = lockc_set(c->lockd_sock, path, compliance ? l.until_ms : 0, l.legal_hold);
+    else if (lockc_is_immutable(path))
+        rc = lockc_hold_off(c->lockd_sock, path);
+    if (rc != 0) LOG_W("lock-immutable: fs3-lockd did not apply %s (%s)", path,
+                       rc < 0 ? "unreachable" : "refused");
+}
+
 static void commit_done(iojob_t *j) {
     commit_job_t *cj = (commit_job_t *)j;
     conn_t *c = job_finish(j);
@@ -1106,6 +1134,16 @@ static void commit_done(iojob_t *j) {
                             size_t kn = pct_decode(kb, c->req.path.n - off);
                             store_lock_write(c->store, bk, (s3_str_t){ kb, kn },
                                              cj->meta.version_id, &c->lock_new);
+                        }
+                    }
+                    if (c->lockd_sock) {
+                        const char *sl = memchr(c->req.path.p + 1, '/', c->req.path.n - 1);
+                        size_t off = sl ? (size_t)(sl - c->req.path.p) + 1 : c->req.path.n;
+                        char *kb = scratch_alloc(c, c->req.path.n);
+                        if (kb && c->req.path.n > off) {
+                            memcpy(kb, c->req.path.p + off, c->req.path.n - off);
+                            size_t kn = pct_decode(kb, c->req.path.n - off);
+                            immutable_sync(c, bk, (s3_str_t){ kb, kn }, cj->meta.version_id);
                         }
                     }
                 }
@@ -1582,8 +1620,10 @@ static void copy_done(iojob_t *j) {
     copy_job_t *cj = (copy_job_t *)j;
     conn_t *c = job_finish(j);
     if (c) {
-        if (cj->err == S3_OK && !cj->part)
+        if (cj->err == S3_OK && !cj->part) {
             add_version_header(c, c->copy_bucket, cj->meta.version_id);
+            immutable_sync(c, c->copy_bucket, c->copy_key, cj->meta.version_id);
+        }
         job_respond(c, cj->err != S3_OK
             ? rsp_build_s3_error(c, cj->err, c->req.path, NULL)
             : cj->part ? rsp_build_copy_part(c, cj->etag, cj->mtime_ms, cj->ck_algo,
@@ -2130,6 +2170,7 @@ static void mpu_complete_done(iojob_t *j) {
     if (c) {
         /* c->mpu_bucket/mpu_key are still valid: the request isn't reset
          * until its response has been written. */
+        if (mj->err == S3_OK) immutable_sync(c, c->mpu_bucket, c->mpu_key, mj->meta.version_id);
         job_respond(c, mj->err != S3_OK
             ? rsp_build_s3_error(c, mj->err, c->req.path, NULL)
             : (add_checksum_headers(c, &mj->meta),
@@ -2508,6 +2549,7 @@ static int lock_put_finish(conn_t *c, int legal) {
     }
     e = store_lock_write(c->store, c->cfg_bucket, c->cfg_key, m.version_id, &next);
     if (e != S3_OK) return rsp_build_s3_error(c, e, c->req.path, NULL);
+    immutable_sync(c, c->cfg_bucket, c->cfg_key, m.version_id);
     return rsp_build_status(c, 200, "OK");
 }
 

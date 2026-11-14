@@ -169,6 +169,10 @@ struct s3_store {
     uint64_t dedup_min;
     int      dedup_verify;
     int      fs_compress;    /* STORE_COMPRESS_*; 0 if the probe failed */
+    /* Before a version file is unlinked (item 9: fs3-lockd clears an
+     * immutable flag only if retention allows). 0 = go ahead. */
+    int    (*vunlink_hook)(void *user, const char *path);
+    void    *vunlink_user;
 
     int  (*mpu_gc_filter)(void *user, s3_str_t bucket, s3_str_t key);
     void  *mpu_gc_filter_user;
@@ -419,6 +423,9 @@ static void q_bucket_added(s3_store_t *s, s3_str_t name, const char *owner);
 static void q_bucket_removed(s3_store_t *s, s3_str_t name);
 static int  fd_is_known_corrupt(int fd, uint64_t mtime_ms);
 static int  lock_parse_file(const char *path, s3_lock_t *out);
+static int  bucket_layout(s3_store_t *s, s3_str_t bucket);
+static s3_err_t l2_publish(s3_store_t *s, s3_str_t bucket, const char hex[65],
+                           const char *tmp_file, uint64_t mtime_ms, const uint8_t vid[16]);
 static void dedup_commit(s3_writer_t *w, const uint8_t dg[32]);
 static void hex_name(const char *in, char *out, size_t cap);
 static void hex16(const uint8_t *b, size_t n, char *out);
@@ -634,6 +641,8 @@ static s3_err_t write_bucket_meta_full(const char *dir,
                       m->versioning == S3_VERSIONING_ENABLED ? "Enabled" : "Suspended");
     if (m->object_lock && n > 0 && (size_t)n < sizeof(buf))
         n += snprintf(buf + n, sizeof(buf) - (size_t)n, "object_lock=1\n");
+    if (m->layout == 2 && n > 0 && (size_t)n < sizeof(buf))
+        n += snprintf(buf + n, sizeof(buf) - (size_t)n, "layout=2\n");
     if (n < 0 || (size_t)n >= sizeof(buf)
         || xwrite(fd, buf, (size_t)n) != n || xfsync(fd) < 0) {
         s3_err_t e = (n < 0 || (size_t)n >= sizeof(buf))
@@ -671,6 +680,8 @@ static void read_bucket_meta(const char *bucket_dir, s3_bucket_meta_t *out) {
             out->versioning = S3_VERSIONING_SUSPENDED;
         else if (strcmp(line, "object_lock=1") == 0)
             out->object_lock = 1;
+        else if (strcmp(line, "layout=2") == 0)
+            out->layout = 2;
     }
     fclose(fp);
     /* Lock implies versioning, whatever the file says (fail safe). */
@@ -747,7 +758,10 @@ static s3_err_t bucket_create(s3_store_t *s, s3_str_t name,
     memset(&nm, 0, sizeof(nm));
     snprintf(nm.id, sizeof(nm.id), "%s", id);
     snprintf(nm.owner, sizeof(nm.owner), "%s", owner ? owner : "");
-    if (locked) { nm.object_lock = 1; nm.versioning = S3_VERSIONING_ENABLED; }
+    /* Object-lock buckets get layout 2 (item 9): every version, the
+     * current one too, lives in versions/; data/ holds symlinks, so no
+     * write ever links or renames a (possibly immutable) version inode. */
+    if (locked) { nm.object_lock = 1; nm.versioning = S3_VERSIONING_ENABLED; nm.layout = 2; }
     s3_err_t e = write_bucket_meta_full(stage, &nm);
     if (e != S3_OK) { rm_rf(stage); return e; }
 
@@ -1917,8 +1931,17 @@ s3_err_t store_put_commit(s3_writer_t *w, s3_obj_meta_t *meta_out) {
     key_usage(w->store, bucket, hex, &q_b0, &q_o0);
 
     /* Versioned bucket: move the current version aside first (hard link,
-     * crash-safe; see store.h). */
-    {
+     * crash-safe; see store.h). Layout 2 instead writes the version into
+     * versions/ and re-points the data symlink (item 9). */
+    if (bm.layout == 2) {
+        s3_err_t le = l2_publish(w->store, bucket, hex, w->tmp_path, w->hdr.mtime_ms,
+                                 w->ext.version_id);
+        if (le != S3_OK) {
+            pthread_mutex_unlock(&w->store->ns_mu);
+            pthread_mutex_unlock(km);
+            writer_free(w); return le;
+        }
+    } else {
         s3_err_t le = link_aside_locked(w->store, bucket, hex, path, versioning);
         if (le != S3_OK) {
             pthread_mutex_unlock(&w->store->ns_mu);
@@ -1928,7 +1951,7 @@ s3_err_t store_put_commit(s3_writer_t *w, s3_obj_meta_t *meta_out) {
     }
 
     /* Atomic rename. Can also fail with ENOSPC (new dirent allocation). */
-    if (rename(w->tmp_path, path) < 0) {
+    if (bm.layout != 2 && rename(w->tmp_path, path) < 0) {
         LOG_E("rename %s -> %s: %s", w->tmp_path, path, strerror(errno));
         s3_err_t e = map_io_err(errno);
         pthread_mutex_unlock(&w->store->ns_mu);
@@ -2265,8 +2288,10 @@ static int starts_with(const char *p, size_t n, s3_str_t pref) {
 }
 
 /* Read one object file's header into entry. Sets entry->key (malloc'd). */
+static int open_cur(const char *path);
+
 static int load_entry(const char *path, list_entry_t *out) {
-    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    int fd = open_cur(path);
     if (fd < 0) return -1;
     obj_header_t h;
     obj_ext_v3_t x;
@@ -3535,6 +3560,10 @@ s3_err_t store_mpu_complete2(s3_store_t *s, s3_str_t bucket, s3_str_t key,
     pthread_mutex_lock(&s->ns_mu);
     if (!store_bucket_exists(s, bucket))          e = S3_ERR_NO_SUCH_BUCKET;
     else if (access(up_meta, F_OK) < 0)           e = S3_ERR_NO_SUCH_UPLOAD;
+    else if (bucket_layout(s, bucket) == 2) {
+        e = l2_publish(s, bucket, hex, tmp_path, hdr.mtime_ms, ext.version_id);
+        if (e == S3_OK) { q_parts = upload_part_bytes(up_dir); rm_rf(up_dir); tmp_path[0] = '\0'; }
+    }
     else if ((e = link_aside_locked(s, bucket, hex, target_path, versioning)) != S3_OK) ;
     else if (mkdir_p(target_dir, 0700) < 0
              || rename(tmp_path, target_path) < 0) e = map_io_err(errno);
@@ -4097,9 +4126,71 @@ static int vname_cmp(const void *a, const void *b) {
     return strcmp(((const vname_t *)a)->name, ((const vname_t *)b)->name);
 }
 
-/* Sorted (newest first) entry names of a version dir. */
+/* Layout 2 (round 2, item 9): data/<b>/xx/yy/<hex> may be a relative
+ * symlink to the current version, ../../../../versions/<b>/xx/yy/<hex>/<entry>.
+ * Anything else in the data tree that is not a regular file is refused:
+ * the share is untrusted and a planted symlink must never redirect reads.
+ * Returns 0 regular file (real = path), 1 valid layout-2 link (real =
+ * the version file), -1 absent, -2 invalid. */
+static int resolve_current(const char *path, char *real, size_t cap, char entry[50]) {
+    struct stat st;
+    if (lstat(path, &st) < 0) return -1;
+    if (S_ISREG(st.st_mode)) {
+        if (snprintf(real, cap, "%s", path) >= (int)cap) return -2;
+        if (entry) entry[0] = '\0';
+        return 0;
+    }
+    if (!S_ISLNK(st.st_mode)) return -2;
+    char tgt[1024];
+    ssize_t n = readlink(path, tgt, sizeof(tgt) - 1);
+    if (n <= 0) return -2;
+    tgt[n] = '\0';
+    /* Last four components of path: <b>/<xx>/<yy>/<hex>. */
+    const char *p = path + strlen(path);
+    int slashes = 0;
+    while (p > path && slashes < 5) { p--; if (*p == '/') slashes++; }
+    if (slashes != 5) return -2;
+    const char *tail = p + 1 + strlen("data/");             /* "<b>/<xx>/<yy>/<hex>" */
+    if (strncmp(p + 1, "data/", 5)) return -2;
+    char want[1024];
+    int wn = snprintf(want, sizeof(want), "../../../../versions/%s/", tail);
+    if (wn <= 0 || (size_t)wn >= sizeof(want) || strncmp(tgt, want, (size_t)wn)) return -2;
+    const char *ent = tgt + wn;
+    uint8_t vid[16];
+    if (strchr(ent, '/') || ventry_parse(ent, vid) < 0) return -2;
+    if (snprintf(real, cap, "%.*s/versions/%s/%s", (int)(p - path), path, tail, ent) >= (int)cap)
+        return -2;
+    if (entry) snprintf(entry, 50, "%s", ent);
+    return 1;
+}
+
+/* Open the current object file (layout 1 or 2) without following any
+ * other symlink. -1 with errno set when absent or invalid. */
+static int open_cur(const char *path) {
+    char real[4600];
+    int r = resolve_current(path, real, sizeof(real), NULL);
+    if (r == -1) { errno = ENOENT; return -1; }
+    if (r < 0) { errno = ELOOP; return -1; }
+    return open(real, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+}
+
+/* Sorted (newest first) entry names of a version dir — the noncurrent
+ * versions: in layout 2 the entry the data symlink points at is the
+ * current version and is left out, so both layouts read the same. */
 static vname_t *vdir_list(const char *vdir, size_t *n_out) {
     *n_out = 0;
+    char cur_entry[50] = "";
+    {
+        /* data path: <root>/data/<b>/xx/yy/<hex> from <root>/versions/<b>/xx/yy/<hex> */
+        const char *p = vdir + strlen(vdir);
+        int slashes = 0;
+        while (p > vdir && slashes < 5) { p--; if (*p == '/') slashes++; }
+        if (slashes == 5 && !strncmp(p + 1, "versions/", 9)) {
+            char dp[4600], real[4600];
+            snprintf(dp, sizeof(dp), "%.*s/data/%s", (int)(p - vdir), vdir, p + 10);
+            if (resolve_current(dp, real, sizeof(real), cur_entry) != 1) cur_entry[0] = '\0';
+        }
+    }
     DIR *d = opendir(vdir);
     if (!d) return NULL;
     vname_t *v = NULL;
@@ -4108,6 +4199,7 @@ static vname_t *vdir_list(const char *vdir, size_t *n_out) {
     while ((e = readdir(d)) != NULL) {
         uint8_t vid[16];
         if (ventry_parse(e->d_name, vid) < 0) continue;
+        if (cur_entry[0] && !strcmp(e->d_name, cur_entry)) continue;   /* layout 2: current */
         if (n == cap) {
             size_t nc = cap ? cap * 2 : 8;
             vname_t *nv = realloc(v, nc * sizeof(*nv));
@@ -4130,11 +4222,67 @@ static int bucket_versioning(s3_store_t *s, s3_str_t bucket) {
 
 /* Header of the file at path (0 ok). */
 static int peek_meta(const char *path, s3_obj_meta_t *m) {
-    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    int fd = open_cur(path);
     if (fd < 0) return -1;
     s3_err_t e = read_header(fd, NULL, m);
     close(fd);
     return e == S3_OK ? 0 : -1;
+}
+
+static int bucket_layout(s3_store_t *s, s3_str_t bucket) {
+    s3_bucket_meta_t m;
+    return store_bucket_meta(s, bucket, &m) == S3_OK ? m.layout : 0;
+}
+
+void store_set_version_unlink_hook(s3_store_t *s, int (*fn)(void *, const char *), void *user) {
+    s->vunlink_hook = fn;
+    s->vunlink_user = user;
+}
+
+/* Unlink one version file, asking the hook first. */
+static s3_err_t unlink_version_file(s3_store_t *s, const char *vp) {
+    if (s->vunlink_hook && s->vunlink_hook(s->vunlink_user, vp) != 0) return S3_ERR_LOCKED;
+    if (unlink(vp) < 0 && errno != ENOENT) return map_io_err(errno);
+    return S3_OK;
+}
+
+/* Layout 2: point data/<hex> at versions/.../<hex>/<entry> (NULL: no
+ * current version — remove the link). New link made in tmp/ and renamed
+ * over the old one, so readers see the old or the new current, never
+ * none. Caller holds the key's stripe lock. */
+static s3_err_t l2_point(s3_store_t *s, s3_str_t bucket, const char hex[65], const char *entry) {
+    char path[4096], dir[4096];
+    if (obj_path(s, bucket, hex, path, sizeof(path)) < 0
+        || obj_dir(s, bucket, hex, dir, sizeof(dir)) < 0) return S3_ERR_INTERNAL;
+    if (!entry) {
+        if (unlink(path) < 0 && errno != ENOENT) return map_io_err(errno);
+        fsync_dir(dir);
+        return S3_OK;
+    }
+    if (mkdir_p(dir, 0700) < 0) return map_io_err(errno);
+    char target[1200], lnk[4300], rid[33];
+    snprintf(target, sizeof(target), "../../../../versions/" S3_STR_FMT "/%c%c/%c%c/%s/%s",
+             S3_STR_ARG(bucket), hex[0], hex[1], hex[2], hex[3], hex, entry);
+    if (random_hex_id(rid, sizeof(rid)) < 0) return S3_ERR_INTERNAL;
+    snprintf(lnk, sizeof(lnk), "%s/lnk.%s", s->tmp_dir, rid);
+    if (symlink(target, lnk) < 0) return map_io_err(errno);
+    if (rename(lnk, path) < 0) { s3_err_t e = map_io_err(errno); unlink(lnk); return e; }
+    fsync_dir(dir);
+    return S3_OK;
+}
+
+/* Layout 2: tmp file → versions/.../<hex>/<inv_ts>-<vid>, then make it
+ * current. Caller holds the stripe lock (and ns_mu for the bucket check). */
+static s3_err_t l2_publish(s3_store_t *s, s3_str_t bucket, const char hex[65],
+                           const char *tmp_file, uint64_t mtime_ms, const uint8_t vid[16]) {
+    char vdir[4300], name[50], vp[4400];
+    if (vdir_path(s, bucket, hex, vdir, sizeof(vdir)) < 0) return S3_ERR_INTERNAL;
+    if (mkdir_p(vdir, 0700) < 0) return map_io_err(errno);
+    ventry_name(mtime_ms, vid, name);
+    snprintf(vp, sizeof(vp), "%s/%s", vdir, name);
+    if (rename(tmp_file, vp) < 0) return map_io_err(errno);
+    fsync_dir(vdir);
+    return l2_point(s, bucket, hex, name);
 }
 
 /* Before replacing the current object of a versioned bucket: move the
@@ -4208,7 +4356,9 @@ static void recover_version_links(const s3_store_t *s) {
                     snprintf(cur, sizeof(cur), "%s/%s/%s/%s/%s", s->data_dir, be->d_name,
                              e1->d_name, e2->d_name, eh->d_name);
                     struct stat cst;
-                    if (stat(cur, &cst) < 0) continue;
+                    /* Layout 2: the current file is a symlink into the
+                     * version dir — not a link-aside leftover. */
+                    if (lstat(cur, &cst) < 0 || !S_ISREG(cst.st_mode)) continue;
                     DIR *d3 = opendir(vdir);
                     if (!d3) continue;
                     struct dirent *e3;
@@ -4248,7 +4398,7 @@ s3_err_t store_get_open_version(s3_store_t *s, s3_str_t bucket, s3_str_t key,
     hash_bucket_key(bucket, key, hex);
     if (obj_path(s, bucket, hex, path, sizeof(path)) < 0) return S3_ERR_INTERNAL;
 
-    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    int fd = open_cur(path);
     obj_header_t h;
     if (fd >= 0) {
         s3_err_t e = read_header(fd, &h, meta_out);
@@ -4402,11 +4552,18 @@ static s3_err_t delete_locked_raw(s3_store_t *s, s3_str_t bucket, s3_str_t key,
         char tmp[4096];
         s3_err_t e = make_marker_tmp(s, key, nv, tmp, sizeof(tmp));
         if (e != S3_OK) return e;
+        int layout = bucket_layout(s, bucket);
+        s3_obj_meta_t mm;
+        if (layout == 2 && peek_meta(tmp, &mm) < 0) e = S3_ERR_INTERNAL;
         pthread_mutex_lock(&s->ns_mu);
         if (!store_bucket_exists(s, bucket)) e = S3_ERR_NO_SUCH_BUCKET;
-        if (e == S3_OK) e = link_aside_locked(s, bucket, hex, path, versioning);
-        if (e == S3_OK && (mkdir_p(dir, 0700) < 0 || rename(tmp, path) < 0))
-            e = map_io_err(errno);
+        if (e == S3_OK && layout == 2) {
+            e = l2_publish(s, bucket, hex, tmp, mm.mtime_ms, nv);
+        } else {
+            if (e == S3_OK) e = link_aside_locked(s, bucket, hex, path, versioning);
+            if (e == S3_OK && (mkdir_p(dir, 0700) < 0 || rename(tmp, path) < 0))
+                e = map_io_err(errno);
+        }
         pthread_mutex_unlock(&s->ns_mu);
         if (e != S3_OK) { unlink(tmp); return e; }
         fsync_dir(dir);
@@ -4423,6 +4580,16 @@ static s3_err_t delete_locked_raw(s3_store_t *s, s3_str_t bucket, s3_str_t key,
         res->delete_marker = (cur.flags & S3_OBJF_DELETE_MARKER) != 0;
         size_t n;
         vname_t *v = vdir_list(vdir, &n);
+        char real[4600];
+        if (resolve_current(path, real, sizeof(real), NULL) == 1) {
+            /* Layout 2: remove the version file, then re-point the link
+             * at the newest remaining version (or drop it). */
+            s3_err_t e2 = unlink_version_file(s, real);
+            if (e2 == S3_OK) e2 = l2_point(s, bucket, hex, n ? v[0].name : NULL);
+            fsync_dir(vdir);
+            free(v);
+            return e2;
+        }
         int rc;
         if (n) {
             char vp[4400];
@@ -4452,7 +4619,7 @@ static s3_err_t delete_locked_raw(s3_store_t *s, s3_str_t bucket, s3_str_t key,
         e = guard_check(s, bucket, key, &m);
         if (e != S3_OK) break;
         res->delete_marker = (m.flags & S3_OBJF_DELETE_MARKER) != 0;
-        if (unlink(vp) < 0) e = map_io_err(errno);
+        e = unlink_version_file(s, vp);
         fsync_dir(vdir);
         found = 1;
         break;
@@ -5001,7 +5168,8 @@ static void key_usage(s3_store_t *s, s3_str_t bucket, const char hex[65],
     if (obj_path(s, bucket, hex, path, sizeof(path)) < 0
         || vdir_path(s, bucket, hex, vdir, sizeof(vdir)) < 0) return;
     struct stat cst;
-    int have = stat(path, &cst) == 0;
+    char real[4600];
+    int have = resolve_current(path, real, sizeof(real), NULL) >= 0 && stat(real, &cst) == 0;
     s3_obj_meta_t m;
     if (have) {
         (*objs)++;
@@ -5059,7 +5227,8 @@ typedef struct { uint64_t bytes, objs; } q_acc_t;
 
 static void acc_object(const char *path, const char *name, void *ctx) {
     q_acc_t *a = ctx;
-    if (strlen(name) != 64) return;
+    struct stat lst;
+    if (strlen(name) != 64 || lstat(path, &lst) < 0 || !S_ISREG(lst.st_mode)) return;
     s3_obj_meta_t m;
     a->objs++;
     if (peek_meta(path, &m) == 0) a->bytes += m.size;
@@ -5955,4 +6124,25 @@ static ssize_t ssec_read(s3_reader_t *r, void *buf, size_t n) {
         r->pos += take;
     }
     return (ssize_t)done;
+}
+
+int store_version_file(s3_store_t *s, s3_str_t bucket, s3_str_t key, const uint8_t vid[16],
+                       char *out, size_t cap) {
+    if (!valid_bucket_name(bucket) || !valid_key(key) || bucket_layout(s, bucket) != 2) return -1;
+    char hex[65], vdir[4300], want[33];
+    hash_bucket_key(bucket, key, hex);
+    if (vdir_path(s, bucket, hex, vdir, sizeof(vdir)) < 0) return -1;
+    vid_hex(vid, want);
+    DIR *d = opendir(vdir);
+    if (!d) return -1;
+    int rc = -1;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        uint8_t v[16];
+        if (ventry_parse(e->d_name, v) < 0 || strcmp(e->d_name + 17, want)) continue;
+        rc = snprintf(out, cap, "%s/%s", vdir, e->d_name) < (int)cap ? 0 : -1;
+        break;
+    }
+    closedir(d);
+    return rc;
 }

@@ -97,6 +97,8 @@ static void usage(const char *argv0) {
         "      --dedup-min-size N     only objects of at least N bytes (default 1M)\n"
         "      --dedup-verify         byte-compare before sharing\n"
         "      --fs-compress off|auto|all  Btrfs transparent compression of objects (default off)\n"
+        "      --lock-immutable       make COMPLIANCE / legal-hold versions FS_IMMUTABLE_FL via\n"
+        "                             fs3-lockd (--lockd-socket PATH); refuses to start without it\n"
         "      --scrub-interval-days N  integrity scrub every N days (default 30; 0 = only on demand)\n"
         "      --scrub-now            start a scrub pass right after startup\n"
         "      --scrub-rate N         scrub read rate in bytes/s (default 20M; 0 = unthrottled)\n"
@@ -416,6 +418,8 @@ enum {
     OPT_REFLINK,
     OPT_DEDUP,
     OPT_FS_COMPRESS,
+    OPT_LOCK_IMMUTABLE,
+    OPT_LOCKD_SOCKET,
     OPT_DEDUP_MIN,
     OPT_DEDUP_VERIFY,
     OPT_SECCOMP_LIST,
@@ -498,7 +502,8 @@ int main(int argc, char **argv) {
     int key_max_age_days = 0;
     int seccomp_mode = SANDBOX_ENFORCE;
     int reflink_off = 0;
-    int dedup_mode = 0, dedup_verify = 0, fs_compress = 0;
+    int dedup_mode = 0, dedup_verify = 0, fs_compress = 0, lock_immutable = 0;
+    const char *lockd_socket = NULL;
     uint64_t dedup_min = 1024 * 1024;
     uint64_t scrub_rate = 20ULL * 1024 * 1024;           /* 20 MiB/s */
     int tls_port = 0, require_tls = 0, require_signed_payload = 0, tls_max_per_ip = 32;
@@ -556,6 +561,8 @@ int main(int argc, char **argv) {
         { "reflink",          required_argument, NULL, OPT_REFLINK },
         { "dedup",            required_argument, NULL, OPT_DEDUP },
         { "fs-compress",      required_argument, NULL, OPT_FS_COMPRESS },
+        { "lock-immutable",   no_argument,       NULL, OPT_LOCK_IMMUTABLE },
+        { "lockd-socket",     required_argument, NULL, OPT_LOCKD_SOCKET },
         { "dedup-min-size",   required_argument, NULL, OPT_DEDUP_MIN },
         { "dedup-verify",     no_argument,       NULL, OPT_DEDUP_VERIFY },
         { "seccomp-list",     no_argument,       NULL, OPT_SECCOMP_LIST },
@@ -798,6 +805,8 @@ int main(int argc, char **argv) {
                 }
                 break;
             case OPT_DEDUP_VERIFY: dedup_verify = 1; break;
+            case OPT_LOCK_IMMUTABLE: lock_immutable = 1; break;
+            case OPT_LOCKD_SOCKET:   lockd_socket = optarg; break;
             case OPT_FS_COMPRESS:
                 if (!strcmp(optarg, "off")) fs_compress = STORE_COMPRESS_OFF;
                 else if (!strcmp(optarg, "auto")) fs_compress = STORE_COMPRESS_AUTO;
@@ -975,6 +984,7 @@ int main(int argc, char **argv) {
         .dedup_min = dedup_min,
         .dedup_verify = dedup_verify,
         .fs_compress = fs_compress,
+        .lockd_socket = lock_immutable ? lockd_socket : NULL,
         .tls_port        = (uint16_t)tls_port,
         .tls_addr        = tls_addr,
         .tls_cert        = tls_cert,
@@ -992,6 +1002,10 @@ int main(int argc, char **argv) {
         .tick_user      = &reload_ctx,
     };
 
+    if (lock_immutable && !lockd_socket) {
+        fprintf(stderr, "--lock-immutable needs --lockd-socket PATH\n");
+        return 2;
+    }
     if (auth) {
         snprintf(g_keys_state, sizeof(g_keys_state), "%s/keys.state", data_root);
         keys_state_load(auth);

@@ -26,6 +26,12 @@ trap 'rm -rf "${BUILD}"' EXIT
 mkdir -p "${BUILD}/pkg/bin"
 cp "${BIN}" "${BUILD}/pkg/bin/fs3"
 chmod 755 "${BUILD}/pkg/bin/fs3"
+# Optional root helper for --lock-immutable (round 2, item 9). It is not
+# started by the package: DSM runs packages unprivileged (see CHANGELOG).
+if [ -f "${PROJ_ROOT}/fs3-lockd" ]; then
+    cp "${PROJ_ROOT}/fs3-lockd" "${BUILD}/pkg/bin/fs3-lockd"
+    chmod 755 "${BUILD}/pkg/bin/fs3-lockd"
+fi
 cp "${PROJ_ROOT}/README.md"  "${BUILD}/pkg/README.md"  2>/dev/null || true
 cp "${PROJ_ROOT}/LICENSE"    "${BUILD}/pkg/LICENSE"     2>/dev/null || true
 

@@ -214,9 +214,31 @@ What's working end-to-end:
   intended. A missing lock record
   falls back to the bucket default; an unreadable one fails closed.
   Retention trusts the system clock; a backwards jump of more than an
-  hour is logged. This is API-level WORM only: root on the NAS can still
-  delete files (`FS_IMMUTABLE_FL` hardening is not implemented — it
-  conflicts with the hard-link version scheme).
+  hour is logged. By default this is API-level WORM: root, or another
+  account with write access to the share, can still delete files.
+
+- **Filesystem immutability** (opt-in) — buckets created with Object
+  Lock use *layout 2*: every version, the current one included, is a file
+  in `versions/`, and `data/<b>/…/<hex>` is a relative symlink to the
+  current one (re-pointed atomically), so no write ever links or renames
+  a locked inode. Reads follow such a link only if it points exactly into
+  that key's own version directory. With `--lock-immutable
+  --lockd-socket PATH`, COMPLIANCE and legal-hold versions are made
+  `FS_IMMUTABLE_FL` by **`fs3-lockd`**, a separate ~300-line root-run
+  helper and the only holder of `CAP_LINUX_IMMUTABLE` (fs3 runs without
+  it). The helper keeps its own root-only, append-only journal
+  (inode → retain-until, hold), only ever extends retention, releases a
+  hold only on an explicit `HOLD_OFF`, and refuses to clear the flag
+  early whatever fs3 asks, so neither other share users, fs3 bugs nor a
+  compromised fs3 can delete such a version. A permanent delete asks it
+  to clear the flag first (lifecycle expiry works the same way).
+  GOVERNANCE versions stay bypassable and are not made immutable. With
+  `--lock-immutable`, fs3 refuses to start if the helper is unreachable or
+  the filesystem refuses the flag. Root can still clear the flag, and
+  retention still trusts the clock. Existing lock buckets keep layout 1
+  (API-level WORM). Start the helper as root:
+  `fs3-lockd --root <data dir> --socket <path> --journal <file>
+  [--peer-uid <fs3 uid>]`; on DSM see the SPK notes.
 
 - **Static website hosting** (Garage's model) — `PUT/GET/DELETE
   /bucket?website` with `IndexDocument/Suffix`, `ErrorDocument/Key` or
@@ -432,13 +454,14 @@ What's working end-to-end:
 
 What's *not* yet wired:
 
-- Application-level compression (ext4), `FS_IMMUTABLE_FL` for
-  COMPLIANCE versions.
+- Application-level compression (ext4); an offline converter from
+  layout 1 to layout 2 for existing object-lock buckets.
 - Tag-based lifecycle filters, transitions, website routing rules (all
   refused with 501 rather than ignored).
 - Replication, server-side encryption, STS.
 
-**Upgrading:** the object header (schema 4 since round 2), version and lock trees are
+**Upgrading:** the object header (schema 4 since round 2), layout-2
+object-lock buckets, credential attributes, version and lock trees are
 one-way migrations — an older fs3 cannot read data written by this one.
 See `packaging/synology/CHANGELOG.md`.
 

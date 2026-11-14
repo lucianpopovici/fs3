@@ -28,6 +28,19 @@
 - Opt-in whole-object dedup on Btrfs (`--dedup owner|global`, new `cas/` pool dir).
 - Btrfs transparent compression of objects (`--fs-compress auto|all`).
 - SSE-C (customer-provided keys; TLS only).
+- Object-lock buckets created from now on use **layout 2** (versions/ +
+  data/ symlinks); one-way: an older fs3 cannot read them. Existing
+  lock buckets are unchanged.
+- Optional `FS_IMMUTABLE_FL` for COMPLIANCE / legal-hold versions via the
+  new root helper `fs3-lockd` (`--lock-immutable --lockd-socket`). **Manual
+  opt-in on DSM:** DSM 7 runs packages as an unprivileged user and kernel
+  3.10 has no ambient capabilities, so the helper cannot run inside the
+  package. Start it as root yourself (e.g. a root "Triggered task" at boot
+  in Task Scheduler running
+  `/var/packages/fs3/target/bin/fs3-lockd --root <data dir> --socket
+  /var/packages/fs3/var/lockd.sock --journal /var/packages/fs3/var/lockd.journal`),
+  then add `--lock-immutable --lockd-socket /var/packages/fs3/var/lockd.sock`
+  to the service flags. Without it the status stays "API-level WORM".
 - Audit log lines carry the S3 error code (`"error":"…"`).
 - Fix: a request refused before `100 Continue` now closes the connection
   (botocore stalled 60 s on the next request).

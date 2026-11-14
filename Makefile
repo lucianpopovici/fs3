@@ -38,7 +38,7 @@ INCLUDES   := -Iinclude -I$(LLHTTP_DIR)/include -I$(XML_DIR)
 # Server objects
 SRV_SRCS := src/main.c src/server.c src/conn.c src/log.c src/store_fs.c \
             src/route.c src/response.c src/sigv4.c src/metrics.c \
-            src/iopool.c src/action.c src/checksum.c src/query.c src/cors.c src/lifecycle.c src/website.c src/json.c src/admin.c src/policy.c src/objlock.c src/tls.c src/audit.c src/objmeta.c src/scrub.c src/sandbox.c src/ssec.c
+            src/iopool.c src/action.c src/checksum.c src/query.c src/cors.c src/lifecycle.c src/website.c src/json.c src/admin.c src/policy.c src/objlock.c src/tls.c src/audit.c src/objmeta.c src/scrub.c src/sandbox.c src/ssec.c src/lockc.c
 SRV_OBJS := $(SRV_SRCS:.c=.o)
 
 LLHTTP_OBJS := $(LLHTTP_DIR)/src/api.o $(LLHTTP_DIR)/src/http.o \
@@ -55,7 +55,7 @@ ifeq ($(DEBUG),1)
                    -fsanitize=address,undefined -fno-omit-frame-pointer
 endif
 
-all: fs3
+all: fs3 fs3-lockd
 
 fs3: $(OBJS)
 	$(CC) $(OBJS) -o $@ $(LDFLAGS)
@@ -104,7 +104,7 @@ check-test-deps:
 	    echo "missing tool '$$t' (aws: pip install -r tests/requirements.txt; curl/openssl: apt-get install curl openssl)" >&2; \
 	    exit 1; }; done
 
-test: check-test-deps $(TEST_BINS) fs3
+test: check-test-deps $(TEST_BINS) fs3 fs3-lockd
 	@echo "=== test_policy (+50000 fuzz iterations) ==="
 	@./tests/test_policy 50000
 	@echo "=== test_json (+50000 fuzz iterations) ==="
@@ -157,6 +157,8 @@ test: check-test-deps $(TEST_BINS) fs3
 	@./tests/test_e2e_reflink.sh
 	@echo "=== test_e2e_ssec (round 2: SSE-C over TLS) ==="
 	@./tests/test_e2e_ssec.sh
+	@echo "=== test_e2e_immutable (round 2: layout 2 + fs3-lockd; needs root) ==="
+	@./tests/test_e2e_immutable.sh
 	@echo "=== test_e2e_phase9 (range / bulk-delete / bucket-subresources) ==="
 	@./tests/test_e2e_phase9.sh
 	@echo "=== test_e2e_phase10 (object copy / ?acl stub) ==="
@@ -256,13 +258,13 @@ tests/test_sigv4: tests/test_sigv4.c src/sigv4.c src/query.c
 # test_credfile needs the FS3_MAIN_TESTING macro to expose main.c's
 # credentials-file parser and exclude main()/on_signal, so it can supply
 # its own main() without pulling in server.c's dependency chain.
-tests/test_credfile: tests/test_credfile.c src/main.c src/sigv4.c src/log.c src/query.c src/sandbox.c src/ssec.c
+tests/test_credfile: tests/test_credfile.c src/main.c src/sigv4.c src/log.c src/query.c src/sandbox.c src/ssec.c src/lockc.c
 	$(CC) $(CFLAGS) $(INCLUDES) -DFS3_MAIN_TESTING \
 	    tests/test_credfile.c src/main.c src/sigv4.c src/log.c src/query.c src/sandbox.c \
 	    $(LDFLAGS) -o $@
 
 clean:
-	rm -f fs3 fs3-tls $(OBJS) $(OBJS:.o=.d) $(TEST_BINS) tests/*.d
+	rm -f fs3 fs3-tls fs3-lockd $(OBJS) $(OBJS:.o=.d) $(TEST_BINS) tests/*.d
 
 # Auto-include compiler-generated dependency files so header changes
 # correctly invalidate object files. Created via -MMD -MP above.
@@ -306,3 +308,11 @@ smoketest: fs3
 # suites under strace and diff against the compiled-in allowlist.
 seccomp-profile: fs3 fs3-tls
 	@./tests/tools/seccomp_profile.sh
+
+# Root-run immutability helper (round 2, item 9); no store dependency.
+fs3-lockd: src/lockd.c
+	$(CC) $(CFLAGS) src/lockd.c -o $@
+
+# Static helper for the Synology package (no libcrypto needed).
+fs3-lockd-static: src/lockd.c
+	$(CC) $(CFLAGS) -static src/lockd.c -o fs3-lockd

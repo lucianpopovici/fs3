@@ -67,7 +67,14 @@ integrity scrub (`src/scrub.c`, `store_scrub_file`) and key hygiene
 seccomp (`src/sandbox.c`) and reflink fast paths (`clone_range`,
 `store_writer_clone`), dedup (`dedup_commit`, `cas/`), Btrfs
 compression (`set_compr_flag`) and SSE-C (`src/ssec.c`, writer/reader
-transform in store_fs.c). Not done yet: `FS_IMMUTABLE_FL` hardening.
+transform in store_fs.c) and layout 2 + `fs3-lockd` (`src/lockd.c`,
+`src/lockc.c`, `l2_publish`/`l2_point`, `resolve_current`).
+
+- **Layout 2 (object-lock buckets):** `data/<hex>` is a symlink into
+  `versions/`. Open current objects with `open_cur()` (never plain
+  `open()` on a data path); `vdir_list()` leaves the current entry out so
+  "versions dir = noncurrent" holds in both layouts. Version files are
+  unlinked through `unlink_version_file()` (the fs3-lockd hook).
 
 - **Writer byte counts:** `data_written` is plaintext (quota, data_size),
   `stored_written` is on disk (stored_size, part records). Any new path

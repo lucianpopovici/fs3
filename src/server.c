@@ -14,6 +14,7 @@
 #include "lifecycle.h"
 #include "scrub.h"
 #include "sandbox.h"
+#include "lockc.h"
 #include "sigv4.h"
 #include "admin.h"
 #include "objlock.h"
@@ -315,6 +316,15 @@ static void admin_handle(server_t *s, int lfd, int via_uds) {
     }
 }
 
+/* Before a version file is unlinked: an immutable one must be cleared by
+ * fs3-lockd, which refuses while retention or a hold applies. */
+static int lockd_unlink_hook(void *user, const char *path) {
+    if (!lockc_is_immutable(path)) return 0;
+    int rc = lockc_clear((const char *)user, path);
+    if (rc != 0) LOG_W("lock-immutable: fs3-lockd refused to clear %s", path);
+    return rc == 0 ? 0 : -1;
+}
+
 server_t *server_create(const server_cfg_t *cfg) {
     if (action_selfcheck() != 0) {
         LOG_E("action table incomplete: refusing to start (default deny)");
@@ -344,6 +354,22 @@ server_t *server_create(const server_cfg_t *cfg) {
               (double)cfg->min_free_bytes / (1024.0 * 1024.0));
     }
     LOG_I("store opened at %s", cfg->data_root);
+
+    /* --lock-immutable (item 9): fail closed — probe fs3-lockd (set and
+     * clear on a scratch file) or refuse to start rather than silently
+     * fall back to API-level WORM. */
+    if (cfg->lockd_socket) {
+        char why[300], td[4200];
+        snprintf(td, sizeof(td), "%s/tmp", cfg->data_root);
+        if (lockc_probe(cfg->lockd_socket, td, why, sizeof(why)) < 0) {
+            LOG_E("--lock-immutable: %s; refusing to start", why);
+            goto fail;
+        }
+        store_set_version_unlink_hook(s->store, lockd_unlink_hook, (void *)cfg->lockd_socket);
+        LOG_I("lock-immutable: fs3-lockd at %s (COMPLIANCE / legal-hold versions in "
+              "object-lock buckets become FS_IMMUTABLE_FL)", cfg->lockd_socket);
+    }
+
 
     if (cfg->legacy_owner) {
         int n = store_assign_legacy_owner(s->store, cfg->legacy_owner);
@@ -714,6 +740,7 @@ static void accept_new(server_t *s, int lfd, int is_web) {
             conn_destroy(c);
             continue;
         }
+        c->lockd_sock = s->cfg.lockd_socket;
         c->max_retention_ms = (uint64_t)(s->cfg.max_retention_days > 0
                                          ? s->cfg.max_retention_days : 3650) * 86400000ULL;
 

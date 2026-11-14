@@ -73,7 +73,7 @@ static const sb_call_t ALLOW[] = {
     /* files and directories */
     C(openat), C(newfstatat), C(fstat), C(statfs), C(fstatfs), C(getdents64),
     C(renameat), C(linkat), C(unlinkat), C(mkdirat), C(faccessat), C(readlinkat),
-    C(utimensat), C(fchmod), C(umask), C(getcwd),
+    C(utimensat), C(fchmod), C(umask), C(getcwd), C(symlinkat),   /* layout-2 links */
 #ifdef __NR_renameat2
     C(renameat2),
 #endif
@@ -85,11 +85,12 @@ static const sb_call_t ALLOW[] = {
 #endif
 #ifdef __NR_open
     C(open), C(stat), C(lstat), C(rename), C(link), C(unlink), C(mkdir), C(rmdir),
-    C(access), C(readlink), C(getdents),
+    C(access), C(readlink), C(getdents), C(symlink),
 #endif
     /* network (listeners already bound) */
     C(accept4), C(recvfrom), C(sendto), C(recvmsg), C(sendmsg), C(shutdown),
     C(setsockopt), C(getsockopt), C(getpeername), C(getsockname),
+    C(connect),                         /* fs3-lockd's Unix socket (item 9) */
 #ifdef __NR_accept
     C(accept),
 #endif

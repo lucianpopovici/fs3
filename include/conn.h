@@ -149,6 +149,7 @@ typedef struct conn {
     int                metrics_flushed;
     int                expect_pending; /* Expect: 100-continue not answered yet */
     const char        *deny_reason;   /* sigv4 refusal reason (static string) */
+    const char        *lockd_sock;    /* --lock-immutable: fs3-lockd socket (item 9) */
     int                last_err;
     /* SSE-C keys for this request only (item 8): cleansed at request end. */
     int                ssec_on, ssec_src_on;
