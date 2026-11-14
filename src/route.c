@@ -20,6 +20,8 @@
 #include "cors.h"
 #include "lifecycle.h"
 #include "website.h"
+#include "policy.h"
+#include "xml_parser.h"
 #include "conn.h"
 #include "iopool.h"
 #include "log.h"
@@ -129,6 +131,11 @@ static const s3_str_t *hdr_get(const conn_t *c, const char *lc_name) {
     return NULL;
 }
 
+static int bucket_versioning_state(conn_t *c, s3_str_t bucket) {
+    s3_bucket_meta_t m;
+    return store_bucket_meta(c->store, bucket, &m) == S3_OK ? m.versioning : 0;
+}
+
 /* Queue x-amz-checksum-<algo> (+ type) response headers for m. */
 static void add_checksum_headers(conn_t *c, const s3_obj_meta_t *m) {
     if (!m->cksum_algo) return;
@@ -163,6 +170,24 @@ static int ieq_lit(s3_str_t a, const char *b) {
         if (x != y) return 0;
     }
     return 1;
+}
+
+/* x-amz-version-id for a versioned response. vid all-zero: "null", but
+ * only if the bucket has (ever had) versioning. */
+static void add_version_header(conn_t *c, s3_str_t bucket, const uint8_t vid[16]) {
+    char vs[33];
+    store_vid_format(vid, vs);
+    if (!strcmp(vs, "null") && bucket_versioning_state(c, bucket) == S3_VERSIONING_UNSET)
+        return;
+    conn_add_header(c, "x-amz-version-id", vs);
+}
+
+/* ?versionId → *vid (returns 1), absent → 0, malformed → -1 (S5:
+ * validated before any path is built). */
+static int version_param(const conn_t *c, uint8_t vid[16]) {
+    const conn_qparam_t *p = conn_query_get(c, "versionId");
+    if (!p) return 0;
+    return store_vid_parse(p->v, vid) == 0 ? 1 : -1;
 }
 
 /* Method comparison. */
@@ -210,34 +235,69 @@ static void scratch_reset(conn_t *c) { c->req_scratch_used = 0; }
  * denial. Unclassified actions (no table entry) are always denied.
  *
  * Evaluation order (later items plug in here):
+ *   policy actions                        → owner/admin only (lockout rule)
+ *   bucket policy explicit Deny           → deny    (item 9)
  *   owner or admin                        → allow
  *   per-user grant covering the action    → allow   (item 3)
+ *   bucket policy Allow                   → allow   (anonymous via "*")
  *   otherwise                             → deny
  */
+static int is_policy_action(s3_action_t a) {
+    return a == ACT_GET_BUCKET_POLICY || a == ACT_PUT_BUCKET_POLICY
+        || a == ACT_DELETE_BUCKET_POLICY;
+}
+
 s3_err_t authz(conn_t *c, s3_str_t bucket, s3_str_t key, s3_action_t act) {
-    (void)key;
     const s3_action_info_t *ai = action_info(act);
     if (!ai) return S3_ERR_ACCESS_DENIED;          /* default deny */
     if (!c->auth) return S3_OK;                    /* open mode */
+    int anon = !c->id.user[0];
     if (act == ACT_LIST_BUCKETS || act == ACT_CREATE_BUCKET)
-        return c->id.user[0] ? S3_OK : S3_ERR_ACCESS_DENIED;
+        return anon ? S3_ERR_ACCESS_DENIED : S3_OK;
     s3_bucket_meta_t m;
     s3_err_t e = store_bucket_meta(c->store, bucket, &m);
     if (e != S3_OK) {
         /* Anonymous callers learn nothing about which buckets exist. */
-        return c->id.user[0] ? e : S3_ERR_ACCESS_DENIED;
+        return anon ? S3_ERR_ACCESS_DENIED : e;
     }
-    if (!c->id.user[0]) return S3_ERR_ACCESS_DENIED;
-    if (c->id.is_admin) return S3_OK;
-    if (m.owner[0] && strcmp(m.owner, c->id.user) == 0) return S3_OK;
+    int owner = !anon && (c->id.is_admin
+                          || (m.owner[0] && strcmp(m.owner, c->id.user) == 0));
+
+    /* Policy lockout rule (S6): the owner and admins can always read,
+     * replace or delete the policy, whatever it says; nobody else can. */
+    if (is_policy_action(act)) return owner ? S3_OK : S3_ERR_ACCESS_DENIED;
+
+    /* Bucket policy: an explicit Deny wins over everything, owner and
+     * admin included (admins can still edit the policy). */
+    policy_effect_t pe = POLICY_NONE;
+    store_cfg_ref_t *pref = store_sidecar_get(c->store, bucket, "policy.json",
+                                              POLICY_MAX_BYTES, policy_parse_cb,
+                                              policy_free_cb);
+    if (pref) {
+        const conn_qparam_t *qp = act == ACT_LIST_OBJECTS ? conn_query_get(c, "prefix") : NULL;
+        policy_req_t pr = {
+            .user = c->id.user, .action = ai->iam_name, .bucket = bucket,
+            .key = ai->bucket_level ? S3_STR_NULL : key,
+            .source_ip = c->client_ip[0] ? c->client_ip : NULL,
+            .secure = c->secure,
+            .prefix = qp ? qp->v : S3_STR_NULL, .has_prefix = qp != NULL,
+        };
+        pe = policy_eval(store_cfg_obj(pref), &pr);
+        store_sidecar_put(c->store, pref);
+    }
+    if (pe == POLICY_DENY) return S3_ERR_POLICY_DENIED;
+    if (owner) return S3_OK;
     /* Grants: r → list/get, w → put/delete/MPU, o → config. Bucket
      * delete and create are never grantable. */
-    if (act != ACT_DELETE_BUCKET) {
+    if (!anon && act != ACT_DELETE_BUCKET) {
         int g = store_bucket_grant_perms(c->store, bucket, c->id.user);
         int need = ai->perm == PERM_R ? S3_GRANT_R
                  : ai->perm == PERM_W ? S3_GRANT_W : S3_GRANT_O;
         if (g & need) return S3_OK;
     }
+    /* A policy Allow (including Principal "*" for anonymous callers) —
+     * never for bucket deletion. */
+    if (pe == POLICY_ALLOW && act != ACT_DELETE_BUCKET) return S3_OK;
     return S3_ERR_ACCESS_DENIED;
 }
 
@@ -306,7 +366,8 @@ static int handle_bulk_delete_begin(conn_t *c, s3_str_t bucket) {
  * Sets quiet_out to 1 if <Quiet>true</Quiet> is present. Returns 0 ok,
  * -1 on OOM. Caller frees each key and the array. */
 static int parse_delete_body(const char *body, size_t body_len,
-                              char ***keys_out, size_t *n_out, int *quiet_out) {
+                              char ***keys_out, char ***vids_out,
+                              size_t *n_out, int *quiet_out) {
     *quiet_out = 0;
     static const char qt_open[]  = "<Quiet>";
     static const char qt_close[] = "</Quiet>";
@@ -326,7 +387,7 @@ static int parse_delete_body(const char *body, size_t body_len,
     static const char key_open[]  = "<Key>";
     static const char key_close[] = "</Key>";
 
-    char **keys = NULL;
+    char **keys = NULL, **vids = NULL;
     size_t n_keys = 0, cap = 0;
     size_t pos = 0;
 
@@ -356,8 +417,21 @@ static int parse_delete_body(const char *body, size_t body_len,
                     size_t nc = cap ? cap * 2 : 16;
                     char **nk = realloc(keys, nc * sizeof(*nk));
                     if (!nk) { free(k); goto oom; }
-                    keys = nk; cap = nc;
+                    keys = nk;
+                    char **nv = realloc(vids, nc * sizeof(*nv));
+                    if (!nv) { free(k); goto oom; }
+                    vids = nv;
+                    cap = nc;
                 }
+                char *vid = NULL;
+                static const char vo[] = "<VersionId>", vc[] = "</VersionId>";
+                const char *vp = memmem(body + obj_start, obj_end - obj_start, vo, sizeof(vo) - 1);
+                if (vp) {
+                    size_t v0 = (size_t)(vp - body) + sizeof(vo) - 1;
+                    const char *vq = memmem(body + v0, obj_end - v0, vc, sizeof(vc) - 1);
+                    if (vq) vid = strndup(body + v0, (size_t)(vq - body) - v0);
+                }
+                vids[n_keys] = vid;
                 keys[n_keys++] = k;
             }
         }
@@ -365,11 +439,13 @@ static int parse_delete_body(const char *body, size_t body_len,
     }
 
     *keys_out = keys;
+    *vids_out = vids;
     *n_out    = n_keys;
     return 0;
 oom:
-    for (size_t i = 0; i < n_keys; i++) free(keys[i]);
+    for (size_t i = 0; i < n_keys; i++) { free(keys[i]); if (vids) free(vids[i]); }
     free(keys);
+    free(vids);
     return -1;
 }
 
@@ -377,11 +453,11 @@ static int handle_bulk_delete_finish(conn_t *c, s3_str_t bucket) {
     if (c->req_body_len > c->req_body_cap) {
         return rsp_build_s3_error(c, S3_ERR_ENTITY_TOO_LARGE, c->req.path, NULL);
     }
-    char **keys = NULL;
+    char **keys = NULL, **vids = NULL;
     size_t n_keys = 0;
     int quiet = 0;
     if (parse_delete_body(c->req_body_buf, c->req_body_len,
-                          &keys, &n_keys, &quiet) < 0) {
+                          &keys, &vids, &n_keys, &quiet) < 0) {
         return rsp_build_s3_error(c, S3_ERR_INTERNAL, c->req.path, NULL);
     }
     if (n_keys == 0) {
@@ -391,13 +467,22 @@ static int handle_bulk_delete_finish(conn_t *c, s3_str_t bucket) {
     const char **error_keys   = malloc(n_keys * sizeof(*error_keys));
     size_t n_deleted = 0, n_errors = 0;
     if (!deleted_keys || !error_keys) {
-        for (size_t i = 0; i < n_keys; i++) free(keys[i]);
-        free(keys); free(deleted_keys); free(error_keys);
+        for (size_t i = 0; i < n_keys; i++) { free(keys[i]); free(vids[i]); }
+        free(keys); free(vids); free(deleted_keys); free(error_keys);
         return rsp_build_s3_error(c, S3_ERR_INTERNAL, c->req.path, NULL);
     }
     for (size_t i = 0; i < n_keys; i++) {
         s3_str_t k = { keys[i], strlen(keys[i]) };
-        s3_err_t e = store_delete(c->store, bucket, k);
+        /* Each key is its own delete: it needs w on the bucket (checked at
+         * dispatch) and, with versions, a valid id (S5). */
+        uint8_t vid[16];
+        s3_err_t e;
+        if (vids[i] && store_vid_parse((s3_str_t){ vids[i], strlen(vids[i]) }, vid) < 0)
+            e = S3_ERR_INVALID_ARGUMENT;
+        else if ((e = authz(c, bucket, k, ACT_DELETE_OBJECT)) != S3_OK)
+            ;   /* per-key policy decision (prefix-scoped Deny etc.) */
+        else
+            e = store_delete_ex(c->store, bucket, k, vids[i] ? vid : NULL, NULL);
         if (e == S3_OK) {
             if (!quiet) deleted_keys[n_deleted++] = keys[i];
         } else {
@@ -406,8 +491,8 @@ static int handle_bulk_delete_finish(conn_t *c, s3_str_t bucket) {
     }
     int rc = rsp_build_delete_objects(c, deleted_keys, n_deleted,
                                        error_keys, n_errors);
-    for (size_t i = 0; i < n_keys; i++) free(keys[i]);
-    free(keys); free(deleted_keys); free(error_keys);
+    for (size_t i = 0; i < n_keys; i++) { free(keys[i]); free(vids[i]); }
+    free(keys); free(vids); free(deleted_keys); free(error_keys);
     return rc;
 }
 
@@ -435,6 +520,8 @@ static const cfg_kind_t CFG_KINDS[] = {
       "lifecycle.xml", S3_ERR_NO_SUCH_LIFECYCLE, "application/xml" },
     { ACT_GET_BUCKET_WEBSITE, ACT_PUT_BUCKET_WEBSITE, ACT_DELETE_BUCKET_WEBSITE,
       "website.xml", S3_ERR_NO_SUCH_WEBSITE, "application/xml" },
+    { ACT_GET_BUCKET_POLICY, ACT_PUT_BUCKET_POLICY, ACT_DELETE_BUCKET_POLICY,
+      "policy.json", S3_ERR_NO_SUCH_POLICY, "application/json" },
 };
 
 static const cfg_kind_t *cfg_kind_for(s3_action_t act) {
@@ -468,6 +555,25 @@ static s3_err_t cfg_validate(conn_t *c, s3_action_t act, const char *body,
         LOG_W("lifecycle configuration installed on " S3_STR_FMT
               "%s: matching objects will be deleted by the sweeper",
               S3_STR_ARG(c->cfg_bucket), imm ? " (immediate expiry confirmed)" : "");
+        return S3_OK;
+    }
+    case ACT_PUT_BUCKET_POLICY: {
+        policy_check_t chk;
+        policy_t *pol = policy_compile(body, n, c->cfg_bucket, &chk);
+        if (!pol) {
+            LOG_D("policy rejected: %s", chk.msg ? chk.msg : "?");
+            return S3_ERR_MALFORMED_POLICY;
+        }
+        policy_free(pol);
+        /* S6: public grants need --allow-public, public writes need
+         * --allow-public-write as well. */
+        if ((chk.public_read && !c->allow_public)
+            || (chk.public_write && !c->allow_public_write)) {
+            LOG_W("refusing public bucket policy on " S3_STR_FMT
+                  " (--allow-public%s not set)", S3_STR_ARG(c->cfg_bucket),
+                  chk.public_write ? "-write" : "");
+            return S3_ERR_ACCESS_DENIED;
+        }
         return S3_OK;
     }
     case ACT_PUT_BUCKET_WEBSITE: {
@@ -507,9 +613,33 @@ static int cfg_put_begin(conn_t *c, s3_str_t bucket, s3_action_t act) {
     return 0;
 }
 
+static int put_versioning_finish(conn_t *c) {
+    if (c->req_body_len > c->req_body_cap)
+        return rsp_build_s3_error(c, S3_ERR_ENTITY_TOO_LARGE, c->req.path, NULL);
+    xml_parse_opts_t po = { .max_depth = 4, .max_nodes = 16 };
+    XMLNode *root = parse_xml(c->req_body_buf, c->req_body_len, &po, NULL);
+    if (!root || strcmp(root->local_name, "VersioningConfiguration") != 0) {
+        free_tree(root);
+        return rsp_build_s3_error(c, S3_ERR_MALFORMED_XML, c->req.path, NULL);
+    }
+    XMLNode *st = find_child(root, "Status");
+    XMLNode *mfa = find_child(root, "MfaDelete");
+    int state = -1;
+    if (st && st->content && !strcmp(st->content, "Enabled")) state = S3_VERSIONING_ENABLED;
+    else if (st && st->content && !strcmp(st->content, "Suspended")) state = S3_VERSIONING_SUSPENDED;
+    int mfa_on = mfa && mfa->content && !strcmp(mfa->content, "Enabled");
+    free_tree(root);
+    if (mfa_on) return rsp_build_s3_error(c, S3_ERR_NOT_IMPLEMENTED, c->req.path, NULL);
+    if (state < 0) return rsp_build_s3_error(c, S3_ERR_MALFORMED_XML, c->req.path, NULL);
+    s3_err_t e = store_bucket_set_versioning(c->store, c->cfg_bucket, state);
+    if (e != S3_OK) return rsp_build_s3_error(c, e, c->req.path, NULL);
+    return rsp_build_status(c, 200, "OK");
+}
+
 static int cfg_put_finish(conn_t *c) {
     s3_action_t act = (s3_action_t)c->cfg_act;
     c->cfg_act = 0;
+    if (act == ACT_PUT_BUCKET_VERSIONING) return put_versioning_finish(c);
     const cfg_kind_t *k = cfg_kind_for(act);
     if (!k) return rsp_build_s3_error(c, S3_ERR_INTERNAL, c->req.path, NULL);
     if (c->req_body_len > c->req_body_cap)
@@ -685,7 +815,8 @@ static int handle_bucket(conn_t *c, s3_str_t bucket, s3_action_t act) {
                                       c->req.path, NULL);
         if (act == ACT_GET_BUCKET_ACL)        return rsp_build_acl(c);
         if (act == ACT_GET_BUCKET_LOCATION)   return rsp_build_bucket_location(c);
-        if (act == ACT_GET_BUCKET_VERSIONING) return rsp_build_bucket_versioning(c);
+        if (act == ACT_GET_BUCKET_VERSIONING)
+            return rsp_build_bucket_versioning_state(c, bucket_versioning_state(c, bucket));
         return rsp_build_status(c, 200, "OK");
 
     case ACT_CREATE_BUCKET: {
@@ -715,6 +846,28 @@ static int handle_bucket(conn_t *c, s3_str_t bucket, s3_action_t act) {
 
     case ACT_DELETE_OBJECTS:
         return handle_bulk_delete_begin(c, bucket);
+
+    case ACT_PUT_BUCKET_VERSIONING:
+        return cfg_put_begin(c, bucket, act);
+
+    case ACT_LIST_OBJECT_VERSIONS: {
+        s3_version_list_opts_t o = {
+            .prefix = q_val(c, "prefix"), .delimiter = q_val(c, "delimiter"),
+            .key_marker = q_val(c, "key-marker"),
+            .version_id_marker = q_val(c, "version-id-marker"),
+            .max_keys = max_keys_param(c, "max-keys"),
+        };
+        s3_version_info_t *v = NULL;
+        size_t n = 0;
+        int trunc = 0;
+        char *nk = NULL, nv[33];
+        s3_err_t e = store_list_versions(c->store, bucket, &o, &v, &n, &trunc, &nk, nv);
+        if (e != S3_OK) return rsp_build_s3_error(c, e, c->req.path, NULL);
+        int rc = rsp_build_list_versions(c, bucket, &o, v, n, trunc, nk, nv);
+        store_versions_free(v, n);
+        free(nk);
+        return rc;
+    }
 
     case ACT_LIST_MPU_UPLOADS: {
         s3_str_t prefix = q_val(c, "prefix");
@@ -828,6 +981,11 @@ static void commit_done(iojob_t *j) {
                 snprintf(extra, sizeof(extra), "ETag: %s\r\n", etag);
             }
             echo_request_checksum(c);
+            if (!cj->is_part) {
+                char bb[64];
+                s3_str_t bk;
+                if (path_bucket(c, bb, &bk)) add_version_header(c, bk, cj->meta.version_id);
+            }
             rc = rsp_build_status_with_headers(c, 200, "OK", extra);
         }
         job_respond(c, rc);
@@ -950,10 +1108,19 @@ static int handle_object_get(conn_t *c, s3_str_t bucket, s3_str_t key,
                              int head_only) {
     s3_reader_t *r;
     s3_obj_meta_t m;
-    s3_err_t e = store_get_open(c->store, bucket, key, &r, &m);
+    uint8_t vid[16];
+    int hv = c->is_web ? 0 : version_param(c, vid);
+    if (hv < 0) return rsp_build_s3_error(c, S3_ERR_INVALID_ARGUMENT, c->req.path, NULL);
+    s3_err_t e = store_get_open_version(c->store, bucket, key, hv ? vid : NULL, &r, &m);
     if (e != S3_OK) {
+        if (m.flags & S3_OBJF_DELETE_MARKER) {
+            conn_add_header(c, "x-amz-delete-marker", "true");
+            add_version_header(c, bucket, m.version_id);
+            if (e == S3_ERR_METHOD_NOT_ALLOWED) conn_add_header(c, "Allow", "DELETE");
+        }
         return rsp_build_s3_error(c, e, c->req.path, NULL);
     }
+    if (!c->is_web) add_version_header(c, bucket, m.version_id);
     /* S7: an uploaded HTML object opened via a presigned or anonymous URL
      * must not run as an active page on this origin. */
     if (!c->is_web && (!c->id.user[0] || c->id.presigned))
@@ -1002,10 +1169,18 @@ static int handle_object_get(conn_t *c, s3_str_t bucket, s3_str_t key,
 }
 
 static int handle_object_delete(conn_t *c, s3_str_t bucket, s3_str_t key) {
-    s3_err_t e = store_delete(c->store, bucket, key);
+    uint8_t vid[16];
+    int hv = version_param(c, vid);
+    if (hv < 0) return rsp_build_s3_error(c, S3_ERR_INVALID_ARGUMENT, c->req.path, NULL);
+    const s3_str_t *bp = hdr_get(c, "x-amz-bypass-governance-retention");
+    store_set_guard_bypass(bp && ieq_lit(*bp, "true") && c->id.is_admin);
+    store_delete_result_t res;
+    s3_err_t e = store_delete_ex(c->store, bucket, key, hv ? vid : NULL, &res);
     if (e != S3_OK) {
         return rsp_build_s3_error(c, e, c->req.path, NULL);
     }
+    if (res.delete_marker) conn_add_header(c, "x-amz-delete-marker", "true");
+    if (res.versioned || hv) conn_add_header(c, "x-amz-version-id", res.version_id);
     return rsp_build_status(c, 204, "No Content");
 }
 
@@ -1047,6 +1222,7 @@ static void copy_done(iojob_t *j) {
     copy_job_t *cj = (copy_job_t *)j;
     conn_t *c = job_finish(j);
     if (c) {
+        if (cj->err == S3_OK) add_version_header(c, c->copy_bucket, cj->meta.version_id);
         job_respond(c, cj->err != S3_OK
             ? rsp_build_s3_error(c, cj->err, c->req.path, NULL)
             : rsp_build_copy_object(c, &cj->meta));
@@ -1066,9 +1242,20 @@ static int handle_object_copy(conn_t *c, s3_str_t dst_bucket, s3_str_t dst_key) 
     memcpy(src_buf, src_hdr->p, src_hdr->n);
     size_t src_n = pct_decode(src_buf, src_hdr->n);
 
-    /* Strip optional versionId query string (we ignore versions). */
+    /* Optional ?versionId=<id> selects a source version. */
+    uint8_t src_vid[16];
+    int has_src_vid = 0;
     char *qmark = memchr(src_buf, '?', src_n);
-    if (qmark) src_n = (size_t)(qmark - src_buf);
+    if (qmark) {
+        s3_str_t q = { qmark + 1, src_n - (size_t)(qmark + 1 - src_buf) };
+        if (q.n < 10 || memcmp(q.p, "versionId=", 10) != 0
+            || store_vid_parse((s3_str_t){ q.p + 10, q.n - 10 }, src_vid) < 0) {
+            free(src_buf);
+            return rsp_build_s3_error(c, S3_ERR_INVALID_ARGUMENT, c->req.path, NULL);
+        }
+        has_src_vid = 1;
+        src_n = (size_t)(qmark - src_buf);
+    }
 
     /* Skip optional leading '/'. */
     char *p = src_buf;
@@ -1100,7 +1287,14 @@ static int handle_object_copy(conn_t *c, s3_str_t dst_bucket, s3_str_t dst_key) 
     /* Open source. */
     s3_reader_t *reader = NULL;
     s3_obj_meta_t src_meta;
-    s3_err_t e = store_get_open(c->store, src_bucket, src_key, &reader, &src_meta);
+    s3_err_t e = store_get_open_version(c->store, src_bucket, src_key,
+                                        has_src_vid ? src_vid : NULL,
+                                        &reader, &src_meta);
+    if (e == S3_OK && has_src_vid) {
+        char vs[33];
+        store_vid_format(src_vid, vs);
+        conn_add_header(c, "x-amz-copy-source-version-id", vs);
+    }
     if (e != S3_OK) {
         free(src_buf);
         return rsp_build_s3_error(c, e, c->req.path, NULL);
@@ -1367,6 +1561,7 @@ static void mpu_complete_done(iojob_t *j) {
         job_respond(c, mj->err != S3_OK
             ? rsp_build_s3_error(c, mj->err, c->req.path, NULL)
             : (add_checksum_headers(c, &mj->meta),
+               add_version_header(c, c->mpu_bucket, mj->meta.version_id),
                rsp_build_complete_mpu2(c, c->mpu_bucket, c->mpu_key, mj->etag,
                                        &mj->meta)));
     }
@@ -1702,7 +1897,7 @@ static s3_action_t classify_service(const conn_t *c, s3_err_t *err) {
 static s3_action_t classify_bucket(const conn_t *c, s3_err_t *err) {
     static const char *const handled[] = {
         "acl", "location", "versioning", "uploads", "delete", "cors",
-        "lifecycle", "website", NULL
+        "lifecycle", "website", "versions", "policy", NULL
     };
     int unhandled;
     const char *sub = pick_subresource(c, handled, &unhandled);
@@ -1723,7 +1918,9 @@ static s3_action_t classify_bucket(const conn_t *c, s3_err_t *err) {
         if (get) return ACT_GET_BUCKET_LOCATION;
     } else if (!strcmp(sub, "versioning")) {
         if (get) return ACT_GET_BUCKET_VERSIONING;
-        if (put) { *err = S3_ERR_NOT_IMPLEMENTED; return ACT_NONE; }
+        if (put) return ACT_PUT_BUCKET_VERSIONING;
+    } else if (!strcmp(sub, "versions")) {
+        if (get) return ACT_LIST_OBJECT_VERSIONS;
     } else if (!strcmp(sub, "uploads")) {
         if (get) return ACT_LIST_MPU_UPLOADS;
     } else if (!strcmp(sub, "delete")) {
@@ -1736,6 +1933,10 @@ static s3_action_t classify_bucket(const conn_t *c, s3_err_t *err) {
         if (get) return ACT_GET_BUCKET_LIFECYCLE;
         if (put) return ACT_PUT_BUCKET_LIFECYCLE;
         if (del) return ACT_DELETE_BUCKET_LIFECYCLE;
+    } else if (!strcmp(sub, "policy")) {
+        if (get) return ACT_GET_BUCKET_POLICY;
+        if (put) return ACT_PUT_BUCKET_POLICY;
+        if (del) return ACT_DELETE_BUCKET_POLICY;
     } else if (!strcmp(sub, "website")) {
         if (get) return ACT_GET_BUCKET_WEBSITE;
         if (put) return ACT_PUT_BUCKET_WEBSITE;
@@ -1763,6 +1964,12 @@ static s3_action_t classify_object(const conn_t *c, s3_err_t *err) {
         if (!is_known_subresource(k)) continue;
         if (s3_str_eq_lit(k, "uploadId") || s3_str_eq_lit(k, "partNumber"))
             continue;
+        /* versionId modifies GET/HEAD/DELETE (and ?acl etc.); a PUT can't
+         * target a version. */
+        if (s3_str_eq_lit(k, "versionId")) {
+            if (put || post) { *err = S3_ERR_INVALID_ARGUMENT; return ACT_NONE; }
+            continue;
+        }
         int ok = 0;
         for (size_t h = 0; handled[h]; h++)
             if (s3_str_eq_lit(k, handled[h])) { ok = 1; break; }

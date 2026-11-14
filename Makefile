@@ -30,7 +30,7 @@ INCLUDES   := -Iinclude -I$(LLHTTP_DIR)/include -I$(XML_DIR)
 # Server objects
 SRV_SRCS := src/main.c src/server.c src/conn.c src/log.c src/store_fs.c \
             src/route.c src/response.c src/sigv4.c src/metrics.c \
-            src/iopool.c src/action.c src/checksum.c src/query.c src/cors.c src/lifecycle.c src/website.c src/json.c src/admin.c
+            src/iopool.c src/action.c src/checksum.c src/query.c src/cors.c src/lifecycle.c src/website.c src/json.c src/admin.c src/policy.c
 SRV_OBJS := $(SRV_SRCS:.c=.o)
 
 LLHTTP_OBJS := $(LLHTTP_DIR)/src/api.o $(LLHTTP_DIR)/src/http.o \
@@ -119,6 +119,8 @@ test: $(TEST_BINS) fs3
 	@./tests/test_e2e_subresources.sh
 	@echo "=== test_e2e_checksum (item 1: trailers + x-amz-checksum-*) ==="
 	@./tests/test_e2e_checksum.sh
+	@echo "=== test_e2e_versioning (item 8: versioning) ==="
+	@./tests/test_e2e_versioning.sh
 	@echo "=== test_e2e_admin (item 11: admin API) ==="
 	@./tests/test_e2e_admin.sh
 	@echo "=== test_e2e_website (item 6: static websites) ==="

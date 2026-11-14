@@ -225,8 +225,18 @@ typedef struct conn {
      * Authorization ignored, bucket from Host. */
     int                is_web;
     const char        *web_root_domain;   /* server-lifetime string */
-    /* --allow-public: website configs / public policies may be stored. */
+    /* --allow-public: website configs / public policies may be stored.
+     * --allow-public-write: public policies may also grant writes. */
     int                allow_public;
+    int                allow_public_write;
+    /* Trust signals (items 7.6 / 9): client address and whether the
+     * request arrived over TLS. Behind a proxy listed in
+     * trusted_proxies, X-Forwarded-For / X-Forwarded-Proto are honoured;
+     * from anyone else they are ignored. */
+    const char        *trusted_proxies;   /* comma-separated IPs, server-lifetime */
+    int                conn_tls;          /* this connection is TLS (native) */
+    char               client_ip[64];
+    int                secure;
 
     /* The request's signature was verified (header or presigned). */
     int                sig_verified;
@@ -317,6 +327,10 @@ int     conn_parse_query(conn_t *c);
 const conn_qparam_t *conn_query_get(const conn_t *c, const char *name);
 /* Number of parameters named `name`. */
 int     conn_query_count(const conn_t *c, const char *name);
+
+/* Fill c->client_ip / c->secure from the peer and, for a trusted proxy,
+ * X-Forwarded-For (rightmost entry) / X-Forwarded-Proto. */
+void    conn_resolve_client(conn_t *c);
 
 /* Queue an extra response header for the current request. Returns 0, or
  * -1 if the extra-header buffer is full (the header is dropped). */

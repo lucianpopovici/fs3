@@ -111,8 +111,10 @@ void     store_admin_stats(s3_store_t *s, s3_admin_stats_t *out);
  * one header per object — O(objects) opens, so call per scrape or
  * page load, not per request. */
 typedef struct {
-    uint64_t objects;
+    uint64_t objects;          /* current objects (delete markers excluded) */
     uint64_t bytes;
+    uint64_t versions;         /* noncurrent versions + delete markers */
+    uint64_t version_bytes;
 } s3_bucket_stats_t;
 s3_err_t store_bucket_stats(s3_store_t *s, s3_str_t bucket,
                             s3_bucket_stats_t *out);
@@ -460,6 +462,92 @@ void     store_set_mpu_gc_filter(s3_store_t *s,
                                  int (*filter)(void *user, s3_str_t bucket,
                                                s3_str_t key),
                                  void *user);
+
+/* ---- Versioning (item 8) ----
+ *
+ * The current version stays where unversioned objects live (data/...), so
+ * unversioned GET/list are as fast as before. Superseded versions move to
+ *   versions/<b>/xx/yy/<hex>/<inv_ts>-<vid>
+ * with inv_ts = UINT64_MAX - mtime_ms (16 hex, so readdir order sorted is
+ * newest first) and vid = 32 hex (all zeros = the null version). They are
+ * moved aside with link(2) before the new current is renamed in, all under
+ * the key's stripe lock: a crash in between leaves a version entry that
+ * shares the current file's inode, removed at startup.
+ *
+ * Version ids on the wire: 32 lowercase hex, or "null". */
+#define S3_VID_HEX_LEN 32
+
+/* "null" for the all-zero id, else 32 hex. out: 33 bytes. */
+void     store_vid_format(const uint8_t vid[16], char out[33]);
+/* Parse a wire version id ("null" or exactly 32 hex — validated before
+ * any path is built, security review S5). 0 ok, -1 invalid. */
+int      store_vid_parse(s3_str_t s, uint8_t vid[16]);
+
+/* Open a specific version (vid NULL = current). The current version being
+ * a delete marker yields S3_ERR_NO_SUCH_KEY with meta_out filled (flags
+ * has S3_OBJF_DELETE_MARKER). Opening a delete marker by version id gives
+ * S3_ERR_METHOD_NOT_ALLOWED with meta_out filled. */
+s3_err_t store_get_open_version(s3_store_t *s, s3_str_t bucket, s3_str_t key,
+                                const uint8_t *vid,
+                                s3_reader_t **out, s3_obj_meta_t *meta_out);
+
+typedef struct {
+    int     delete_marker;      /* a marker was created / removed */
+    int     versioned;          /* bucket versioning not Unset */
+    char    version_id[33];     /* created marker's, or deleted version's */
+} store_delete_result_t;
+
+/* DELETE with versioning semantics. vid NULL: Unset → unlink; Enabled →
+ * new delete marker (old current moved aside); Suspended → null delete
+ * marker. vid given: permanently remove that version (current → newest
+ * noncurrent is promoted; removing a delete marker "undeletes"). The
+ * version-delete guard (object lock) can veto with S3_ERR_ACCESS_DENIED. */
+s3_err_t store_delete_ex(s3_store_t *s, s3_str_t bucket, s3_str_t key,
+                         const uint8_t *vid, store_delete_result_t *res);
+
+/* Veto hook for permanently removing a version (item 10). Return S3_OK to
+ * allow. Called with the key's stripe lock held: must not call back into
+ * mutating store functions. */
+typedef s3_err_t (*store_version_guard_fn)(void *user, s3_str_t bucket,
+                                           s3_str_t key, const s3_obj_meta_t *m,
+                                           int bypass);
+void     store_set_version_guard(s3_store_t *s, store_version_guard_fn fn,
+                                 void *user);
+/* Per-thread "bypass governance retention" flag consulted by the guard
+ * for the next store_delete_ex on this thread (cleared after use). */
+void     store_set_guard_bypass(int bypass);
+
+typedef struct {
+    char         *key;           /* owned; NULL for a common prefix entry */
+    char         *prefix;        /* owned; common prefix (delimiter) */
+    char          version_id[33];
+    int           is_latest;
+    s3_obj_meta_t meta;
+} s3_version_info_t;
+
+typedef struct {
+    s3_str_t prefix, delimiter, key_marker, version_id_marker;
+    int      max_keys;           /* 0 → 1000 */
+} s3_version_list_opts_t;
+
+/* ListObjectVersions: keys in order, versions newest first. *truncated
+ * and next markers are set when max_keys stopped the listing. */
+s3_err_t store_list_versions(s3_store_t *s, s3_str_t bucket,
+                             const s3_version_list_opts_t *o,
+                             s3_version_info_t **out, size_t *n_out,
+                             int *truncated, char **next_key,
+                             char next_vid[33]);
+void     store_versions_free(s3_version_info_t *v, size_t n);
+
+/* Noncurrent versions of one key, newest first (lifecycle). noncurrent_
+ * since_ms = mtime of the next newer version. */
+typedef struct {
+    uint8_t       vid[16];
+    s3_obj_meta_t meta;
+    uint64_t      noncurrent_since_ms;
+} s3_noncurrent_t;
+s3_err_t store_list_noncurrent(s3_store_t *s, s3_str_t bucket, s3_str_t key,
+                               s3_noncurrent_t **out, size_t *n_out);
 
 /* ---- Object walk (lifecycle sweeper, scrub) ----
  *

@@ -76,6 +76,10 @@ typedef struct {
     /* Block-public-access off (S6): website configs (and public bucket
      * policies) may be stored. Default 0. */
     int                    allow_public;
+    int                    allow_public_write;   /* public policies may grant writes */
+    /* Comma-separated proxy IPs whose X-Forwarded-For/-Proto are trusted
+     * (aws:SourceIp, aws:SecureTransport). */
+    const char            *trusted_proxies;
 
     /* Admin API (item 11): /v1 on the metrics listener needs this bearer
      * token (NULL = disabled there); admin_socket adds a Unix-socket

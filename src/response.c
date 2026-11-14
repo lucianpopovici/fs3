@@ -121,6 +121,9 @@ static const err_entry_t ERR_TABLE[] = {
     { S3_ERR_NO_SUCH_WEBSITE,            404, "NoSuchWebsiteConfiguration", "The specified bucket does not have a website configuration." },
     { S3_ERR_NO_SUCH_POLICY,             404, "NoSuchBucketPolicy",       "The bucket policy does not exist." },
     { S3_ERR_NO_SUCH_OBJECT_LOCK,        404, "ObjectLockConfigurationNotFoundError", "Object Lock configuration does not exist for this bucket." },
+    { S3_ERR_NO_SUCH_VERSION,            404, "NoSuchVersion",            "The specified version does not exist." },
+    { S3_ERR_POLICY_DENIED,              403, "AccessDenied",             "Access denied by bucket policy." },
+    { S3_ERR_LOCKED,                     403, "AccessDenied",             "Access denied: the object version is locked." },
     { S3_ERR_MALFORMED_POLICY,           400, "MalformedPolicy",          "Policies must be valid JSON within the supported grammar." },
     { S3_ERR_INSUFFICIENT_STORAGE,       507, "QuotaExceeded",            "There is insufficient storage available to complete the request." },
 };
@@ -140,6 +143,8 @@ const char *s3_err_name(s3_err_t e) {
     case S3_ERR_INVALID_CHECKSUM:  return "InvalidChecksum";
     case S3_ERR_CHECKSUM_MISMATCH: return "ChecksumMismatch";
     case S3_ERR_BAD_DIGEST:        return "ContentSHA256Mismatch";
+    case S3_ERR_POLICY_DENIED:     return "PolicyDenied";
+    case S3_ERR_LOCKED:            return "LockDenied";
     default: return err_lookup(e)->s3_code;
     }
 }
@@ -807,12 +812,18 @@ int rsp_build_bucket_location(conn_t *c) {
 }
 
 int rsp_build_bucket_versioning(conn_t *c) {
+    return rsp_build_bucket_versioning_state(c, 0);
+}
+
+int rsp_build_bucket_versioning_state(conn_t *c, int state) {
     XMLNode *root = create_node("VersioningConfiguration");
     if (!root) return -1;
     if (add_attr(root, "xmlns", "http://s3.amazonaws.com/doc/2006-03-01/") < 0) {
         free_tree(root); return -1;
     }
     /* No Status child = versioning never configured. */
+    if (state == S3_VERSIONING_ENABLED) xml_text_child(root, "Status", "Enabled");
+    else if (state == S3_VERSIONING_SUSPENDED) xml_text_child(root, "Status", "Suspended");
     size_t blen = 0;
     char *body = xml_render_with_decl(root, &blen);
     free_tree(root);
@@ -860,6 +871,63 @@ int rsp_build_list_mpu_uploads(conn_t *c, s3_str_t bucket, s3_str_t prefix,
          * AWS clients tolerate their absence. */
     }
 
+    size_t blen = 0;
+    char *body = xml_render_with_decl(root, &blen);
+    free_tree(root);
+    if (!body) return -1;
+    return ship_xml_200(c, body, blen);
+}
+
+int rsp_build_list_versions(conn_t *c, s3_str_t bucket,
+                            const s3_version_list_opts_t *o,
+                            const s3_version_info_t *v, size_t n,
+                            int truncated, const char *next_key,
+                            const char *next_vid) {
+    XMLNode *root = create_node("ListVersionsResult");
+    if (!root) return -1;
+    if (add_attr(root, "xmlns", "http://s3.amazonaws.com/doc/2006-03-01/") < 0) {
+        free_tree(root); return -1;
+    }
+    xml_text_child_n(root, "Name", bucket.p, bucket.n);
+    xml_text_child_n(root, "Prefix", o->prefix.p ? o->prefix.p : "", o->prefix.n);
+    xml_text_child_n(root, "KeyMarker", o->key_marker.p ? o->key_marker.p : "", o->key_marker.n);
+    xml_text_child_n(root, "VersionIdMarker", o->version_id_marker.p ? o->version_id_marker.p : "",
+                     o->version_id_marker.n);
+    char mk[16];
+    snprintf(mk, sizeof(mk), "%d", o->max_keys > 0 && o->max_keys <= 1000 ? o->max_keys : 1000);
+    xml_text_child(root, "MaxKeys", mk);
+    if (o->delimiter.n) xml_text_child_n(root, "Delimiter", o->delimiter.p, o->delimiter.n);
+    xml_text_child(root, "IsTruncated", truncated ? "true" : "false");
+    if (truncated && next_key) {
+        xml_text_child(root, "NextKeyMarker", next_key);
+        if (next_vid && next_vid[0]) xml_text_child(root, "NextVersionIdMarker", next_vid);
+    }
+    for (size_t i = 0; i < n; i++) {
+        if (v[i].prefix) {
+            XMLNode *cp = create_node("CommonPrefixes");
+            if (!cp || add_child(root, cp) < 0) { free_tree(cp); free_tree(root); return -1; }
+            xml_text_child(cp, "Prefix", v[i].prefix);
+            continue;
+        }
+        int marker = (v[i].meta.flags & S3_OBJF_DELETE_MARKER) != 0;
+        XMLNode *e = create_node(marker ? "DeleteMarker" : "Version");
+        if (!e || add_child(root, e) < 0) { free_tree(e); free_tree(root); return -1; }
+        xml_text_child(e, "Key", v[i].key);
+        xml_text_child(e, "VersionId", v[i].version_id);
+        xml_text_child(e, "IsLatest", v[i].is_latest ? "true" : "false");
+        char ts[32];
+        rsp_format_iso8601(v[i].meta.mtime_ms, ts);
+        xml_text_child(e, "LastModified", ts);
+        if (!marker) {
+            char etag[41];
+            rsp_format_etag_with_parts(v[i].meta.etag, v[i].meta.part_count, etag);
+            xml_text_child(e, "ETag", etag);
+            char sz[24];
+            snprintf(sz, sizeof(sz), "%llu", (unsigned long long)v[i].meta.size);
+            xml_text_child(e, "Size", sz);
+            xml_text_child(e, "StorageClass", "STANDARD");
+        }
+    }
     size_t blen = 0;
     char *body = xml_render_with_decl(root, &blen);
     free_tree(root);

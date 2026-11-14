@@ -61,6 +61,19 @@ if cmd == "setup":
         s3.put_object(Bucket="lcb", Key=k, Body=b"x")
     s3.create_multipart_upload(Bucket="lcb", Key="uploads/big")
     s3.create_multipart_upload(Bucket="lcb", Key="other/big")
+    s3.create_bucket(Bucket="lcv")
+    s3.put_bucket_versioning(Bucket="lcv", VersioningConfiguration={"Status": "Enabled"})
+    s3.put_object(Bucket="lcv", Key="doc", Body=b"v1")
+    s3.put_object(Bucket="lcv", Key="doc", Body=b"v2")
+    s3.put_object(Bucket="lcv", Key="tmp/x", Body=b"t")
+    s3.put_bucket_lifecycle_configuration(Bucket="lcv", LifecycleConfiguration={"Rules": [
+        {"ID": "nc", "Status": "Enabled", "Filter": {"Prefix": ""},
+         "NoncurrentVersionExpiration": {"NoncurrentDays": 1}},
+        {"ID": "tmp", "Status": "Enabled", "Filter": {"Prefix": "tmp/"}, "Expiration": {"Days": 1}}]})
+elif cmd == "lcv":
+    r = s3.list_object_versions(Bucket="lcv")
+    print(len(r.get("Versions", [])), len(r.get("DeleteMarkers", [])),
+          s3.get_object(Bucket="lcv", Key="doc")["Body"].read().decode())
 elif cmd == "nosuch":
     print(code(lambda: s3.get_bucket_lifecycle_configuration(Bucket="lcb")))
 elif cmd == "put":
@@ -130,8 +143,9 @@ start --lifecycle-now --lifecycle-time-offset 172800
 wait_sweep || { echo "sweep did not run" >&2; cat "$LOG" >&2; }
 check_eq "tmp/ expired, others kept" "$(py keys)" "keep/c logs/d"
 check_eq "uploads/ MPU aborted, other kept" "$(py uploads)" "other/big"
+check_eq "versioned: noncurrent versions expired, tmp/x behind a marker, doc current kept" "$(py lcv)" "1 1 v2"
 m=$(curl -s "http://127.0.0.1:$MPORT/metrics")
-check_eq "expired counter" "$(echo "$m" | grep '^fs3_lifecycle_expired_total' | cut -d' ' -f2)" "2"
+check_eq "expired counter" "$(echo "$m" | grep '^fs3_lifecycle_expired_total' | cut -d' ' -f2)" "5"
 check_eq "aborted counter" "$(echo "$m" | grep '^fs3_lifecycle_aborted_mpu_total' | cut -d' ' -f2)" "1"
 check_eq "past Date with confirmation header accepted" "$(py pastdate-confirmed)" "ok"
 check_eq "delete lifecycle" "$(py delete)" "ok"

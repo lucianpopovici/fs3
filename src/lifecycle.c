@@ -251,7 +251,7 @@ int64_t lc_abort_after_ms(const lc_config_t *c, s3_str_t key) {
 
 /* ---- Sweeper -------------------------------------------------------- */
 
-typedef struct { char *key; size_t n; uint64_t mtime; } victim_t;
+typedef struct { char *key; size_t n; uint64_t mtime; int marker; uint8_t vid[16]; } victim_t;
 
 typedef struct {
     const lc_config_t *cfg;
@@ -259,24 +259,82 @@ typedef struct {
     victim_t *v;
     size_t n, cap;
     uint64_t scanned;
+    int versioned;
+    /* Keys whose noncurrent versions need checking. */
+    char **keys; size_t *klen; size_t nk, kcap;
 } collect_t;
+
+static int any_rule(const lc_config_t *c, s3_str_t key, int what) {
+    for (size_t i = 0; i < c->n_rules; i++) {
+        const lc_rule_t *r = &c->rules[i];
+        size_t pn = strlen(r->prefix);
+        if (!r->enabled || key.n < pn || memcmp(key.p, r->prefix, pn)) continue;
+        if (what == 0 && r->exp_delete_marker) return 1;
+        if (what == 1 && r->noncurrent_days) return 1;
+    }
+    return 0;
+}
+
+static int64_t noncurrent_after_ms(const lc_config_t *c, s3_str_t key) {
+    int64_t best = 0;
+    for (size_t i = 0; i < c->n_rules; i++) {
+        const lc_rule_t *r = &c->rules[i];
+        size_t pn = strlen(r->prefix);
+        if (!r->enabled || !r->noncurrent_days || key.n < pn || memcmp(key.p, r->prefix, pn))
+            continue;
+        int64_t t = r->noncurrent_days * DAY_MS;
+        if (!best || t < best) best = t;
+    }
+    return best;
+}
+
+static int push_victim(collect_t *cl, s3_str_t key, uint64_t mtime, int marker,
+                       const uint8_t *vid) {
+    if (cl->n == cl->cap) {
+        size_t nc = cl->cap ? cl->cap * 2 : 64;
+        victim_t *nv = realloc(cl->v, nc * sizeof(*nv));
+        if (!nv) return -1;
+        cl->v = nv; cl->cap = nc;
+    }
+    char *k = malloc(key.n);
+    if (!k) return -1;
+    memcpy(k, key.p, key.n);
+    victim_t *v = &cl->v[cl->n++];
+    memset(v, 0, sizeof(*v));
+    v->key = k; v->n = key.n; v->mtime = mtime; v->marker = marker;
+    if (vid) memcpy(v->vid, vid, 16);
+    return 0;
+}
 
 static int collect_cb(void *user, s3_str_t key, const s3_obj_meta_t *m) {
     collect_t *cl = user;
     cl->scanned++;
+    if (cl->versioned && any_rule(cl->cfg, key, 1)) {
+        if (cl->nk == cl->kcap) {
+            size_t nc = cl->kcap ? cl->kcap * 2 : 64;
+            char **nk = realloc(cl->keys, nc * sizeof(*nk));
+            size_t *nl = realloc(cl->klen, nc * sizeof(*nl));
+            if (nk) cl->keys = nk;
+            if (nl) cl->klen = nl;
+            if (!nk || !nl) return 1;
+            cl->kcap = nc;
+        }
+        char *k = malloc(key.n);
+        if (!k) return 1;
+        memcpy(k, key.p, key.n);
+        cl->keys[cl->nk] = k;
+        cl->klen[cl->nk++] = key.n;
+    }
+    if (m->flags & S3_OBJF_DELETE_MARKER) {
+        /* ExpiredObjectDeleteMarker: a marker with nothing behind it.
+         * Checked again at delete time below. */
+        if (any_rule(cl->cfg, key, 0))
+            return push_victim(cl, key, m->mtime_ms, 1, m->version_id) < 0;
+        return 0;
+    }
     int64_t t = lc_expiry_ms(cl->cfg, key, m->mtime_ms);
     if (!t || t > cl->now) return 0;
-    if (cl->n == cl->cap) {
-        size_t nc = cl->cap ? cl->cap * 2 : 64;
-        victim_t *nv = realloc(cl->v, nc * sizeof(*nv));
-        if (!nv) return 1;
-        cl->v = nv; cl->cap = nc;
-    }
-    char *k = malloc(key.n);
-    if (!k) return 1;
-    memcpy(k, key.p, key.n);
-    cl->v[cl->n++] = (victim_t){ k, key.n, m->mtime_ms };
-    return 0;
+    return push_victim(cl, key, m->mtime_ms, 0, NULL) < 0;
 }
 
 static void pace(int rate) {
@@ -299,11 +357,27 @@ void lc_sweep(struct s3_store *s, const lc_opts_t *o, lc_stats_t *out) {
         const lc_config_t *cfg = store_cfg_obj(ref);
         out->buckets++;
 
+        s3_bucket_meta_t bm;
         collect_t cl = { .cfg = cfg, .now = o->now_ms };
+        cl.versioned = store_bucket_meta(s, bucket, &bm) == S3_OK && bm.versioning;
         store_walk_objects(s, bucket, collect_cb, &cl);
         out->scanned += cl.scanned;
         for (size_t i = 0; i < cl.n; i++) {
             s3_str_t k = { cl.v[i].key, cl.v[i].n };
+            if (cl.v[i].marker) {
+                s3_noncurrent_t *nc = NULL;
+                size_t nn = 0;
+                store_list_noncurrent(s, bucket, k, &nc, &nn);
+                free(nc);
+                if (nn == 0 && !o->dry_run
+                    && store_delete_ex(s, bucket, k, cl.v[i].vid, NULL) == S3_OK) {
+                    out->expired++;
+                    if (o->expired_total)
+                        __atomic_fetch_add(o->expired_total, 1, __ATOMIC_RELAXED);
+                }
+                free(cl.v[i].key);
+                continue;
+            }
             if (o->dry_run) {
                 LOG_I("lifecycle (dry run): would expire %s/%.*s", bl[b].name,
                       (int)k.n, k.p);
@@ -321,6 +395,35 @@ void lc_sweep(struct s3_store *s, const lc_opts_t *o, lc_stats_t *out) {
             free(cl.v[i].key);
         }
         free(cl.v);
+
+        /* NoncurrentVersionExpiration: delete versions that have been
+         * noncurrent for NoncurrentDays (object lock can veto). */
+        for (size_t i = 0; i < cl.nk; i++) {
+            s3_str_t k = { cl.keys[i], cl.klen[i] };
+            int64_t after = noncurrent_after_ms(cfg, k);
+            s3_noncurrent_t *nc = NULL;
+            size_t nn = 0;
+            if (after && store_list_noncurrent(s, bucket, k, &nc, &nn) == S3_OK) {
+                for (size_t j = 0; j < nn; j++) {
+                    if ((int64_t)nc[j].noncurrent_since_ms + after > o->now_ms) continue;
+                    if (o->dry_run) {
+                        LOG_I("lifecycle (dry run): would expire a noncurrent version of %s/%.*s",
+                              bl[b].name, (int)k.n, k.p);
+                        continue;
+                    }
+                    if (store_delete_ex(s, bucket, k, nc[j].vid, NULL) == S3_OK) {
+                        out->expired++;
+                        if (o->expired_total)
+                            __atomic_fetch_add(o->expired_total, 1, __ATOMIC_RELAXED);
+                        pace(o->rate_per_s);
+                    }
+                }
+            }
+            free(nc);
+            free(cl.keys[i]);
+        }
+        free(cl.keys);
+        free(cl.klen);
 
         s3_mpu_info_t *ups = NULL;
         size_t nu = 0;

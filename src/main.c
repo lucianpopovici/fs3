@@ -73,6 +73,9 @@ static void usage(const char *argv0) {
         "      --web-addr <ip>        website listener address (default 127.0.0.1)\n"
         "      --web-root-domain <d>  websites at <bucket>.<d> (else Host = bucket name)\n"
         "      --allow-public         allow website configs / public bucket policies\n"
+        "      --allow-public-write   also allow public policies that grant writes\n"
+        "      --trusted-proxy <ip>   honour X-Forwarded-For/-Proto from this proxy\n"
+        "                             (repeatable; e.g. 127.0.0.1 behind DSM)\n"
         "      --admin-token-file <f> bearer token for the /v1 admin API on the metrics\n"
         "                             port; file must be mode 0600 and owned by us\n"
         "      --admin-socket <path>  serve the /v1 admin API on a unix socket (0600)\n"
@@ -257,6 +260,8 @@ enum {
     OPT_ALLOW_PUBLIC,
     OPT_ADMIN_TOKEN_FILE,
     OPT_ADMIN_SOCKET,
+    OPT_ALLOW_PUBLIC_WRITE,
+    OPT_TRUSTED_PROXY,
 };
 
 #ifndef FS3_MAIN_TESTING
@@ -322,6 +327,8 @@ int main(int argc, char **argv) {
     int web_port = 0, allow_public = 0;
     char admin_token[256] = "";
     const char *admin_socket = NULL;
+    int allow_public_write = 0;
+    char trusted_proxies[1024] = "";
     sigv4_verifier_t *auth = NULL;
     reload_ctx_t reload_ctx = {0};
 
@@ -355,6 +362,8 @@ int main(int argc, char **argv) {
         { "allow-public",     no_argument,       NULL, OPT_ALLOW_PUBLIC },
         { "admin-token-file", required_argument, NULL, OPT_ADMIN_TOKEN_FILE },
         { "admin-socket",     required_argument, NULL, OPT_ADMIN_SOCKET },
+        { "allow-public-write", no_argument,     NULL, OPT_ALLOW_PUBLIC_WRITE },
+        { "trusted-proxy",    required_argument, NULL, OPT_TRUSTED_PROXY },
         { "verbose",          no_argument,       NULL, 'v' },
         { "help",             no_argument,       NULL, 'h' },
         { 0 },
@@ -537,6 +546,18 @@ int main(int argc, char **argv) {
             }
             case OPT_ALLOW_PUBLIC: allow_public = 1; break;
             case OPT_ADMIN_SOCKET: admin_socket = optarg; break;
+            case OPT_ALLOW_PUBLIC_WRITE: allow_public_write = 1; allow_public = 1; break;
+            case OPT_TRUSTED_PROXY: {
+                size_t cur = strlen(trusted_proxies);
+                if (strlen(optarg) > 60 || strchr(optarg, ',')
+                    || cur + strlen(optarg) + 2 >= sizeof(trusted_proxies)) {
+                    fprintf(stderr, "--trusted-proxy: one IP per flag\n");
+                    return 2;
+                }
+                snprintf(trusted_proxies + cur, sizeof(trusted_proxies) - cur, "%s%s",
+                         cur ? "," : "", optarg);
+                break;
+            }
             case OPT_ADMIN_TOKEN_FILE:
                 if (read_secret_file(optarg, admin_token, sizeof(admin_token)) < 0)
                     return 2;
@@ -603,6 +624,8 @@ int main(int argc, char **argv) {
         .web_port        = (uint16_t)web_port,
         .web_root_domain = web_root_domain,
         .allow_public    = allow_public,
+        .allow_public_write = allow_public_write,
+        .trusted_proxies = trusted_proxies[0] ? trusted_proxies : NULL,
         .admin_token     = admin_token[0] ? admin_token : NULL,
         .admin_socket    = admin_socket,
         .admin_cred_file = reload_ctx.cred_file,

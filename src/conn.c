@@ -38,6 +38,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
@@ -201,6 +202,8 @@ static void request_reset(conn_t *c) {
     c->copy_bucket = (s3_str_t){0};
     c->copy_key = (s3_str_t){0};
     c->body_limit_hit = 0;
+    c->client_ip[0] = '\0';
+    c->secure = 0;
     memset(&c->id, 0, sizeof(c->id));
     c->req_start_ns = 0;
     c->bytes_out_body = 0;
@@ -250,6 +253,46 @@ int conn_add_header(conn_t *c, const char *name, const char *value) {
 }
 
 void conn_clear_headers(conn_t *c) { c->xhdr_len = 0; }
+
+static int ip_in_list(const char *ip, const char *list) {
+    if (!list) return 0;
+    size_t n = strlen(ip);
+    for (const char *p = list; *p; ) {
+        const char *e = strchr(p, ',');
+        size_t l = e ? (size_t)(e - p) : strlen(p);
+        if (l == n && memcmp(p, ip, n) == 0) return 1;
+        if (!e) break;
+        p = e + 1;
+    }
+    return 0;
+}
+
+void conn_resolve_client(conn_t *c) {
+    /* peer is "ip:port" (IPv4 listeners). */
+    snprintf(c->client_ip, sizeof(c->client_ip), "%s", c->peer);
+    char *colon = strrchr(c->client_ip, ':');
+    if (colon) *colon = '\0';
+    c->secure = c->conn_tls;
+    if (!ip_in_list(c->client_ip, c->trusted_proxies)) return;
+    for (size_t i = 0; i < c->req.n_headers; i++) {
+        s3_str_t k = c->req.headers[i].k, v = c->req.headers[i].v;
+        if (s3_str_eq_lit(k, "x-forwarded-proto")) {
+            c->secure = v.n == 5 && strncasecmp(v.p, "https", 5) == 0;
+        } else if (s3_str_eq_lit(k, "x-forwarded-for") && v.n) {
+            /* Rightmost entry: the one our proxy appended. */
+            const char *last = v.p + v.n;
+            const char *st = last;
+            while (st > v.p && st[-1] != ',') st--;
+            while (st < last && *st == ' ') st++;
+            size_t l = (size_t)(last - st);
+            while (l && st[l-1] == ' ') l--;
+            if (l > 0 && l < sizeof(c->client_ip)) {
+                memcpy(c->client_ip, st, l);
+                c->client_ip[l] = '\0';
+            }
+        }
+    }
+}
 
 /* Splice xhdr into the head in wbuf, before the blank line. If an inline
  * body would no longer fit, it moves to ext_body. */
@@ -541,6 +584,7 @@ static int cb_on_headers_complete(llhttp_t *p) {
      * Origin are added before auth so even auth errors carry them —
      * otherwise browsers hide the S3 error body. */
     conn_add_header(c, "X-Content-Type-Options", "nosniff");
+    conn_resolve_client(c);
     if (!is_preflight && !c->is_web) route_cors_decorate(c);
 
     /* The website listener is anonymous by design: Authorization is
@@ -618,6 +662,16 @@ static int cb_on_headers_complete(llhttp_t *p) {
     /* Nothing more to set up if the router already answered (error,
      * GET, ...): remaining body bytes just drain. */
     if (c->wlen > 0 || c->ext_body || c->state != CST_READ_BODY) return 0;
+
+    /* Expect: 100-continue — the request is accepted (auth, routing and
+     * size checks passed), so tell the client to send the body now
+     * instead of making it wait out its timeout (1 s in botocore). A
+     * request that was refused above gets its final status instead. */
+    const s3_str_t *ex = find_hdr(c, "expect");
+    if (ex && ex->n == 12 && strncasecmp(ex->p, "100-continue", 12) == 0) {
+        static const char cont[] = "HTTP/1.1 100 Continue\r\n\r\n";
+        (void)!write(c->fd, cont, sizeof(cont) - 1);
+    }
 
     /* Additional checksums (x-amz-checksum-* header or trailer,
      * Content-MD5) over the decoded body. */

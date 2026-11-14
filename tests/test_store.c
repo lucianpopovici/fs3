@@ -1692,9 +1692,10 @@ static void t_expire_if_unchanged(void) {
              "changed object skipped");
     CHECK_EQ(store_head(s, b, k, &m2), S3_OK, "newer survives");
     CHECK_EQ(m2.size, 5, "newer content");
-    CHECK_EQ(store_expire_if_unchanged(s, b, k, m2.mtime_ms), S3_OK, "unchanged expires");
+    uint64_t mt = m2.mtime_ms;
+    CHECK_EQ(store_expire_if_unchanged(s, b, k, mt), S3_OK, "unchanged expires");
     CHECK_EQ(store_head(s, b, k, &m2), S3_ERR_NO_SUCH_KEY, "gone");
-    CHECK_EQ(store_expire_if_unchanged(s, b, k, m2.mtime_ms), S3_ERR_NO_SUCH_KEY, "absent");
+    CHECK_EQ(store_expire_if_unchanged(s, b, k, mt), S3_ERR_NO_SUCH_KEY, "absent");
     /* store_walk_objects visits every object once. */
     put(s, "lcb", "x1", "1", 1, "", NULL); put(s, "lcb", "x2", "2", 1, "", NULL);
     int count = 0;

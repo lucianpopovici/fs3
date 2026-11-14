@@ -114,6 +114,9 @@ struct s3_store {
     char    *tmp_dir;        /* ROOT/tmp */
     char    *buckets_dir;    /* ROOT/buckets */
     char    *mpu_dir;        /* ROOT/mpu — multipart upload staging */
+    char    *versions_dir;   /* ROOT/versions — noncurrent versions (item 8) */
+    store_version_guard_fn vguard;   /* object-lock veto (item 10) */
+    void    *vguard_user;
     uint64_t min_free_bytes; /* 0 = no quota check */
     /* Namespace lock. Commits run on iopool worker threads while the
      * event loop keeps serving other requests, so the short steps that
@@ -362,6 +365,15 @@ static void recover_tmp_dir(const s3_store_t *s) {
 }
 
 static void cfg_cache_clear(s3_store_t *s);
+static void recover_version_links(const s3_store_t *s);
+static int bucket_versioning(s3_store_t *s, s3_str_t bucket);
+static int random_vid(uint8_t vid[16]);
+static s3_err_t link_aside_locked(s3_store_t *s, s3_str_t bucket,
+                                  const char hex[65], const char *path,
+                                  int versioning);
+static s3_err_t delete_locked(s3_store_t *s, s3_str_t bucket, s3_str_t key,
+                              const char hex[65], const uint8_t *vid,
+                              uint64_t expect_mtime, store_delete_result_t *res);
 
 /* Startup: remove half-written sidecars (buckets/<b>/<name>.tmp.XXXXXX
  * and meta.tmp) left by a crash between write and rename. */
@@ -404,7 +416,9 @@ s3_err_t store_open(s3_store_t **out, const char *root) {
     s->tmp_dir     = xstrdup_join(root, "tmp");
     s->buckets_dir = xstrdup_join(root, "buckets");
     s->mpu_dir     = xstrdup_join(root, "mpu");
-    if (!s->root || !s->data_dir || !s->tmp_dir || !s->buckets_dir || !s->mpu_dir) {
+    s->versions_dir = xstrdup_join(root, "versions");
+    if (!s->root || !s->data_dir || !s->tmp_dir || !s->buckets_dir || !s->mpu_dir
+        || !s->versions_dir) {
         store_close(s);
         return S3_ERR_INTERNAL;
     }
@@ -413,7 +427,8 @@ s3_err_t store_open(s3_store_t **out, const char *root) {
         || mkdir_p(s->data_dir, 0700) < 0
         || mkdir_p(s->tmp_dir, 0700) < 0
         || mkdir_p(s->buckets_dir, 0700) < 0
-        || mkdir_p(s->mpu_dir, 0700) < 0) {
+        || mkdir_p(s->mpu_dir, 0700) < 0
+        || mkdir_p(s->versions_dir, 0700) < 0) {
         LOG_E("store_open: mkdir failed under %s: %s", root, strerror(errno));
         store_close(s);
         return S3_ERR_INTERNAL;
@@ -421,6 +436,7 @@ s3_err_t store_open(s3_store_t **out, const char *root) {
 
     recover_tmp_dir(s);
     recover_sidecar_tmp(s);
+    recover_version_links(s);
 
     *out = s;
     return S3_OK;
@@ -433,6 +449,7 @@ void store_close(s3_store_t *s) {
     free(s->tmp_dir);
     free(s->buckets_dir);
     free(s->mpu_dir);
+    free(s->versions_dir);
     pthread_mutex_destroy(&s->ns_mu);
     cfg_cache_clear(s);
     pthread_mutex_destroy(&s->cfg_mu);
@@ -781,6 +798,11 @@ static s3_err_t bucket_delete_locked(s3_store_t *s, s3_str_t name) {
     char dp[4096];
     snprintf(dp, sizeof(dp), "%s/" S3_STR_FMT, s->data_dir, S3_STR_ARG(name));
     if (dir_has_files(dp)) return S3_ERR_BUCKET_NOT_EMPTY;
+    /* Versioning: noncurrent versions and delete markers count too. */
+    char vp[4096];
+    snprintf(vp, sizeof(vp), "%s/" S3_STR_FMT, s->versions_dir, S3_STR_ARG(name));
+    if (dir_has_files(vp)) return S3_ERR_BUCKET_NOT_EMPTY;
+    rm_rf(vp);
 
     /* Drop any in-flight multipart uploads first. Left behind, they could
      * be completed into a later bucket of the same name. */
@@ -1388,6 +1410,18 @@ s3_err_t store_put_commit(s3_writer_t *w, s3_obj_meta_t *meta_out) {
     w->hdr.mtime_ms = (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)(ts.tv_nsec / 1000000);
     w->hdr.data_size = w->data_written;
 
+    /* Versioning: an Enabled bucket gives every new object a fresh
+     * version id; Suspended/Unset write the null version. */
+    int versioning = 0;
+    {
+        s3_str_t bk = { w->bucket_dup, strlen(w->bucket_dup) };
+        versioning = bucket_versioning(w->store, bk);
+        memset(w->ext.version_id, 0, 16);
+        if (versioning == S3_VERSIONING_ENABLED && random_vid(w->ext.version_id) < 0) {
+            writer_free(w); return S3_ERR_INTERNAL;
+        }
+    }
+
     /* Pwrite the finalized header back at offset 0. */
     if (pwrite(w->fd, &w->hdr, sizeof(w->hdr), 0) != (ssize_t)sizeof(w->hdr)
         || pwrite(w->fd, &w->ext, sizeof(w->ext), sizeof(w->hdr))
@@ -1439,6 +1473,17 @@ s3_err_t store_put_commit(s3_writer_t *w, s3_obj_meta_t *meta_out) {
         pthread_mutex_unlock(&w->store->ns_mu);
     pthread_mutex_unlock(km);
         writer_free(w); return e;
+    }
+
+    /* Versioned bucket: move the current version aside first (hard link,
+     * crash-safe; see store.h). */
+    {
+        s3_err_t le = link_aside_locked(w->store, bucket, hex, path, versioning);
+        if (le != S3_OK) {
+            pthread_mutex_unlock(&w->store->ns_mu);
+            pthread_mutex_unlock(km);
+            writer_free(w); return le;
+        }
     }
 
     /* Atomic rename. Can also fail with ENOSPC (new dirent allocation). */
@@ -1578,34 +1623,7 @@ static s3_err_t read_header(int fd, obj_header_t *hdr_out, s3_obj_meta_t *meta_o
 
 s3_err_t store_get_open(s3_store_t *s, s3_str_t bucket, s3_str_t key,
                         s3_reader_t **out, s3_obj_meta_t *meta_out) {
-    if (!s || !out) return S3_ERR_INVALID_ARGUMENT;
-    if (!valid_bucket_name(bucket)) return S3_ERR_INVALID_BUCKET_NAME;
-    if (!valid_key(key))            return S3_ERR_INVALID_ARGUMENT;
-    if (!store_bucket_exists(s, bucket)) return S3_ERR_NO_SUCH_BUCKET;
-
-    char hex[65];
-    hash_bucket_key(bucket, key, hex);
-    char path[4096];
-    if (obj_path(s, bucket, hex, path, sizeof(path)) < 0) return S3_ERR_INTERNAL;
-
-    int fd = open(path, O_RDONLY | O_CLOEXEC);
-    if (fd < 0) {
-        if (errno == ENOENT) return S3_ERR_NO_SUCH_KEY;
-        return S3_ERR_INTERNAL;
-    }
-
-    obj_header_t h;
-    s3_err_t e = read_header(fd, &h, meta_out);
-    if (e != S3_OK) { close(fd); return e; }
-
-    s3_reader_t *r = calloc(1, sizeof(*r));
-    if (!r) { close(fd); return S3_ERR_INTERNAL; }
-    r->fd        = fd;
-    r->data_off  = h.header_size;
-    r->data_size = h.data_size;
-    r->pos       = 0;
-    *out = r;
-    return S3_OK;
+    return store_get_open_version(s, bucket, key, NULL, out, meta_out);
 }
 
 ssize_t store_get_read(s3_reader_t *r, void *buf, size_t n) {
@@ -1655,36 +1673,7 @@ s3_err_t store_head(s3_store_t *s, s3_str_t bucket, s3_str_t key,
 }
 
 s3_err_t store_delete(s3_store_t *s, s3_str_t bucket, s3_str_t key) {
-    if (!s) return S3_ERR_INVALID_ARGUMENT;
-    if (!valid_bucket_name(bucket)) return S3_ERR_INVALID_BUCKET_NAME;
-    if (!valid_key(key))            return S3_ERR_INVALID_ARGUMENT;
-    if (!store_bucket_exists(s, bucket)) return S3_ERR_NO_SUCH_BUCKET;
-
-    char hex[65];
-    hash_bucket_key(bucket, key, hex);
-    char path[4096];
-    if (obj_path(s, bucket, hex, path, sizeof(path)) < 0) return S3_ERR_INTERNAL;
-    pthread_mutex_t *km = key_lock(s, hex);
-    pthread_mutex_lock(km);
-    int urc = unlink(path);
-    int uerr = errno;
-    pthread_mutex_unlock(km);
-    errno = uerr;
-    if (urc < 0) {
-        if (errno == ENOENT) {
-            /* S3 DELETE is idempotent: deleting a missing key is success. */
-            return S3_OK;
-        }
-        LOG_W("unlink %s: %s", path, strerror(errno));
-        return S3_ERR_INTERNAL;
-    }
-    /* fsync the leaf dir for durability. */
-    char *slash = strrchr(path, '/');
-    if (slash) {
-        *slash = '\0';
-        (void)fsync_dir(path);
-    }
-    return S3_OK;
+    return store_delete_ex(s, bucket, key, NULL, NULL);
 }
 
 /* ===================================================================== */
@@ -1808,7 +1797,11 @@ static int walk_bucket(const char *bucket_data_dir, list_entry_t **items_out,
                     if (!ni) { closedir(d3); closedir(d2); closedir(d1); goto oom; }
                     items = ni; cap = nc;
                 }
-                if (load_entry(path, &items[n]) == 0) n++;
+                if (load_entry(path, &items[n]) == 0) {
+                    /* A delete marker hides the key from listings. */
+                    if (items[n].meta.flags & S3_OBJF_DELETE_MARKER) free(items[n].key);
+                    else n++;
+                }
             }
             closedir(d3);
         }
@@ -2054,6 +2047,58 @@ void store_buckets_free(s3_bucket_info_t *list, size_t n) {
     free(list);
 }
 
+/* Noncurrent versions (and markers) under versions/<b>/xx/yy/<hex>/. */
+static void count_versions(s3_store_t *s, s3_str_t bucket, s3_bucket_stats_t *st) {
+    char vb[4200];
+    snprintf(vb, sizeof(vb), "%s/" S3_STR_FMT, s->versions_dir, S3_STR_ARG(bucket));
+    DIR *d1 = opendir(vb);
+    if (!d1) return;
+    struct dirent *e1;
+    while ((e1 = readdir(d1)) != NULL) {
+        if (e1->d_name[0] == '.') continue;
+        char p1[4500];
+        snprintf(p1, sizeof(p1), "%s/%s", vb, e1->d_name);
+        DIR *d2 = opendir(p1);
+        if (!d2) continue;
+        struct dirent *e2;
+        while ((e2 = readdir(d2)) != NULL) {
+            if (e2->d_name[0] == '.') continue;
+            char p2[4800];
+            snprintf(p2, sizeof(p2), "%s/%s", p1, e2->d_name);
+            DIR *d3 = opendir(p2);
+            if (!d3) continue;
+            struct dirent *e3;
+            while ((e3 = readdir(d3)) != NULL) {
+                if (e3->d_name[0] == '.') continue;
+                char p3[5100];
+                snprintf(p3, sizeof(p3), "%s/%s", p2, e3->d_name);
+                DIR *d4 = opendir(p3);
+                if (!d4) continue;
+                struct dirent *e4;
+                while ((e4 = readdir(d4)) != NULL) {
+                    if (e4->d_name[0] == '.') continue;
+                    char fp[5400];
+                    snprintf(fp, sizeof(fp), "%s/%s", p3, e4->d_name);
+                    int fd = open(fp, O_RDONLY | O_CLOEXEC);
+                    if (fd < 0) continue;
+                    obj_header_t h;
+                    obj_ext_v3_t x;
+                    uint32_t co;
+                    if (obj_read_hdr(fd, &h, &x, &co) == S3_OK) {
+                        st->versions++;
+                        st->version_bytes += h.data_size;
+                    }
+                    close(fd);
+                }
+                closedir(d4);
+            }
+            closedir(d3);
+        }
+        closedir(d2);
+    }
+    closedir(d1);
+}
+
 /* Read just the header of one object file and accumulate into stats.
  * Unreadable or non-object files are skipped, not errors: the walk is
  * advisory (admin display), and a file mid-rename shouldn't fail it. */
@@ -2066,6 +2111,7 @@ static void stats_count_file(const char *path, s3_bucket_stats_t *st) {
     s3_err_t e = obj_read_hdr(fd, &h, &x, &ct_off);
     close(fd);
     if (e != S3_OK) return;
+    if (x.flags & S3_OBJF_DELETE_MARKER) { st->versions++; return; }
     st->objects++;
     st->bytes += h.data_size;
 }
@@ -2112,6 +2158,7 @@ s3_err_t store_bucket_stats(s3_store_t *s, s3_str_t bucket,
         closedir(d2);
     }
     closedir(d1);
+    count_versions(s, bucket, out);
     return S3_OK;
 }
 
@@ -2748,6 +2795,11 @@ s3_err_t store_mpu_complete2(s3_store_t *s, s3_str_t bucket, s3_str_t key,
     hdr.data_size = total_size;
     obj_ext_v3_t ext;
     memset(&ext, 0, sizeof(ext));
+    int versioning = bucket_versioning(s, bucket);
+    if (versioning == S3_VERSIONING_ENABLED && random_vid(ext.version_id) < 0) {
+        close(tfd); unlink(tmp_path); free(stored_ct); cksum_free(&comp); cksum_free(&full);
+        return S3_ERR_INTERNAL;
+    }
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     uint64_t mtime_ms = (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
@@ -2846,6 +2898,7 @@ s3_err_t store_mpu_complete2(s3_store_t *s, s3_str_t bucket, s3_str_t key,
     s3_err_t pe = S3_OK;
     if (!store_bucket_exists(s, bucket))          pe = S3_ERR_NO_SUCH_BUCKET;
     else if (access(up_meta, F_OK) < 0)           pe = S3_ERR_NO_SUCH_UPLOAD;
+    else if ((pe = link_aside_locked(s, bucket, hex, target_path, versioning)) != S3_OK) ;
     else if (mkdir_p(target_dir, 0700) < 0
              || rename(tmp_path, target_path) < 0) pe = map_io_err(errno);
     else                                          rm_rf(up_dir);
@@ -2867,6 +2920,7 @@ s3_err_t store_mpu_complete2(s3_store_t *s, s3_str_t bucket, s3_str_t key,
         meta_out->mtime_ms = mtime_ms;
         meta_out->part_count = (uint16_t)n_parts;
         memcpy(meta_out->etag, mp_md5, 16);
+        memcpy(meta_out->version_id, ext.version_id, 16);
         meta_out->cksum_algo  = ext.cksum_algo;
         meta_out->cksum_type  = ext.cksum_type;
         meta_out->cksum_parts = ext.cksum_parts;
@@ -3129,27 +3183,682 @@ s3_err_t store_expire_if_unchanged(s3_store_t *s, s3_str_t bucket,
     if (!s) return S3_ERR_INVALID_ARGUMENT;
     if (!valid_bucket_name(bucket)) return S3_ERR_INVALID_BUCKET_NAME;
     if (!valid_key(key)) return S3_ERR_INVALID_ARGUMENT;
-    char hex[65], path[4096], dir[4096];
+    char hex[65];
     hash_bucket_key(bucket, key, hex);
-    if (obj_path(s, bucket, hex, path, sizeof(path)) < 0
-        || obj_dir(s, bucket, hex, dir, sizeof(dir)) < 0)
-        return S3_ERR_INTERNAL;
     pthread_mutex_t *km = key_lock(s, hex);
     pthread_mutex_lock(km);
-    s3_err_t e = S3_OK;
-    int fd = open(path, O_RDONLY | O_CLOEXEC);
-    if (fd < 0) {
-        e = errno == ENOENT ? S3_ERR_NO_SUCH_KEY : S3_ERR_INTERNAL;
-    } else {
-        s3_obj_meta_t m;
-        e = read_header(fd, NULL, &m);
-        close(fd);
-        if (e == S3_OK && m.mtime_ms != mtime_ms) e = S3_ERR_INVALID_REQUEST;
-        if (e == S3_OK && unlink(path) < 0) e = map_io_err(errno);
-    }
+    /* Normal delete path: a versioned bucket gets a delete marker. */
+    store_delete_result_t res;
+    memset(&res, 0, sizeof(res));
+    s3_err_t e = delete_locked(s, bucket, key, hex, NULL, mtime_ms, &res);
     pthread_mutex_unlock(km);
-    if (e == S3_OK) fsync_dir(dir);
     return e;
 }
 
 int store_valid_bucket_name(s3_str_t name) { return valid_bucket_name(name); }
+
+/* ===================================================================== */
+/* Versioning (item 8)                                                    */
+/* ===================================================================== */
+
+static __thread int g_guard_bypass;
+
+void store_set_guard_bypass(int bypass) { g_guard_bypass = bypass; }
+
+void store_set_version_guard(s3_store_t *s, store_version_guard_fn fn, void *user) {
+    if (!s) return;
+    s->vguard = fn;
+    s->vguard_user = user;
+}
+
+static int vid_is_null(const uint8_t vid[16]) {
+    for (int i = 0; i < 16; i++) if (vid[i]) return 0;
+    return 1;
+}
+
+static void vid_hex(const uint8_t vid[16], char out[33]) {
+    static const char H[] = "0123456789abcdef";
+    for (int i = 0; i < 16; i++) {
+        out[2*i] = H[vid[i] >> 4];
+        out[2*i + 1] = H[vid[i] & 15];
+    }
+    out[32] = '\0';
+}
+
+void store_vid_format(const uint8_t vid[16], char out[33]) {
+    if (vid_is_null(vid)) snprintf(out, 33, "null");
+    else vid_hex(vid, out);
+}
+
+int store_vid_parse(s3_str_t s, uint8_t vid[16]) {
+    if (s3_str_eq_lit(s, "null")) { memset(vid, 0, 16); return 0; }
+    if (s.n != 32) return -1;
+    for (size_t i = 0; i < 32; i++) {
+        char c = s.p[i];
+        int v = (c >= '0' && c <= '9') ? c - '0' : (c >= 'a' && c <= 'f') ? c - 'a' + 10 : -1;
+        if (v < 0) return -1;
+        if (i % 2 == 0) vid[i / 2] = (uint8_t)(v << 4); else vid[i / 2] |= (uint8_t)v;
+    }
+    return vid_is_null(vid) ? -1 : 0;    /* zeros only via "null" */
+}
+
+static int random_vid(uint8_t vid[16]) {
+    char hx[33];
+    if (random_hex_id(hx, sizeof(hx)) < 0) return -1;
+    s3_str_t h = { hx, 32 };
+    for (size_t i = 0; i < 32; i++) {
+        char c = hx[i];
+        if (c >= 'A' && c <= 'F') hx[i] = (char)(c + 32);
+    }
+    if (store_vid_parse(h, vid) < 0) { memset(vid, 0, 16); vid[15] = 1; }
+    return 0;
+}
+
+static int vdir_path(const s3_store_t *s, s3_str_t bucket, const char hex[65],
+                     char *out, size_t cap) {
+    int n = snprintf(out, cap, "%s/" S3_STR_FMT "/%c%c/%c%c/%s", s->versions_dir,
+                     S3_STR_ARG(bucket), hex[0], hex[1], hex[2], hex[3], hex);
+    return (n > 0 && (size_t)n < cap) ? 0 : -1;
+}
+
+/* "<inv_ts 16 hex>-<vid 32 hex>" */
+static void ventry_name(uint64_t mtime_ms, const uint8_t vid[16], char out[50]) {
+    char vh[33];
+    vid_hex(vid, vh);
+    snprintf(out, 50, "%016" PRIx64 "-%s", UINT64_MAX - mtime_ms, vh);
+}
+
+static int ventry_parse(const char *name, uint8_t vid[16]) {
+    if (strlen(name) != 49 || name[16] != '-') return -1;
+    s3_str_t h = { name + 17, 32 };
+    if (s3_str_eq_lit(h, "00000000000000000000000000000000")) { memset(vid, 0, 16); return 0; }
+    return store_vid_parse(h, vid);
+}
+
+typedef struct { char name[50]; } vname_t;
+
+static int vname_cmp(const void *a, const void *b) {
+    return strcmp(((const vname_t *)a)->name, ((const vname_t *)b)->name);
+}
+
+/* Sorted (newest first) entry names of a version dir. */
+static vname_t *vdir_list(const char *vdir, size_t *n_out) {
+    *n_out = 0;
+    DIR *d = opendir(vdir);
+    if (!d) return NULL;
+    vname_t *v = NULL;
+    size_t n = 0, cap = 0;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        uint8_t vid[16];
+        if (ventry_parse(e->d_name, vid) < 0) continue;
+        if (n == cap) {
+            size_t nc = cap ? cap * 2 : 8;
+            vname_t *nv = realloc(v, nc * sizeof(*nv));
+            if (!nv) break;
+            v = nv; cap = nc;
+        }
+        snprintf(v[n++].name, sizeof(v[0].name), "%s", e->d_name);
+    }
+    closedir(d);
+    if (n) qsort(v, n, sizeof(*v), vname_cmp);
+    *n_out = n;
+    return v;
+}
+
+static int bucket_versioning(s3_store_t *s, s3_str_t bucket) {
+    s3_bucket_meta_t m;
+    if (store_bucket_meta(s, bucket, &m) != S3_OK) return 0;
+    return m.versioning;
+}
+
+/* Header of the file at path (0 ok). */
+static int peek_meta(const char *path, s3_obj_meta_t *m) {
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return -1;
+    s3_err_t e = read_header(fd, NULL, m);
+    close(fd);
+    return e == S3_OK ? 0 : -1;
+}
+
+/* Before replacing the current object of a versioned bucket: move the
+ * current version aside (hard link) unless it is the null version in a
+ * Suspended bucket (overwritten in place). In Suspended mode any older
+ * noncurrent null version is dropped: there is only ever one null
+ * version. Caller holds the key's stripe lock. */
+static s3_err_t link_aside_locked(s3_store_t *s, s3_str_t bucket,
+                                  const char hex[65], const char *path,
+                                  int versioning) {
+    if (versioning == S3_VERSIONING_UNSET) return S3_OK;
+    char vdir[4300];
+    if (vdir_path(s, bucket, hex, vdir, sizeof(vdir)) < 0) return S3_ERR_INTERNAL;
+    if (versioning == S3_VERSIONING_SUSPENDED) {
+        size_t n;
+        vname_t *v = vdir_list(vdir, &n);
+        for (size_t i = 0; i < n; i++) {
+            if (!strcmp(v[i].name + 17, "00000000000000000000000000000000")) {
+                char vp[4400];
+                snprintf(vp, sizeof(vp), "%s/%s", vdir, v[i].name);
+                unlink(vp);
+            }
+        }
+        free(v);
+    }
+    s3_obj_meta_t cur;
+    if (peek_meta(path, &cur) < 0) return S3_OK;          /* no current */
+    if (versioning == S3_VERSIONING_SUSPENDED && vid_is_null(cur.version_id))
+        return S3_OK;
+    if (mkdir_p(vdir, 0700) < 0) return map_io_err(errno);
+    char name[50], vp[4400];
+    ventry_name(cur.mtime_ms, cur.version_id, name);
+    snprintf(vp, sizeof(vp), "%s/%s", vdir, name);
+    if (link(path, vp) < 0 && errno != EEXIST) return map_io_err(errno);
+    fsync_dir(vdir);
+    return S3_OK;
+}
+
+/* Startup: a crash between link-aside and the rename of the new current
+ * leaves a version entry that is the same inode as current. Drop those. */
+static void recover_version_links(const s3_store_t *s) {
+    DIR *b = opendir(s->versions_dir);
+    if (!b) return;
+    int removed = 0;
+    struct dirent *be;
+    while ((be = readdir(b)) != NULL) {
+        if (be->d_name[0] == '.') continue;
+        char p1[4500];
+        snprintf(p1, sizeof(p1), "%s/%s", s->versions_dir, be->d_name);
+        DIR *d1 = opendir(p1);
+        if (!d1) continue;
+        struct dirent *e1;
+        while ((e1 = readdir(d1)) != NULL) {
+            if (e1->d_name[0] == '.') continue;
+            char p2[4800];
+            snprintf(p2, sizeof(p2), "%s/%s", p1, e1->d_name);
+            DIR *d2 = opendir(p2);
+            if (!d2) continue;
+            struct dirent *e2;
+            while ((e2 = readdir(d2)) != NULL) {
+                if (e2->d_name[0] == '.') continue;
+                char p3[5100];
+                snprintf(p3, sizeof(p3), "%s/%s", p2, e2->d_name);
+                DIR *dh = opendir(p3);
+                if (!dh) continue;
+                struct dirent *eh;
+                while ((eh = readdir(dh)) != NULL) {
+                    if (eh->d_name[0] == '.') continue;
+                    char vdir[5400], cur[5400];
+                    snprintf(vdir, sizeof(vdir), "%s/%s", p3, eh->d_name);
+                    snprintf(cur, sizeof(cur), "%s/%s/%s/%s/%s", s->data_dir, be->d_name,
+                             e1->d_name, e2->d_name, eh->d_name);
+                    struct stat cst;
+                    if (stat(cur, &cst) < 0) continue;
+                    DIR *d3 = opendir(vdir);
+                    if (!d3) continue;
+                    struct dirent *e3;
+                    while ((e3 = readdir(d3)) != NULL) {
+                        if (e3->d_name[0] == '.') continue;
+                        char vp[5700];
+                        snprintf(vp, sizeof(vp), "%s/%s", vdir, e3->d_name);
+                        struct stat vst;
+                        if (stat(vp, &vst) == 0 && vst.st_ino == cst.st_ino
+                            && vst.st_dev == cst.st_dev && unlink(vp) == 0)
+                            removed++;
+                    }
+                    closedir(d3);
+                }
+                closedir(dh);
+            }
+            closedir(d2);
+        }
+        closedir(d1);
+    }
+    closedir(b);
+    if (removed) LOG_I("recovery: removed %d duplicate version link(s)", removed);
+}
+
+s3_err_t store_get_open_version(s3_store_t *s, s3_str_t bucket, s3_str_t key,
+                                const uint8_t *vid,
+                                s3_reader_t **out, s3_obj_meta_t *meta_out) {
+    if (!s || !out) return S3_ERR_INVALID_ARGUMENT;
+    if (!valid_bucket_name(bucket)) return S3_ERR_INVALID_BUCKET_NAME;
+    if (!valid_key(key))            return S3_ERR_INVALID_ARGUMENT;
+    if (!store_bucket_exists(s, bucket)) return S3_ERR_NO_SUCH_BUCKET;
+    s3_obj_meta_t mtmp;
+    if (!meta_out) meta_out = &mtmp;
+    memset(meta_out, 0, sizeof(*meta_out));
+
+    char hex[65], path[4096];
+    hash_bucket_key(bucket, key, hex);
+    if (obj_path(s, bucket, hex, path, sizeof(path)) < 0) return S3_ERR_INTERNAL;
+
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    obj_header_t h;
+    if (fd >= 0) {
+        s3_err_t e = read_header(fd, &h, meta_out);
+        if (e != S3_OK) { close(fd); return e; }
+        if (vid && memcmp(meta_out->version_id, vid, 16) != 0) {
+            close(fd);
+            fd = -1;
+        }
+    } else if (errno != ENOENT) {
+        return S3_ERR_INTERNAL;
+    }
+    if (fd < 0 && vid) {
+        /* Look for the version among the noncurrent ones. */
+        char vdir[4300];
+        if (vdir_path(s, bucket, hex, vdir, sizeof(vdir)) < 0) return S3_ERR_INTERNAL;
+        size_t n;
+        vname_t *v = vdir_list(vdir, &n);
+        char want[33];
+        vid_hex(vid, want);
+        for (size_t i = 0; i < n && fd < 0; i++) {
+            if (strcmp(v[i].name + 17, want) != 0) continue;
+            char vp[4400];
+            snprintf(vp, sizeof(vp), "%s/%s", vdir, v[i].name);
+            fd = open(vp, O_RDONLY | O_CLOEXEC);
+        }
+        free(v);
+        if (fd < 0) { memset(meta_out, 0, sizeof(*meta_out)); return S3_ERR_NO_SUCH_VERSION; }
+        s3_err_t e = read_header(fd, &h, meta_out);
+        if (e != S3_OK) { close(fd); return e; }
+    }
+    if (fd < 0) return S3_ERR_NO_SUCH_KEY;
+    if (meta_out->flags & S3_OBJF_DELETE_MARKER) {
+        close(fd);
+        return vid ? S3_ERR_METHOD_NOT_ALLOWED : S3_ERR_NO_SUCH_KEY;
+    }
+
+    s3_reader_t *r = calloc(1, sizeof(*r));
+    if (!r) { close(fd); return S3_ERR_INTERNAL; }
+    r->fd        = fd;
+    r->data_off  = h.header_size;
+    r->data_size = h.data_size;
+    r->pos       = 0;
+    *out = r;
+    return S3_OK;
+}
+
+/* Write a delete marker (zero-length v3 object) into a tmp file. */
+static s3_err_t make_marker_tmp(s3_store_t *s, s3_str_t key, const uint8_t vid[16],
+                                char *tmp_path, size_t cap) {
+    int fd = tmp_open(s, tmp_path, cap);
+    if (fd < 0) return map_io_err(errno);
+    obj_header_t h;
+    obj_ext_v3_t x;
+    memset(&h, 0, sizeof(h));
+    memset(&x, 0, sizeof(x));
+    memcpy(h.magic, OBJ_MAGIC, OBJ_MAGIC_LEN);
+    h.schema = OBJ_SCHEMA;
+    h.header_size = (uint32_t)(sizeof(h) + sizeof(x) + key.n);
+    h.key_len = (uint16_t)key.n;
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    h.mtime_ms = (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
+    static const uint8_t empty_md5[16] = { 0xd4,0x1d,0x8c,0xd9,0x8f,0x00,0xb2,0x04,
+                                           0xe9,0x80,0x09,0x98,0xec,0xf8,0x42,0x7e };
+    memcpy(h.etag, empty_md5, 16);
+    memcpy(x.version_id, vid, 16);
+    x.flags = S3_OBJF_DELETE_MARKER;
+    if (xwrite(fd, &h, sizeof(h)) != (ssize_t)sizeof(h)
+        || xwrite(fd, &x, sizeof(x)) != (ssize_t)sizeof(x)
+        || xwrite(fd, key.p, key.n) != (ssize_t)key.n || xfsync(fd) < 0) {
+        s3_err_t e = map_io_err(errno);
+        close(fd); unlink(tmp_path);
+        return e;
+    }
+    close(fd);
+    return S3_OK;
+}
+
+static s3_err_t guard_check(s3_store_t *s, s3_str_t bucket, s3_str_t key,
+                            const s3_obj_meta_t *m) {
+    int bypass = g_guard_bypass;
+    if (!s->vguard || (m->flags & S3_OBJF_DELETE_MARKER)) return S3_OK;
+    return s->vguard(s->vguard_user, bucket, key, m, bypass);
+}
+
+/* Delete (versioning-aware) with the key lock held. expect_mtime != 0:
+ * lifecycle — only if the current object still has that mtime. */
+static s3_err_t delete_locked(s3_store_t *s, s3_str_t bucket, s3_str_t key,
+                              const char hex[65], const uint8_t *vid,
+                              uint64_t expect_mtime, store_delete_result_t *res) {
+    char path[4096], dir[4096], vdir[4300];
+    if (obj_path(s, bucket, hex, path, sizeof(path)) < 0
+        || obj_dir(s, bucket, hex, dir, sizeof(dir)) < 0
+        || vdir_path(s, bucket, hex, vdir, sizeof(vdir)) < 0)
+        return S3_ERR_INTERNAL;
+    int versioning = bucket_versioning(s, bucket);
+    res->versioned = versioning != S3_VERSIONING_UNSET;
+    s3_obj_meta_t cur;
+    int have_cur = peek_meta(path, &cur) == 0;
+    if (expect_mtime && (!have_cur || cur.mtime_ms != expect_mtime))
+        return have_cur ? S3_ERR_INVALID_REQUEST : S3_ERR_NO_SUCH_KEY;
+
+    if (!vid) {
+        if (versioning == S3_VERSIONING_UNSET) {
+            if (unlink(path) < 0)
+                return errno == ENOENT ? S3_OK : map_io_err(errno);
+            fsync_dir(dir);
+            return S3_OK;
+        }
+        uint8_t nv[16] = {0};
+        if (versioning == S3_VERSIONING_ENABLED && random_vid(nv) < 0)
+            return S3_ERR_INTERNAL;
+        char tmp[4096];
+        s3_err_t e = make_marker_tmp(s, key, nv, tmp, sizeof(tmp));
+        if (e != S3_OK) return e;
+        pthread_mutex_lock(&s->ns_mu);
+        if (!store_bucket_exists(s, bucket)) e = S3_ERR_NO_SUCH_BUCKET;
+        if (e == S3_OK) e = link_aside_locked(s, bucket, hex, path, versioning);
+        if (e == S3_OK && (mkdir_p(dir, 0700) < 0 || rename(tmp, path) < 0))
+            e = map_io_err(errno);
+        pthread_mutex_unlock(&s->ns_mu);
+        if (e != S3_OK) { unlink(tmp); return e; }
+        fsync_dir(dir);
+        res->delete_marker = 1;
+        store_vid_format(nv, res->version_id);
+        return S3_OK;
+    }
+
+    /* Permanent removal of one version. */
+    store_vid_format(vid, res->version_id);
+    if (have_cur && memcmp(cur.version_id, vid, 16) == 0) {
+        s3_err_t g = guard_check(s, bucket, key, &cur);
+        if (g != S3_OK) return g;
+        res->delete_marker = (cur.flags & S3_OBJF_DELETE_MARKER) != 0;
+        size_t n;
+        vname_t *v = vdir_list(vdir, &n);
+        int rc;
+        if (n) {
+            char vp[4400];
+            snprintf(vp, sizeof(vp), "%s/%s", vdir, v[0].name);
+            rc = rename(vp, path);                 /* promote the newest */
+            fsync_dir(vdir);
+        } else {
+            rc = unlink(path);
+        }
+        free(v);
+        if (rc < 0) return map_io_err(errno);
+        fsync_dir(dir);
+        return S3_OK;
+    }
+    size_t n;
+    vname_t *v = vdir_list(vdir, &n);
+    char want[33];
+    vid_hex(vid, want);
+    s3_err_t e = S3_OK;
+    int found = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (strcmp(v[i].name + 17, want) != 0) continue;
+        char vp[4400];
+        snprintf(vp, sizeof(vp), "%s/%s", vdir, v[i].name);
+        s3_obj_meta_t m;
+        if (peek_meta(vp, &m) < 0) { e = S3_ERR_INTERNAL; break; }
+        e = guard_check(s, bucket, key, &m);
+        if (e != S3_OK) break;
+        res->delete_marker = (m.flags & S3_OBJF_DELETE_MARKER) != 0;
+        if (unlink(vp) < 0) e = map_io_err(errno);
+        fsync_dir(vdir);
+        found = 1;
+        break;
+    }
+    free(v);
+    /* S3: deleting a version id that does not exist succeeds. */
+    (void)found;
+    return e;
+}
+
+s3_err_t store_delete_ex(s3_store_t *s, s3_str_t bucket, s3_str_t key,
+                         const uint8_t *vid, store_delete_result_t *res) {
+    store_delete_result_t tmp;
+    if (!res) res = &tmp;
+    memset(res, 0, sizeof(*res));
+    int bypass = g_guard_bypass;
+    g_guard_bypass = 0;
+    if (!s) return S3_ERR_INVALID_ARGUMENT;
+    if (!valid_bucket_name(bucket)) return S3_ERR_INVALID_BUCKET_NAME;
+    if (!valid_key(key))            return S3_ERR_INVALID_ARGUMENT;
+    if (!store_bucket_exists(s, bucket)) return S3_ERR_NO_SUCH_BUCKET;
+    char hex[65];
+    hash_bucket_key(bucket, key, hex);
+    pthread_mutex_t *km = key_lock(s, hex);
+    pthread_mutex_lock(km);
+    g_guard_bypass = bypass;
+    s3_err_t e = delete_locked(s, bucket, key, hex, vid, 0, res);
+    g_guard_bypass = 0;
+    pthread_mutex_unlock(km);
+    return e;
+}
+
+s3_err_t store_list_noncurrent(s3_store_t *s, s3_str_t bucket, s3_str_t key,
+                               s3_noncurrent_t **out, size_t *n_out) {
+    *out = NULL;
+    *n_out = 0;
+    char hex[65], vdir[4300], path[4096];
+    hash_bucket_key(bucket, key, hex);
+    if (vdir_path(s, bucket, hex, vdir, sizeof(vdir)) < 0
+        || obj_path(s, bucket, hex, path, sizeof(path)) < 0) return S3_ERR_INTERNAL;
+    size_t n;
+    vname_t *v = vdir_list(vdir, &n);
+    if (!n) { free(v); return S3_OK; }
+    s3_noncurrent_t *r = calloc(n, sizeof(*r));
+    if (!r) { free(v); return S3_ERR_INTERNAL; }
+    s3_obj_meta_t cur;
+    uint64_t newer = peek_meta(path, &cur) == 0 ? cur.mtime_ms : 0;
+    size_t k = 0;
+    for (size_t i = 0; i < n; i++) {
+        char vp[4400];
+        snprintf(vp, sizeof(vp), "%s/%s", vdir, v[i].name);
+        if (peek_meta(vp, &r[k].meta) < 0) continue;
+        memcpy(r[k].vid, r[k].meta.version_id, 16);
+        r[k].noncurrent_since_ms = newer ? newer : r[k].meta.mtime_ms;
+        newer = r[k].meta.mtime_ms;
+        k++;
+    }
+    free(v);
+    *out = r;
+    *n_out = k;
+    return S3_OK;
+}
+
+/* ---- ListObjectVersions ----------------------------------------------- */
+
+typedef struct { char *key; size_t kn; char hex[65]; } vkey_t;
+
+static int vkey_cmp(const void *a, const void *b) {
+    const vkey_t *x = a, *y = b;
+    size_t n = x->kn < y->kn ? x->kn : y->kn;
+    int r = memcmp(x->key, y->key, n);
+    return r ? r : (x->kn < y->kn ? -1 : x->kn > y->kn);
+}
+
+typedef struct { vkey_t *v; size_t n, cap; s3_str_t prefix; } vkcollect_t;
+
+static int vk_add(vkcollect_t *c, const char *key, size_t kn) {
+    if (c->prefix.n && (kn < c->prefix.n || memcmp(key, c->prefix.p, c->prefix.n)))
+        return 0;
+    if (c->n == c->cap) {
+        size_t nc = c->cap ? c->cap * 2 : 64;
+        vkey_t *nv = realloc(c->v, nc * sizeof(*nv));
+        if (!nv) return -1;
+        c->v = nv; c->cap = nc;
+    }
+    char *k = malloc(kn + 1);
+    if (!k) return -1;
+    memcpy(k, key, kn);
+    k[kn] = '\0';
+    c->v[c->n++] = (vkey_t){ k, kn, "" };
+    return 0;
+}
+
+static int vk_walk_cb(void *u, s3_str_t key, const s3_obj_meta_t *m) {
+    (void)m;
+    return vk_add(u, key.p, key.n) < 0;
+}
+
+s3_err_t store_list_versions(s3_store_t *s, s3_str_t bucket,
+                             const s3_version_list_opts_t *o,
+                             s3_version_info_t **out, size_t *n_out,
+                             int *truncated, char **next_key,
+                             char next_vid[33]) {
+    *out = NULL; *n_out = 0; *truncated = 0; *next_key = NULL; next_vid[0] = '\0';
+    if (!store_bucket_exists(s, bucket)) return S3_ERR_NO_SUCH_BUCKET;
+    int max = o->max_keys > 0 && o->max_keys <= 1000 ? o->max_keys : 1000;
+
+    /* Keys: every current object (markers included) plus keys that only
+     * have noncurrent versions (read from their newest version file). */
+    vkcollect_t kc = { .prefix = o->prefix };
+    store_walk_objects(s, bucket, vk_walk_cb, &kc);
+    char vb[4200];
+    snprintf(vb, sizeof(vb), "%s/" S3_STR_FMT, s->versions_dir, S3_STR_ARG(bucket));
+    DIR *d1 = opendir(vb);
+    if (d1) {
+        struct dirent *e1;
+        while ((e1 = readdir(d1)) != NULL) {
+            if (e1->d_name[0] == '.') continue;
+            char p1[4500];
+            snprintf(p1, sizeof(p1), "%s/%s", vb, e1->d_name);
+            DIR *d2 = opendir(p1);
+            if (!d2) continue;
+            struct dirent *e2;
+            while ((e2 = readdir(d2)) != NULL) {
+                if (e2->d_name[0] == '.') continue;
+                char p2[4800];
+                snprintf(p2, sizeof(p2), "%s/%s", p1, e2->d_name);
+                DIR *d3 = opendir(p2);
+                if (!d3) continue;
+                struct dirent *e3;
+                while ((e3 = readdir(d3)) != NULL) {
+                    if (e3->d_name[0] == '.') continue;
+                    char cur[5100];
+                    snprintf(cur, sizeof(cur), "%s/" S3_STR_FMT "/%s/%s/%s", s->data_dir,
+                             S3_STR_ARG(bucket), e1->d_name, e2->d_name, e3->d_name);
+                    struct stat st;
+                    if (stat(cur, &st) == 0) continue;     /* already listed */
+                    char vdir[5100];
+                    snprintf(vdir, sizeof(vdir), "%s/%s", p2, e3->d_name);
+                    size_t nv;
+                    vname_t *vn = vdir_list(vdir, &nv);
+                    if (nv) {
+                        char vp[5400];
+                        snprintf(vp, sizeof(vp), "%s/%s", vdir, vn[0].name);
+                        list_entry_t ent;
+                        if (load_entry(vp, &ent) == 0) {
+                            vk_add(&kc, ent.key, ent.key_len);
+                            free(ent.key);
+                        }
+                    }
+                    free(vn);
+                }
+                closedir(d3);
+            }
+            closedir(d2);
+        }
+        closedir(d1);
+    }
+    if (kc.n) qsort(kc.v, kc.n, sizeof(*kc.v), vkey_cmp);
+
+    s3_version_info_t *res = NULL;
+    size_t rn = 0, rcap = 0;
+    int emitted = 0;
+    char *last_prefix = NULL;
+    for (size_t i = 0; i < kc.n && !*truncated; i++) {
+        s3_str_t key = { kc.v[i].key, kc.v[i].kn };
+        /* key-marker: keys after it (or, with version-id-marker, the rest
+         * of that key's versions after the marker). */
+        int cmpm = 0;
+        if (o->key_marker.n) {
+            size_t n = key.n < o->key_marker.n ? key.n : o->key_marker.n;
+            cmpm = memcmp(key.p, o->key_marker.p, n);
+            if (!cmpm) cmpm = key.n < o->key_marker.n ? -1 : key.n > o->key_marker.n;
+            if (cmpm < 0 || (cmpm == 0 && !o->version_id_marker.n)) continue;
+        }
+        if (o->delimiter.n) {
+            const char *after = key.p + o->prefix.n;
+            size_t an = key.n - o->prefix.n;
+            const char *dl = memmem(after, an, o->delimiter.p, o->delimiter.n);
+            if (dl) {
+                size_t pn = (size_t)(dl - key.p) + o->delimiter.n;
+                if (last_prefix && strlen(last_prefix) == pn && !memcmp(last_prefix, key.p, pn))
+                    continue;
+                if (emitted >= max) { *truncated = 1; break; }
+                if (rn == rcap) {
+                    rcap = rcap ? rcap * 2 : 32;
+                    s3_version_info_t *nr = realloc(res, rcap * sizeof(*nr));
+                    if (!nr) break;
+                    res = nr;
+                }
+                memset(&res[rn], 0, sizeof(res[rn]));
+                res[rn].prefix = strndup(key.p, pn);
+                free(last_prefix);
+                last_prefix = strndup(key.p, pn);
+                rn++;
+                emitted++;
+                continue;
+            }
+        }
+        /* Versions of this key: current, then noncurrent newest first. */
+        char hex[65], path[4096], vdir[4300];
+        hash_bucket_key(bucket, key, hex);
+        obj_path(s, bucket, hex, path, sizeof(path));
+        vdir_path(s, bucket, hex, vdir, sizeof(vdir));
+        size_t nv;
+        vname_t *vn = vdir_list(vdir, &nv);
+        int skipping = cmpm == 0 && o->version_id_marker.n;
+        for (size_t j = 0; j <= nv; j++) {
+            s3_obj_meta_t m;
+            int latest = 0;
+            if (j == 0) {
+                if (peek_meta(path, &m) < 0) continue;
+                latest = 1;
+            } else {
+                char vp[4400];
+                snprintf(vp, sizeof(vp), "%s/%s", vdir, vn[j-1].name);
+                if (peek_meta(vp, &m) < 0) continue;
+            }
+            char vs[33];
+            store_vid_format(m.version_id, vs);
+            if (skipping) {
+                if (o->version_id_marker.n == strlen(vs)
+                    && !memcmp(o->version_id_marker.p, vs, strlen(vs)))
+                    skipping = 0;
+                continue;
+            }
+            if (emitted >= max) {
+                *truncated = 1;
+                break;
+            }
+            if (rn == rcap) {
+                rcap = rcap ? rcap * 2 : 32;
+                s3_version_info_t *nr = realloc(res, rcap * sizeof(*nr));
+                if (!nr) break;
+                res = nr;
+            }
+            memset(&res[rn], 0, sizeof(res[rn]));
+            res[rn].key = strndup(key.p, key.n);
+            memcpy(res[rn].version_id, vs, sizeof(vs));
+            res[rn].is_latest = latest;
+            res[rn].meta = m;
+            rn++;
+            emitted++;
+        }
+        free(vn);
+    }
+    if (*truncated && rn) {
+        s3_version_info_t *l = &res[rn - 1];
+        *next_key = strdup(l->key ? l->key : l->prefix);
+        if (l->key) memcpy(next_vid, l->version_id, 33);
+    }
+    free(last_prefix);
+    for (size_t i = 0; i < kc.n; i++) free(kc.v[i].key);
+    free(kc.v);
+    *out = res;
+    *n_out = rn;
+    return S3_OK;
+}
+
+void store_versions_free(s3_version_info_t *v, size_t n) {
+    for (size_t i = 0; i < n; i++) { free(v[i].key); free(v[i].prefix); }
+    free(v);
+}

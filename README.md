@@ -149,6 +149,27 @@ What's working end-to-end:
   the practical cap is the directory entry limit, well above any
   realistic in-flight set).
 
+- **Versioning** — `PUT/GET /bucket?versioning` (Enabled / Suspended;
+  never back to Unset; MFA delete → 501). The current version stays at
+  `data/...`, so unversioned GET and listing are as fast as before;
+  superseded versions move to `versions/<b>/xx/yy/<hex>/<inv_ts>-<vid>`
+  (newest first in directory order) through a hard link made under the
+  key's stripe lock before the new current is renamed in — a crash in
+  between leaves a duplicate link that startup recovery removes. DELETE
+  writes a delete marker (`x-amz-delete-marker`, `x-amz-version-id`);
+  `versionId` works on GET/HEAD/DELETE, copy sources and bulk delete;
+  deleting the current version by id promotes the newest noncurrent one
+  and deleting a marker undeletes. Suspended buckets write and overwrite
+  the single null version. `GET /bucket?versions` (ListObjectVersions)
+  paginates with `key-marker`/`version-id-marker` and supports
+  prefix/delimiter. Every mutating response carries `x-amz-version-id`.
+  A bucket can only be deleted once no current object, noncurrent
+  version or marker is left; bucket stats report versions separately.
+  Version ids are validated (32 hex or `null`) before any path is built.
+- **`Expect: 100-continue`** is answered as soon as a request passes
+  auth and routing. botocore sends it on every upload and used to wait
+  its 1-second timeout per PUT.
+
 - **Static website hosting** (Garage's model) — `PUT/GET/DELETE
   /bucket?website` with `IndexDocument/Suffix`, `ErrorDocument/Key` or
   `RedirectAllRequestsTo` (`RoutingRules` → 501). A website config makes

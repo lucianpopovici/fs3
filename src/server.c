@@ -554,6 +554,8 @@ static void accept_new(server_t *s, int lfd, int is_web) {
         c->is_web = is_web;
         c->web_root_domain = s->cfg.web_root_domain;
         c->allow_public = s->cfg.allow_public;
+        c->allow_public_write = s->cfg.allow_public_write;
+        c->trusted_proxies = s->cfg.trusted_proxies;
 
         struct epoll_event ev = {
             .events = EPOLLIN | EPOLLRDHUP,

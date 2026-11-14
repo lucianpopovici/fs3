@@ -144,6 +144,12 @@ int rsp_build_bucket_location(conn_t *c);
 
 /* Build a GetBucketVersioning XML response (versioning never enabled). */
 int rsp_build_bucket_versioning(conn_t *c);
+int rsp_build_bucket_versioning_state(conn_t *c, int state);
+int rsp_build_list_versions(conn_t *c, s3_str_t bucket,
+                            const s3_version_list_opts_t *o,
+                            const s3_version_info_t *v, size_t n,
+                            int truncated, const char *next_key,
+                            const char *next_vid);
 
 /* Map an s3_err_t to an HTTP status code. */
 int rsp_status_for_err(s3_err_t err);

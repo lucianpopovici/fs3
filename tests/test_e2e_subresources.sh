@@ -44,7 +44,7 @@ body_is_original() {
 
 for sub in tagging retention legal-hold torrent restore select attributes \
            versions policy cors lifecycle website object-lock encryption \
-           replication notification logging "versionId=abc"; do
+           replication notification logging; do
     check_eq "PUT ?$sub → 501" \
         "$(code -X PUT --data-binary '<Tagging/>' "$URL/subb/k?$sub")" "501"
     body_is_original "PUT ?$sub"
@@ -53,20 +53,28 @@ for sub in tagging retention legal-hold torrent restore select attributes \
     check_eq "GET ?$sub → 501" "$(code "$URL/subb/k?$sub")" "501"
 done
 
+# A malformed versionId is refused before any path is built (S5) and
+# never touches the current object.
+for m in PUT DELETE GET; do
+    check_eq "$m ?versionId=../x → 400" \
+        "$(code -X $m --data-binary 'x' "$URL/subb/k?versionId=../../etc")" "400"
+    body_is_original "$m ?versionId"
+done
+
 # POST ?restore / ?select must not be treated as anything else.
 check_eq "POST ?restore → 501" "$(code -X POST --data-binary x "$URL/subb/k?restore")" "501"
 body_is_original "POST ?restore"
 
 # Bucket level: DELETE ?cors must not delete the bucket; PUT ?versioning
 # must not try to create it.
-for sub in policy tagging encryption object-lock \
+for sub in tagging encryption object-lock \
            replication publicAccessBlock; do
     check_eq "bucket DELETE ?$sub → 501" "$(code -X DELETE "$URL/subb?$sub")" "501"
     check_eq "bucket PUT ?$sub → 501" \
         "$(code -X PUT --data-binary '<x/>' "$URL/subb?$sub")" "501"
     check_eq "bucket GET ?$sub → 501" "$(code "$URL/subb?$sub")" "501"
 done
-check_eq "bucket PUT ?versioning → 501" "$(code -X PUT --data-binary '<x/>' "$URL/subb?versioning")" "501"
+check_eq "bucket PUT ?versioning malformed → 400" "$(code -X PUT --data-binary '<x/>' "$URL/subb?versioning")" "400"
 check_eq "bucket survives" "$(code -I "$URL/subb")" "200"
 body_is_original "bucket-level probes"
 
