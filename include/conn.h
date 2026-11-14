@@ -295,6 +295,7 @@ typedef struct conn {
     int                copy_pending;
     s3_str_t           copy_bucket;
     s3_str_t           copy_key;
+    int                copy_part;     /* UploadPartCopy: part number, 0 = CopyObject */
 
     /* Bucket config PUT (?cors, ?lifecycle, ?website, ?policy, ...):
      * body buffered into req_body_buf, handled at message-complete.

@@ -127,6 +127,8 @@ static const err_entry_t ERR_TABLE[] = {
     { S3_ERR_SLOW_DOWN,                  503, "SlowDown",                 "Please reduce your request rate." },
     { S3_ERR_INVALID_PART_ORDER,         400, "InvalidPartOrder",         "The list of parts was not in ascending order." },
     { S3_ERR_ENTITY_TOO_SMALL,           400, "EntityTooSmall",           "Your proposed upload is smaller than the minimum allowed object size." },
+    { S3_ERR_PRECONDITION_FAILED,        412, "PreconditionFailed",       "At least one of the pre-conditions you specified did not hold." },
+    { S3_ERR_INVALID_RANGE,              416, "InvalidRange",             "The requested range is not satisfiable." },
     { S3_ERR_MALFORMED_POLICY,           400, "MalformedPolicy",          "Policies must be valid JSON within the supported grammar." },
     { S3_ERR_INSUFFICIENT_STORAGE,       507, "QuotaExceeded",            "There is insufficient storage available to complete the request." },
 };
@@ -665,6 +667,28 @@ int rsp_build_health(conn_t *c) {
 /* ===================================================================== */
 /* Object copy: CopyObjectResult                                          */
 /* ===================================================================== */
+
+int rsp_build_copy_part(conn_t *c, const char etag_hex[33], uint64_t mtime_ms,
+                        uint8_t algo, const uint8_t *ck, size_t ck_n) {
+    char etag[40]; snprintf(etag, sizeof(etag), "\"%s\"", etag_hex);
+    char ts[32];   rsp_format_iso8601(mtime_ms, ts);
+    XMLNode *root = create_node("CopyPartResult");
+    if (!root) return -1;
+    if (!xml_text_child(root, "LastModified", ts)
+        || !xml_text_child(root, "ETag", etag)) {
+        free_tree(root); return -1;
+    }
+    if (algo && ck_n) {
+        char b64[64];
+        base64_encode(ck, ck_n, b64);
+        xml_text_child(root, cksum_xml_name(algo), b64);
+    }
+    size_t blen = 0;
+    char *body = xml_render_with_decl(root, &blen);
+    free_tree(root);
+    if (!body) return -1;
+    return ship_xml_200(c, body, blen);
+}
 
 int rsp_build_copy_object(conn_t *c, const s3_obj_meta_t *m) {
     char etag[41]; rsp_format_etag_with_parts(m->etag, m->part_count, etag);

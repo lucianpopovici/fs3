@@ -1246,39 +1246,164 @@ typedef struct {
     s3_writer_t   *w;
     s3_err_t       err;
     s3_obj_meta_t  meta;
+    /* UploadPartCopy */
+    int            part;
+    uint8_t        ck_algo, ck_type;
+    uint8_t        ck[CKSUM_MAX_DIGEST];
+    size_t         ck_n;
+    char           etag[33];
+    uint64_t       mtime_ms;
 } copy_job_t;
 
 static void copy_run(iojob_t *j) {
     copy_job_t *cj = (copy_job_t *)j;
     char xbuf[64 * 1024];
     int stream_ok = 1;
-    for (;;) {
+    cksum_ctx_t k;
+    memset(&k, 0, sizeof(k));
+    if (cj->ck_algo && cksum_begin(&k, cj->ck_algo) < 0) stream_ok = 0;
+    while (stream_ok) {
         ssize_t n = store_get_read(cj->r, xbuf, sizeof(xbuf));
         if (n == 0) break;
-        if (n < 0 || store_put_write(cj->w, xbuf, (size_t)n) != S3_OK) {
+        if (n > 0 && cj->ck_algo) cksum_update(&k, xbuf, (size_t)n);
+        if (n < 0 || (cj->part ? store_mpu_part_write(cj->w, xbuf, (size_t)n)
+                               : store_put_write(cj->w, xbuf, (size_t)n)) != S3_OK) {
             stream_ok = 0;
             break;
         }
     }
     store_get_close(cj->r);
+    if (stream_ok && cj->ck_algo) {
+        /* The copy computed the part checksum itself: the upload's
+         * algorithm requires one on every part. */
+        if (cksum_final(&k, cj->ck, &cj->ck_n) != 0
+            || store_put_set_checksum(cj->w, cj->ck_algo, S3_CKSUM_TYPE_FULL_OBJECT, 0,
+                                      cj->ck, cj->ck_n) != S3_OK)
+            stream_ok = 0;
+    }
+    cksum_free(&k);
     if (!stream_ok) {
-        store_put_abort(cj->w);
+        if (cj->part) store_mpu_part_abort(cj->w);
+        else          store_put_abort(cj->w);
         cj->err = S3_ERR_INTERNAL;
         return;
     }
-    cj->err = store_put_commit(cj->w, &cj->meta);
+    if (cj->part) {
+        cj->err = store_mpu_part_commit(cj->w, cj->etag);
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        cj->mtime_ms = (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
+    } else {
+        cj->err = store_put_commit(cj->w, &cj->meta);
+    }
 }
 
 static void copy_done(iojob_t *j) {
     copy_job_t *cj = (copy_job_t *)j;
     conn_t *c = job_finish(j);
     if (c) {
-        if (cj->err == S3_OK) add_version_header(c, c->copy_bucket, cj->meta.version_id);
+        if (cj->err == S3_OK && !cj->part)
+            add_version_header(c, c->copy_bucket, cj->meta.version_id);
         job_respond(c, cj->err != S3_OK
             ? rsp_build_s3_error(c, cj->err, c->req.path, NULL)
-            : rsp_build_copy_object(c, &cj->meta));
+            : cj->part ? rsp_build_copy_part(c, cj->etag, cj->mtime_ms, cj->ck_algo,
+                                             cj->ck, cj->ck_n)
+                       : rsp_build_copy_object(c, &cj->meta));
     }
     free(cj);
+}
+
+/* RFC 7231 HTTP-date ("Wed, 21 Oct 2015 07:28:00 GMT") or ISO 8601 →
+ * epoch ms. -1 if unparseable. */
+static int64_t parse_http_date_ms(const s3_str_t *v) {
+    char buf[64];
+    if (!v || v->n == 0 || v->n >= sizeof(buf)) return -1;
+    memcpy(buf, v->p, v->n);
+    buf[v->n] = '\0';
+    struct tm tm;
+    static const char *fmts[] = { "%a, %d %b %Y %H:%M:%S GMT", "%Y-%m-%dT%H:%M:%S",
+                                  "%A, %d-%b-%y %H:%M:%S GMT", NULL };
+    for (int i = 0; fmts[i]; i++) {
+        memset(&tm, 0, sizeof(tm));
+        const char *end = strptime(buf, fmts[i], &tm);
+        if (end && (*end == '\0' || *end == 'Z' || *end == '.'))
+            return (int64_t)timegm(&tm) * 1000;
+    }
+    return -1;
+}
+
+/* ETag list match for If-Match / If-None-Match: "*" or comma-separated,
+ * quoted or not. etag is the formatted (quoted) ETag. */
+static int etag_list_matches(const s3_str_t *v, const char *etag) {
+    size_t en = strlen(etag);
+    const char *bare = etag; size_t bn = en;
+    if (bn >= 2 && bare[0] == '"') { bare++; bn -= 2; }
+    size_t i = 0;
+    while (i < v->n) {
+        while (i < v->n && (v->p[i] == ' ' || v->p[i] == ',')) i++;
+        size_t st = i;
+        while (i < v->n && v->p[i] != ',') i++;
+        size_t e = i;
+        while (e > st && v->p[e - 1] == ' ') e--;
+        const char *t = v->p + st; size_t tn = e - st;
+        if (tn >= 2 && t[0] == 'W' && t[1] == '/') { t += 2; tn -= 2; }
+        if (tn >= 2 && t[0] == '"' && t[tn - 1] == '"') { t++; tn -= 2; }
+        if (tn == 1 && t[0] == '*') return 1;
+        if (tn == bn && memcmp(t, bare, bn) == 0) return 1;
+    }
+    return 0;
+}
+
+/* x-amz-copy-source-if-{match,none-match,unmodified-since,modified-since}
+ * against the source (RFC 7232 precedence: a passing If-Match overrides
+ * If-Unmodified-Since; a failing If-None-Match overrides
+ * If-Modified-Since). */
+static s3_err_t copy_source_conditions(conn_t *c, const s3_obj_meta_t *m) {
+    char etag[41];
+    rsp_format_etag_with_parts(m->etag, m->part_count, etag);
+    const s3_str_t *im  = hdr_get(c, "x-amz-copy-source-if-match");
+    const s3_str_t *inm = hdr_get(c, "x-amz-copy-source-if-none-match");
+    const s3_str_t *ius = hdr_get(c, "x-amz-copy-source-if-unmodified-since");
+    const s3_str_t *ims = hdr_get(c, "x-amz-copy-source-if-modified-since");
+    int64_t mt = (int64_t)(m->mtime_ms / 1000) * 1000;   /* HTTP dates: seconds */
+    if (im) {
+        if (!etag_list_matches(im, etag)) return S3_ERR_PRECONDITION_FAILED;
+    } else if (ius) {
+        int64_t t = parse_http_date_ms(ius);
+        if (t >= 0 && mt > t) return S3_ERR_PRECONDITION_FAILED;
+    }
+    if (inm) {
+        if (etag_list_matches(inm, etag)) return S3_ERR_PRECONDITION_FAILED;
+    } else if (ims) {
+        int64_t t = parse_http_date_ms(ims);
+        if (t >= 0 && mt <= t) return S3_ERR_PRECONDITION_FAILED;
+    }
+    return S3_OK;
+}
+
+/* x-amz-copy-source-range: exactly "bytes=A-B", A <= B < size. */
+static s3_err_t copy_source_range(const s3_str_t *h, uint64_t size,
+                                  uint64_t *first, uint64_t *last) {
+    if (h->n < 9 || memcmp(h->p, "bytes=", 6) != 0) return S3_ERR_INVALID_ARGUMENT;
+    uint64_t v[2] = { 0, 0 };
+    size_t i = 6;
+    for (int k = 0; k < 2; k++) {
+        size_t st = i;
+        while (i < h->n && h->p[i] >= '0' && h->p[i] <= '9') {
+            if (i - st >= 19) return S3_ERR_INVALID_ARGUMENT;
+            v[k] = v[k] * 10 + (uint64_t)(h->p[i] - '0');
+            i++;
+        }
+        if (i == st) return S3_ERR_INVALID_ARGUMENT;
+        if (k == 0) {
+            if (i >= h->n || h->p[i] != '-') return S3_ERR_INVALID_ARGUMENT;
+            i++;
+        }
+    }
+    if (i != h->n || v[0] > v[1]) return S3_ERR_INVALID_ARGUMENT;
+    if (v[1] >= size) return S3_ERR_INVALID_RANGE;
+    *first = v[0]; *last = v[1];
+    return S3_OK;
 }
 
 /* Validate and open both ends on the loop (cheap, and errors answer
@@ -1351,9 +1476,30 @@ static int handle_object_copy(conn_t *c, s3_str_t dst_bucket, s3_str_t dst_key) 
         return rsp_build_s3_error(c, e, c->req.path, NULL);
     }
 
-    /* Open dest writer with source content-type. */
+    e = copy_source_conditions(c, &src_meta);
+    int part = c->copy_part;
+    c->copy_part = 0;
+    const s3_str_t *rh = part ? hdr_get(c, "x-amz-copy-source-range") : NULL;
+    if (e == S3_OK && rh) {
+        uint64_t first, last;
+        e = copy_source_range(rh, src_meta.size, &first, &last);
+        if (e == S3_OK) e = store_get_seek(reader, first, last);
+    }
+    uint8_t ck_algo = 0, ck_type = 0;
+    if (e == S3_OK && part)
+        e = store_mpu_checksum_info(c->store, dst_bucket, c->mpu_upload_id, &ck_algo, &ck_type);
+    if (e != S3_OK) {
+        store_get_close(reader);
+        free(src_buf);
+        return rsp_build_s3_error(c, e, c->req.path, NULL);
+    }
+
+    /* Open dest writer: a part of the upload, or an object with the
+     * source content-type. */
     s3_writer_t *writer = NULL;
-    e = store_put_begin(c->store, dst_bucket, dst_key, src_meta.content_type, &writer);
+    e = part ? store_mpu_part_begin(c->store, dst_bucket, dst_key, c->mpu_upload_id,
+                                    part, &writer)
+             : store_put_begin(c->store, dst_bucket, dst_key, src_meta.content_type, &writer);
     if (e != S3_OK) {
         store_get_close(reader);
         free(src_buf);
@@ -1364,13 +1510,17 @@ static int handle_object_copy(conn_t *c, s3_str_t dst_bucket, s3_str_t dst_key) 
     copy_job_t *cj = calloc(1, sizeof(*cj));
     if (!cj) {
         store_get_close(reader);
-        store_put_abort(writer);
+        if (part) store_mpu_part_abort(writer);
+        else      store_put_abort(writer);
         return rsp_build_s3_error(c, S3_ERR_INTERNAL, c->req.path, NULL);
     }
     cj->base.run  = copy_run;
     cj->base.done = copy_done;
     cj->r = reader;
     cj->w = writer;
+    cj->part = part;
+    cj->ck_algo = ck_algo;
+    cj->ck_type = ck_type;
     return job_submit(c, &cj->base);
 }
 
@@ -2199,14 +2349,7 @@ static s3_action_t classify_object(const conn_t *c, s3_err_t *err) {
     } else if (sub) {   /* uploads */
         if (post) return ACT_MPU_CREATE;
     } else if (has_upload_id) {
-        if (put && has_part) {
-            /* UploadPartCopy is not implemented: refuse rather than
-             * store the (empty) request body as the part. */
-            if (hdr_get(c, "x-amz-copy-source")) {
-                *err = S3_ERR_NOT_IMPLEMENTED; return ACT_NONE;
-            }
-            return ACT_MPU_UPLOAD_PART;
-        }
+        if (put && has_part) return ACT_MPU_UPLOAD_PART;   /* or UploadPartCopy */
         if (post && !has_part) return ACT_MPU_COMPLETE;
         if (del && !has_part)  return ACT_MPU_ABORT;
         if (get && !has_part)  return ACT_MPU_LIST_PARTS;
@@ -2339,6 +2482,15 @@ int route_dispatch_headers(conn_t *c) {
             if (pn < 1)
                 return rsp_build_s3_error(c, S3_ERR_INVALID_ARGUMENT,
                                           c->req.path, NULL);
+            if (hdr_get(c, "x-amz-copy-source")) {
+                /* UploadPartCopy: runs at message-complete, like CopyObject. */
+                c->copy_pending = 1;
+                c->copy_part    = pn;
+                c->copy_bucket  = bucket;
+                c->copy_key     = key;
+                memcpy(c->mpu_upload_id, upload_id_buf, 33);
+                return 0;
+            }
             return handle_mpu_upload_part_begin(c, bucket, key, pn,
                                                 upload_id_buf);
         }

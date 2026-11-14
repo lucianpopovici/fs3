@@ -117,6 +117,8 @@ int rsp_build_health(conn_t *c);
 
 /* Build a CopyObjectResult XML body (200 OK) for server-side object copy.
  * `m` is the metadata of the newly written destination object. */
+int rsp_build_copy_part(conn_t *c, const char etag_hex[33], uint64_t mtime_ms,
+                        uint8_t algo, const uint8_t *ck, size_t ck_n);
 int rsp_build_copy_object(conn_t *c, const s3_obj_meta_t *m);
 
 /* Build an AccessControlPolicy XML body (200 OK). fs3 has no real ACL

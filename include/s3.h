@@ -47,10 +47,12 @@ typedef enum {
     S3_ERR_MALFORMED_POLICY,
     S3_ERR_NO_SUCH_VERSION,
     S3_ERR_POLICY_DENIED,               /* explicit Deny in a bucket policy */
-    S3_ERR_LOCKED,
-    S3_ERR_SLOW_DOWN,
+    S3_ERR_LOCKED,                      /* object lock retention / legal hold */
+    S3_ERR_SLOW_DOWN,                   /* auth-failure throttling */
     S3_ERR_INVALID_PART_ORDER,
-    S3_ERR_ENTITY_TOO_SMALL,                   /* auth-failure throttling */                      /* object lock retention / legal hold */
+    S3_ERR_ENTITY_TOO_SMALL,
+    S3_ERR_PRECONDITION_FAILED,
+    S3_ERR_INVALID_RANGE,               /* x-amz-copy-source-range outside the source */
     S3_ERR_MAX
 } s3_err_t;
 

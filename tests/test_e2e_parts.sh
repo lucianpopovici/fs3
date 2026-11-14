@@ -31,7 +31,7 @@ sleep 0.4
 kill -0 "$SP" 2>/dev/null || { echo "server did not start" >&2; cat "$LOG" >&2; exit 1; }
 
 ORPHAN_OUT="$DATA.orphan" python3 -u - "$URL" "$A" "$AS" "$B" "$BS" "$DATA" <<'PY'
-import sys, os, glob, hashlib, boto3, botocore
+import sys, os, glob, hashlib, base64, boto3, botocore
 url, a, asec, b, bsec, data = sys.argv[1:7]
 mk = lambda ak, sk: boto3.client("s3", endpoint_url=url, aws_access_key_id=ak,
                                  aws_secret_access_key=sk, region_name="us-east-1")
@@ -156,9 +156,94 @@ check("orphan record ignored", [p["PartNumber"] for p in s3.list_parts(Bucket="p
 with open(os.environ.get("ORPHAN_OUT", "/dev/null"), "w") as f:
     f.write(f"{data}/mpu/partb/{uid}/part-00009.rec")
 
+# --- 1c: UploadPartCopy ----------------------------------------------------
+src = os.urandom(10000)
+s3.put_object(Bucket="partb", Key="src", Body=src)
+src_etag = s3.head_object(Bucket="partb", Key="src")["ETag"]
+uid = start("pc")
+r1 = s3.upload_part_copy(Bucket="partb", Key="pc", UploadId=uid, PartNumber=1,
+                         CopySource={"Bucket": "partb", "Key": "src"})["CopyPartResult"]
+check("part copy ETag = MD5 of source", r1["ETag"].strip('"'), hashlib.md5(src).hexdigest())
+r2 = s3.upload_part_copy(Bucket="partb", Key="pc", UploadId=uid, PartNumber=2,
+                         CopySource="partb/src", CopySourceRange="bytes=100-2099")["CopyPartResult"]
+check("ranged part copy ETag", r2["ETag"].strip('"'), hashlib.md5(src[100:2100]).hexdigest())
+check("range past the end → InvalidRange", code(lambda: s3.upload_part_copy(Bucket="partb", Key="pc",
+      UploadId=uid, PartNumber=3, CopySource="partb/src", CopySourceRange="bytes=0-10000")), "InvalidRange")
+check("malformed range → InvalidArgument", code(lambda: s3.upload_part_copy(Bucket="partb", Key="pc",
+      UploadId=uid, PartNumber=3, CopySource="partb/src", CopySourceRange="bytes=5-")), "InvalidArgument")
+check("if-match ok", code(lambda: s3.upload_part_copy(Bucket="partb", Key="pc", UploadId=uid, PartNumber=3,
+      CopySource="partb/src", CopySourceRange="bytes=0-1023", CopySourceIfMatch=src_etag)), "ok")
+check("if-match mismatch → PreconditionFailed", code(lambda: s3.upload_part_copy(Bucket="partb", Key="pc",
+      UploadId=uid, PartNumber=4, CopySource="partb/src", CopySourceIfMatch='"' + "1" * 32 + '"')), "PreconditionFailed")
+check("if-none-match hit → PreconditionFailed", code(lambda: s3.upload_part_copy(Bucket="partb", Key="pc",
+      UploadId=uid, PartNumber=4, CopySource="partb/src", CopySourceIfNoneMatch=src_etag)), "PreconditionFailed")
+import datetime
+future = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=1)
+past = datetime.datetime(2000, 1, 1, tzinfo=datetime.timezone.utc)
+check("if-modified-since future → PreconditionFailed", code(lambda: s3.upload_part_copy(Bucket="partb", Key="pc",
+      UploadId=uid, PartNumber=4, CopySource="partb/src", CopySourceIfModifiedSince=future)), "PreconditionFailed")
+check("if-unmodified-since past → PreconditionFailed", code(lambda: s3.upload_part_copy(Bucket="partb", Key="pc",
+      UploadId=uid, PartNumber=4, CopySource="partb/src", CopySourceIfUnmodifiedSince=past)), "PreconditionFailed")
+check("if-modified-since past ok", code(lambda: s3.upload_part_copy(Bucket="partb", Key="pc", UploadId=uid,
+      PartNumber=4, CopySource="partb/src", CopySourceRange="bytes=0-0", CopySourceIfModifiedSince=past)), "ok")
+check("CopyObject honours if-match too", code(lambda: s3.copy_object(Bucket="partb", Key="cpo",
+      CopySource="partb/src", CopySourceIfMatch='"' + "1" * 32 + '"')), "PreconditionFailed")
+check("missing source → NoSuchKey", code(lambda: s3.upload_part_copy(Bucket="partb", Key="pc", UploadId=uid,
+      PartNumber=5, CopySource="partb/nope")), "NoSuchKey")
+check("unknown upload → NoSuchUpload", code(lambda: s3.upload_part_copy(Bucket="partb", Key="pc",
+      UploadId="0" * 32, PartNumber=5, CopySource="partb/src")), "NoSuchUpload")
+# Bob's bucket: Alice can't read from it, Bob can't write into Alice's upload.
+bob.create_bucket(Bucket="bobb")
+bob.put_object(Bucket="bobb", Key="secret", Body=b"s" * 2000)
+check("source bucket the caller can't read → AccessDenied", code(lambda: s3.upload_part_copy(Bucket="partb",
+      Key="pc", UploadId=uid, PartNumber=5, CopySource="bobb/secret")), "AccessDenied")
+check("destination upload the caller can't write → AccessDenied", code(lambda: bob.upload_part_copy(Bucket="partb",
+      Key="pc", UploadId=uid, PartNumber=5, CopySource="bobb/secret")), "AccessDenied")
+parts = [(p["PartNumber"], p["ETag"]) for p in s3.list_parts(Bucket="partb", Key="pc", UploadId=uid)["Parts"]]
+check("copied parts listed", [n for n, _ in parts], [1, 2, 3, 4])
+complete("pc", uid, parts)
+check("assembled from copies", s3.get_object(Bucket="partb", Key="pc")["Body"].read(),
+      src + src[100:2100] + src[0:1024] + src[0:1])
+
+# Upload with a checksum algorithm: the copy computes the part checksum.
+uid = s3.create_multipart_upload(Bucket="partb", Key="pcck", ChecksumAlgorithm="SHA256")["UploadId"]
+r = s3.upload_part_copy(Bucket="partb", Key="pcck", UploadId=uid, PartNumber=1,
+                        CopySource="partb/src")["CopyPartResult"]
+check("CopyPartResult ChecksumSHA256", r.get("ChecksumSHA256"),
+      base64.b64encode(hashlib.sha256(src).digest()).decode())
+r = s3.complete_multipart_upload(Bucket="partb", Key="pcck", UploadId=uid, MultipartUpload={"Parts": [
+    {"PartNumber": 1, "ETag": r["ETag"], "ChecksumSHA256": r["ChecksumSHA256"]}]})
+check("checksummed copy completes", s3.get_object(Bucket="partb", Key="pcck")["Body"].read(), src)
+
+# Versioned source.
+s3.put_bucket_versioning(Bucket="partb", VersioningConfiguration={"Status": "Enabled"})
+v1 = s3.put_object(Bucket="partb", Key="vs", Body=b"A" * 1500)["VersionId"]
+s3.put_object(Bucket="partb", Key="vs", Body=b"B" * 1500)
+uid = start("pv")
+r = s3.upload_part_copy(Bucket="partb", Key="pv", UploadId=uid, PartNumber=1,
+                        CopySource={"Bucket": "partb", "Key": "vs", "VersionId": v1})
+check("versioned source: version id echoed", r.get("CopySourceVersionId"), v1)
+check("versioned source: old bytes", r["CopyPartResult"]["ETag"].strip('"'), hashlib.md5(b"A" * 1500).hexdigest())
+s3.abort_multipart_upload(Bucket="partb", Key="pv", UploadId=uid)
+s3.put_bucket_versioning(Bucket="partb", VersioningConfiguration={"Status": "Suspended"})
+
 print(f"\nPYPASS={PASS} PYFAIL={FAIL}")
 sys.exit(1 if FAIL else 0)
 PY
+# AWS CLI s3 cp between buckets with a low multipart threshold → it uses
+# CreateMultipartUpload + UploadPartCopy + Complete.
+CLICFG=$DATA.awscfg
+printf '[default]\nregion = us-east-1\ns3 =\n    addressing_style = path\n    multipart_threshold = 5MB\n    multipart_chunksize = 5MB\n' >"$CLICFG"
+head -c $((12 * 1024 * 1024 + 77)) /dev/urandom >"$DATA.big"
+export AWS_CONFIG_FILE=$CLICFG AWS_ACCESS_KEY_ID=$A AWS_SECRET_ACCESS_KEY=$AS
+aws --endpoint-url "$URL" s3 cp "$DATA.big" s3://partb/big >/dev/null
+aws --endpoint-url "$URL" s3 mb s3://partc >/dev/null
+aws --endpoint-url "$URL" s3 cp s3://partb/big s3://partc/big-copy >/dev/null
+aws --endpoint-url "$URL" s3 cp s3://partc/big-copy "$DATA.back" >/dev/null
+cmp -s "$DATA.big" "$DATA.back" || { echo "FAIL: aws s3 cp bucket→bucket mismatch"; exit 1; }
+echo "aws s3 cp s3→s3 (multipart copy) ok"
+rm -f "$DATA.big" "$DATA.back" "$CLICFG"
+
 # Startup recovery removes the orphan record left above.
 ORPHAN=$(cat "$DATA.orphan")
 [ -f "$ORPHAN" ] || { echo "FAIL: orphan record missing before restart"; exit 1; }

@@ -207,6 +207,7 @@ static void request_reset(conn_t *c) {
     c->cfg_key = (s3_str_t){0};
     c->lock_pending = 0;
     c->copy_pending = 0;
+    c->copy_part = 0;
     c->copy_bucket = (s3_str_t){0};
     c->copy_key = (s3_str_t){0};
     c->body_limit_hit = 0;
@@ -736,7 +737,7 @@ static int cb_on_headers_complete(llhttp_t *p) {
     s3_err_t ce = checksum_setup(c);
     if (ce != S3_OK) {
         abort_writer(c);
-        c->mpu_complete_pending = c->delete_pending = c->copy_pending = 0;
+        c->mpu_complete_pending = c->delete_pending = c->copy_pending = c->copy_part = 0;
         c->cfg_act = 0;
         if (route_build_error(c, ce) < 0) return -1;
         return 0;
@@ -804,7 +805,7 @@ static int cb_on_body(llhttp_t *p, const char *at, size_t len) {
         }
         c->mpu_complete_pending = 0;
         c->delete_pending = 0;
-        c->copy_pending = 0;
+        c->copy_pending = c->copy_part = 0;
         c->cfg_act = 0;
         if (route_build_error(c, S3_ERR_ENTITY_TOO_LARGE) < 0) return -1;
         return 0;
@@ -820,7 +821,7 @@ static int cb_on_body(llhttp_t *p, const char *at, size_t len) {
             abort_writer(c);
             sigv4_chunk_free(c->chunk_decoder);
             c->chunk_decoder = NULL;
-            c->mpu_complete_pending = c->delete_pending = c->copy_pending = 0;
+            c->mpu_complete_pending = c->delete_pending = c->copy_pending = c->copy_part = 0;
             c->cfg_act = 0;
             s3_err_t fe = c->sig_verified ? S3_ERR_SIGNATURE_DOES_NOT_MATCH
                                           : S3_ERR_INVALID_REQUEST;
@@ -872,7 +873,7 @@ static int cb_on_message_complete(llhttp_t *p) {
         if (!ok) {
             LOG_D("chunk finish failed on %s", c->peer);
             abort_writer(c);
-            c->mpu_complete_pending = c->delete_pending = c->copy_pending = 0;
+            c->mpu_complete_pending = c->delete_pending = c->copy_pending = c->copy_part = 0;
             c->cfg_act = 0;
             if (route_build_error(c, fe) < 0) {
                 return -1;
@@ -910,7 +911,7 @@ static int cb_on_message_complete(llhttp_t *p) {
         if (ce != S3_OK) {
             LOG_D("checksum mismatch on %s", c->peer);
             abort_writer(c);
-            c->mpu_complete_pending = c->delete_pending = c->copy_pending = 0;
+            c->mpu_complete_pending = c->delete_pending = c->copy_pending = c->copy_part = 0;
             c->cfg_act = 0;
             if (route_build_error(c, ce) < 0) return -1;
             c->request_dispatched = 1;
