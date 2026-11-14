@@ -95,7 +95,16 @@ $(XML_DIR)/%.o: $(XML_DIR)/%.c
 
 TEST_BINS := tests/test_policy tests/test_json tests/test_config_fuzz tests/test_chunk_fuzz tests/test_checksum tests/test_store tests/test_conn tests/test_xml tests/test_xml_legacy tests/test_xml_fuzz tests/test_sigv4 tests/test_credfile
 
-test: $(TEST_BINS) fs3
+# Fail fast, with the install line, if a test dependency is missing —
+# otherwise e.g. a missing awscrt shows up as checksum "server bugs".
+check-test-deps:
+	@python3 -c "import botocore, boto3, awscrt" 2>/dev/null || { \
+	    echo "missing Python test deps: pip install -r tests/requirements.txt" >&2; exit 1; }
+	@for t in aws curl openssl; do command -v $$t >/dev/null || { \
+	    echo "missing tool '$$t' (aws: pip install -r tests/requirements.txt; curl/openssl: apt-get install curl openssl)" >&2; \
+	    exit 1; }; done
+
+test: check-test-deps $(TEST_BINS) fs3
 	@echo "=== test_policy (+50000 fuzz iterations) ==="
 	@./tests/test_policy 50000
 	@echo "=== test_json (+50000 fuzz iterations) ==="
@@ -260,4 +269,4 @@ smoketest: fs3
 	    http://127.0.0.1:19000/b/k || true; \
 	kill `cat /tmp/fs3.pid` 2>/dev/null; rm -f /tmp/fs3.pid
 
-.PHONY: all clean test smoketest fetch-llhttp
+.PHONY: all clean test check-test-deps smoketest fetch-llhttp

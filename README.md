@@ -396,6 +396,14 @@ multipart upload (default >8 MB) round-trips byte-for-byte against fs3.
 
 ## Tests
 
+Test dependencies: `pip install -r tests/requirements.txt` (boto3 ≥ 1.36,
+`botocore[crt]` for CRC32C/CRC64NVME, AWS CLI) plus `curl` and
+`openssl`. `make test` checks for them first (`make check-test-deps`) and
+prints the install line instead of failing deep inside a suite. Without
+`awscrt`, `test_e2e_checksum.sh` skips the boto3 CRC32C/CRC64NVME cases
+and says so in its summary; `FS3_TEST_STRICT=1` turns those skips into
+failures (use it in CI).
+
 | target                   | what it covers                                                |
 |--------------------------|---------------------------------------------------------------|
 | `tests/test_store`       | bucket CRUD, streaming PUT/GET, sendfile, listing, persistence, multipart lifecycle |

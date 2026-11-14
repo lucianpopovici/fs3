@@ -36,7 +36,24 @@ unset AWS_REQUEST_CHECKSUM_CALCULATION AWS_RESPONSE_CHECKSUM_VALIDATION || true
 boto() { python3 "$ROOT/tests/boto_checksum.py" "$@" 2>&1 | tail -1; }
 trailer() { python3 "$ROOT/tests/sign_trailer.py" "$@"; }
 
-PASS=0; FAIL=0
+PASS=0; FAIL=0; SKIP=0
+# boto3's CRC32C / CRC64NVME need the awscrt wheel. Without it those
+# client-side cases are skipped (visibly); FS3_TEST_STRICT=1 (CI) makes a
+# skip a failure. The server paths are still covered by the hand-framed
+# trailer cases below, which compute the digests in pure Python.
+HAVE_CRT=1
+python3 -c "import awscrt" 2>/dev/null || HAVE_CRT=0
+[ "${FS3_TEST_NO_CRT:-0}" = 1 ] && HAVE_CRT=0     # exercise the skip path
+needs_crt() {   # name algo → 0 to run the case, 1 to skip it
+    case "$2" in CRC32C|CRC64NVME) ;; *) return 0 ;; esac
+    [ "$HAVE_CRT" = 1 ] && return 0
+    if [ "${FS3_TEST_STRICT:-0}" = 1 ]; then
+        FAIL=$((FAIL+1)); printf '\nFAIL: %s (awscrt missing, FS3_TEST_STRICT=1)\n' "$1"
+    else
+        SKIP=$((SKIP+1)); printf 's'
+    fi
+    return 1
+}
 check_eq() {
     if [ "$2" = "$3" ]; then PASS=$((PASS+1)); printf '.'
     else FAIL=$((FAIL+1)); printf '\nFAIL: %s\n  want=%s\n  got =%s\n' "$1" "$3" "$2"; fi
@@ -62,6 +79,7 @@ hc=$(boto head-checksum ckb small)
 case "$hc" in ChecksumCRC32=*|ChecksumCRC64NVME=*|ChecksumCRC32C=*) ok=yes ;; *) ok="no:$hc" ;; esac
 check_eq "head-object --checksum-mode ENABLED returns checksum" "$ok" "yes"
 for a in CRC32 CRC32C SHA1 SHA256 CRC64NVME; do
+    needs_crt "boto3 put_object $a" "$a" || continue
     check_eq "put_object $a" "$(boto put ckb "obj-$a" "$T.mid" "$a")" "200"
     hc=$(boto head-checksum ckb "obj-$a")
     case "$hc" in *"Checksum$a="*) ok=yes ;; *) ok="no:$hc" ;; esac
@@ -73,6 +91,7 @@ check_eq "upload_file multipart default" "$(boto upload ckb big "$T.big")" "ok"
 check_eq "download multipart" "$(boto download ckb big "$T.big.dl")" "ok"
 check_eq "multipart bytes" "$(md5sum < "$T.big.dl")" "$(md5sum < "$T.big")"
 for a in CRC32 SHA256 CRC64NVME; do
+    needs_crt "boto3 upload_file $a" "$a" || continue
     check_eq "upload_file multipart $a" "$(boto upload ckb "big-$a" "$T.big" "$a")" "ok"
     hc=$(boto head-checksum ckb "big-$a")
     case "$hc" in *"Checksum$a="*) ok=yes ;; *) ok="no:$hc" ;; esac
@@ -101,7 +120,7 @@ check_eq "delete_objects with checksum" "$(boto delete-objects ckb obj-SHA1 obj-
 # ---- Trailer variants, hand-framed ----------------------------------------
 n0=$(objfile)
 for mode in unsigned signed; do
-    for a in crc32 crc32c sha256 sha1; do
+    for a in crc32 crc32c sha256 sha1 crc64nvme; do
         out=$(trailer --url "$URL/ckb/t-$mode-$a" --mode "$mode" --algo "$a" \
               --body-file "$T.mid" --chunk-size 65536)
         check_eq "$mode trailer $a PUT" "$(status_of "$out")" "STATUS=200"
@@ -201,5 +220,9 @@ check_eq "open mode unsigned trailer PUT" "$(status_of "$out")" "STATUS=200"
 check_eq "open mode body decoded" "$(curl -s "http://127.0.0.1:$OPORT/openb/u" | md5sum)" "$(md5sum < "$T.small")"
 
 echo
-echo "===== checksum e2e: $PASS passed, $FAIL failed ====="
+if [ "$SKIP" -gt 0 ]; then
+    echo "===== checksum e2e: $PASS passed, $FAIL failed, $SKIP SKIP (awscrt missing: pip install -r tests/requirements.txt) ====="
+else
+    echo "===== checksum e2e: $PASS passed, $FAIL failed ====="
+fi
 [ "$FAIL" -eq 0 ]

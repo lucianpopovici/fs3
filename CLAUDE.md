@@ -65,7 +65,7 @@ the latest tarball under `/mnt/user-data/outputs/`. After
 
 ```sh
 apt-get install -y libssl-dev          # for openssl/evp.h
-pip install --break-system-packages botocore boto3 awscli "botocore[crt]"
+pip install --break-system-packages -r tests/requirements.txt
                                         # for tests/sign_request.py and aws cli
 chmod +x tests/*.sh                     # tar may not preserve +x in this env
 mkdir -p ~/.aws && cat > ~/.aws/config <<EOF

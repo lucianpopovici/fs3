@@ -1,0 +1,7 @@
+# Test dependencies for `make test`:  pip install -r tests/requirements.txt
+# boto3 >= 1.36 defaults to CRC checksums on uploads (the code path
+# test_e2e_checksum.sh exercises); awscrt is needed for boto3's CRC32C
+# and CRC64NVME.
+boto3>=1.36
+botocore[crt]>=1.36
+awscli>=1.37
