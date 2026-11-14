@@ -125,9 +125,10 @@ cl=$(curl -sS -H "Range: bytes=0-4" "$URL/p9b/obj" -D - -o /dev/null \
 check_eq "content-length for range" "$cl" "5"
 
 # ---------- Range: 416 errors -----------------------------------------------
-# first > last → 416
+# first > last is an invalid header, not an unsatisfiable range: ignored
+# (RFC 9110 §14.1.1, and what S3 does) → full object
 code=$(curl -sS -H "Range: bytes=10-5" "$URL/p9b/obj" -o /dev/null -w "%{http_code}")
-check_eq "range 10-5 invalid → 416" "$code" "416"
+check_eq "range 10-5 invalid → 200 full" "$code" "200"
 
 # first beyond end of file → 416
 code=$(curl -sS -H "Range: bytes=20-25" "$URL/p9b/obj" -o /dev/null -w "%{http_code}")
@@ -148,6 +149,30 @@ body=$(echo "$out" | head -1)
 code=$(echo "$out" | tail -1)
 check_eq "GET no range → 200" "$code" "200"
 check_eq "GET no range body" "$body" "ABCDEFGHIJKLMNOPQRST"
+
+# ---------- Range edge cases (round 2, item 1d) ------------------------------
+# Multi-range: S3 ignores the header and serves the whole object.
+hdrs=$(curl -sS -H "Range: bytes=0-1,5-9" "$URL/p9b/obj" -D - -o /tmp/fs3-p9-$$.mr -w "%{http_code}")
+check_eq "multi-range → 200" "$(echo "$hdrs" | tail -1)" "200"
+check_eq "multi-range → full body" "$(cat /tmp/fs3-p9-$$.mr)" "ABCDEFGHIJKLMNOPQRST"
+check_eq "multi-range → Accept-Ranges" "$(echo "$hdrs" | grep -ci '^accept-ranges: bytes' || true)" "1"
+check_eq "multi-range → no Content-Range" "$(echo "$hdrs" | grep -ci '^content-range' || true)" "0"
+rm -f /tmp/fs3-p9-$$.mr
+code=$(curl -sS -H "Range: items=0-1" "$URL/p9b/obj" -o /dev/null -w "%{http_code}")
+check_eq "unknown unit → 200" "$code" "200"
+code=$(curl -sS -H "Range: bytes=abc-1" "$URL/p9b/obj" -o /dev/null -w "%{http_code}")
+check_eq "non-digit range → 200" "$code" "200"
+cr=$(curl -sS -H "Range: bytes=20-" "$URL/p9b/obj" -D - -o /dev/null | tr -d '\r' | grep -i '^content-range:' | cut -d' ' -f2- || true)
+check_eq "bytes=N- with N ≥ size → Content-Range */size" "$cr" "bytes */20"
+code=$(curl -sS -H "Range: bytes=-0" "$URL/p9b/obj" -o /dev/null -w "%{http_code}")
+check_eq "bytes=-0 → 416" "$code" "416"
+out=$(curl -sS -H "Range: bytes=18-99999999999999999999999999" "$URL/p9b/obj" -w "\n%{http_code}")
+check_eq "overlong last digits clamp, no wrap → 206" "$(echo "$out" | tail -1)" "206"
+check_eq "overlong last digits body" "$(echo "$out" | head -1)" "ST"
+code=$(curl -sS -H "Range: bytes=99999999999999999999999-" "$URL/p9b/obj" -o /dev/null -w "%{http_code}")
+check_eq "overlong first digits → 416 (no wrap to a small offset)" "$code" "416"
+out=$(curl -sS -H "Range: bytes=-99999999999999999999999" "$URL/p9b/obj" -w "\n%{http_code}")
+check_eq "overlong suffix → whole object as 206" "$(echo "$out" | head -1)" "ABCDEFGHIJKLMNOPQRST"
 
 # ---------- ?delete: PUT some keys to delete ---------------------------------
 for k in del1 del2 del3; do

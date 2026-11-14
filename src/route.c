@@ -34,6 +34,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
+#include <stdint.h>
 #include <sys/sendfile.h>
 #include <time.h>
 #include <unistd.h>
@@ -1085,70 +1087,63 @@ static int handle_object_put_complete(conn_t *c) {
     return submit_commit(c, 0);
 }
 
-/* Parse an HTTP Range header value of the form "bytes=A-B", "bytes=A-",
- * or "bytes=-N". Returns 1 if a satisfiable range was decoded and written
- * to first_out/last_out, 0 if the header is absent or uses an
- * unrecognized unit (treat as full GET), or -1 if the range is syntactically
- * invalid or outside the object (send 416). */
+/* Decimal digits → u64, saturating at UINT64_MAX (no wrap on long
+ * strings). -1 if empty or not all digits. */
+static int range_u64(const char *p, size_t n, uint64_t *out) {
+    if (n == 0) return -1;
+    uint64_t v = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (p[i] < '0' || p[i] > '9') return -1;
+        unsigned d = (unsigned)(p[i] - '0');
+        v = (v > (UINT64_MAX - d) / 10) ? UINT64_MAX : v * 10 + d;
+    }
+    *out = v;
+    return 0;
+}
+
+/* Parse an HTTP Range header (RFC 9110 §14) as S3 does. Returns
+ *   1  one satisfiable range, written to first_out/last_out;
+ *   0  no usable range: absent, unknown unit, syntactically invalid
+ *      (incl. last < first), or a multi-range set ("bytes=0-1,5-9" —
+ *      S3 ignores those and serves the whole object with 200);
+ *  -1  valid but unsatisfiable (416 with Content-Range: bytes * /size). */
 static int parse_byte_range(const s3_str_t *hdr, uint64_t obj_size,
                              uint64_t *first_out, uint64_t *last_out) {
     if (!hdr || hdr->n == 0) return 0;
     static const char prefix[] = "bytes=";
     const size_t prefix_n = sizeof(prefix) - 1;
-    if (hdr->n < prefix_n || memcmp(hdr->p, prefix, prefix_n) != 0) return 0;
+    if (hdr->n < prefix_n || strncasecmp(hdr->p, prefix, prefix_n) != 0) return 0;
 
     const char *spec  = hdr->p + prefix_n;
     size_t      spec_n = hdr->n - prefix_n;
+    while (spec_n && (*spec == ' ' || *spec == '\t')) { spec++; spec_n--; }
+    while (spec_n && (spec[spec_n - 1] == ' ' || spec[spec_n - 1] == '\t')) spec_n--;
+    if (memchr(spec, ',', spec_n)) return 0;          /* multi-range */
 
     const char *dash = memchr(spec, '-', spec_n);
-    if (!dash) return 0;  /* no '-' → unrecognized form */
-
+    if (!dash) return 0;
     size_t before_n = (size_t)(dash - spec);
     size_t after_n  = spec_n - before_n - 1;
-
-    if (before_n == 0 && after_n == 0) return -1;  /* "bytes=-" is invalid */
-
-    if (obj_size == 0) return -1;  /* no valid range on empty object */
+    uint64_t a = 0, b = 0;
+    if (before_n && range_u64(spec, before_n, &a) < 0) return 0;
+    if (after_n && range_u64(dash + 1, after_n, &b) < 0) return 0;
 
     uint64_t first, last;
     if (before_n == 0) {
-        /* "bytes=-N" — last N bytes */
-        uint64_t suffix = 0;
-        for (size_t i = 0; i < after_n; i++) {
-            char ch = dash[1 + i];
-            if (ch < '0' || ch > '9') return -1;
-            suffix = suffix * 10 + (uint64_t)(ch - '0');
-        }
-        if (suffix == 0) return -1;
-        first = (suffix >= obj_size) ? 0 : obj_size - suffix;
+        if (after_n == 0) return 0;                   /* "bytes=-" */
+        /* "bytes=-N": last N bytes; N = 0 or an empty object can't be served. */
+        if (b == 0 || obj_size == 0) return -1;
+        first = b >= obj_size ? 0 : obj_size - b;
         last  = obj_size - 1;
     } else if (after_n == 0) {
-        /* "bytes=A-" — from A to end */
-        first = 0;
-        for (size_t i = 0; i < before_n; i++) {
-            char ch = spec[i];
-            if (ch < '0' || ch > '9') return -1;
-            first = first * 10 + (uint64_t)(ch - '0');
-        }
-        if (first >= obj_size) return -1;
-        last = obj_size - 1;
+        if (a >= obj_size) return -1;                 /* "bytes=A-" */
+        first = a;
+        last  = obj_size - 1;
     } else {
-        /* "bytes=A-B" */
-        first = 0;
-        for (size_t i = 0; i < before_n; i++) {
-            char ch = spec[i];
-            if (ch < '0' || ch > '9') return -1;
-            first = first * 10 + (uint64_t)(ch - '0');
-        }
-        last = 0;
-        for (size_t i = 0; i < after_n; i++) {
-            char ch = dash[1 + i];
-            if (ch < '0' || ch > '9') return -1;
-            last = last * 10 + (uint64_t)(ch - '0');
-        }
-        if (first > last) return -1;
-        if (first >= obj_size) return -1;
-        if (last >= obj_size) last = obj_size - 1;  /* clamp per RFC 9110 */
+        if (b < a) return 0;                          /* invalid, not unsatisfiable */
+        if (a >= obj_size) return -1;
+        first = a;
+        last  = b >= obj_size ? obj_size - 1 : b;     /* clamp per RFC 9110 */
     }
     *first_out = first;
     *last_out  = last;

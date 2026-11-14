@@ -283,10 +283,20 @@ What's working end-to-end:
   reaches the store, so a client that thinks it is setting tags or
   retention cannot overwrite or delete the object by accident.
 
+- **Multipart, round 2** — every part gets a record (MD5, size,
+  checksum, CRC64) and Complete verifies the client's ETag list against
+  it (`InvalidPart`, `InvalidPartOrder`, `EntityTooSmall` below
+  `--mpu-min-part-size`, default 5 MiB). `ListParts` and UploadPartCopy
+  (with `x-amz-copy-source-range` and the `x-amz-copy-source-if-*`
+  conditionals, also honoured by CopyObject) are implemented.
+
+- **Range requests** follow S3 and RFC 9110: one `bytes=` range → 206;
+  multi-range requests (`bytes=0-1,5-9`) return the full object with 200,
+  as S3 does; an invalid header (unknown unit, last < first) is ignored;
+  an unsatisfiable one → 416 with `Content-Range: bytes */size`.
+
 What's *not* yet wired:
 
-- `ListParts` (`GET /bucket/key?uploadId=`) and UploadPartCopy answer 501.
-- Multi-range `Range:` (`bytes=A-B,C-D`).
 - Per-bucket / per-user quotas, background integrity scrub, key expiry /
   disable, SSE-C, seccomp, `FS_IMMUTABLE_FL` for COMPLIANCE versions.
 - Tag-based lifecycle filters, transitions, website routing rules (all

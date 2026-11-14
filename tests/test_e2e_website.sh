@@ -103,6 +103,7 @@ check_eq "//evil.example/docs → no protocol-relative redirect" \
 check_eq "file with content type" \
     "$(curl -sS -o /dev/null -w '%{content_type}' -H "Host: $H" "$WURL/app.js")" "application/javascript"
 check_eq "Range works" "$(wget $H /big.bin -H 'Range: bytes=2-4')" "234"
+check_eq "multi-range → whole object" "$(wcode $H /big.bin -H 'Range: bytes=0-1,3-4')" "200"
 check_eq "missing → custom 404 status" "$(wcode $H /nope)" "404"
 check_eq "missing → custom 404 body" "$(wget $H /nope)" "<h1>custom 404</h1>"
 check_eq "HEAD ok" "$(curl -sS -o /dev/null -w '%{http_code}' -I -H "Host: $H" "$WURL/")" "200"
