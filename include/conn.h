@@ -21,6 +21,7 @@
 #include "s3.h"
 #include "sigv4.h"
 #include "checksum.h"
+#include "store.h"
 
 #define CONN_RBUF_SZ          (16 * 1024)
 #define CONN_WBUF_SZ          (16 * 1024)
@@ -289,6 +290,13 @@ typedef struct conn {
      * cfg_act is the s3_action_t (0 = none). */
     int                cfg_act;
     s3_str_t           cfg_bucket;      /* points into req_scratch */
+    s3_str_t           cfg_key;         /* object subresources (?retention) */
+
+    /* Object Lock (item 10): lock headers on a PUT, applied to the new
+     * version when the commit finishes. */
+    int                lock_pending;
+    s3_lock_t          lock_new;
+    uint64_t           max_retention_ms;   /* server-lifetime setting */
 
     /* Bulk-delete context (POST /<bucket>?delete) */
     int                delete_pending;

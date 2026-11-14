@@ -549,6 +549,26 @@ typedef struct {
 s3_err_t store_list_noncurrent(s3_store_t *s, s3_str_t bucket, s3_str_t key,
                                s3_noncurrent_t **out, size_t *n_out);
 
+/* ---- Object lock state (item 10) ----
+ *
+ * Per-version sidecar locks/<b>/xx/yy/<hex>/<vid hex> (retention can be
+ * extended after write without rewriting data). */
+#define S3_LOCK_NONE        0
+#define S3_LOCK_GOVERNANCE  1
+#define S3_LOCK_COMPLIANCE  2
+
+typedef struct {
+    int      mode;           /* S3_LOCK_* */
+    uint64_t until_ms;       /* retain-until, 0 = none */
+    int      legal_hold;
+} s3_lock_t;
+
+/* 0 = sidecar present and parsed, 1 = absent, -1 = unreadable/corrupt. */
+int      store_lock_read(s3_store_t *s, s3_str_t bucket, s3_str_t key,
+                         const uint8_t vid[16], s3_lock_t *out);
+s3_err_t store_lock_write(s3_store_t *s, s3_str_t bucket, s3_str_t key,
+                          const uint8_t vid[16], const s3_lock_t *l);
+
 /* ---- Object walk (lifecycle sweeper, scrub) ----
  *
  * Calls cb for every current object in `bucket` (unsorted, no key

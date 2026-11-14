@@ -198,6 +198,8 @@ static void request_reset(conn_t *c) {
     c->delete_bucket = (s3_str_t){0};
     c->cfg_act = 0;
     c->cfg_bucket = (s3_str_t){0};
+    c->cfg_key = (s3_str_t){0};
+    c->lock_pending = 0;
     c->copy_pending = 0;
     c->copy_bucket = (s3_str_t){0};
     c->copy_key = (s3_str_t){0};

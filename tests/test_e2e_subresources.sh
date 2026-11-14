@@ -42,7 +42,7 @@ body_is_original() {
     check_eq "$1: object unchanged" "$(curl -sS "$URL/subb/k")" "original"
 }
 
-for sub in tagging retention legal-hold torrent restore select attributes \
+for sub in tagging torrent restore select attributes \
            versions policy cors lifecycle website object-lock encryption \
            replication notification logging; do
     check_eq "PUT ?$sub → 501" \
@@ -51,6 +51,14 @@ for sub in tagging retention legal-hold torrent restore select attributes \
     check_eq "DELETE ?$sub → 501" "$(code -X DELETE "$URL/subb/k?$sub")" "501"
     body_is_original "DELETE ?$sub"
     check_eq "GET ?$sub → 501" "$(code "$URL/subb/k?$sub")" "501"
+done
+
+# Object-lock subresources on a bucket without object lock: refused,
+# object untouched.
+for sub in retention legal-hold; do
+    check_eq "PUT ?$sub (no lock) → 400" \
+        "$(code -X PUT --data-binary '<Retention/>' "$URL/subb/k?$sub")" "400"
+    body_is_original "PUT ?$sub"
 done
 
 # A malformed versionId is refused before any path is built (S5) and
@@ -67,7 +75,7 @@ body_is_original "POST ?restore"
 
 # Bucket level: DELETE ?cors must not delete the bucket; PUT ?versioning
 # must not try to create it.
-for sub in tagging encryption object-lock \
+for sub in tagging encryption \
            replication publicAccessBlock; do
     check_eq "bucket DELETE ?$sub → 501" "$(code -X DELETE "$URL/subb?$sub")" "501"
     check_eq "bucket PUT ?$sub → 501" \

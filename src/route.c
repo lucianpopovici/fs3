@@ -21,6 +21,7 @@
 #include "lifecycle.h"
 #include "website.h"
 #include "policy.h"
+#include "objlock.h"
 #include "xml_parser.h"
 #include "conn.h"
 #include "iopool.h"
@@ -522,12 +523,15 @@ static const cfg_kind_t CFG_KINDS[] = {
       "website.xml", S3_ERR_NO_SUCH_WEBSITE, "application/xml" },
     { ACT_GET_BUCKET_POLICY, ACT_PUT_BUCKET_POLICY, ACT_DELETE_BUCKET_POLICY,
       "policy.json", S3_ERR_NO_SUCH_POLICY, "application/json" },
+    { ACT_GET_BUCKET_OBJECT_LOCK, ACT_PUT_BUCKET_OBJECT_LOCK, ACT_NONE,
+      "object-lock.xml", S3_ERR_NO_SUCH_OBJECT_LOCK, "application/xml" },
 };
 
 static const cfg_kind_t *cfg_kind_for(s3_action_t act) {
     for (size_t i = 0; i < sizeof(CFG_KINDS) / sizeof(*CFG_KINDS); i++)
         if (CFG_KINDS[i].get == act || CFG_KINDS[i].put == act
-            || CFG_KINDS[i].del == act) return &CFG_KINDS[i];
+            || (CFG_KINDS[i].del != ACT_NONE && CFG_KINDS[i].del == act))
+            return &CFG_KINDS[i];
     return NULL;
 }
 
@@ -555,6 +559,16 @@ static s3_err_t cfg_validate(conn_t *c, s3_action_t act, const char *body,
         LOG_W("lifecycle configuration installed on " S3_STR_FMT
               "%s: matching objects will be deleted by the sweeper",
               S3_STR_ARG(c->cfg_bucket), imm ? " (immediate expiry confirmed)" : "");
+        return S3_OK;
+    }
+    case ACT_PUT_BUCKET_OBJECT_LOCK: {
+        if (!store_bucket_object_lock(c->store, c->cfg_bucket)) return S3_ERR_INVALID_REQUEST;
+        s3_err_t e;
+        olock_cfg_t *oc = olock_cfg_parse(body, n, &e);
+        if (!oc) return e;
+        uint64_t span = (uint64_t)oc->days * 86400000ULL;
+        free(oc);
+        if (c->max_retention_ms && span > c->max_retention_ms) return S3_ERR_INVALID_ARGUMENT;
         return S3_OK;
     }
     case ACT_PUT_BUCKET_POLICY: {
@@ -613,6 +627,8 @@ static int cfg_put_begin(conn_t *c, s3_str_t bucket, s3_action_t act) {
     return 0;
 }
 
+static int lock_put_finish(conn_t *c, int legal);
+
 static int put_versioning_finish(conn_t *c) {
     if (c->req_body_len > c->req_body_cap)
         return rsp_build_s3_error(c, S3_ERR_ENTITY_TOO_LARGE, c->req.path, NULL);
@@ -640,6 +656,8 @@ static int cfg_put_finish(conn_t *c) {
     s3_action_t act = (s3_action_t)c->cfg_act;
     c->cfg_act = 0;
     if (act == ACT_PUT_BUCKET_VERSIONING) return put_versioning_finish(c);
+    if (act == ACT_PUT_OBJECT_RETENTION) return lock_put_finish(c, 0);
+    if (act == ACT_PUT_OBJECT_LEGAL_HOLD) return lock_put_finish(c, 1);
     const cfg_kind_t *k = cfg_kind_for(act);
     if (!k) return rsp_build_s3_error(c, S3_ERR_INTERNAL, c->req.path, NULL);
     if (c->req_body_len > c->req_body_cap)
@@ -657,6 +675,20 @@ static int cfg_get(conn_t *c, s3_str_t bucket, const cfg_kind_t *k) {
     size_t n = 0;
     s3_err_t e = store_bucket_sidecar_read(c->store, bucket, k->sidecar,
                                            CFG_BODY_CAP, &data, &n);
+    if (k->get == ACT_GET_BUCKET_OBJECT_LOCK) {
+        if (!store_bucket_object_lock(c->store, bucket)) {
+            free(data);
+            return rsp_build_s3_error(c, S3_ERR_NO_SUCH_OBJECT_LOCK, c->req.path, NULL);
+        }
+        if (e == S3_ERR_NO_SUCH_KEY) {
+            static const char x[] = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+                "<ObjectLockConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">"
+                "<ObjectLockEnabled>Enabled</ObjectLockEnabled></ObjectLockConfiguration>";
+            data = strdup(x);
+            if (!data) return -1;
+            return rsp_build_raw(c, 200, "OK", "application/xml", data, sizeof(x) - 1);
+        }
+    }
     if (e == S3_ERR_NO_SUCH_KEY) e = k->missing;
     if (e != S3_OK) return rsp_build_s3_error(c, e, c->req.path, NULL);
     return rsp_build_raw(c, 200, "OK", k->content_type, data, n);
@@ -713,6 +745,7 @@ static int path_bucket(const conn_t *c, char out[64], s3_str_t *b) {
         out[o++] = p.p[i++];
     }
     size_t n = pct_decode(out, o);
+    out[n] = '\0';
     *b = (s3_str_t){ out, n };
     return n > 0;
 }
@@ -828,7 +861,10 @@ static int handle_bucket(conn_t *c, s3_str_t bucket, s3_action_t act) {
                                           c->req.path, NULL);
             owner = c->id.user;
         }
-        s3_err_t e = store_bucket_create_owned(c->store, bucket, owner);
+        const s3_str_t *ol = hdr_get(c, "x-amz-bucket-object-lock-enabled");
+        s3_err_t e = (ol && ieq_lit(*ol, "true"))
+                   ? store_bucket_create_locked(c->store, bucket, owner)
+                   : store_bucket_create_owned(c->store, bucket, owner);
         if (e == S3_OK) {
             char loc[1100];
             snprintf(loc, sizeof(loc), "Location: /" S3_STR_FMT "\r\n",
@@ -984,7 +1020,22 @@ static void commit_done(iojob_t *j) {
             if (!cj->is_part) {
                 char bb[64];
                 s3_str_t bk;
-                if (path_bucket(c, bb, &bk)) add_version_header(c, bk, cj->meta.version_id);
+                if (path_bucket(c, bb, &bk)) {
+                    add_version_header(c, bk, cj->meta.version_id);
+                    if (c->lock_pending) {
+                        /* Key = path minus "/<bucket>/" (decoded). */
+                        /* Raw (encoded) bucket segment length. */
+                        const char *sl = memchr(c->req.path.p + 1, '/', c->req.path.n - 1);
+                        size_t off = sl ? (size_t)(sl - c->req.path.p) + 1 : c->req.path.n;
+                        char *kb = scratch_alloc(c, c->req.path.n);
+                        if (kb && c->req.path.n > off) {
+                            memcpy(kb, c->req.path.p + off, c->req.path.n - off);
+                            size_t kn = pct_decode(kb, c->req.path.n - off);
+                            store_lock_write(c->store, bk, (s3_str_t){ kb, kn },
+                                             cj->meta.version_id, &c->lock_new);
+                        }
+                    }
+                }
             }
             rc = rsp_build_status_with_headers(c, 200, "OK", extra);
         }
@@ -1829,6 +1880,120 @@ out:
     return rc;
 }
 
+/* ===================================================================== */
+/* Object Lock: ?retention / ?legal-hold (item 10)                        */
+/* ===================================================================== */
+
+/* Resolve the version a lock subresource targets (versionId or current). */
+static s3_err_t lock_target(conn_t *c, s3_str_t bucket, s3_str_t key,
+                            s3_obj_meta_t *m) {
+    if (!store_bucket_object_lock(c->store, bucket)) return S3_ERR_INVALID_REQUEST;
+    uint8_t vid[16];
+    int hv = version_param(c, vid);
+    if (hv < 0) return S3_ERR_INVALID_ARGUMENT;
+    s3_reader_t *r;
+    s3_err_t e = store_get_open_version(c->store, bucket, key, hv ? vid : NULL, &r, m);
+    if (e == S3_OK) store_get_close(r);
+    return e;
+}
+
+static int lock_get(conn_t *c, s3_str_t bucket, s3_str_t key, int legal) {
+    s3_obj_meta_t m;
+    s3_err_t e = lock_target(c, bucket, key, &m);
+    if (e != S3_OK) return rsp_build_s3_error(c, e, c->req.path, NULL);
+    s3_lock_t l;
+    olock_effective(c->store, bucket, key, &m, &l);
+    char *b = malloc(512);
+    if (!b) return -1;
+    int n;
+    if (legal) {
+        n = snprintf(b, 512, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+                     "<LegalHold xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">"
+                     "<Status>%s</Status></LegalHold>", l.legal_hold ? "ON" : "OFF");
+    } else {
+        if (!l.mode) {
+            free(b);
+            return rsp_build_s3_error(c, S3_ERR_NO_SUCH_OBJECT_LOCK, c->req.path, NULL);
+        }
+        char ts[32];
+        rsp_format_iso8601(l.until_ms, ts);
+        n = snprintf(b, 512, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+                     "<Retention xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">"
+                     "<Mode>%s</Mode><RetainUntilDate>%s</RetainUntilDate></Retention>",
+                     olock_mode_name(l.mode), ts);
+    }
+    return rsp_build_raw(c, 200, "OK", "application/xml", b, (size_t)n);
+}
+
+static int lock_put_finish(conn_t *c, int legal) {
+    if (c->req_body_len > c->req_body_cap)
+        return rsp_build_s3_error(c, S3_ERR_ENTITY_TOO_LARGE, c->req.path, NULL);
+    s3_obj_meta_t m;
+    s3_err_t e = lock_target(c, c->cfg_bucket, c->cfg_key, &m);
+    if (e != S3_OK) return rsp_build_s3_error(c, e, c->req.path, NULL);
+    s3_lock_t cur, next;
+    olock_effective(c->store, c->cfg_bucket, c->cfg_key, &m, &cur);
+    next = cur;
+    if (legal) {
+        int on;
+        if (olock_parse_legal_hold(c->req_body_buf, c->req_body_len, &on) < 0)
+            return rsp_build_s3_error(c, S3_ERR_MALFORMED_XML, c->req.path, NULL);
+        next.legal_hold = on;
+    } else {
+        s3_lock_t r;
+        if (olock_parse_retention(c->req_body_buf, c->req_body_len, &r) < 0)
+            return rsp_build_s3_error(c, S3_ERR_MALFORMED_XML, c->req.path, NULL);
+        const s3_str_t *bp = hdr_get(c, "x-amz-bypass-governance-retention");
+        int bypass = bp && ieq_lit(*bp, "true") && c->id.is_admin;
+        e = olock_check_retention_change(&cur, &r, bypass, c->max_retention_ms);
+        if (e != S3_OK) return rsp_build_s3_error(c, e, c->req.path, NULL);
+        next.mode = r.mode;
+        next.until_ms = r.until_ms;
+    }
+    e = store_lock_write(c->store, c->cfg_bucket, c->cfg_key, m.version_id, &next);
+    if (e != S3_OK) return rsp_build_s3_error(c, e, c->req.path, NULL);
+    return rsp_build_status(c, 200, "OK");
+}
+
+/* PUT object with x-amz-object-lock-* headers: validate now, apply to
+ * the new version after commit. S3 requires an integrity check on such
+ * PUTs (Content-MD5 or x-amz-checksum-*), and setting retention needs the
+ * PutObjectRetention / PutObjectLegalHold permission (o, not w — S9). */
+static s3_err_t lock_headers_begin(conn_t *c, s3_str_t bucket, s3_str_t key) {
+    const s3_str_t *mh = hdr_get(c, "x-amz-object-lock-mode");
+    const s3_str_t *uh = hdr_get(c, "x-amz-object-lock-retain-until-date");
+    const s3_str_t *lh = hdr_get(c, "x-amz-object-lock-legal-hold");
+    if (!mh && !uh && !lh) return S3_OK;
+    if (!store_bucket_object_lock(c->store, bucket)) return S3_ERR_INVALID_REQUEST;
+    int has_ck = hdr_get(c, "content-md5") || hdr_get(c, "x-amz-trailer");
+    for (size_t i = 0; i < c->req.n_headers && !has_ck; i++)
+        has_ck = cksum_algo_from_header(c->req.headers[i].k) != 0;
+    if (!has_ck) return S3_ERR_INVALID_REQUEST;
+    memset(&c->lock_new, 0, sizeof(c->lock_new));
+    if (mh || uh) {
+        if (!mh || !uh) return S3_ERR_INVALID_ARGUMENT;
+        char buf[64];
+        snprintf(buf, sizeof(buf), "%.*s", (int)(mh->n < 60 ? mh->n : 60), mh->p);
+        c->lock_new.mode = olock_mode_parse(buf);
+        snprintf(buf, sizeof(buf), "%.*s", (int)(uh->n < 60 ? uh->n : 60), uh->p);
+        if (c->lock_new.mode < 0 || olock_parse_date(buf, &c->lock_new.until_ms) < 0)
+            return S3_ERR_INVALID_ARGUMENT;
+        s3_lock_t none = {0};
+        s3_err_t e = olock_check_retention_change(&none, &c->lock_new, 0, c->max_retention_ms);
+        if (e != S3_OK) return e;
+        e = authz(c, bucket, key, ACT_PUT_OBJECT_RETENTION);
+        if (e != S3_OK) return e;
+    }
+    if (lh) {
+        if (ieq_lit(*lh, "ON")) c->lock_new.legal_hold = 1;
+        else if (!ieq_lit(*lh, "OFF")) return S3_ERR_INVALID_ARGUMENT;
+        s3_err_t e = authz(c, bucket, key, ACT_PUT_OBJECT_LEGAL_HOLD);
+        if (e != S3_OK) return e;
+    }
+    c->lock_pending = 1;
+    return S3_OK;
+}
+
 /* ---- Request classification (S0 + F2) -------------------------------
  *
  * Every request is mapped to exactly one S3 operation from its method,
@@ -1897,7 +2062,7 @@ static s3_action_t classify_service(const conn_t *c, s3_err_t *err) {
 static s3_action_t classify_bucket(const conn_t *c, s3_err_t *err) {
     static const char *const handled[] = {
         "acl", "location", "versioning", "uploads", "delete", "cors",
-        "lifecycle", "website", "versions", "policy", NULL
+        "lifecycle", "website", "versions", "policy", "object-lock", NULL
     };
     int unhandled;
     const char *sub = pick_subresource(c, handled, &unhandled);
@@ -1933,6 +2098,9 @@ static s3_action_t classify_bucket(const conn_t *c, s3_err_t *err) {
         if (get) return ACT_GET_BUCKET_LIFECYCLE;
         if (put) return ACT_PUT_BUCKET_LIFECYCLE;
         if (del) return ACT_DELETE_BUCKET_LIFECYCLE;
+    } else if (!strcmp(sub, "object-lock")) {
+        if (get) return ACT_GET_BUCKET_OBJECT_LOCK;
+        if (put) return ACT_PUT_BUCKET_OBJECT_LOCK;
     } else if (!strcmp(sub, "policy")) {
         if (get) return ACT_GET_BUCKET_POLICY;
         if (put) return ACT_PUT_BUCKET_POLICY;
@@ -1948,7 +2116,7 @@ static s3_action_t classify_bucket(const conn_t *c, s3_err_t *err) {
 
 static s3_action_t classify_object(const conn_t *c, s3_err_t *err) {
     static const char *const handled[] = {
-        "acl", "uploads", "uploadId", "partNumber", NULL
+        "acl", "uploads", "uploadId", "partNumber", "retention", "legal-hold", NULL
     };
     int get = method_is(c, "GET"), put = method_is(c, "PUT");
     int del = method_is(c, "DELETE"), post = method_is(c, "POST");
@@ -1967,14 +2135,17 @@ static s3_action_t classify_object(const conn_t *c, s3_err_t *err) {
         /* versionId modifies GET/HEAD/DELETE (and ?acl etc.); a PUT can't
          * target a version. */
         if (s3_str_eq_lit(k, "versionId")) {
-            if (put || post) { *err = S3_ERR_INVALID_ARGUMENT; return ACT_NONE; }
+            if ((put && !q_has(c, "retention") && !q_has(c, "legal-hold")) || post) {
+                *err = S3_ERR_INVALID_ARGUMENT; return ACT_NONE;
+            }
             continue;
         }
         int ok = 0;
         for (size_t h = 0; handled[h]; h++)
             if (s3_str_eq_lit(k, handled[h])) { ok = 1; break; }
         if (!ok || sub) { unhandled = 1; break; }
-        sub = s3_str_eq_lit(k, "acl") ? "acl" : "uploads";
+        sub = s3_str_eq_lit(k, "acl") ? "acl" : s3_str_eq_lit(k, "retention") ? "retention"
+            : s3_str_eq_lit(k, "legal-hold") ? "legal-hold" : "uploads";
     }
     if (unhandled) { *err = S3_ERR_NOT_IMPLEMENTED; return ACT_NONE; }
 
@@ -1984,6 +2155,12 @@ static s3_action_t classify_object(const conn_t *c, s3_err_t *err) {
     if (sub && !strcmp(sub, "acl")) {
         if (get) return ACT_GET_OBJECT_ACL;
         if (put) return ACT_PUT_OBJECT_ACL;
+    } else if (sub && !strcmp(sub, "retention")) {
+        if (get) return ACT_GET_OBJECT_RETENTION;
+        if (put) return ACT_PUT_OBJECT_RETENTION;
+    } else if (sub && !strcmp(sub, "legal-hold")) {
+        if (get) return ACT_GET_OBJECT_LEGAL_HOLD;
+        if (put) return ACT_PUT_OBJECT_LEGAL_HOLD;
     } else if (sub) {   /* uploads */
         if (post) return ACT_MPU_CREATE;
     } else if (has_upload_id) {
@@ -2089,6 +2266,13 @@ int route_dispatch_headers(conn_t *c) {
     case ACT_PUT_OBJECT_ACL:
         return rsp_build_status(c, 200, "OK");
 
+    case ACT_GET_OBJECT_RETENTION:  return lock_get(c, bucket, key, 0);
+    case ACT_GET_OBJECT_LEGAL_HOLD: return lock_get(c, bucket, key, 1);
+    case ACT_PUT_OBJECT_RETENTION:
+    case ACT_PUT_OBJECT_LEGAL_HOLD:
+        c->cfg_key = key;
+        return cfg_put_begin(c, bucket, act);
+
     case ACT_MPU_CREATE:
         return handle_mpu_initiate(c, bucket, key);
 
@@ -2130,7 +2314,11 @@ int route_dispatch_headers(conn_t *c) {
         c->copy_key     = key;
         return 0;
 
-    case ACT_PUT_OBJECT:    return handle_object_put_begin(c, bucket, key);
+    case ACT_PUT_OBJECT: {
+        s3_err_t le = lock_headers_begin(c, bucket, key);
+        if (le != S3_OK) return rsp_build_s3_error(c, le, c->req.path, NULL);
+        return handle_object_put_begin(c, bucket, key);
+    }
     case ACT_GET_OBJECT:    return handle_object_get(c, bucket, key, 0);
     case ACT_HEAD_OBJECT:   return handle_object_get(c, bucket, key, 1);
     case ACT_DELETE_OBJECT: return handle_object_delete(c, bucket, key);

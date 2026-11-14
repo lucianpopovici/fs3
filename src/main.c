@@ -76,6 +76,8 @@ static void usage(const char *argv0) {
         "      --allow-public-write   also allow public policies that grant writes\n"
         "      --trusted-proxy <ip>   honour X-Forwarded-For/-Proto from this proxy\n"
         "                             (repeatable; e.g. 127.0.0.1 behind DSM)\n"
+        "      --max-retention-days N longest object-lock retention clients may set\n"
+        "                             (default 3650)\n"
         "      --admin-token-file <f> bearer token for the /v1 admin API on the metrics\n"
         "                             port; file must be mode 0600 and owned by us\n"
         "      --admin-socket <path>  serve the /v1 admin API on a unix socket (0600)\n"
@@ -262,6 +264,7 @@ enum {
     OPT_ADMIN_SOCKET,
     OPT_ALLOW_PUBLIC_WRITE,
     OPT_TRUSTED_PROXY,
+    OPT_MAX_RETENTION_DAYS,
 };
 
 #ifndef FS3_MAIN_TESTING
@@ -328,6 +331,7 @@ int main(int argc, char **argv) {
     char admin_token[256] = "";
     const char *admin_socket = NULL;
     int allow_public_write = 0;
+    int max_retention_days = 3650;
     char trusted_proxies[1024] = "";
     sigv4_verifier_t *auth = NULL;
     reload_ctx_t reload_ctx = {0};
@@ -364,6 +368,7 @@ int main(int argc, char **argv) {
         { "admin-socket",     required_argument, NULL, OPT_ADMIN_SOCKET },
         { "allow-public-write", no_argument,     NULL, OPT_ALLOW_PUBLIC_WRITE },
         { "trusted-proxy",    required_argument, NULL, OPT_TRUSTED_PROXY },
+        { "max-retention-days", required_argument, NULL, OPT_MAX_RETENTION_DAYS },
         { "verbose",          no_argument,       NULL, 'v' },
         { "help",             no_argument,       NULL, 'h' },
         { 0 },
@@ -546,6 +551,13 @@ int main(int argc, char **argv) {
             }
             case OPT_ALLOW_PUBLIC: allow_public = 1; break;
             case OPT_ADMIN_SOCKET: admin_socket = optarg; break;
+            case OPT_MAX_RETENTION_DAYS:
+                max_retention_days = atoi(optarg);
+                if (max_retention_days < 1 || max_retention_days > 36500) {
+                    fprintf(stderr, "--max-retention-days must be 1..36500\n");
+                    return 2;
+                }
+                break;
             case OPT_ALLOW_PUBLIC_WRITE: allow_public_write = 1; allow_public = 1; break;
             case OPT_TRUSTED_PROXY: {
                 size_t cur = strlen(trusted_proxies);
@@ -625,6 +637,7 @@ int main(int argc, char **argv) {
         .web_root_domain = web_root_domain,
         .allow_public    = allow_public,
         .allow_public_write = allow_public_write,
+        .max_retention_days = max_retention_days,
         .trusted_proxies = trusted_proxies[0] ? trusted_proxies : NULL,
         .admin_token     = admin_token[0] ? admin_token : NULL,
         .admin_socket    = admin_socket,

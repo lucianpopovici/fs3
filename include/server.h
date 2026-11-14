@@ -80,6 +80,8 @@ typedef struct {
     /* Comma-separated proxy IPs whose X-Forwarded-For/-Proto are trusted
      * (aws:SourceIp, aws:SecureTransport). */
     const char            *trusted_proxies;
+    /* Longest retention a client may set (S9), days; 0 = default 3650. */
+    int                    max_retention_days;
 
     /* Admin API (item 11): /v1 on the metrics listener needs this bearer
      * token (NULL = disabled there); admin_socket adds a Unix-socket

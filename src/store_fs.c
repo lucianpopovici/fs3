@@ -40,6 +40,7 @@
 #include "log.h"
 
 #include <dirent.h>
+#include <ftw.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
@@ -115,6 +116,7 @@ struct s3_store {
     char    *buckets_dir;    /* ROOT/buckets */
     char    *mpu_dir;        /* ROOT/mpu — multipart upload staging */
     char    *versions_dir;   /* ROOT/versions — noncurrent versions (item 8) */
+    char    *locks_dir;      /* ROOT/locks — object lock sidecars (item 10) */
     store_version_guard_fn vguard;   /* object-lock veto (item 10) */
     void    *vguard_user;
     uint64_t min_free_bytes; /* 0 = no quota check */
@@ -366,6 +368,18 @@ static void recover_tmp_dir(const s3_store_t *s) {
 
 static void cfg_cache_clear(s3_store_t *s);
 static void recover_version_links(const s3_store_t *s);
+
+/* Startup: half-written object-lock sidecars (locks/.../<vid>.tmp.XXXXXX). */
+static int lock_tmp_cb(const char *path, const struct stat *st, int type,
+                       struct FTW *ftw) {
+    (void)st; (void)ftw;
+    const char *base = strrchr(path, '/');
+    if (type == FTW_F && strstr(base ? base : path, ".tmp.")) unlink(path);
+    return 0;
+}
+static void recover_lock_tmp(const s3_store_t *s) {
+    nftw(s->locks_dir, lock_tmp_cb, 16, FTW_PHYS);
+}
 static int bucket_versioning(s3_store_t *s, s3_str_t bucket);
 static int random_vid(uint8_t vid[16]);
 static s3_err_t link_aside_locked(s3_store_t *s, s3_str_t bucket,
@@ -417,8 +431,9 @@ s3_err_t store_open(s3_store_t **out, const char *root) {
     s->buckets_dir = xstrdup_join(root, "buckets");
     s->mpu_dir     = xstrdup_join(root, "mpu");
     s->versions_dir = xstrdup_join(root, "versions");
+    s->locks_dir   = xstrdup_join(root, "locks");
     if (!s->root || !s->data_dir || !s->tmp_dir || !s->buckets_dir || !s->mpu_dir
-        || !s->versions_dir) {
+        || !s->versions_dir || !s->locks_dir) {
         store_close(s);
         return S3_ERR_INTERNAL;
     }
@@ -428,7 +443,8 @@ s3_err_t store_open(s3_store_t **out, const char *root) {
         || mkdir_p(s->tmp_dir, 0700) < 0
         || mkdir_p(s->buckets_dir, 0700) < 0
         || mkdir_p(s->mpu_dir, 0700) < 0
-        || mkdir_p(s->versions_dir, 0700) < 0) {
+        || mkdir_p(s->versions_dir, 0700) < 0
+        || mkdir_p(s->locks_dir, 0700) < 0) {
         LOG_E("store_open: mkdir failed under %s: %s", root, strerror(errno));
         store_close(s);
         return S3_ERR_INTERNAL;
@@ -437,6 +453,7 @@ s3_err_t store_open(s3_store_t **out, const char *root) {
     recover_tmp_dir(s);
     recover_sidecar_tmp(s);
     recover_version_links(s);
+    recover_lock_tmp(s);
 
     *out = s;
     return S3_OK;
@@ -450,6 +467,7 @@ void store_close(s3_store_t *s) {
     free(s->buckets_dir);
     free(s->mpu_dir);
     free(s->versions_dir);
+    free(s->locks_dir);
     pthread_mutex_destroy(&s->ns_mu);
     cfg_cache_clear(s);
     pthread_mutex_destroy(&s->cfg_mu);
@@ -802,6 +820,8 @@ static s3_err_t bucket_delete_locked(s3_store_t *s, s3_str_t name) {
     char vp[4096];
     snprintf(vp, sizeof(vp), "%s/" S3_STR_FMT, s->versions_dir, S3_STR_ARG(name));
     if (dir_has_files(vp)) return S3_ERR_BUCKET_NOT_EMPTY;
+    rm_rf(vp);
+    snprintf(vp, sizeof(vp), "%s/" S3_STR_FMT, s->locks_dir, S3_STR_ARG(name));
     rm_rf(vp);
 
     /* Drop any in-flight multipart uploads first. Left behind, they could
@@ -3861,4 +3881,72 @@ s3_err_t store_list_versions(s3_store_t *s, s3_str_t bucket,
 void store_versions_free(s3_version_info_t *v, size_t n) {
     for (size_t i = 0; i < n; i++) { free(v[i].key); free(v[i].prefix); }
     free(v);
+}
+
+/* ===================================================================== */
+/* Object lock sidecars (item 10)                                         */
+/* ===================================================================== */
+
+static int lock_path(const s3_store_t *s, s3_str_t bucket, s3_str_t key,
+                     const uint8_t vid[16], char *dir, size_t dcap,
+                     char *path, size_t pcap) {
+    char hex[65], vh[33];
+    hash_bucket_key(bucket, key, hex);
+    vid_hex(vid, vh);
+    int n = snprintf(dir, dcap, "%s/" S3_STR_FMT "/%c%c/%c%c/%s", s->locks_dir,
+                     S3_STR_ARG(bucket), hex[0], hex[1], hex[2], hex[3], hex);
+    if (n <= 0 || (size_t)n >= dcap) return -1;
+    n = snprintf(path, pcap, "%s/%s", dir, vh);
+    return (n > 0 && (size_t)n < pcap) ? 0 : -1;
+}
+
+int store_lock_read(s3_store_t *s, s3_str_t bucket, s3_str_t key,
+                    const uint8_t vid[16], s3_lock_t *out) {
+    memset(out, 0, sizeof(*out));
+    char dir[4300], path[4400];
+    if (!valid_bucket_name(bucket) || !valid_key(key)
+        || lock_path(s, bucket, key, vid, dir, sizeof(dir), path, sizeof(path)) < 0)
+        return -1;
+    FILE *f = fopen(path, "re");
+    if (!f) return errno == ENOENT ? 1 : -1;
+    char line[128];
+    int ok = 0;
+    while (fgets(line, sizeof(line), f)) {
+        line[strcspn(line, "\r\n")] = '\0';
+        if (!strcmp(line, "mode=GOVERNANCE")) out->mode = S3_LOCK_GOVERNANCE;
+        else if (!strcmp(line, "mode=COMPLIANCE")) out->mode = S3_LOCK_COMPLIANCE;
+        else if (!strcmp(line, "mode=NONE")) out->mode = S3_LOCK_NONE;
+        else if (!strncmp(line, "until_ms=", 9)) out->until_ms = strtoull(line + 9, NULL, 10);
+        else if (!strcmp(line, "legal_hold=1")) out->legal_hold = 1;
+        else if (!strcmp(line, "legal_hold=0")) out->legal_hold = 0;
+        else if (!strcmp(line, "v=1")) ok = 1;
+    }
+    fclose(f);
+    return ok ? 0 : -1;
+}
+
+s3_err_t store_lock_write(s3_store_t *s, s3_str_t bucket, s3_str_t key,
+                          const uint8_t vid[16], const s3_lock_t *l) {
+    char dir[4300], path[4400], tmp[4500];
+    if (!valid_bucket_name(bucket) || !valid_key(key)
+        || lock_path(s, bucket, key, vid, dir, sizeof(dir), path, sizeof(path)) < 0)
+        return S3_ERR_INVALID_ARGUMENT;
+    if (mkdir_p(dir, 0700) < 0) return map_io_err(errno);
+    snprintf(tmp, sizeof(tmp), "%s.tmp.XXXXXX", path);
+    int fd = mkstemp(tmp);
+    if (fd < 0) return map_io_err(errno);
+    char buf[160];
+    int n = snprintf(buf, sizeof(buf), "v=1\nmode=%s\nuntil_ms=%" PRIu64 "\nlegal_hold=%d\n",
+                     l->mode == S3_LOCK_COMPLIANCE ? "COMPLIANCE"
+                     : l->mode == S3_LOCK_GOVERNANCE ? "GOVERNANCE" : "NONE",
+                     l->until_ms, l->legal_hold ? 1 : 0);
+    if (xwrite(fd, buf, (size_t)n) != n || xfsync(fd) < 0) {
+        s3_err_t e = map_io_err(errno);
+        close(fd); unlink(tmp);
+        return e;
+    }
+    close(fd);
+    if (rename(tmp, path) < 0) { s3_err_t e = map_io_err(errno); unlink(tmp); return e; }
+    fsync_dir(dir);
+    return S3_OK;
 }

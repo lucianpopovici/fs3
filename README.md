@@ -194,6 +194,28 @@ What's working end-to-end:
   auth and routing. botocore sends it on every upload and used to wait
   its 1-second timeout per PUT.
 
+- **Object Lock** — enabled only at bucket creation
+  (`x-amz-bucket-object-lock-enabled: true`, which pins versioning to
+  Enabled). `PUT/GET /bucket?object-lock` sets a default retention
+  (GOVERNANCE/COMPLIANCE, Days/Years). Per-version retention and legal
+  hold (`?retention`, `?legal-hold`, `versionId`, and the
+  `x-amz-object-lock-*` PUT headers, which require Content-MD5 or an
+  `x-amz-checksum-*`) live in sidecars under `locks/`, so retention can
+  be extended without rewriting data. Enforcement is in the store: no
+  path — S3 API, lifecycle, admin API — can permanently delete a version
+  under legal hold or unexpired retention. COMPLIANCE can only be
+  extended; GOVERNANCE can be shortened, removed or bypassed by an admin
+  with `x-amz-bypass-governance-retention: true`. Overwriting or deleting
+  the current key without a version id still works (it adds a version or
+  marker). Setting retention needs the owner/`o` permission, not just
+  `w`, and is capped by `--max-retention-days` (default 3650) so writers
+  can't fill the volume with undeletable data. A missing lock record
+  falls back to the bucket default; an unreadable one fails closed.
+  Retention trusts the system clock; a backwards jump of more than an
+  hour is logged. This is API-level WORM only: root on the NAS can still
+  delete files (`FS_IMMUTABLE_FL` hardening is not implemented — it
+  conflicts with the hard-link version scheme).
+
 - **Static website hosting** (Garage's model) — `PUT/GET/DELETE
   /bucket?website` with `IndexDocument/Suffix`, `ErrorDocument/Key` or
   `RedirectAllRequestsTo` (`RoutingRules` → 501). A website config makes

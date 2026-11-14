@@ -13,6 +13,7 @@
 #include "action.h"
 #include "lifecycle.h"
 #include "admin.h"
+#include "objlock.h"
 #include "conn.h"
 #include "iopool.h"
 #include "log.h"
@@ -58,6 +59,8 @@ struct server {
     int           lc_running;        /* a sweep job is in flight */
     int           lc_last_yday;      /* day of year of the last scheduled run */
     int           lc_pending_now;    /* run at the first tick (--lifecycle-now) */
+    time_t        clock_wall_last;   /* clock-jump detection (item 10.6) */
+    time_t        clock_mono_last;
     int           gc_interval_s;     /* sweep cadence */
     uint64_t      gc_max_age_ms;     /* TTL */
     /* Idle-connection sweep (cfg.idle_timeout_s > 0). Runs at most once
@@ -436,6 +439,9 @@ server_t *server_create(const server_cfg_t *cfg) {
     s->lc_pending_now = cfg->lifecycle_now;
     /* Bucket lifecycle abort rules override the global MPU TTL. */
     store_set_mpu_gc_filter(s->store, lc_mpu_gc_filter, s->store);
+    /* Object lock is enforced in the store: no path deletes a locked
+     * version (item 10). */
+    store_set_version_guard(s->store, olock_guard, s->store);
     return s;
 
 fail:
@@ -556,6 +562,8 @@ static void accept_new(server_t *s, int lfd, int is_web) {
         c->allow_public = s->cfg.allow_public;
         c->allow_public_write = s->cfg.allow_public_write;
         c->trusted_proxies = s->cfg.trusted_proxies;
+        c->max_retention_ms = (uint64_t)(s->cfg.max_retention_days > 0
+                                         ? s->cfg.max_retention_days : 3650) * 86400000ULL;
 
         struct epoll_event ev = {
             .events = EPOLLIN | EPOLLRDHUP,
@@ -670,6 +678,21 @@ int server_run(server_t *s) {
         }
 
         lc_maybe_start(s, now);
+
+        /* Retention trusts the wall clock: warn if it jumps backwards by
+         * more than an hour relative to the monotonic clock. */
+        {
+            struct timespec mt;
+            clock_gettime(CLOCK_MONOTONIC, &mt);
+            if (s->clock_mono_last) {
+                long expect = (long)(s->clock_wall_last + (mt.tv_sec - s->clock_mono_last));
+                if ((long)now < expect - 3600)
+                    LOG_W("wall clock jumped backwards by %ld s: object lock retention "
+                          "and lifecycle rely on it", expect - (long)now);
+            }
+            s->clock_wall_last = now;
+            s->clock_mono_last = mt.tv_sec;
+        }
 
         int jobs_ready = 0;
         for (int i = 0; i < n; i++) {
