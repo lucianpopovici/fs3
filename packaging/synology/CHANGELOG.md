@@ -1,6 +1,14 @@
 # fs3 SPK changelog
 
-## Unreleased
+## Unreleased (round 2)
+
+- Object files are now written in on-disk **schema 4** (adds stored size,
+  a CRC64NVME over the on-disk payload, a TLV area for metadata, and
+  4 KiB header padding on reflink-capable volumes). Schemas 2 and 3 are
+  still read. One-way: an older fs3 answers `InternalError` for schema-4
+  objects — **no downgrade after upgrade**.
+
+## Previous release
 
 **One-way on-disk migrations — no downgrade after upgrade.** Once this
 version has written data, an older fs3 package cannot read it. Back up

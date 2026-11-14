@@ -74,6 +74,27 @@ int main(void) {
         CHECK(ok, "crc32c hw == sw");
     }
 
+    /* crc64nvme_combine(crc(A), crc(B), |B|) == crc(A‖B) for many splits. */
+    {
+        int ok = 1;
+        for (size_t split = 0; split <= 1000 && ok; split += 13) {
+            uint8_t a[32], b[32], w[32]; size_t n;
+            cksum_oneshot(S3_CKSUM_CRC64NVME, buf, split, a, &n);
+            cksum_oneshot(S3_CKSUM_CRC64NVME, buf + split, 1000 - split, b, &n);
+            cksum_oneshot(S3_CKSUM_CRC64NVME, buf, 1000, w, &n);
+            uint64_t c = crc64nvme_combine(crc64nvme_from_be(a), crc64nvme_from_be(b),
+                                           1000 - split);
+            if (c != crc64nvme_from_be(w)) ok = 0;
+        }
+        CHECK(ok, "crc64nvme_combine == one-shot");
+        /* Check value: "12345" + "6789" → crc("123456789"). */
+        uint8_t a[32], b[32]; size_t n;
+        cksum_oneshot(S3_CKSUM_CRC64NVME, "12345", 5, a, &n);
+        cksum_oneshot(S3_CKSUM_CRC64NVME, "6789", 4, b, &n);
+        CHECK(crc64nvme_combine(crc64nvme_from_be(a), crc64nvme_from_be(b), 4)
+              == 0xae8b14860a799888ull, "combine check value");
+    }
+
     /* base64 */
     char e[64]; uint8_t d[64];
     base64_encode((const uint8_t *)"\xcb\xf4\x39\x26", 4, e);

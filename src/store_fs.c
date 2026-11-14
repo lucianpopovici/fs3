@@ -41,6 +41,8 @@
 
 #include <dirent.h>
 #include <ftw.h>
+#include <linux/fs.h>
+#include <sys/ioctl.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
@@ -68,7 +70,8 @@
 #define OBJ_MAGIC    "YS3OBJ\0"
 #define OBJ_MAGIC_LEN 8         /* "YS3OBJ\0\0" — 6 chars + 2 NUL */
 #define OBJ_SCHEMA_V2 2u        /* v2 added part_count */
-#define OBJ_SCHEMA   3u         /* v3 added obj_ext_v3_t (checksum, version id, flags) */
+#define OBJ_SCHEMA_V3 3u        /* v3 added obj_ext_v3_t (checksum, version id, flags) */
+#define OBJ_SCHEMA   4u         /* v4 added obj_ext_v4_t + TLV area + padding */
 
 typedef struct __attribute__((packed)) {
     char     magic[OBJ_MAGIC_LEN];   /* "YS3OBJ\0\0" */
@@ -102,7 +105,29 @@ typedef struct __attribute__((packed)) {
 
 _Static_assert(sizeof(obj_ext_v3_t) == 64, "obj_ext_v3_t layout");
 
-/* Upper bound on content-type bytes we write (s3_obj_meta_t holds 127). */
+/* Schema 4 (the last fixed migration): a second extension block and a
+ * TLV area, then optional zero padding so header_size can be a multiple
+ * of 4096 (block-aligned payloads make extent cloning possible):
+ *
+ *   [obj_header_t][obj_ext_v3_t][obj_ext_v4_t][ct][key][TLV...][pad][data]
+ *
+ * TLV records are [u16 type][u32 len][bytes] (little endian); unknown
+ * types are skipped on read and preserved on copy. */
+typedef struct __attribute__((packed)) {
+    uint64_t stored_size;      /* payload bytes on disk (== data_size unless
+                                  compressed or encrypted) */
+    uint8_t  payload_crc64[8]; /* CRC64NVME over the on-disk payload, BE */
+    uint32_t tlv_len;
+    uint32_t pad_len;
+    uint8_t  reserved[8];
+} obj_ext_v4_t;
+
+_Static_assert(sizeof(obj_ext_v4_t) == 32, "obj_ext_v4_t layout");
+
+#define OBJ_MAX_TLV  (64 * 1024)
+#define OBJ_MAX_PAD  4095
+
+/* Upper bound on content-type bytes we write. */
 #define OBJ_MAX_CT_LEN 1024
 
 /* ===================================================================== */
@@ -134,6 +159,9 @@ struct s3_store {
      * sequences on the same key serialize. Order: key lock before ns_mu;
      * never two key locks at once. */
     pthread_mutex_t key_mu[256];
+
+    int  pad_headers;        /* schema-4 headers padded to 4096 */
+    int  reflink;            /* filesystem supports FICLONE (probed) */
 
     int  (*mpu_gc_filter)(void *user, s3_str_t bucket, s3_str_t key);
     void  *mpu_gc_filter_user;
@@ -368,6 +396,7 @@ static void recover_tmp_dir(const s3_store_t *s) {
 
 static void cfg_cache_clear(s3_store_t *s);
 static void recover_version_links(const s3_store_t *s);
+static int probe_reflink(const s3_store_t *s);
 
 /* Startup: half-written object-lock sidecars (locks/.../<vid>.tmp.XXXXXX). */
 static int lock_tmp_cb(const char *path, const struct stat *st, int type,
@@ -454,6 +483,10 @@ s3_err_t store_open(s3_store_t **out, const char *root) {
     recover_sidecar_tmp(s);
     recover_version_links(s);
     recover_lock_tmp(s);
+    s->reflink = probe_reflink(s);
+    s->pad_headers = s->reflink;
+    LOG_I("store: reflink %s", s->reflink ? "supported (headers padded to 4 KiB)"
+                                          : "not supported (plain copies)");
 
     *out = s;
     return S3_OK;
@@ -866,6 +899,40 @@ s3_err_t store_bucket_delete(s3_store_t *s, s3_str_t name) {
 }
 
 /* ===================================================================== */
+/* Header padding / reflink probe (schema 4)                              */
+/* ===================================================================== */
+
+static uint32_t obj_pad_for(const s3_store_t *s, size_t base) {
+    if (!s || !s->pad_headers) return 0;
+    return (uint32_t)((4096 - base % 4096) % 4096);
+}
+
+int store_set_header_pad(s3_store_t *s, int on) {
+    int old = s->pad_headers;
+    s->pad_headers = on ? 1 : 0;
+    return old;
+}
+
+int store_reflink_capable(const s3_store_t *s) { return s->reflink; }
+
+/* Try FICLONE between two temp files: Btrfs/XFS say yes, ext4 no. */
+static int probe_reflink(const s3_store_t *s) {
+    char a[4200], b[4200];
+    snprintf(a, sizeof(a), "%s/probe.XXXXXX", s->tmp_dir);
+    snprintf(b, sizeof(b), "%s/probe.XXXXXX", s->tmp_dir);
+    int fa = mkstemp(a);
+    if (fa < 0) return 0;
+    int fb = mkstemp(b);
+    if (fb < 0) { close(fa); unlink(a); return 0; }
+    static char blk[4096];
+    int ok = write(fa, blk, sizeof(blk)) == (ssize_t)sizeof(blk)
+             && ioctl(fb, FICLONE, fa) == 0;
+    close(fa); close(fb);
+    unlink(a); unlink(b);
+    return ok;
+}
+
+/* ===================================================================== */
 /* Bucket config sidecars + parsed-config cache                           */
 /* ===================================================================== */
 
@@ -1248,6 +1315,53 @@ s3_err_t store_bucket_grant_set(s3_store_t *s, s3_str_t bucket,
 /* Streaming PUT                                                          */
 /* ===================================================================== */
 
+/* Padding that makes `base` a multiple of 4096, when the store pads
+ * headers (reflink-capable filesystem); 0 otherwise. */
+static uint32_t obj_pad_for(const s3_store_t *s, size_t base);
+
+/* Write the complete object prefix (fixed blocks, ct, key, TLV, zero pad)
+ * at the current file position; fills h->header_size and x4 lengths. */
+static int obj_write_prefix(const s3_store_t *s, int fd, obj_header_t *h,
+                            obj_ext_v3_t *x3, obj_ext_v4_t *x4,
+                            const char *ct, size_t ct_n,
+                            const char *key, size_t key_n,
+                            const uint8_t *tlv, size_t tlv_n) {
+    if (ct_n > OBJ_MAX_CT_LEN || key_n > UINT16_MAX || tlv_n > OBJ_MAX_TLV) {
+        errno = EINVAL;
+        return -1;
+    }
+    size_t base = sizeof(*h) + sizeof(*x3) + sizeof(*x4) + ct_n + key_n + tlv_n;
+    uint32_t pad = obj_pad_for(s, base);
+    memcpy(h->magic, OBJ_MAGIC, OBJ_MAGIC_LEN);
+    h->schema = OBJ_SCHEMA;
+    h->ct_len = (uint16_t)ct_n;
+    h->key_len = (uint16_t)key_n;
+    h->header_size = (uint32_t)(base + pad);
+    x4->tlv_len = (uint32_t)tlv_n;
+    x4->pad_len = pad;
+    static const char zeros[4096];
+    if (xwrite(fd, h, sizeof(*h)) != (ssize_t)sizeof(*h)
+        || xwrite(fd, x3, sizeof(*x3)) != (ssize_t)sizeof(*x3)
+        || xwrite(fd, x4, sizeof(*x4)) != (ssize_t)sizeof(*x4)
+        || (ct_n && xwrite(fd, ct, ct_n) != (ssize_t)ct_n)
+        || (key_n && xwrite(fd, key, key_n) != (ssize_t)key_n)
+        || (tlv_n && xwrite(fd, tlv, tlv_n) != (ssize_t)tlv_n)
+        || (pad && xwrite(fd, zeros, pad) != (ssize_t)pad))
+        return -1;
+    return 0;
+}
+
+/* Rewrite the three fixed blocks in place (commit time). */
+static int obj_rewrite_fixed(int fd, const obj_header_t *h,
+                             const obj_ext_v3_t *x3, const obj_ext_v4_t *x4) {
+    return (pwrite(fd, h, sizeof(*h), 0) == (ssize_t)sizeof(*h)
+            && pwrite(fd, x3, sizeof(*x3), sizeof(*h)) == (ssize_t)sizeof(*x3)
+            && pwrite(fd, x4, sizeof(*x4), sizeof(*h) + sizeof(*x3))
+               == (ssize_t)sizeof(*x4)) ? 0 : -1;
+}
+
+static int tlv_validate(const uint8_t *t, size_t n);
+
 struct s3_writer {
     s3_store_t *store;
     int         fd;                  /* tmp file fd */
@@ -1256,6 +1370,8 @@ struct s3_writer {
     EVP_MD_CTX *md5_ctx;             /* running MD5 */
     obj_header_t hdr;                /* accumulated header (filled in begin) */
     obj_ext_v3_t ext;                /* schema-3 extension (checksum, ...) */
+    obj_ext_v4_t ext4;               /* schema-4 extension (payload CRC, ...) */
+    cksum_ctx_t  pcrc;               /* CRC64NVME over the payload */
     char       *bucket_dup;
     char       *key_dup;             /* NOT NUL-terminated; key_len in hdr.key_len */
     char       *content_type_dup;    /* NUL-terminated */
@@ -1278,6 +1394,7 @@ struct s3_writer {
 
 static void writer_free(s3_writer_t *w) {
     if (!w) return;
+    cksum_free(&w->pcrc);
     if (w->fd >= 0) close(w->fd);
     if (w->tmp_path[0]) unlink(w->tmp_path);
     if (w->md5_ctx) EVP_MD_CTX_free(w->md5_ctx);
@@ -1347,9 +1464,7 @@ s3_err_t store_put_begin_opts(s3_store_t *s, s3_str_t bucket, s3_str_t key,
 
     const char *ct = content_type ? content_type : "";
     size_t ct_n = strlen(ct);
-    if (ct_n > sizeof(((s3_obj_meta_t*)0)->content_type) - 1) {
-        ct_n = sizeof(((s3_obj_meta_t*)0)->content_type) - 1;
-    }
+    if (ct_n > OBJ_MAX_CT_LEN) { writer_free(w); return S3_ERR_INVALID_ARGUMENT; }
     w->content_type_dup = malloc(ct_n + 1);
     if (!w->content_type_dup) { writer_free(w); return S3_ERR_INTERNAL; }
     memcpy(w->content_type_dup, ct, ct_n);
@@ -1358,19 +1473,18 @@ s3_err_t store_put_begin_opts(s3_store_t *s, s3_str_t bucket, s3_str_t key,
     /* Header lengths are known now; data size + etag come at commit time. */
     if (key.n > UINT16_MAX) { writer_free(w); return S3_ERR_INVALID_ARGUMENT; }
     if (ct_n > UINT16_MAX)  { writer_free(w); return S3_ERR_INVALID_ARGUMENT; }
-    memcpy(w->hdr.magic, OBJ_MAGIC, OBJ_MAGIC_LEN);
-    w->hdr.schema      = OBJ_SCHEMA;
-    w->hdr.header_size = (uint32_t)(sizeof(obj_header_t) + sizeof(obj_ext_v3_t)
-                                    + ct_n + key.n);
     if (opts->have_cksum
         && store_put_set_checksum(w, opts->cksum_algo, opts->cksum_type,
                                   opts->cksum_parts, opts->cksum,
                                   sizeof(opts->cksum)) != S3_OK) {
         writer_free(w); return S3_ERR_INVALID_ARGUMENT;
     }
-    w->hdr.ct_len      = (uint16_t)ct_n;
-    w->hdr.key_len     = (uint16_t)key.n;
-    /* data_size, mtime_ms, etag filled at commit */
+    /* data_size, mtime_ms, etag, payload CRC filled at commit */
+    if (opts->tlv_len > OBJ_MAX_TLV
+        || (opts->tlv_len && (!opts->tlv || tlv_validate(opts->tlv, opts->tlv_len) < 0))) {
+        writer_free(w); return S3_ERR_INVALID_ARGUMENT;
+    }
+    if (cksum_begin(&w->pcrc, S3_CKSUM_CRC64NVME) < 0) { writer_free(w); return S3_ERR_INTERNAL; }
 
     /* Open temp file. */
     w->fd = tmp_open(s, w->tmp_path, sizeof(w->tmp_path));
@@ -1384,10 +1498,9 @@ s3_err_t store_put_begin_opts(s3_store_t *s, s3_str_t bucket, s3_str_t key,
     /* Reserve header space by writing the (incomplete) header, then the
      * variable-length content_type and key bytes. We'll pwrite the final
      * header back at offset 0 in commit. */
-    if (xwrite(w->fd, &w->hdr, sizeof(w->hdr)) != (ssize_t)sizeof(w->hdr)
-        || xwrite(w->fd, &w->ext, sizeof(w->ext)) != (ssize_t)sizeof(w->ext)
-        || (ct_n  && xwrite(w->fd, w->content_type_dup, ct_n) != (ssize_t)ct_n)
-        || (key.n && xwrite(w->fd, w->key_dup, key.n)         != (ssize_t)key.n)) {
+    if (obj_write_prefix(s, w->fd, &w->hdr, &w->ext, &w->ext4,
+                         w->content_type_dup, ct_n, w->key_dup, key.n,
+                         opts->tlv, opts->tlv_len) < 0) {
         LOG_E("write header: %s", strerror(errno));
         s3_err_t e = map_io_err(errno);
         writer_free(w);
@@ -1403,6 +1516,7 @@ s3_err_t store_put_write(s3_writer_t *w, const void *buf, size_t n) {
     if (n == 0) return S3_OK;
 
     if (EVP_DigestUpdate(w->md5_ctx, buf, n) != 1) return S3_ERR_INTERNAL;
+    if (w->pcrc.algo) cksum_update(&w->pcrc, buf, n);
 
     const char *p = buf;
     size_t left = n;
@@ -1443,9 +1557,15 @@ s3_err_t store_put_commit(s3_writer_t *w, s3_obj_meta_t *meta_out) {
     }
 
     /* Pwrite the finalized header back at offset 0. */
-    if (pwrite(w->fd, &w->hdr, sizeof(w->hdr), 0) != (ssize_t)sizeof(w->hdr)
-        || pwrite(w->fd, &w->ext, sizeof(w->ext), sizeof(w->hdr))
-           != (ssize_t)sizeof(w->ext)) {
+    w->ext4.stored_size = w->data_written;
+    if (w->pcrc.algo) {
+        uint8_t d[CKSUM_MAX_DIGEST]; size_t dn;
+        if (cksum_final(&w->pcrc, d, &dn) == 0 && dn == 8) {
+            memcpy(w->ext4.payload_crc64, d, 8);
+            w->ext.flags |= S3_OBJF_PAYLOAD_CRC;
+        }
+    }
+    if (obj_rewrite_fixed(w->fd, &w->hdr, &w->ext, &w->ext4) < 0) {
         LOG_E("pwrite header: %s", strerror(errno));
         s3_err_t e = map_io_err(errno);
         writer_free(w); return e;
@@ -1540,6 +1660,9 @@ s3_err_t store_put_commit(s3_writer_t *w, s3_obj_meta_t *meta_out) {
         meta_out->cksum_type  = w->ext.cksum_type;
         meta_out->cksum_parts = w->ext.cksum_parts;
         memcpy(meta_out->cksum, w->ext.cksum, 32);
+        meta_out->stored_size = w->ext4.stored_size;
+        memcpy(meta_out->payload_crc64, w->ext4.payload_crc64, 8);
+        meta_out->header_size = w->hdr.header_size;
     }
 
     writer_free(w);
@@ -1558,6 +1681,7 @@ void store_put_abort(s3_writer_t *w) {
 
 struct s3_reader {
     int      fd;
+    uint32_t tlv_off, tlv_len;  /* schema-4 TLV area (0 if none) */
     uint64_t data_off;       /* file offset where data begins */
     uint64_t data_size;      /* total data length */
     uint64_t pos;            /* bytes already returned to caller */
@@ -1569,16 +1693,33 @@ struct s3_reader {
  * inside the file, and the data region must match the file size.
  * Fills h, x (zeroes for schema 2) and *ct_off (offset of content-type
  * bytes; the key follows them). */
-static s3_err_t obj_read_hdr(int fd, obj_header_t *h, obj_ext_v3_t *x,
-                             uint32_t *ct_off) {
+/* Walk a TLV area: every record must fit exactly. 0 ok, -1 malformed. */
+static int tlv_validate(const uint8_t *t, size_t n) {
+    size_t o = 0;
+    while (o < n) {
+        if (n - o < 6) return -1;
+        uint32_t len = (uint32_t)t[o+2] | (uint32_t)t[o+3] << 8
+                     | (uint32_t)t[o+4] << 16 | (uint32_t)t[o+5] << 24;
+        if (len > n - o - 6) return -1;
+        o += 6 + len;
+    }
+    return 0;
+}
+
+static s3_err_t obj_read_hdr4(int fd, obj_header_t *h, obj_ext_v3_t *x,
+                              obj_ext_v4_t *x4, uint32_t *ct_off,
+                              uint32_t *tlv_off) {
     ssize_t r = pread(fd, h, sizeof(*h), 0);
     if (r != (ssize_t)sizeof(*h)) return S3_ERR_INTERNAL;
     if (memcmp(h->magic, OBJ_MAGIC, OBJ_MAGIC_LEN) != 0) return S3_ERR_INTERNAL;
     uint32_t fixed;
+    obj_ext_v4_t x4l;
+    if (!x4) x4 = &x4l;
     memset(x, 0, sizeof(*x));
+    memset(x4, 0, sizeof(*x4));
     if (h->schema == OBJ_SCHEMA_V2) {
         fixed = (uint32_t)sizeof(*h);
-    } else if (h->schema == OBJ_SCHEMA) {
+    } else if (h->schema == OBJ_SCHEMA_V3 || h->schema == OBJ_SCHEMA) {
         fixed = (uint32_t)(sizeof(*h) + sizeof(*x));
         if (pread(fd, x, sizeof(*x), sizeof(*h)) != (ssize_t)sizeof(*x))
             return S3_ERR_INTERNAL;
@@ -1587,29 +1728,62 @@ static s3_err_t obj_read_hdr(int fd, obj_header_t *h, obj_ext_v3_t *x,
             || (x->cksum_type == S3_CKSUM_TYPE_COMPOSITE
                 && (x->cksum_parts == 0 || x->cksum_parts > 10000)))
             return S3_ERR_INTERNAL;
+        if (h->schema == OBJ_SCHEMA) {
+            if (pread(fd, x4, sizeof(*x4), fixed) != (ssize_t)sizeof(*x4))
+                return S3_ERR_INTERNAL;
+            fixed += (uint32_t)sizeof(*x4);
+            if (x4->tlv_len > OBJ_MAX_TLV || x4->pad_len > OBJ_MAX_PAD)
+                return S3_ERR_INTERNAL;
+        }
     } else {
         return S3_ERR_INTERNAL;
     }
     if (h->ct_len > OBJ_MAX_CT_LEN || h->key_len == 0 || h->key_len > 1024)
         return S3_ERR_INTERNAL;
-    if ((uint64_t)h->header_size != (uint64_t)fixed + h->ct_len + h->key_len)
+    if ((uint64_t)h->header_size != (uint64_t)fixed + h->ct_len + h->key_len
+                                    + x4->tlv_len + x4->pad_len)
         return S3_ERR_INTERNAL;
     if (h->part_count > 10000) return S3_ERR_INTERNAL;
+    uint64_t stored = h->schema == OBJ_SCHEMA ? x4->stored_size : h->data_size;
+    if (h->schema != OBJ_SCHEMA) x4->stored_size = h->data_size;
     struct stat st;
     if (fstat(fd, &st) < 0 || st.st_size < 0
         || (uint64_t)st.st_size < h->header_size
-        || (uint64_t)st.st_size - h->header_size != h->data_size)
+        || (uint64_t)st.st_size - h->header_size != stored)
         return S3_ERR_INTERNAL;
+    if (x4->tlv_len) {
+        uint8_t *t = malloc(x4->tlv_len);
+        if (!t) return S3_ERR_INTERNAL;
+        off_t to = (off_t)fixed + h->ct_len + h->key_len;
+        int bad = pread(fd, t, x4->tlv_len, to) != (ssize_t)x4->tlv_len
+                  || tlv_validate(t, x4->tlv_len) < 0;
+        free(t);
+        if (bad) return S3_ERR_INTERNAL;
+    }
     *ct_off = fixed;
+    if (tlv_off) *tlv_off = fixed + h->ct_len + h->key_len;
     return S3_OK;
+}
+
+static s3_err_t obj_read_hdr(int fd, obj_header_t *h, obj_ext_v3_t *x,
+                             uint32_t *ct_off) {
+    return obj_read_hdr4(fd, h, x, NULL, ct_off, NULL);
 }
 
 /* Fill meta from a validated header (content-type read from fd). */
 static s3_err_t obj_fill_meta(int fd, const obj_header_t *h,
-                              const obj_ext_v3_t *x, uint32_t ct_off,
+                              const obj_ext_v3_t *x, const obj_ext_v4_t *x4,
+                              uint32_t ct_off, uint32_t tlv_off,
                               s3_obj_meta_t *m) {
     memset(m, 0, sizeof(*m));
     m->size       = h->data_size;
+    m->stored_size = x4 ? x4->stored_size : h->data_size;
+    if (x4) {
+        memcpy(m->payload_crc64, x4->payload_crc64, 8);
+        m->tlv_len = x4->tlv_len;
+        m->tlv_off = x4->tlv_len ? tlv_off : 0;
+    }
+    m->header_size = h->header_size;
     m->mtime_ms   = h->mtime_ms;
     m->part_count = h->part_count;
     memcpy(m->etag, h->etag, 16);
@@ -1633,11 +1807,12 @@ static s3_err_t obj_fill_meta(int fd, const obj_header_t *h,
 static s3_err_t read_header(int fd, obj_header_t *hdr_out, s3_obj_meta_t *meta_out) {
     obj_header_t h;
     obj_ext_v3_t x;
-    uint32_t ct_off;
-    s3_err_t e = obj_read_hdr(fd, &h, &x, &ct_off);
+    obj_ext_v4_t x4;
+    uint32_t ct_off, tlv_off;
+    s3_err_t e = obj_read_hdr4(fd, &h, &x, &x4, &ct_off, &tlv_off);
     if (e != S3_OK) return e;
     if (hdr_out) *hdr_out = h;
-    if (meta_out) return obj_fill_meta(fd, &h, &x, ct_off, meta_out);
+    if (meta_out) return obj_fill_meta(fd, &h, &x, &x4, ct_off, tlv_off, meta_out);
     return S3_OK;
 }
 
@@ -1768,7 +1943,7 @@ static int load_entry(const char *path, list_entry_t *out) {
     char *kbuf = malloc((size_t)h.key_len + 1);
     if (!kbuf) { close(fd); return -1; }
     if (pread(fd, kbuf, h.key_len, (off_t)ct_off + h.ct_len) != (ssize_t)h.key_len
-        || obj_fill_meta(fd, &h, &x, ct_off, &out->meta) != S3_OK) {
+        || obj_fill_meta(fd, &h, &x, NULL, ct_off, 0, &out->meta) != S3_OK) {
         free(kbuf); close(fd); return -1;
     }
     kbuf[h.key_len] = '\0';
@@ -2659,6 +2834,8 @@ s3_err_t store_mpu_complete2(s3_store_t *s, s3_str_t bucket, s3_str_t key,
     }
     free(stored_key);
     /* stored_ct may be NULL/empty; we'll use it for the new object. */
+    const uint8_t *mpu_tlv = NULL;      /* TLVs captured at Create (item 1e) */
+    size_t mpu_tlv_n = 0;
 
     /* Validate the parts list:
      *   - part_numbers strictly increasing, each in [1,10000]
@@ -2807,14 +2984,18 @@ s3_err_t store_mpu_complete2(s3_store_t *s, s3_str_t bucket, s3_str_t key,
         close(tfd); unlink(tmp_path); free(stored_ct); cksum_free(&comp); cksum_free(&full);
         return S3_ERR_INVALID_ARGUMENT;
     }
-    hdr.ct_len = (uint16_t)ct_n;
-    hdr.key_len = (uint16_t)key.n;
     hdr.part_count = (uint16_t)n_parts;
-    hdr.header_size = (uint32_t)(sizeof(hdr) + sizeof(obj_ext_v3_t)
-                                 + ct_n + key.n);
     hdr.data_size = total_size;
     obj_ext_v3_t ext;
     memset(&ext, 0, sizeof(ext));
+    obj_ext_v4_t ext4;
+    memset(&ext4, 0, sizeof(ext4));
+    ext4.stored_size = total_size;
+    cksum_ctx_t pcrc;
+    if (cksum_begin(&pcrc, S3_CKSUM_CRC64NVME) < 0) {
+        close(tfd); unlink(tmp_path); free(stored_ct); cksum_free(&comp); cksum_free(&full);
+        return S3_ERR_INTERNAL;
+    }
     int versioning = bucket_versioning(s, bucket);
     if (versioning == S3_VERSIONING_ENABLED && random_vid(ext.version_id) < 0) {
         close(tfd); unlink(tmp_path); free(stored_ct); cksum_free(&comp); cksum_free(&full);
@@ -2826,12 +3007,11 @@ s3_err_t store_mpu_complete2(s3_store_t *s, s3_str_t bucket, s3_str_t key,
     hdr.mtime_ms = mtime_ms;
     memcpy(hdr.etag, mp_md5, 16);
 
-    if (xwrite(tfd, &hdr, sizeof(hdr)) != (ssize_t)sizeof(hdr)
-        || xwrite(tfd, &ext, sizeof(ext)) != (ssize_t)sizeof(ext)
-        || (ct_n && xwrite(tfd, stored_ct, ct_n) != (ssize_t)ct_n)
-        || (key.n && xwrite(tfd, key.p, key.n) != (ssize_t)key.n)) {
+    if (obj_write_prefix(s, tfd, &hdr, &ext, &ext4, stored_ct, ct_n,
+                         key.p, key.n, mpu_tlv, mpu_tlv_n) < 0) {
         s3_err_t e = map_io_err(errno);
         close(tfd); unlink(tmp_path); free(stored_ct); cksum_free(&comp); cksum_free(&full);
+        cksum_free(&pcrc);
         return e;
     }
 
@@ -2855,6 +3035,7 @@ s3_err_t store_mpu_complete2(s3_store_t *s, s3_str_t bucket, s3_str_t key,
                 return S3_ERR_INTERNAL;
             }
             if (full.algo) cksum_update(&full, buf, (size_t)r);
+            cksum_update(&pcrc, buf, (size_t)r);
             ssize_t off = 0;
             while (off < r) {
                 ssize_t wr = xwrite(tfd, buf + off, (size_t)(r - off));
@@ -2887,14 +3068,23 @@ s3_err_t store_mpu_complete2(s3_store_t *s, s3_str_t bucket, s3_str_t key,
         ext.cksum_type = mpu_type;
         ext.cksum_parts = mpu_type == S3_CKSUM_TYPE_COMPOSITE ? (uint16_t)n_parts : 0;
         memcpy(ext.cksum, dg, dn);
-        if (pwrite(tfd, &ext, sizeof(ext), sizeof(hdr)) != (ssize_t)sizeof(ext)) {
-            s3_err_t e = map_io_err(errno);
-            close(tfd); unlink(tmp_path); free(stored_ct); cksum_free(&comp); cksum_free(&full);
-            return e;
-        }
+        /* written with the fixed blocks below */
     }
     cksum_free(&comp);
     cksum_free(&full);
+    {
+        uint8_t d[CKSUM_MAX_DIGEST]; size_t dn;
+        if (cksum_final(&pcrc, d, &dn) == 0 && dn == 8) {
+            memcpy(ext4.payload_crc64, d, 8);
+            ext.flags |= S3_OBJF_PAYLOAD_CRC;
+        }
+        cksum_free(&pcrc);
+    }
+    if (obj_rewrite_fixed(tfd, &hdr, &ext, &ext4) < 0) {
+        s3_err_t e = map_io_err(errno);
+        close(tfd); unlink(tmp_path); free(stored_ct);
+        return e;
+    }
 
     if (xfsync(tfd) < 0) {
         s3_err_t e = map_io_err(errno);
@@ -3495,7 +3685,25 @@ s3_err_t store_get_open_version(s3_store_t *s, s3_str_t bucket, s3_str_t key,
     r->data_off  = h.header_size;
     r->data_size = h.data_size;
     r->pos       = 0;
+    r->tlv_off   = meta_out->tlv_off;
+    r->tlv_len   = meta_out->tlv_len;
     *out = r;
+    return S3_OK;
+}
+
+s3_err_t store_reader_tlv(const s3_reader_t *r, uint8_t **out, size_t *n_out) {
+    *out = NULL;
+    *n_out = 0;
+    if (!r || !r->tlv_len) return S3_OK;
+    uint8_t *b = malloc(r->tlv_len);
+    if (!b) return S3_ERR_INTERNAL;
+    if (pread(r->fd, b, r->tlv_len, r->tlv_off) != (ssize_t)r->tlv_len
+        || tlv_validate(b, r->tlv_len) < 0) {       /* re-validate: untrusted */
+        free(b);
+        return S3_ERR_INTERNAL;
+    }
+    *out = b;
+    *n_out = r->tlv_len;
     return S3_OK;
 }
 
@@ -3506,12 +3714,10 @@ static s3_err_t make_marker_tmp(s3_store_t *s, s3_str_t key, const uint8_t vid[1
     if (fd < 0) return map_io_err(errno);
     obj_header_t h;
     obj_ext_v3_t x;
+    obj_ext_v4_t x4;
     memset(&h, 0, sizeof(h));
     memset(&x, 0, sizeof(x));
-    memcpy(h.magic, OBJ_MAGIC, OBJ_MAGIC_LEN);
-    h.schema = OBJ_SCHEMA;
-    h.header_size = (uint32_t)(sizeof(h) + sizeof(x) + key.n);
-    h.key_len = (uint16_t)key.n;
+    memset(&x4, 0, sizeof(x4));
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     h.mtime_ms = (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
@@ -3520,9 +3726,8 @@ static s3_err_t make_marker_tmp(s3_store_t *s, s3_str_t key, const uint8_t vid[1
     memcpy(h.etag, empty_md5, 16);
     memcpy(x.version_id, vid, 16);
     x.flags = S3_OBJF_DELETE_MARKER;
-    if (xwrite(fd, &h, sizeof(h)) != (ssize_t)sizeof(h)
-        || xwrite(fd, &x, sizeof(x)) != (ssize_t)sizeof(x)
-        || xwrite(fd, key.p, key.n) != (ssize_t)key.n || xfsync(fd) < 0) {
+    if (obj_write_prefix(s, fd, &h, &x, &x4, NULL, 0, key.p, key.n, NULL, 0) < 0
+        || xfsync(fd) < 0) {
         s3_err_t e = map_io_err(errno);
         close(fd); unlink(tmp_path);
         return e;

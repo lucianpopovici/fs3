@@ -47,8 +47,22 @@ typedef enum {
 #define S3_CKSUM_TYPE_FULL_OBJECT 0
 #define S3_CKSUM_TYPE_COMPOSITE   1
 
-/* Object flags (schema-3 header). */
+/* Object flags (schema-3/4 header). */
 #define S3_OBJF_DELETE_MARKER (1u << 0)
+#define S3_OBJF_PAYLOAD_CRC   (1u << 1)   /* payload_crc64 is valid */
+#define S3_OBJF_SSEC          (1u << 2)   /* payload is SSE-C sealed */
+#define S3_OBJF_ZSTD          (1u << 3)   /* payload is zstd-compressed */
+
+/* Schema-4 TLV record types ([u16 type][u32 len][bytes], LE). Values are
+ * stored on disk: never renumber. Unknown types are preserved on copy. */
+enum {
+    S3_TLV_USER_META      = 1,   /* repeated [u16 nlen][u16 vlen][name][value] */
+    S3_TLV_STD_HEADERS    = 2,   /* repeated [u8 id][u16 len][value] */
+    S3_TLV_CONTENT_SHA256 = 3,   /* 32 raw bytes */
+    S3_TLV_PART_TABLE     = 4,
+    S3_TLV_SSEC           = 5,
+    S3_TLV_ZSTD_SEEK      = 6,
+};
 
 typedef struct {
     uint64_t size;             /* body size in bytes */
@@ -57,7 +71,7 @@ typedef struct {
                                   multipart-of-MD5s (multipart upload) */
     uint16_t part_count;       /* 0 for single-PUT, >0 for multipart;
                                   formatters render as "hex-N" if >0 */
-    char     content_type[128];/* NUL-terminated; "" if not set */
+    char     content_type[1025];/* NUL-terminated; "" if not set */
 
     /* Schema 3 fields; zero for objects written by schema 2. */
     uint8_t  version_id[16];   /* all-zero = null version */
@@ -66,6 +80,12 @@ typedef struct {
     uint8_t  cksum_type;       /* S3_CKSUM_TYPE_* */
     uint16_t cksum_parts;      /* composite: number of parts */
     uint8_t  cksum[32];        /* raw digest, left-aligned */
+
+    /* Schema 4; zero for older objects (stored_size = size). */
+    uint64_t stored_size;      /* payload bytes on disk */
+    uint8_t  payload_crc64[8]; /* valid iff flags & S3_OBJF_PAYLOAD_CRC */
+    uint32_t header_size;      /* data offset in the object file */
+    uint32_t tlv_off, tlv_len; /* TLV area (read with store_reader_tlv) */
 } s3_obj_meta_t;
 
 /* Options for store_put_begin_opts. Zero-initialise and set what you
@@ -81,6 +101,10 @@ typedef struct {
     uint16_t    cksum_parts;
     int         have_cksum;
     uint8_t     cksum[32];
+    /* Schema-4 TLV area to store with the object (pre-built records,
+     * validated; ≤ 64 KiB). Copied at begin. */
+    const uint8_t *tlv;
+    size_t      tlv_len;
 } store_put_opts_t;
 
 /* ---- Lifecycle ---- */
@@ -93,6 +117,13 @@ void     store_close(s3_store_t *s);
  * the filesystem has fewer than `min_free_bytes` available. Pass 0 to
  * disable the check (the default). */
 void     store_set_min_free_bytes(s3_store_t *s, uint64_t min_free_bytes);
+
+/* Pad object headers to 4096 so payloads are block-aligned (set at
+ * store_open when the filesystem supports reflinks; tests may force it).
+ * Returns the previous setting. */
+int      store_set_header_pad(s3_store_t *s, int on);
+/* 1 if store_open found the filesystem reflink-capable. */
+int      store_reflink_capable(const s3_store_t *s);
 
 /* Point-in-time stats for the metrics endpoint: bucket count, in-flight
  * multipart uploads, and data-volume usage from statvfs. Cheap (two
@@ -283,6 +314,9 @@ ssize_t  store_get_sendfile(s3_reader_t *r, int out_fd, size_t max);
  * if the range falls outside the object body. */
 s3_err_t store_get_seek(s3_reader_t *r, uint64_t first, uint64_t last);
 void     store_get_close(s3_reader_t *r);
+/* The object's schema-4 TLV area (malloc'd copy, re-validated; NULL/0 if
+ * none). Caller frees. */
+s3_err_t store_reader_tlv(const s3_reader_t *r, uint8_t **out, size_t *n_out);
 /* For zero-copy senders (SSL_sendfile): the file, the absolute offset of
  * the next body byte and how many remain. store_get_advance consumes n. */
 void     store_get_raw(const s3_reader_t *r, int *fd, off_t *off, uint64_t *remaining);
