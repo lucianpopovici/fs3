@@ -2455,7 +2455,19 @@ s3_err_t store_mpu_create_opts(s3_store_t *s, s3_str_t bucket, s3_str_t key,
                                const char *content_type,
                                uint8_t cksum_algo, uint8_t cksum_type,
                                char upload_id_out[S3_MULTIPART_UPLOAD_ID_LEN + 1]) {
+    return store_mpu_create_tlv(s, bucket, key, content_type, cksum_algo, cksum_type,
+                                NULL, 0, upload_id_out);
+}
+
+s3_err_t store_mpu_create_tlv(s3_store_t *s, s3_str_t bucket, s3_str_t key,
+                              const char *content_type,
+                              uint8_t cksum_algo, uint8_t cksum_type,
+                              const uint8_t *tlv, size_t tlv_n,
+                              char upload_id_out[S3_MULTIPART_UPLOAD_ID_LEN + 1]) {
     if (!s || !upload_id_out) return S3_ERR_INVALID_ARGUMENT;
+    if (tlv_n > OBJ_MAX_TLV || (tlv_n && (!tlv || tlv_validate(tlv, tlv_n) < 0)))
+        return S3_ERR_INVALID_ARGUMENT;
+    if (content_type && strlen(content_type) > OBJ_MAX_CT_LEN) return S3_ERR_INVALID_ARGUMENT;
     if (cksum_algo >= S3_CKSUM_MAX || cksum_type > S3_CKSUM_TYPE_COMPOSITE)
         return S3_ERR_INVALID_ARGUMENT;
     /* Content-type and key go into a line-based file: no newlines. */
@@ -2513,6 +2525,11 @@ s3_err_t store_mpu_create_opts(s3_store_t *s, s3_str_t bucket, s3_str_t key,
         fprintf(fp, "ctime_ms=%" PRIu64 "\n", ctime_ms);
         if (cksum_algo)
             fprintf(fp, "cksum=%u\ncktype=%u\n", cksum_algo, cksum_type);
+        if (tlv_n) {
+            fputs("tlv=", fp);
+            for (size_t i = 0; i < tlv_n; i++) fprintf(fp, "%02x", tlv[i]);
+            fputc('\n', fp);
+        }
         if (fflush(fp) < 0 || xfsync(fileno(fp)) < 0) {
             s3_err_t e = map_io_err(errno);
             fclose(fp); unlink(meta_tmp); rmdir(dir);

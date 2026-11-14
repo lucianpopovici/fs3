@@ -38,7 +38,7 @@ INCLUDES   := -Iinclude -I$(LLHTTP_DIR)/include -I$(XML_DIR)
 # Server objects
 SRV_SRCS := src/main.c src/server.c src/conn.c src/log.c src/store_fs.c \
             src/route.c src/response.c src/sigv4.c src/metrics.c \
-            src/iopool.c src/action.c src/checksum.c src/query.c src/cors.c src/lifecycle.c src/website.c src/json.c src/admin.c src/policy.c src/objlock.c src/tls.c src/audit.c
+            src/iopool.c src/action.c src/checksum.c src/query.c src/cors.c src/lifecycle.c src/website.c src/json.c src/admin.c src/policy.c src/objlock.c src/tls.c src/audit.c src/objmeta.c
 SRV_OBJS := $(SRV_SRCS:.c=.o)
 
 LLHTTP_OBJS := $(LLHTTP_DIR)/src/api.o $(LLHTTP_DIR)/src/http.o \
@@ -93,7 +93,7 @@ $(XML_DIR)/%.o: $(XML_DIR)/%.c
 
 # ----- Tests --------------------------------------------------------
 
-TEST_BINS := tests/test_policy tests/test_json tests/test_config_fuzz tests/test_chunk_fuzz tests/test_checksum tests/test_store tests/test_conn tests/test_xml tests/test_xml_legacy tests/test_xml_fuzz tests/test_sigv4 tests/test_credfile
+TEST_BINS := tests/test_objmeta tests/test_policy tests/test_json tests/test_config_fuzz tests/test_chunk_fuzz tests/test_checksum tests/test_store tests/test_conn tests/test_xml tests/test_xml_legacy tests/test_xml_fuzz tests/test_sigv4 tests/test_credfile
 
 # Fail fast, with the install line, if a test dependency is missing —
 # otherwise e.g. a missing awscrt shows up as checksum "server bugs".
@@ -113,6 +113,8 @@ test: check-test-deps $(TEST_BINS) fs3
 	@./tests/test_config_fuzz 50000
 	@echo "=== test_chunk_fuzz (50000 iterations) ==="
 	@./tests/test_chunk_fuzz 50000
+	@echo "=== test_objmeta (+50000 fuzz iterations) ==="
+	@./tests/test_objmeta 50000
 	@echo "=== test_checksum ==="
 	@./tests/test_checksum
 	@echo "=== test_store ==="
@@ -137,6 +139,8 @@ test: check-test-deps $(TEST_BINS) fs3
 	@./tests/test_e2e_mpu.sh
 	@echo "=== test_e2e_parts (round 2: part records, ListParts, UploadPartCopy) ==="
 	@./tests/test_e2e_parts.sh
+	@echo "=== test_e2e_metadata (round 2: user metadata, std headers, response-*) ==="
+	@./tests/test_e2e_metadata.sh
 	@echo "=== test_e2e_phase9 (range / bulk-delete / bucket-subresources) ==="
 	@./tests/test_e2e_phase9.sh
 	@echo "=== test_e2e_phase10 (object copy / ?acl stub) ==="
@@ -189,6 +193,9 @@ tests/test_json: tests/test_json.c src/json.o
 tests/test_chunk_fuzz: tests/test_chunk_fuzz.c src/sigv4.o src/query.o src/log.o
 	$(CC) $(CFLAGS) $(INCLUDES) tests/test_chunk_fuzz.c src/sigv4.o \
 	    src/query.o src/log.o $(LDFLAGS) -o $@
+
+tests/test_objmeta: tests/test_objmeta.c src/objmeta.o
+	$(CC) $(CFLAGS) $(INCLUDES) tests/test_objmeta.c src/objmeta.o $(LDFLAGS) -o $@
 
 tests/test_checksum: tests/test_checksum.c src/checksum.o
 	$(CC) $(CFLAGS) $(INCLUDES) tests/test_checksum.c src/checksum.o \

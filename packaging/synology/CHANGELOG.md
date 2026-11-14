@@ -2,6 +2,16 @@
 
 ## Unreleased (round 2)
 
+- Multipart: part records + ETag verification at Complete (InvalidPart,
+  InvalidPartOrder, EntityTooSmall below `--mpu-min-part-size`, default
+  5 MiB), ListParts, UploadPartCopy; `x-amz-copy-source-if-*` honoured.
+- Multi-range GETs return the whole object (200) as S3 does; invalid
+  Range headers are ignored.
+- User metadata and standard object headers are stored and returned;
+  `response-*` overrides; `x-amz-metadata-directive`. A self-copy
+  without `REPLACE` is now `400 InvalidRequest` (S3 behaviour).
+- Fix: `Connection: close` from a client was ignored (wrong llhttp flag).
+
 - Object files are now written in on-disk **schema 4** (adds stored size,
   a CRC64NVME over the on-disk payload, a TLV area for metadata, and
   4 KiB header padding on reflink-capable volumes). Schemas 2 and 3 are

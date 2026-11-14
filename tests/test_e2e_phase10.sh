@@ -117,9 +117,14 @@ code=$(curl -sS -X PUT "$URL/nosuchbucket/key" \
 check_eq "copy missing dest bucket → 404" "$code" "404"
 
 # ---------- Self-copy (same bucket, same key) --------------------------------
+# Without REPLACE S3 refuses it (400 InvalidRequest); with REPLACE it is
+# how metadata is edited.
 code=$(curl -sS -X PUT "$URL/src/hello" \
        -H "x-amz-copy-source: /src/hello" -o /dev/null -w "%{http_code}")
-check_eq "self-copy → 200" "$code" "200"
+check_eq "self-copy → 400" "$code" "400"
+code=$(curl -sS -X PUT "$URL/src/hello" -H "x-amz-metadata-directive: REPLACE" \
+       -H "x-amz-copy-source: /src/hello" -o /dev/null -w "%{http_code}")
+check_eq "self-copy with REPLACE → 200" "$code" "200"
 
 body=$(curl -sS "$URL/src/hello")
 check_eq "self-copy body unchanged" "$body" "Hello, World!"

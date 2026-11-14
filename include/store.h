@@ -380,6 +380,15 @@ s3_err_t store_mpu_create_opts(s3_store_t *s, s3_str_t bucket, s3_str_t key,
                                uint8_t cksum_algo, uint8_t cksum_type,
                                char upload_id_out[S3_MULTIPART_UPLOAD_ID_LEN + 1]);
 
+/* store_mpu_create_opts plus a schema-4 TLV area (user metadata and
+ * standard headers, item 1e) recorded in the upload's meta and written
+ * into the object at Complete. */
+s3_err_t store_mpu_create_tlv(s3_store_t *s, s3_str_t bucket, s3_str_t key,
+                              const char *content_type,
+                              uint8_t cksum_algo, uint8_t cksum_type,
+                              const uint8_t *tlv, size_t tlv_n,
+                              char upload_id_out[S3_MULTIPART_UPLOAD_ID_LEN + 1]);
+
 /* Streaming part upload — same shape as the single-PUT writer. */
 s3_err_t store_mpu_part_begin(s3_store_t *s, s3_str_t bucket, s3_str_t key,
                               const char *upload_id, int part_number,

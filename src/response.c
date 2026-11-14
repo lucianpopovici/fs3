@@ -129,6 +129,7 @@ static const err_entry_t ERR_TABLE[] = {
     { S3_ERR_ENTITY_TOO_SMALL,           400, "EntityTooSmall",           "Your proposed upload is smaller than the minimum allowed object size." },
     { S3_ERR_PRECONDITION_FAILED,        412, "PreconditionFailed",       "At least one of the pre-conditions you specified did not hold." },
     { S3_ERR_INVALID_RANGE,              416, "InvalidRange",             "The requested range is not satisfiable." },
+    { S3_ERR_METADATA_TOO_LARGE,         400, "MetadataTooLarge",         "Your metadata headers exceed the maximum allowed metadata size." },
     { S3_ERR_MALFORMED_POLICY,           400, "MalformedPolicy",          "Policies must be valid JSON within the supported grammar." },
     { S3_ERR_INSUFFICIENT_STORAGE,       507, "QuotaExceeded",            "There is insufficient storage available to complete the request." },
 };

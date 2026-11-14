@@ -290,6 +290,17 @@ What's working end-to-end:
   (with `x-amz-copy-source-range` and the `x-amz-copy-source-if-*`
   conditionals, also honoured by CopyObject) are implemented.
 
+- **User metadata and standard headers** — `x-amz-meta-*` (≤ 2 KiB,
+  name + value bytes, else `MetadataTooLarge`), `Cache-Control`,
+  `Content-Disposition`, `Content-Encoding` (minus `aws-chunked`),
+  `Content-Language` and `Expires` are stored with the object (PUT and
+  multipart) and returned on GET/HEAD. Values with CR, LF, NUL or other
+  control bytes are refused, and re-validated when read back.
+  CopyObject honours `x-amz-metadata-directive: COPY|REPLACE`; a
+  self-copy needs `REPLACE`. `response-*` query overrides work on signed
+  and presigned GET/HEAD and answer `400 InvalidRequest` on anonymous
+  ones. The website listener serves the caching/encoding headers only.
+
 - **Range requests** follow S3 and RFC 9110: one `bytes=` range → 206;
   multi-range requests (`bytes=0-1,5-9`) return the full object with 200,
   as S3 does; an invalid header (unknown unit, last < first) is ignored;

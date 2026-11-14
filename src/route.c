@@ -22,6 +22,7 @@
 #include "website.h"
 #include "policy.h"
 #include "objlock.h"
+#include "objmeta.h"
 #include "xml_parser.h"
 #include "conn.h"
 #include "iopool.h"
@@ -1064,17 +1065,118 @@ static int submit_commit(conn_t *c, int is_part) {
     return job_submit(c, &cj->base);
 }
 
-static int handle_object_put_begin(conn_t *c, s3_str_t bucket, s3_str_t key) {
-    const s3_str_t *ct_hdr = hdr_get(c, "content-type");
-    char ct_buf[128] = {0};
-    if (ct_hdr) {
-        size_t n = ct_hdr->n;
-        if (n >= sizeof(ct_buf)) n = sizeof(ct_buf) - 1;
-        memcpy(ct_buf, ct_hdr->p, n);
-    }
+/* ===================================================================== */
+/* User metadata and standard object headers (round 2, item 1e)           */
+/* ===================================================================== */
 
+_Static_assert(sizeof(objmeta_hdr_t) == sizeof(conn_header_t),
+               "objmeta_hdr_t mirrors conn_header_t");
+
+/* Request Content-Type, validated as a header value and ≤ 1024 bytes
+ * (refused, never truncated). out: NUL-terminated, "" if absent. */
+static s3_err_t req_content_type(const conn_t *c, char out[1025], int *present) {
+    const s3_str_t *h = hdr_get(c, "content-type");
+    out[0] = '\0';
+    if (present) *present = h != NULL;
+    if (!h) return S3_OK;
+    if (h->n > 1024 || !objmeta_valid_value(h->p, h->n)) return S3_ERR_INVALID_ARGUMENT;
+    memcpy(out, h->p, h->n);
+    out[h->n] = '\0';
+    return S3_OK;
+}
+
+static s3_err_t req_meta_tlv(const conn_t *c, uint8_t **tlv, size_t *n) {
+    return objmeta_from_headers((const objmeta_hdr_t *)c->req.headers, c->req.n_headers,
+                                tlv, n);
+}
+
+/* response-* query overrides on GET/HEAD. */
+static const struct { const char *q; int std_id; } RSP_OVR[] = {
+    { "response-content-type",        0 },
+    { "response-cache-control",       OBJMETA_CACHE_CONTROL },
+    { "response-content-disposition", OBJMETA_CONTENT_DISPOSITION },
+    { "response-content-encoding",    OBJMETA_CONTENT_ENCODING },
+    { "response-content-language",    OBJMETA_CONTENT_LANGUAGE },
+    { "response-expires",             OBJMETA_EXPIRES },
+};
+#define N_RSP_OVR (sizeof(RSP_OVR) / sizeof(RSP_OVR[0]))
+
+/* 0 none, 1 some present and valid, or an error. Anonymous requests
+ * under auth may not use them (S3: InvalidRequest), otherwise a public
+ * object could be made to render as HTML from someone's link. */
+static s3_err_t rsp_overrides_check(const conn_t *c, int *any) {
+    *any = 0;
+    for (size_t i = 0; i < N_RSP_OVR; i++) {
+        const conn_qparam_t *p = conn_query_get(c, RSP_OVR[i].q);
+        if (!p) continue;
+        *any = 1;
+        if (p->v.n > OBJMETA_MAX_STD || !objmeta_valid_value(p->v.p, p->v.n))
+            return S3_ERR_INVALID_ARGUMENT;
+    }
+    if (*any && c->auth && !c->sig_verified) return S3_ERR_INVALID_REQUEST;
+    return S3_OK;
+}
+
+typedef struct { conn_t *c; unsigned skip_mask; } meta_emit_t;
+
+static int meta_emit_cb(void *ctx, int std_id, const char *name, const char *value) {
+    meta_emit_t *me = ctx;
+    if (std_id && (me->skip_mask & (1u << std_id))) return 0;
+    conn_add_header(me->c, name, value);
+    return 0;
+}
+
+/* Stored metadata (and response-* overrides) as response headers, and
+ * response-content-type into m. The website listener gets only the
+ * caching/encoding headers and ignores response-*. */
+static void emit_object_meta(conn_t *c, s3_reader_t *r, s3_obj_meta_t *m, int overrides) {
+    meta_emit_t me = { c, 0 };
+    if (overrides) {
+        for (size_t i = 0; i < N_RSP_OVR; i++)
+            if (RSP_OVR[i].std_id && conn_query_get(c, RSP_OVR[i].q))
+                me.skip_mask |= 1u << RSP_OVR[i].std_id;
+    }
+    uint8_t *tlv = NULL;
+    size_t n = 0;
+    if (m->tlv_len && store_reader_tlv(r, &tlv, &n) == S3_OK && tlv) {
+        unsigned mask = c->is_web
+            ? (1u << OBJMETA_CACHE_CONTROL | 1u << OBJMETA_CONTENT_ENCODING
+               | 1u << OBJMETA_CONTENT_LANGUAGE | 1u << OBJMETA_EXPIRES)
+            : ~0u;
+        if (objmeta_walk(tlv, n, !c->is_web, mask, meta_emit_cb, &me) < 0)
+            LOG_W("object metadata area failed validation; not emitted");
+        free(tlv);
+    }
+    if (!overrides) return;
+    for (size_t i = 0; i < N_RSP_OVR; i++) {
+        const conn_qparam_t *p = conn_query_get(c, RSP_OVR[i].q);
+        if (!p) continue;
+        char v[OBJMETA_MAX_STD + 1];
+        memcpy(v, p->v.p, p->v.n);
+        v[p->v.n] = '\0';
+        if (RSP_OVR[i].std_id == 0) {
+            if (p->v.n < sizeof(m->content_type)) memcpy(m->content_type, v, p->v.n + 1);
+        } else {
+            conn_add_header(c, objmeta_std_name(RSP_OVR[i].std_id), v);
+        }
+    }
+}
+
+static int handle_object_put_begin(conn_t *c, s3_str_t bucket, s3_str_t key) {
+    char ct_buf[1025];
+    s3_err_t e = req_content_type(c, ct_buf, NULL);
+    uint8_t *tlv = NULL;
+    size_t tlv_n = 0;
+    if (e == S3_OK) e = req_meta_tlv(c, &tlv, &tlv_n);
+    if (e != S3_OK) return rsp_build_s3_error(c, e, c->req.path, NULL);
+
+    store_put_opts_t o = { 0 };
+    o.content_type = ct_buf;
+    o.tlv = tlv;
+    o.tlv_len = tlv_n;
     s3_writer_t *w;
-    s3_err_t e = store_put_begin(c->store, bucket, key, ct_buf, &w);
+    e = store_put_begin_opts(c->store, bucket, key, &o, &w);
+    free(tlv);
     if (e != S3_OK) {
         return rsp_build_s3_error(c, e, c->req.path, NULL);
     }
@@ -1157,6 +1259,11 @@ static int handle_object_get(conn_t *c, s3_str_t bucket, s3_str_t key,
     uint8_t vid[16];
     int hv = c->is_web ? 0 : version_param(c, vid);
     if (hv < 0) return rsp_build_s3_error(c, S3_ERR_INVALID_ARGUMENT, c->req.path, NULL);
+    int ovr = 0;
+    if (!c->is_web) {
+        s3_err_t oe = rsp_overrides_check(c, &ovr);
+        if (oe != S3_OK) return rsp_build_s3_error(c, oe, c->req.path, NULL);
+    }
     s3_err_t e = store_get_open_version(c->store, bucket, key, hv ? vid : NULL, &r, &m);
     if (e != S3_OK) {
         if (m.flags & S3_OBJF_DELETE_MARKER) {
@@ -1171,6 +1278,7 @@ static int handle_object_get(conn_t *c, s3_str_t bucket, s3_str_t key,
      * must not run as an active page on this origin. */
     if (!c->is_web && (!c->id.user[0] || c->id.presigned))
         conn_add_header(c, "Content-Security-Policy", "sandbox");
+    emit_object_meta(c, r, &m, ovr);
 
     /* Parse optional Range header. */
     const s3_str_t *range_hdr = hdr_get(c, "range");
@@ -1489,12 +1597,56 @@ static int handle_object_copy(conn_t *c, s3_str_t dst_bucket, s3_str_t dst_key) 
         return rsp_build_s3_error(c, e, c->req.path, NULL);
     }
 
-    /* Open dest writer: a part of the upload, or an object with the
-     * source content-type. */
+    /* CopyObject metadata: x-amz-metadata-directive COPY (default) takes
+     * the source's TLVs (incl. unknown types), REPLACE the request's.
+     * Copying an object onto itself is only legal with REPLACE (that is
+     * how metadata is edited) or from a specific version. */
+    uint8_t *tlv = NULL;
+    size_t tlv_n = 0;
+    char ct_buf[1025];
+    const char *ct = src_meta.content_type;
+    if (!part) {
+        const s3_str_t *md = hdr_get(c, "x-amz-metadata-directive");
+        int replace = md && ieq_lit(*md, "REPLACE");
+        if (md && !replace && !ieq_lit(*md, "COPY")) e = S3_ERR_INVALID_ARGUMENT;
+        else if (hdr_get(c, "x-amz-tagging-directive")) e = S3_ERR_NOT_IMPLEMENTED;
+        else if (!replace && !has_src_vid && s3_str_eq(src_bucket, dst_bucket)
+                 && s3_str_eq(src_key, dst_key))
+            e = S3_ERR_INVALID_REQUEST;
+        else if (replace) {
+            int present = 0;
+            e = req_content_type(c, ct_buf, &present);
+            if (e == S3_OK) e = req_meta_tlv(c, &tlv, &tlv_n);
+            if (present) ct = ct_buf;
+        } else if (src_meta.tlv_len) {
+            uint8_t *st = NULL;
+            size_t sn = 0;
+            e = store_reader_tlv(reader, &st, &sn);
+            if (e == S3_OK && objmeta_copy_filter(st, sn, &tlv, &tlv_n) < 0)
+                e = S3_ERR_INTERNAL;
+            free(st);
+        }
+        if (e != S3_OK) {
+            free(tlv);
+            store_get_close(reader);
+            free(src_buf);
+            return rsp_build_s3_error(c, e, c->req.path, NULL);
+        }
+    }
+
+    /* Open dest writer: a part of the upload, or an object. */
     s3_writer_t *writer = NULL;
-    e = part ? store_mpu_part_begin(c->store, dst_bucket, dst_key, c->mpu_upload_id,
-                                    part, &writer)
-             : store_put_begin(c->store, dst_bucket, dst_key, src_meta.content_type, &writer);
+    if (part) {
+        e = store_mpu_part_begin(c->store, dst_bucket, dst_key, c->mpu_upload_id,
+                                 part, &writer);
+    } else {
+        store_put_opts_t po = { 0 };
+        po.content_type = ct;
+        po.tlv = tlv;
+        po.tlv_len = tlv_n;
+        e = store_put_begin_opts(c->store, dst_bucket, dst_key, &po, &writer);
+    }
+    free(tlv);
     if (e != S3_OK) {
         store_get_close(reader);
         free(src_buf);
@@ -1526,13 +1678,10 @@ static int handle_object_copy(conn_t *c, s3_str_t dst_bucket, s3_str_t dst_key) 
 /* POST /bucket/key?uploads — generate an upload ID and return
  * <InitiateMultipartUploadResult>. */
 static int handle_mpu_initiate(conn_t *c, s3_str_t bucket, s3_str_t key) {
-    const s3_str_t *ct_hdr = hdr_get(c, "content-type");
-    char ct_buf[128] = {0};
-    if (ct_hdr) {
-        size_t n = ct_hdr->n;
-        if (n >= sizeof(ct_buf)) n = sizeof(ct_buf) - 1;
-        memcpy(ct_buf, ct_hdr->p, n);
-    }
+    char ct_buf[1025];
+    int ct_present = 0;
+    s3_err_t me = req_content_type(c, ct_buf, &ct_present);
+    if (me != S3_OK) return rsp_build_s3_error(c, me, c->req.path, NULL);
 
     /* x-amz-checksum-algorithm / -type: COMPOSITE is the default except
      * for CRC64NVME, which only exists as a full-object checksum. */
@@ -1556,10 +1705,16 @@ static int handle_mpu_initiate(conn_t *c, s3_str_t bucket, s3_str_t key) {
             return rsp_build_s3_error(c, S3_ERR_INVALID_CHECKSUM, c->req.path, NULL);
     }
 
+    /* Metadata travels in the upload's meta file and is applied at
+     * Complete (the Complete request carries none). */
+    uint8_t *tlv = NULL;
+    size_t tlv_n = 0;
+    s3_err_t e = req_meta_tlv(c, &tlv, &tlv_n);
+    if (e != S3_OK) return rsp_build_s3_error(c, e, c->req.path, NULL);
     char upload_id[33];
-    s3_err_t e = store_mpu_create_opts(c->store, bucket, key,
-                                       ct_hdr ? ct_buf : NULL, algo, type,
-                                       upload_id);
+    e = store_mpu_create_tlv(c->store, bucket, key, ct_present ? ct_buf : NULL,
+                             algo, type, tlv, tlv_n, upload_id);
+    free(tlv);
     if (e != S3_OK) {
         return rsp_build_s3_error(c, e, c->req.path, NULL);
     }

@@ -583,10 +583,11 @@ static int cb_on_headers_complete(llhttp_t *p) {
 
     /* llhttp tracks Content-Length and chunked flag for us. */
     c->req.content_length_hint = p->content_length;
-    c->req.chunked = (p->flags & 0x08) ? 1 : 0;  /* F_CHUNKED = 0x08 */
+    c->req.chunked = (p->flags & F_CHUNKED) ? 1 : 0;
 
-    /* Keep-alive: llhttp's flag F_CONNECTION_CLOSE = 0x04 */
-    int conn_close = (p->flags & 0x04) ? 1 : 0;
+    /* Keep-alive: "Connection: close" (F_CONNECTION_CLOSE is 0x02; this
+     * used to test 0x04, F_CONNECTION_UPGRADE, so close was ignored). */
+    int conn_close = (p->flags & F_CONNECTION_CLOSE) ? 1 : 0;
     int http11 = (p->http_major == 1 && p->http_minor == 1);
     c->req.keep_alive = http11 && !conn_close;
 
