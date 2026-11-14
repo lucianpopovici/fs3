@@ -355,8 +355,19 @@ What's working end-to-end:
   object instead of copying (no double disk space, ETag and CRC come from
   the part records), and CopyObject / UploadPartCopy clone the source
   extent when both payloads are block-aligned; anything misaligned falls
-  back to a copy. `fs3_reflink_clones_total` counts clones. Whole-object
-  dedup is not implemented yet.
+  back to a copy. `fs3_reflink_clones_total` counts clones.
+
+- **Whole-object dedup** (opt-in, needs reflink) — `--dedup owner|global`
+  hashes PUT bodies (SHA-256, stored as a `CONTENT_SHA256` TLV) and
+  shares the extents of identical objects of at least `--dedup-min-size`
+  (default 1 MiB) through `<data>/cas/<scope>/…`. Every object file stays
+  complete: wiping `cas/` only loses future dedup, never data, and there
+  are no refcounts to repair after a crash. The scrub removes pool
+  entries no object references. **Scope:** `owner` (per bucket owner) is
+  the safe default; `global` lets one user confirm that another stores a
+  given file, so use it only on single-tenant NAS installs. Quotas still
+  charge logical bytes. `--dedup-verify` byte-compares before sharing.
+  Metrics `fs3_dedup_hits_total`, `fs3_dedup_pool_adds_total`.
 
 - **Integrity scrub** — a background pass (every `--scrub-interval-days`,
   default 30; `--scrub-now`; admin API `POST /v1/scrub`, progress at
@@ -389,7 +400,7 @@ What's working end-to-end:
 
 What's *not* yet wired:
 
-- SSE-C, whole-object dedup, compression, `FS_IMMUTABLE_FL` for
+- SSE-C, compression, `FS_IMMUTABLE_FL` for
   COMPLIANCE versions.
 - Tag-based lifecycle filters, transitions, website routing rules (all
   refused with 501 rather than ignored).

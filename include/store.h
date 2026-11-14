@@ -105,6 +105,7 @@ typedef struct {
      * validated; ≤ 64 KiB). Copied at begin. */
     const uint8_t *tlv;
     size_t      tlv_len;
+    int         no_dedup;      /* never pool this object (SSE-C) */
 } store_put_opts_t;
 
 /* ---- Lifecycle ---- */
@@ -128,6 +129,18 @@ int      store_reflink_capable(const s3_store_t *s);
  * supports them (1). Returns the previous setting. Tests use it to run
  * the pure-copy paths on Btrfs. */
 int      store_set_reflink(s3_store_t *s, int on);
+/* Whole-object dedup (item 6b, needs reflink): objects of at least
+ * min_size share extents through <root>/cas/<scope>/…; scope is per
+ * bucket owner (STORE_DEDUP_OWNER) or global. verify byte-compares on a
+ * hit. Counters are atomic. */
+enum { STORE_DEDUP_OFF = 0, STORE_DEDUP_OWNER = 1, STORE_DEDUP_GLOBAL = 2 };
+void     store_set_dedup(s3_store_t *s, int mode, uint64_t min_size, int verify);
+extern uint64_t g_store_dedup_hits, g_store_dedup_misses;
+/* Pool GC: drop entries not in the sorted digest array `keep` and older
+ * than `older_than`. Returns the number removed. */
+int      store_dedup_gc(s3_store_t *s, const uint8_t *keep, size_t n_keep, time_t older_than);
+/* An object file's CONTENT_SHA256 TLV (1 found, 0 none). */
+int      store_object_content_sha256(const char *path, uint8_t out[32]);
 /* Number of extent clones done since start (atomic; tests, metrics). */
 extern uint64_t g_store_clone_count;
 /* Reflink copy of the reader's remaining payload into the writer (both

@@ -505,6 +505,16 @@ server_t *server_create(const server_cfg_t *cfg) {
     store_set_mpu_min_part_size(s->store, cfg->mpu_min_part_size);
     store_set_default_quotas(s->store, cfg->default_bucket_quota, cfg->default_user_quota);
     if (cfg->reflink_off) { store_set_reflink(s->store, 0); LOG_I("reflink: off (--reflink off)"); }
+    if (cfg->dedup_mode) {
+        if (!store_reflink_capable(s->store) || cfg->reflink_off)
+            LOG_W("dedup: needs a reflink-capable filesystem (Btrfs/XFS); disabled");
+        else {
+            store_set_dedup(s->store, cfg->dedup_mode, cfg->dedup_min, cfg->dedup_verify);
+            LOG_I("dedup: %s scope, objects >= %llu bytes%s",
+                  cfg->dedup_mode == STORE_DEDUP_GLOBAL ? "global" : "per-owner",
+                  (unsigned long long)cfg->dedup_min, cfg->dedup_verify ? ", verified" : "");
+        }
+    }
 
     /* Seccomp (round 2, item 5): everything privileged is done —
      * listeners bound, TLS loaded, store opened and recovered — and no

@@ -4,6 +4,7 @@
 #include "server.h"
 #include "sigv4.h"
 #include "sandbox.h"
+#include "store.h"
 #include "audit.h"
 
 #include <errno.h>
@@ -89,6 +90,10 @@ static void usage(const char *argv0) {
         "      --key-max-age-days N   keys created by the admin API expire after N days (0 = never)\n"
         "      --seccomp MODE         syscall filter: off, log, enforce (default), require\n"
         "      --reflink auto|off     extent cloning on Btrfs/XFS (default auto)\n"
+        "      --dedup off|owner|global  whole-object dedup via reflink (default off; global\n"
+        "                             lets users learn that someone stores a file: single-tenant only)\n"
+        "      --dedup-min-size N     only objects of at least N bytes (default 1M)\n"
+        "      --dedup-verify         byte-compare before sharing\n"
         "      --scrub-interval-days N  integrity scrub every N days (default 30; 0 = only on demand)\n"
         "      --scrub-now            start a scrub pass right after startup\n"
         "      --scrub-rate N         scrub read rate in bytes/s (default 20M; 0 = unthrottled)\n"
@@ -406,6 +411,9 @@ enum {
     OPT_KEY_MAX_AGE_DAYS,
     OPT_SECCOMP,
     OPT_REFLINK,
+    OPT_DEDUP,
+    OPT_DEDUP_MIN,
+    OPT_DEDUP_VERIFY,
     OPT_SECCOMP_LIST,
     OPT_SCRUB_NOW,
     OPT_SCRUB_RATE,
@@ -486,6 +494,8 @@ int main(int argc, char **argv) {
     int key_max_age_days = 0;
     int seccomp_mode = SANDBOX_ENFORCE;
     int reflink_off = 0;
+    int dedup_mode = 0, dedup_verify = 0;
+    uint64_t dedup_min = 1024 * 1024;
     uint64_t scrub_rate = 20ULL * 1024 * 1024;           /* 20 MiB/s */
     int tls_port = 0, require_tls = 0, require_signed_payload = 0, tls_max_per_ip = 32;
     const char *tls_addr = NULL, *tls_cert = NULL, *tls_key = NULL;
@@ -540,6 +550,9 @@ int main(int argc, char **argv) {
         { "key-max-age-days", required_argument, NULL, OPT_KEY_MAX_AGE_DAYS },
         { "seccomp",          required_argument, NULL, OPT_SECCOMP },
         { "reflink",          required_argument, NULL, OPT_REFLINK },
+        { "dedup",            required_argument, NULL, OPT_DEDUP },
+        { "dedup-min-size",   required_argument, NULL, OPT_DEDUP_MIN },
+        { "dedup-verify",     no_argument,       NULL, OPT_DEDUP_VERIFY },
         { "seccomp-list",     no_argument,       NULL, OPT_SECCOMP_LIST },
         { "scrub-now",        no_argument,       NULL, OPT_SCRUB_NOW },
         { "scrub-rate",       required_argument, NULL, OPT_SCRUB_RATE },
@@ -766,6 +779,20 @@ int main(int argc, char **argv) {
                 }
                 reflink_off = !strcmp(optarg, "off");
                 break;
+            case OPT_DEDUP:
+                if (!strcmp(optarg, "off")) dedup_mode = STORE_DEDUP_OFF;
+                else if (!strcmp(optarg, "owner")) dedup_mode = STORE_DEDUP_OWNER;
+                else if (!strcmp(optarg, "global")) dedup_mode = STORE_DEDUP_GLOBAL;
+                else { fprintf(stderr, "--dedup must be off, owner or global\n"); return 2; }
+                break;
+            case OPT_DEDUP_MIN:
+                dedup_min = strcmp(optarg, "0") == 0 ? 0 : parse_size(optarg);
+                if (strcmp(optarg, "0") && dedup_min == 0) {
+                    fprintf(stderr, "--dedup-min-size: invalid size '%s'\n", optarg);
+                    return 2;
+                }
+                break;
+            case OPT_DEDUP_VERIFY: dedup_verify = 1; break;
             case OPT_SECCOMP_LIST:
                 sandbox_print_allowlist();
                 return 0;
@@ -933,6 +960,9 @@ int main(int argc, char **argv) {
         .key_max_age_days = key_max_age_days,
         .seccomp_mode = seccomp_mode,
         .reflink_off = reflink_off,
+        .dedup_mode = dedup_mode,
+        .dedup_min = dedup_min,
+        .dedup_verify = dedup_verify,
         .tls_port        = (uint16_t)tls_port,
         .tls_addr        = tls_addr,
         .tls_cert        = tls_cert,

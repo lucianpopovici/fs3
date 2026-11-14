@@ -125,4 +125,87 @@ run_py on
 kill "$SP"; wait "$SP" 2>/dev/null || true
 start --reflink off
 run_py off
+kill "$SP"; wait "$SP" 2>/dev/null || true
+
+# ---- 6b: whole-object dedup ---------------------------------------------------
+A=AKIADEDUPALICE01; AS=dedupAliceSecret0123456789012345678901
+B=AKIADEDUPBOB0001; BS=dedupBobSecret012345678901234567890123
+dedup_phase() {   # $1 = owner|global, extra flags after
+    local mode=$1; shift
+    rm -rf "$DATA"; : >"$LOG"
+    start --auth "$A:$AS:alice" --auth "$B:$BS:bob" --dedup "$mode" --dedup-min-size 64K \
+          --scrub-interval-days 0 --admin-socket "$DATA.sock" "$@"
+    python3 -u - "$URL" "$DATA" "$MPORT" "$mode" "$A" "$AS" "$B" "$BS" <<'PY'
+import sys, os, glob, subprocess, urllib.request, json, time, boto3
+from botocore.config import Config
+url, data, mport, mode, a, asec, b, bsec = sys.argv[1:9]
+mk = lambda ak, sk: boto3.client("s3", endpoint_url=url, aws_access_key_id=ak, aws_secret_access_key=sk,
+                                 region_name="us-east-1", config=Config(signature_version="s3v4"))
+al, bo = mk(a, asec), mk(b, bsec)
+PASS = FAIL = 0
+def check(name, got, want):
+    global PASS, FAIL
+    if got == want:
+        PASS += 1; print(".", end="", flush=True)
+    else:
+        FAIL += 1; print(f"\nFAIL: {name}\n  want={want!r}\n  got ={got!r}")
+op = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+def metric(name):
+    m = op.open(f"http://127.0.0.1:{mport}/metrics").read().decode()
+    return int(next(l.split()[1] for l in m.splitlines() if l.startswith(name + " ")))
+def shared(path):
+    return "shared" in subprocess.run(["filefrag", "-v", path], capture_output=True, text=True).stdout
+def files(bucket): return glob.glob(f"{data}/data/{bucket}/*/*/*")
+MiB = 1024 * 1024
+blob = os.urandom(3 * MiB + 5)
+al.create_bucket(Bucket="da1"); al.create_bucket(Bucket="da2"); bo.create_bucket(Bucket="db1")
+h0 = metric("fs3_dedup_hits_total")
+al.put_object(Bucket="da1", Key="x", Body=blob)
+check(f"{mode}: first PUT adds a pool entry", len(glob.glob(f"{data}/cas/*/*/*/*")), 1)
+al.put_object(Bucket="da2", Key="y", Body=blob)
+check(f"{mode}: identical PUT is a hit", metric("fs3_dedup_hits_total") - h0, 1)
+check(f"{mode}: the two objects share extents", shared(files("da1")[0]) and shared(files("da2")[0]), True)
+check(f"{mode}: content intact", al.get_object(Bucket="da2", Key="y")["Body"].read(), blob)
+bo.put_object(Bucket="db1", Key="z", Body=blob)
+if mode == "owner":
+    check("owner scope: another user's identical object is not shared", metric("fs3_dedup_hits_total") - h0, 1)
+    check("owner scope: separate pool per owner", len(os.listdir(f"{data}/cas")), 2)
+else:
+    check("global scope: shared across users", metric("fs3_dedup_hits_total") - h0, 2)
+small = os.urandom(1000)
+al.put_object(Bucket="da1", Key="small", Body=small)
+al.put_object(Bucket="da2", Key="small", Body=small)
+check(f"{mode}: below --dedup-min-size not pooled", metric("fs3_dedup_hits_total") - h0, 1 if mode == "owner" else 2)
+al.delete_object(Bucket="da1", Key="x")
+check(f"{mode}: delete one sharer, the other intact", al.get_object(Bucket="da2", Key="y")["Body"].read(), blob)
+subprocess.run(["rm", "-rf", f"{data}/cas"])
+check(f"{mode}: pool wipe is harmless", al.get_object(Bucket="da2", Key="y")["Body"].read(), blob)
+al.put_object(Bucket="da1", Key="again", Body=blob)
+check(f"{mode}: pool re-created after a wipe", len(glob.glob(f"{data}/cas/*/*/*/*")) >= 1, True)
+# Scrub GC: an entry no object references (and older than the pass) goes.
+orphan_dir = f"{data}/cas/{os.listdir(data + '/cas')[0]}/00/00"
+os.makedirs(orphan_dir, exist_ok=True)
+orphan = orphan_dir + "/" + "0" * 64
+open(orphan, "wb").write(b"orphan")
+os.utime(orphan, (time.time() - 3600, time.time() - 3600))
+for p in glob.glob(f"{data}/cas/*/*/*/*"):
+    os.utime(p, (time.time() - 3600, time.time() - 3600))
+subprocess.run(["curl", "-s", "--unix-socket", data + ".sock", "-X", "POST", "http://x/v1/scrub"], capture_output=True)
+for _ in range(100):
+    st = json.loads(subprocess.run(["curl", "-s", "--unix-socket", data + ".sock", "http://x/v1/scrub"],
+                                   capture_output=True, text=True).stdout)
+    if not st["running"] and st["finished"] >= st["started"] > 0: break
+    time.sleep(0.1)
+check(f"{mode}: scrub removed the unreferenced pool entry", os.path.exists(orphan), False)
+check(f"{mode}: scrub kept the referenced one", len(glob.glob(f"{data}/cas/*/*/*/*")) >= 1, True)
+check(f"{mode}: objects still verify", st["corrupt"], 0)
+print(f"\nPYPASS={PASS} PYFAIL={FAIL}")
+sys.exit(1 if FAIL else 0)
+PY
+    kill "$SP"; wait "$SP" 2>/dev/null || true
+}
+dedup_phase owner
+dedup_phase global --dedup-verify
+grep -q "verified" "$LOG" || { echo "FAIL: --dedup-verify not active"; exit 1; }
+rm -rf "$DATA.sock"
 echo "===== reflink e2e: done ====="

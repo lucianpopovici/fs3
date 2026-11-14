@@ -163,6 +163,10 @@ struct s3_store {
     int  pad_headers;        /* schema-4 headers padded to 4096 */
     uint64_t mpu_min_part;   /* minimum size of non-final parts (0 = none) */
     int  reflink;            /* filesystem supports FICLONE (probed) */
+    /* Whole-object dedup (round 2, item 6b). */
+    int      dedup_mode;     /* STORE_DEDUP_* */
+    uint64_t dedup_min;
+    int      dedup_verify;
 
     int  (*mpu_gc_filter)(void *user, s3_str_t bucket, s3_str_t key);
     void  *mpu_gc_filter_user;
@@ -413,6 +417,9 @@ static void q_bucket_added(s3_store_t *s, s3_str_t name, const char *owner);
 static void q_bucket_removed(s3_store_t *s, s3_str_t name);
 static int  fd_is_known_corrupt(int fd, uint64_t mtime_ms);
 static int  lock_parse_file(const char *path, s3_lock_t *out);
+static void dedup_commit(s3_writer_t *w, const uint8_t dg[32]);
+static void hex_name(const char *in, char *out, size_t cap);
+static void hex16(const uint8_t *b, size_t n, char *out);
 static void recover_version_links(const s3_store_t *s);
 static void recover_mpu_orphans(const s3_store_t *s);
 static int probe_reflink(const s3_store_t *s);
@@ -1459,6 +1466,11 @@ struct s3_writer {
     char        q_bucket[64];
     uint64_t    q_rbytes;
     uint32_t    q_robjs;
+
+    /* Dedup: SHA-256 of the payload and where its TLV slot sits. */
+    EVP_MD_CTX *sha;
+    uint64_t    sha_off;
+    char        dedup_scope[300];   /* "global" or "u-<hex owner>" */
 };
 
 static s3_err_t q_reserve(s3_store_t *s, const char *bucket, uint64_t bytes, uint32_t objs);
@@ -1497,6 +1509,7 @@ s3_err_t store_put_expect(s3_writer_t *w, uint64_t n) {
 static void writer_free(s3_writer_t *w) {
     if (!w) return;
     writer_release_quota(w);
+    if (w->sha) EVP_MD_CTX_free(w->sha);
     cksum_free(&w->pcrc);
     if (w->fd >= 0) close(w->fd);
     if (w->tmp_path[0]) unlink(w->tmp_path);
@@ -1608,14 +1621,44 @@ s3_err_t store_put_begin_opts(s3_store_t *s, s3_str_t bucket, s3_str_t key,
     /* Reserve header space by writing the (incomplete) header, then the
      * variable-length content_type and key bytes. We'll pwrite the final
      * header back at offset 0 in commit. */
+    /* Dedup (item 6b): a CONTENT_SHA256 TLV slot filled at commit. */
+    const uint8_t *tlv = opts->tlv;
+    size_t tlv_n = opts->tlv_len;
+    uint8_t *tlv2 = NULL;
+    if (s->dedup_mode && s->reflink && s->pad_headers && !opts->no_dedup
+        && tlv_n + 38 <= OBJ_MAX_TLV) {
+        tlv2 = malloc(tlv_n + 38);
+        w->sha = EVP_MD_CTX_new();
+        if (!tlv2 || !w->sha || EVP_DigestInit_ex(w->sha, EVP_sha256(), NULL) != 1) {
+            free(tlv2); writer_free(w); return S3_ERR_INTERNAL;
+        }
+        if (tlv_n) memcpy(tlv2, tlv, tlv_n);
+        static const uint8_t slot_head[6] = { S3_TLV_CONTENT_SHA256, 0, 32, 0, 0, 0 };
+        memcpy(tlv2 + tlv_n, slot_head, 6);
+        memset(tlv2 + tlv_n + 6, 0, 32);
+        w->sha_off = sizeof(obj_header_t) + sizeof(obj_ext_v3_t) + sizeof(obj_ext_v4_t)
+                   + ct_n + key.n + tlv_n + 6;
+        tlv = tlv2;
+        tlv_n += 38;
+        if (s->dedup_mode == STORE_DEDUP_GLOBAL) {
+            snprintf(w->dedup_scope, sizeof(w->dedup_scope), "global");
+        } else {
+            s3_bucket_meta_t bm2;
+            char hx[260] = "";
+            if (store_bucket_meta(s, bucket, &bm2) == S3_OK) hex_name(bm2.owner, hx, sizeof(hx));
+            snprintf(w->dedup_scope, sizeof(w->dedup_scope), "u-%s", hx);
+        }
+    }
     if (obj_write_prefix(s, w->fd, &w->hdr, &w->ext, &w->ext4,
                          w->content_type_dup, ct_n, w->key_dup, key.n,
-                         opts->tlv, opts->tlv_len) < 0) {
+                         tlv, tlv_n) < 0) {
         LOG_E("write header: %s", strerror(errno));
         s3_err_t e = map_io_err(errno);
+        free(tlv2);
         writer_free(w);
         return e;
     }
+    free(tlv2);
 
     *out = w;
     return S3_OK;
@@ -1628,6 +1671,7 @@ s3_err_t store_put_write(s3_writer_t *w, const void *buf, size_t n) {
 
     if (EVP_DigestUpdate(w->md5_ctx, buf, n) != 1) return S3_ERR_INTERNAL;
     if (w->pcrc.algo) cksum_update(&w->pcrc, buf, n);
+    if (w->sha) EVP_DigestUpdate(w->sha, buf, n);
 
     const char *p = buf;
     size_t left = n;
@@ -1675,6 +1719,15 @@ s3_err_t store_put_commit(s3_writer_t *w, s3_obj_meta_t *meta_out) {
             memcpy(w->ext4.payload_crc64, d, 8);
             w->ext.flags |= S3_OBJF_PAYLOAD_CRC;
         }
+    }
+    if (w->sha) {
+        /* Fill the CONTENT_SHA256 slot, then share extents through the
+         * pool (item 6b). Any dedup failure just leaves a normal copy. */
+        uint8_t dg[32]; unsigned dn = 32;
+        if (EVP_DigestFinal_ex(w->sha, dg, &dn) == 1
+            && pwrite(w->fd, dg, 32, (off_t)w->sha_off) == 32
+            && w->data_written >= w->store->dedup_min && w->data_written > 0)
+            dedup_commit(w, dg);
     }
     if (obj_rewrite_fixed(w->fd, &w->hdr, &w->ext, &w->ext4) < 0) {
         LOG_E("pwrite header: %s", strerror(errno));
@@ -5421,6 +5474,7 @@ s3_err_t store_writer_clone(s3_writer_t *w, s3_reader_t *r,
         if (n <= 0) return S3_ERR_INTERNAL;
         EVP_DigestUpdate(w->md5_ctx, buf, (size_t)n);
         if (w->pcrc.algo) cksum_update(&w->pcrc, buf, (size_t)n);
+        if (w->sha) EVP_DigestUpdate(w->sha, buf, (size_t)n);
         if (extra) extra(ctx, buf, (size_t)n);
         done += (uint64_t)n;
     }
@@ -5429,3 +5483,168 @@ s3_err_t store_writer_clone(s3_writer_t *w, s3_reader_t *r,
     return S3_OK;
 }
 
+/* ===================================================================== */
+/* Whole-object dedup (round 2, item 6b)                                  */
+/* ===================================================================== */
+/*
+ * Pool: <root>/cas/<scope>/<aa>/<bb>/<sha256>, payload-only files whose
+ * extents objects share via reflink. Object files stay complete, so the
+ * pool can be wiped at any time (future dedup is lost, never data) and
+ * there are no refcounts to repair after a crash. Runs at commit before
+ * the key stripe lock: it only touches the writer's private tmp file and
+ * the pool, where a concurrent miss just renames an identical file. A hit
+ * opens the pool file first, so a concurrent pool GC can't pull it away
+ * mid-clone.
+ */
+uint64_t g_store_dedup_hits, g_store_dedup_misses;
+
+void store_set_dedup(s3_store_t *s, int mode, uint64_t min_size, int verify) {
+    s->dedup_mode = mode;
+    s->dedup_min = min_size;
+    s->dedup_verify = verify;
+}
+
+static int pool_path(const s3_store_t *s, const char *scope, const uint8_t dg[32],
+                     char *dir, size_t dcap, char *path, size_t pcap) {
+    char hx[65];
+    hex16(dg, 32, hx);
+    int n = snprintf(dir, dcap, "%s/cas/%s/%c%c/%c%c", s->root, scope, hx[0], hx[1], hx[2], hx[3]);
+    if (n <= 0 || (size_t)n >= dcap) return -1;
+    n = snprintf(path, pcap, "%s/%s", dir, hx);
+    return n > 0 && (size_t)n < pcap ? 0 : -1;
+}
+
+static int same_bytes(int a, uint64_t aoff, int b, uint64_t boff, uint64_t len) {
+    char x[64 * 1024], y[64 * 1024];
+    while (len) {
+        size_t n = len < sizeof(x) ? (size_t)len : sizeof(x);
+        if (pread(a, x, n, (off_t)aoff) != (ssize_t)n || pread(b, y, n, (off_t)boff) != (ssize_t)n
+            || memcmp(x, y, n)) return 0;
+        aoff += n; boff += n; len -= n;
+    }
+    return 1;
+}
+
+static void dedup_commit(s3_writer_t *w, const uint8_t dg[32]) {
+    s3_store_t *s = w->store;
+    char dir[4300], path[4400];
+    if (pool_path(s, w->dedup_scope, dg, dir, sizeof(dir), path, sizeof(path)) < 0) return;
+    uint64_t doff = w->hdr.header_size, len = w->data_written;
+    int pf = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (pf >= 0) {
+        struct stat st;
+        if (fstat(pf, &st) == 0 && S_ISREG(st.st_mode) && (uint64_t)st.st_size == len
+            && (!s->dedup_verify || same_bytes(pf, 0, w->fd, doff, len))
+            && clone_range(w->fd, doff, pf, 0, len) == 0) {
+            __atomic_fetch_add(&g_store_dedup_hits, 1, __ATOMIC_RELAXED);
+        }
+        close(pf);
+        return;
+    }
+    /* Miss: the payload's extents become a new pool entry (no extra space). */
+    if (mkdir_p(dir, 0700) < 0) return;
+    char tmp[4500];
+    snprintf(tmp, sizeof(tmp), "%s.tmp.XXXXXX", path);
+    int tf = mkstemp(tmp);
+    if (tf < 0) return;
+    if (clone_range(tf, 0, w->fd, doff, len) == 0 && xfsync(tf) == 0 && rename(tmp, path) == 0) {
+        __atomic_fetch_add(&g_store_dedup_misses, 1, __ATOMIC_RELAXED);
+        close(tf);
+        return;
+    }
+    close(tf);
+    unlink(tmp);
+}
+
+/* Pool GC (from the scrub): remove pool entries not in `keep` (sorted
+ * array of 32-byte digests) and last modified before `older_than`.
+ * Returns the number removed. */
+static int dg_cmp(const void *a, const void *b) { return memcmp(a, b, 32); }
+
+int store_dedup_gc(s3_store_t *s, const uint8_t *keep, size_t n_keep, time_t older_than) {
+    char cas[4200];
+    snprintf(cas, sizeof(cas), "%s/cas", s->root);
+    DIR *d0 = opendir(cas);
+    if (!d0) return 0;
+    int removed = 0;
+    struct dirent *e0;
+    while ((e0 = readdir(d0)) != NULL) {
+        if (e0->d_name[0] == '.') continue;
+        char p0[4500];
+        snprintf(p0, sizeof(p0), "%s/%s", cas, e0->d_name);
+        DIR *d1 = opendir(p0);
+        if (!d1) continue;
+        struct dirent *e1;
+        while ((e1 = readdir(d1)) != NULL) {
+            if (e1->d_name[0] == '.') continue;
+            char p1[4800];
+            snprintf(p1, sizeof(p1), "%s/%s", p0, e1->d_name);
+            DIR *d2 = opendir(p1);
+            if (!d2) continue;
+            struct dirent *e2;
+            while ((e2 = readdir(d2)) != NULL) {
+                if (e2->d_name[0] == '.') continue;
+                char p2[5100];
+                snprintf(p2, sizeof(p2), "%s/%s", p1, e2->d_name);
+                DIR *d3 = opendir(p2);
+                if (!d3) continue;
+                struct dirent *e3;
+                while ((e3 = readdir(d3)) != NULL) {
+                    const char *nm = e3->d_name;
+                    if (nm[0] == '.') continue;
+                    char p3[5400];
+                    snprintf(p3, sizeof(p3), "%s/%s", p2, nm);
+                    struct stat st;
+                    if (lstat(p3, &st) < 0 || st.st_mtime >= older_than) continue;
+                    uint8_t dg[32];
+                    int ok = strlen(nm) == 64;
+                    for (int i = 0; ok && i < 32; i++) {
+                        int hi = hexval1(nm[2*i]), lo = hexval1(nm[2*i+1]);
+                        if (hi < 0 || lo < 0) ok = 0; else dg[i] = (uint8_t)(hi << 4 | lo);
+                    }
+                    /* Leftover tmp files and unreferenced entries go. */
+                    if (!ok || !keep || !bsearch(dg, keep, n_keep, 32, dg_cmp)) {
+                        if (unlink(p3) == 0) removed++;
+                    }
+                }
+                closedir(d3);
+            }
+            closedir(d2);
+        }
+        closedir(d1);
+    }
+    closedir(d0);
+    return removed;
+}
+
+/* The CONTENT_SHA256 TLV of an object file (scrub collects referenced
+ * pool digests). 1 found, 0 none. */
+int store_object_content_sha256(const char *path, uint8_t out[32]) {
+    int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0) return 0;
+    obj_header_t h; obj_ext_v3_t x; obj_ext_v4_t x4;
+    uint32_t ct_off = 0, tlv_off = 0;
+    int found = 0;
+    if (obj_read_hdr4(fd, &h, &x, &x4, &ct_off, &tlv_off) == S3_OK && x4.tlv_len
+        && x4.tlv_len <= OBJ_MAX_TLV) {
+        uint8_t *t = malloc(x4.tlv_len);
+        if (t && pread(fd, t, x4.tlv_len, tlv_off) == (ssize_t)x4.tlv_len
+            && tlv_validate(t, x4.tlv_len) == 0) {
+            for (uint32_t o = 0; o + 6 <= x4.tlv_len; ) {
+                unsigned type = (unsigned)t[o] | (unsigned)t[o+1] << 8;
+                uint32_t len = (uint32_t)t[o+2] | (uint32_t)t[o+3] << 8 | (uint32_t)t[o+4] << 16
+                             | (uint32_t)t[o+5] << 24;
+                if (type == S3_TLV_CONTENT_SHA256 && len == 32) {
+                    memcpy(out, t + o + 6, 32);
+                    static const uint8_t zero[32];
+                    found = memcmp(out, zero, 32) != 0;
+                    break;
+                }
+                o += 6 + len;
+            }
+        }
+        free(t);
+    }
+    close(fd);
+    return found;
+}

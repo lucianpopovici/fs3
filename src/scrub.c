@@ -48,6 +48,10 @@ typedef struct { uint64_t dev, ino; } inode_t;
 typedef struct {
     iojob_t   base;
     scrub_t  *sc;
+    /* dedup pool GC: digests still referenced by objects */
+    int       collect_sha;
+    uint8_t  *shas;
+    size_t    shas_n, shas_cap;
     /* throttle */
     struct timespec t0;
     uint64_t  window_bytes;
@@ -277,6 +281,18 @@ static void check_file(scrub_job_t *j, const char *bucket, const char *path, int
     if (r.verdict == SCRUB_UNVERIFIABLE) __atomic_fetch_add(&sc->m_unverifiable, 1, __ATOMIC_RELAXED);
     __atomic_fetch_add(&sc->m_bytes, r.bytes_read, __ATOMIC_RELAXED);
     if (r.verdict == SCRUB_CORRUPT) report_corrupt(sc, bucket, rel, &r);
+    if (j->collect_sha && kind == STORE_SCRUB_OBJECT && r.verdict != SCRUB_GONE) {
+        uint8_t dg[32];
+        if (store_object_content_sha256(path, dg)) {
+            if (j->shas_n == j->shas_cap) {
+                size_t nc = j->shas_cap ? j->shas_cap * 2 : 256;
+                uint8_t *n = realloc(j->shas, nc * 32);
+                if (!n) { j->collect_sha = 0; return; }      /* GC skipped this pass */
+                j->shas = n; j->shas_cap = nc;
+            }
+            memcpy(j->shas + 32 * j->shas_n++, dg, 32);
+        }
+    }
 }
 
 static int is_hex64(const char *n) {
@@ -350,6 +366,8 @@ static void scrub_shard(scrub_job_t *j, int tree, const char *bucket, int shard)
     closedir(d1);
 }
 
+static int dg_cmp32(const void *a, const void *b) { return memcmp(a, b, 32); }
+
 static int name_cmp(const void *a, const void *b) {
     return strcmp(((const s3_bucket_info_t *)a)->name, ((const s3_bucket_info_t *)b)->name);
 }
@@ -375,9 +393,17 @@ static void scrub_run(iojob_t *jb) {
         LOG_I("scrub: resuming pass %" PRIu64 " at %s/%s/%02x", sc->st.pass,
               sc->st.tree < TREE_N ? TREE_NAME[sc->st.tree] : "end", sc->st.bucket, sc->st.shard);
     }
+    int fresh = sc->st.tree == 0 && !sc->st.bucket[0] && sc->st.shard == 0;
     state_save_locked(sc);
     scrub_state_t cur = sc->st;
     pthread_mutex_unlock(&sc->mu);
+    /* Dedup pool GC needs every object seen in one run: only on a pass
+     * that started (not resumed) in this run and only if a pool exists. */
+    char cas[4300];
+    snprintf(cas, sizeof(cas), "%s/cas", store_root(sc->cfg.store));
+    struct stat cst;
+    j->collect_sha = fresh && stat(cas, &cst) == 0;
+    time_t pass_started = (time_t)cur.started;
 
     s3_bucket_info_t *bl = NULL;
     size_t nb = 0;
@@ -423,6 +449,11 @@ static void scrub_run(iojob_t *jb) {
                 LOG_W("scrub: bucket %s quota usage corrected by %+" PRId64 " bytes",
                       bl[bi].name, -drift);
         }
+        if (j->collect_sha) {
+            if (j->shas_n) qsort(j->shas, j->shas_n, 32, dg_cmp32);
+            int gone = store_dedup_gc(sc->cfg.store, j->shas, j->shas_n, pass_started);
+            if (gone) LOG_I("scrub: removed %d unreferenced dedup pool entr%s", gone, gone == 1 ? "y" : "ies");
+        }
         pthread_mutex_lock(&sc->mu);
         sc->st.finished = now_s();
         if (!sc->st.corrupt) sc->st.last_success = sc->st.finished;
@@ -441,6 +472,7 @@ static void scrub_run(iojob_t *jb) {
 static void scrub_done(iojob_t *jb) {
     scrub_job_t *j = (scrub_job_t *)jb;
     j->sc->running = 0;
+    free(j->shas);
     free(j->seen);
     free(j);
 }

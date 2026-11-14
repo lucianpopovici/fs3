@@ -132,6 +132,12 @@ int metrics_render(const fs3_metrics_t *m, struct s3_store *store,
          "# TYPE fs3_reflink_clones_total counter\n"
          "fs3_reflink_clones_total %llu\n",
          (unsigned long long)__atomic_load_n(&g_store_clone_count, __ATOMIC_RELAXED));
+    EMIT("# HELP fs3_dedup_hits_total PUTs whose payload was shared with an identical earlier one.\n"
+         "# TYPE fs3_dedup_hits_total counter\nfs3_dedup_hits_total %llu\n"
+         "# HELP fs3_dedup_pool_adds_total New entries in the dedup pool.\n"
+         "# TYPE fs3_dedup_pool_adds_total counter\nfs3_dedup_pool_adds_total %llu\n",
+         (unsigned long long)__atomic_load_n(&g_store_dedup_hits, __ATOMIC_RELAXED),
+         (unsigned long long)__atomic_load_n(&g_store_dedup_misses, __ATOMIC_RELAXED));
     EMIT("# HELP fs3_quota_rejections_total Writes refused because a bucket or user quota was reached.\n"
          "# TYPE fs3_quota_rejections_total counter\n"
          "fs3_quota_rejections_total %llu\n",

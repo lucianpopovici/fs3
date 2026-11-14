@@ -102,6 +102,9 @@ typedef struct {
     int                    key_max_age_days;      /* default expiry of admin-created keys */
     int                    seccomp_mode;          /* sandbox_mode_t */
     int                    reflink_off;           /* --reflink off */
+    int                    dedup_mode;            /* STORE_DEDUP_* */
+    uint64_t               dedup_min;
+    int                    dedup_verify;
 
     /* Admin API (item 11): /v1 on the metrics listener needs this bearer
      * token (NULL = disabled there); admin_socket adds a Unix-socket
