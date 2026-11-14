@@ -11,6 +11,13 @@
   `response-*` overrides; `x-amz-metadata-directive`. A self-copy
   without `REPLACE` is now `400 InvalidRequest` (S3 behaviour).
 - Fix: `Connection: close` from a client was ignored (wrong llhttp flag).
+- Quotas per bucket and per user (admin API, `--default-bucket-quota`,
+  `--default-user-quota`), `403 QuotaExceeded`, Prometheus gauges, quota
+  column in the DSM console. New files: `buckets/<b>/quota`,
+  `buckets/<b>/usage`, `users/<hex>.quota`, `<root>/.fs3-running`.
+- Audit log lines carry the S3 error code (`"error":"…"`).
+- Fix: a request refused before `100 Continue` now closes the connection
+  (botocore stalled 60 s on the next request).
 - ListObjectsV2 pagination (was capped at the first 1000 keys),
   `encoding-type=url`, ListMultipartUploads pagination; delimiter
   listings no longer repeat a CommonPrefix on the next page.

@@ -167,6 +167,17 @@ struct s3_store {
     int  (*mpu_gc_filter)(void *user, s3_str_t bucket, s3_str_t key);
     void  *mpu_gc_filter_user;
 
+    /* Quotas (round 2, item 2). q_mu is a leaf lock: nothing else is
+     * taken while it is held. */
+    pthread_mutex_t   q_mu;
+    struct q_bucket  *qb;
+    size_t            qb_n, qb_cap;
+    struct q_user    *qu;
+    size_t            qu_n, qu_cap;
+    uint64_t          q_def_bucket, q_def_user;
+    uint64_t          q_rejections;
+    int               q_ready;
+
     /* Parsed bucket-config cache (store_sidecar_get). */
     pthread_mutex_t cfg_mu;
     struct store_cfg_ref *cfg_head;
@@ -396,6 +407,10 @@ static void recover_tmp_dir(const s3_store_t *s) {
 }
 
 static void cfg_cache_clear(s3_store_t *s);
+static void q_load(s3_store_t *s);
+static void q_save(s3_store_t *s);
+static void q_bucket_added(s3_store_t *s, s3_str_t name, const char *owner);
+static void q_bucket_removed(s3_store_t *s, s3_str_t name);
 static void recover_version_links(const s3_store_t *s);
 static void recover_mpu_orphans(const s3_store_t *s);
 static int probe_reflink(const s3_store_t *s);
@@ -454,6 +469,7 @@ s3_err_t store_open(s3_store_t **out, const char *root) {
     if (!s) return S3_ERR_INTERNAL;
     pthread_mutex_init(&s->ns_mu, NULL);
     pthread_mutex_init(&s->cfg_mu, NULL);
+    pthread_mutex_init(&s->q_mu, NULL);
     for (int i = 0; i < 256; i++) pthread_mutex_init(&s->key_mu[i], NULL);
 
     s->root        = strdup(root);
@@ -488,6 +504,7 @@ s3_err_t store_open(s3_store_t **out, const char *root) {
     recover_mpu_orphans(s);
     s->reflink = probe_reflink(s);
     s->pad_headers = s->reflink;
+    q_load(s);
     LOG_I("store: reflink %s", s->reflink ? "supported (headers padded to 4 KiB)"
                                           : "not supported (plain copies)");
 
@@ -497,6 +514,10 @@ s3_err_t store_open(s3_store_t **out, const char *root) {
 
 void store_close(s3_store_t *s) {
     if (!s) return;
+    q_save(s);
+    free(s->qb);
+    free(s->qu);
+    pthread_mutex_destroy(&s->q_mu);
     free(s->root);
     free(s->data_dir);
     free(s->tmp_dir);
@@ -739,6 +760,7 @@ static s3_err_t bucket_create(s3_store_t *s, s3_str_t name,
     pthread_mutex_unlock(&s->ns_mu);
     if (e != S3_OK) { rm_rf(stage); return e; }
     fsync_dir(s->buckets_dir);
+    q_bucket_added(s, name, nm.owner);
     return S3_OK;
 }
 
@@ -773,6 +795,7 @@ s3_err_t store_bucket_set_owner(s3_store_t *s, s3_str_t name,
         }
     }
     pthread_mutex_unlock(&s->ns_mu);
+    if (e == S3_OK) q_bucket_added(s, name, owner);   /* updates the owner */
     return e;
 }
 
@@ -898,6 +921,7 @@ s3_err_t store_bucket_delete(s3_store_t *s, s3_str_t name) {
     pthread_mutex_lock(&s->ns_mu);
     s3_err_t e = bucket_delete_locked(s, name);
     pthread_mutex_unlock(&s->ns_mu);
+    if (e == S3_OK) q_bucket_removed(s, name);
     return e;
 }
 
@@ -1393,10 +1417,50 @@ struct s3_writer {
      * has this id: deleted-and-recreated (maybe by another user) is a
      * different bucket, even under the same name. */
     char        bucket_id[33];
+
+    /* Quota reservation held by this writer (released by writer_free,
+     * converted to usage at commit). */
+    char        q_bucket[64];
+    uint64_t    q_rbytes;
+    uint32_t    q_robjs;
 };
+
+static s3_err_t q_reserve(s3_store_t *s, const char *bucket, uint64_t bytes, uint32_t objs);
+static void     q_release(s3_store_t *s, const char *bucket, uint64_t bytes, uint32_t objs);
+static void     q_charge(s3_store_t *s, const char *bucket, int64_t dbytes, int64_t dobjs);
+static void     key_usage(s3_store_t *s, s3_str_t bucket, const char hex[65],
+                          uint64_t *bytes, uint64_t *objs);
+static uint64_t upload_part_bytes(const char *up_dir);
+
+/* Grow the writer's reservation to cover `total` bytes. */
+static s3_err_t writer_reserve_to(s3_writer_t *w, uint64_t total) {
+    if (total <= w->q_rbytes || !w->q_bucket[0]) return S3_OK;
+    uint64_t need = total - w->q_rbytes;
+    uint64_t want = need < (256u << 10) ? (256u << 10) : need;   /* fewer lock trips */
+    if (q_reserve(w->store, w->q_bucket, want, 0) != S3_OK) {
+        if (want == need || q_reserve(w->store, w->q_bucket, need, 0) != S3_OK)
+            return S3_ERR_QUOTA_EXCEEDED;
+        want = need;
+    }
+    w->q_rbytes += want;
+    return S3_OK;
+}
+
+static void writer_release_quota(s3_writer_t *w) {
+    if (w->q_bucket[0] && (w->q_rbytes || w->q_robjs))
+        q_release(w->store, w->q_bucket, w->q_rbytes, w->q_robjs);
+    w->q_rbytes = 0;
+    w->q_robjs = 0;
+}
+
+s3_err_t store_put_expect(s3_writer_t *w, uint64_t n) {
+    if (!w || w->finalized) return S3_ERR_INVALID_ARGUMENT;
+    return writer_reserve_to(w, n);
+}
 
 static void writer_free(s3_writer_t *w) {
     if (!w) return;
+    writer_release_quota(w);
     cksum_free(&w->pcrc);
     if (w->fd >= 0) close(w->fd);
     if (w->tmp_path[0]) unlink(w->tmp_path);
@@ -1449,6 +1513,13 @@ s3_err_t store_put_begin_opts(s3_store_t *s, s3_str_t bucket, s3_str_t key,
         }
         memcpy(w->bucket_id, bm.id, sizeof(w->bucket_id));
     }
+    /* Quota: room for one more object before any byte is written. */
+    if (q_reserve(s, (snprintf(w->q_bucket, sizeof(w->q_bucket), S3_STR_FMT,
+                               S3_STR_ARG(bucket)), w->q_bucket), 0, 1) != S3_OK) {
+        w->q_bucket[0] = '\0';
+        writer_free(w); return S3_ERR_QUOTA_EXCEEDED;
+    }
+    w->q_robjs = 1;
 
     w->md5_ctx = EVP_MD_CTX_new();
     if (!w->md5_ctx
@@ -1517,6 +1588,7 @@ s3_err_t store_put_begin_opts(s3_store_t *s, s3_str_t bucket, s3_str_t key,
 s3_err_t store_put_write(s3_writer_t *w, const void *buf, size_t n) {
     if (!w || w->finalized) return S3_ERR_INVALID_ARGUMENT;
     if (n == 0) return S3_OK;
+    if (writer_reserve_to(w, w->data_written + n) != S3_OK) return S3_ERR_QUOTA_EXCEEDED;
 
     if (EVP_DigestUpdate(w->md5_ctx, buf, n) != 1) return S3_ERR_INTERNAL;
     if (w->pcrc.algo) cksum_update(&w->pcrc, buf, n);
@@ -1618,6 +1690,9 @@ s3_err_t store_put_commit(s3_writer_t *w, s3_obj_meta_t *meta_out) {
         writer_free(w); return e;
     }
 
+    uint64_t q_b0 = 0, q_o0 = 0;
+    key_usage(w->store, bucket, hex, &q_b0, &q_o0);
+
     /* Versioned bucket: move the current version aside first (hard link,
      * crash-safe; see store.h). */
     {
@@ -1638,6 +1713,14 @@ s3_err_t store_put_commit(s3_writer_t *w, s3_obj_meta_t *meta_out) {
         writer_free(w); return e;
     }
     pthread_mutex_unlock(&w->store->ns_mu);
+    {
+        /* Quota: the key's usage change replaces the reservation. */
+        uint64_t q_b1 = 0, q_o1 = 0;
+        key_usage(w->store, bucket, hex, &q_b1, &q_o1);
+        q_charge(w->store, w->q_bucket, (int64_t)q_b1 - (int64_t)q_b0,
+                 (int64_t)q_o1 - (int64_t)q_o0);
+        writer_release_quota(w);
+    }
     pthread_mutex_unlock(km);
     /* tmp_path is gone; clear so writer_free doesn't unlink the live file. */
     w->tmp_path[0] = '\0';
@@ -2662,6 +2745,10 @@ s3_err_t store_mpu_part_begin(s3_store_t *s, s3_str_t bucket, s3_str_t key,
     w->mpu_algo = mpu_algo;
     if (cksum_begin(&w->pcrc, S3_CKSUM_CRC64NVME) < 0) { writer_free(w); return S3_ERR_INTERNAL; }
 
+    snprintf(w->q_bucket, sizeof(w->q_bucket), S3_STR_FMT, S3_STR_ARG(bucket));
+    if (q_reserve(s, w->q_bucket, 0, 0) != S3_OK) {
+        writer_free(w); return S3_ERR_QUOTA_EXCEEDED;
+    }
     /* Final destination: <mpu>/<bucket>/<upload_id>/part-NNNNN */
     if (mpu_part_path(s, bucket, upload_id, part_number,
                       w->final_path, sizeof(w->final_path)) < 0) {
@@ -2695,6 +2782,7 @@ s3_err_t store_mpu_part_begin(s3_store_t *s, s3_str_t bucket, s3_str_t key,
 s3_err_t store_mpu_part_write(s3_writer_t *w, const void *buf, size_t n) {
     if (!w || w->finalized || !w->is_part) return S3_ERR_INVALID_ARGUMENT;
     if (n == 0) return S3_OK;
+    if (writer_reserve_to(w, w->data_written + n) != S3_OK) return S3_ERR_QUOTA_EXCEEDED;
     ssize_t off = 0;
     while ((size_t)off < n) {
         ssize_t r = xwrite(w->fd, (const char *)buf + off, n - (size_t)off);
@@ -2777,12 +2865,19 @@ s3_err_t store_mpu_part_commit(s3_writer_t *w, char etag_hex_out[33]) {
      * delete) must not interleave with these renames, and Complete reads
      * record + part under the same lock. */
     pthread_mutex_lock(&w->store->ns_mu);
+    struct stat old_st;
+    uint64_t old_part = stat(w->final_path, &old_st) == 0 ? (uint64_t)old_st.st_size : 0;
     int rc = rename(rec_tmp, rec_final);
     if (rc == 0) {
         unlink(ck_old);                       /* superseded by the record */
         rc = rename(w->tmp_path, w->final_path);
     }
     int rename_errno = errno;
+    if (rc == 0) {
+        /* Parts count toward the quota while the upload is in flight. */
+        q_charge(w->store, w->q_bucket, (int64_t)w->data_written - (int64_t)old_part, 0);
+        writer_release_quota(w);
+    }
     pthread_mutex_unlock(&w->store->ns_mu);
     if (rc < 0) unlink(rec_tmp);
     if (rc < 0) {
@@ -2826,7 +2921,13 @@ s3_err_t store_mpu_abort(s3_store_t *s, s3_str_t bucket, s3_str_t key,
     pthread_mutex_lock(&s->ns_mu);
     s3_err_t e = S3_OK;
     if (access(meta, F_OK) < 0)  e = S3_ERR_NO_SUCH_UPLOAD;
-    else if (rm_rf(dir) < 0)     e = S3_ERR_INTERNAL;
+    else {
+        uint64_t pb = upload_part_bytes(dir);
+        if (rm_rf(dir) < 0) e = S3_ERR_INTERNAL;
+        char bn[64];
+        snprintf(bn, sizeof(bn), S3_STR_FMT, S3_STR_ARG(bucket));
+        q_charge(s, bn, -(int64_t)(pb - upload_part_bytes(dir)), 0);
+    }
     pthread_mutex_unlock(&s->ns_mu);
     return e;
 }
@@ -3117,14 +3218,30 @@ s3_err_t store_mpu_complete2(s3_store_t *s, s3_str_t bucket, s3_str_t key,
     snprintf(up_meta, sizeof(up_meta), "%s/meta", up_dir);
     pthread_mutex_t *km = key_lock(s, hex);
     pthread_mutex_lock(km);
+    uint64_t q_b0 = 0, q_o0 = 0, q_parts = 0;
+    key_usage(s, bucket, hex, &q_b0, &q_o0);
     pthread_mutex_lock(&s->ns_mu);
     if (!store_bucket_exists(s, bucket))          e = S3_ERR_NO_SUCH_BUCKET;
     else if (access(up_meta, F_OK) < 0)           e = S3_ERR_NO_SUCH_UPLOAD;
     else if ((e = link_aside_locked(s, bucket, hex, target_path, versioning)) != S3_OK) ;
     else if (mkdir_p(target_dir, 0700) < 0
              || rename(tmp_path, target_path) < 0) e = map_io_err(errno);
-    else { rm_rf(up_dir); tmp_path[0] = '\0'; }
+    else {
+        q_parts = upload_part_bytes(up_dir);
+        rm_rf(up_dir);
+        tmp_path[0] = '\0';
+    }
     pthread_mutex_unlock(&s->ns_mu);
+    if (e == S3_OK) {
+        /* The parts' charge becomes the object's (plus whatever it
+         * replaced or moved aside). */
+        uint64_t q_b1 = 0, q_o1 = 0;
+        key_usage(s, bucket, hex, &q_b1, &q_o1);
+        char bn[64];
+        snprintf(bn, sizeof(bn), S3_STR_FMT, S3_STR_ARG(bucket));
+        q_charge(s, bn, (int64_t)q_b1 - (int64_t)q_b0 - (int64_t)q_parts,
+                 (int64_t)q_o1 - (int64_t)q_o0);
+    }
     pthread_mutex_unlock(km);
     if (e != S3_OK) goto out;
     fsync_dir(target_dir);
@@ -3488,7 +3605,9 @@ int store_mpu_gc(s3_store_t *s, uint64_t now_ms, uint64_t max_age_ms) {
             LOG_I("mpu_gc: reaping stale upload %s (age=%" PRIu64 "ms)",
                   ue->d_name, now_ms - ctime_ms);
             pthread_mutex_lock(&s->ns_mu);
+            uint64_t pb = upload_part_bytes(up_dir);
             if (rm_rf(up_dir) == 0) removed++;
+            q_charge(s, be->d_name, -(int64_t)(pb - upload_part_bytes(up_dir)), 0);
             pthread_mutex_unlock(&s->ns_mu);
         }
         closedir(ud);
@@ -3672,7 +3791,7 @@ static vname_t *vdir_list(const char *vdir, size_t *n_out) {
             if (!nv) break;
             v = nv; cap = nc;
         }
-        snprintf(v[n++].name, sizeof(v[0].name), "%s", e->d_name);
+        snprintf(v[n++].name, sizeof(v[0].name), "%.49s", e->d_name);  /* 49: ventry_parse */
     }
     closedir(d);
     if (n) qsort(v, n, sizeof(*v), vname_cmp);
@@ -3909,9 +4028,27 @@ static s3_err_t guard_check(s3_store_t *s, s3_str_t bucket, s3_str_t key,
 
 /* Delete (versioning-aware) with the key lock held. expect_mtime != 0:
  * lifecycle — only if the current object still has that mtime. */
+static s3_err_t delete_locked_raw(s3_store_t *s, s3_str_t bucket, s3_str_t key,
+                                  const char hex[65], const uint8_t *vid,
+                                  uint64_t expect_mtime, store_delete_result_t *res);
+
+/* Quota: charge the key's usage change around every delete. */
 static s3_err_t delete_locked(s3_store_t *s, s3_str_t bucket, s3_str_t key,
                               const char hex[65], const uint8_t *vid,
                               uint64_t expect_mtime, store_delete_result_t *res) {
+    uint64_t b0 = 0, o0 = 0, b1 = 0, o1 = 0;
+    key_usage(s, bucket, hex, &b0, &o0);
+    s3_err_t e = delete_locked_raw(s, bucket, key, hex, vid, expect_mtime, res);
+    key_usage(s, bucket, hex, &b1, &o1);
+    char bn[64];
+    snprintf(bn, sizeof(bn), S3_STR_FMT, S3_STR_ARG(bucket));
+    q_charge(s, bn, (int64_t)b1 - (int64_t)b0, (int64_t)o1 - (int64_t)o0);
+    return e;
+}
+
+static s3_err_t delete_locked_raw(s3_store_t *s, s3_str_t bucket, s3_str_t key,
+                                  const char hex[65], const uint8_t *vid,
+                                  uint64_t expect_mtime, store_delete_result_t *res) {
     char path[4096], dir[4096], vdir[4300];
     if (obj_path(s, bucket, hex, path, sizeof(path)) < 0
         || obj_dir(s, bucket, hex, dir, sizeof(dir)) < 0
@@ -4372,3 +4509,568 @@ static s3_err_t mpu_read_meta2(const s3_store_t *s, s3_str_t bucket,
 }
 
 void store_set_mpu_min_part_size(s3_store_t *s, uint64_t n) { if (s) s->mpu_min_part = n; }
+
+/* ===================================================================== */
+/* Quotas (round 2, item 2)                                               */
+/* ===================================================================== */
+/*
+ * Logical bytes and object count per bucket (current objects, noncurrent
+ * versions and delete markers; in-flight parts count bytes), charged to
+ * the bucket and so to its owner. Every key mutation measures the key's
+ * usage before and after under its stripe lock (key_usage) and charges
+ * the difference, so overwrite, link-aside, promotion and Suspended-mode
+ * null-version replacement all come out exact without special cases.
+ * Writers reserve before bytes reach disk; writer_free releases whatever
+ * a writer still holds, so no abort path can leak a reservation.
+ */
+
+struct q_bucket {
+    char     name[64];
+    char     owner[129];
+    uint64_t bytes, objects;       /* committed */
+    uint64_t rbytes, robjs;        /* reserved by open writers */
+    int      has_cfg;              /* bucket quota sidecar present */
+    uint64_t max_bytes, max_objects;
+};
+
+struct q_user {
+    char     user[129];
+    uint64_t max_bytes, max_objects;
+};
+
+static struct q_bucket *qb_find(s3_store_t *s, const char *name) {
+    for (size_t i = 0; i < s->qb_n; i++)
+        if (!strcmp(s->qb[i].name, name)) return &s->qb[i];
+    return NULL;
+}
+
+static struct q_bucket *qb_get(s3_store_t *s, const char *name) {
+    struct q_bucket *b = qb_find(s, name);
+    if (b) return b;
+    if (s->qb_n == s->qb_cap) {
+        size_t nc = s->qb_cap ? s->qb_cap * 2 : 16;
+        struct q_bucket *nb = realloc(s->qb, nc * sizeof(*nb));
+        if (!nb) return NULL;
+        s->qb = nb; s->qb_cap = nc;
+    }
+    b = &s->qb[s->qb_n++];
+    memset(b, 0, sizeof(*b));
+    snprintf(b->name, sizeof(b->name), "%s", name);
+    return b;
+}
+
+static struct q_user *qu_find(s3_store_t *s, const char *user) {
+    for (size_t i = 0; i < s->qu_n; i++)
+        if (!strcmp(s->qu[i].user, user)) return &s->qu[i];
+    return NULL;
+}
+
+static void qb_limits(const s3_store_t *s, const struct q_bucket *b,
+                      uint64_t *mb, uint64_t *mo) {
+    if (b->has_cfg) { *mb = b->max_bytes; *mo = b->max_objects; }
+    else            { *mb = s->q_def_bucket; *mo = 0; }
+}
+
+static void qu_limits(s3_store_t *s, const char *user, uint64_t *mb, uint64_t *mo) {
+    struct q_user *u = qu_find(s, user);
+    if (u) { *mb = u->max_bytes; *mo = u->max_objects; }
+    else   { *mb = s->q_def_user; *mo = 0; }
+}
+
+static int over(uint64_t used, uint64_t add, uint64_t max) {
+    return max && (used > max || add > max - used);
+}
+
+static s3_err_t q_reserve(s3_store_t *s, const char *bucket, uint64_t bytes, uint32_t objs) {
+    pthread_mutex_lock(&s->q_mu);
+    struct q_bucket *b = qb_find(s, bucket);
+    s3_err_t e = S3_OK;
+    if (b) {
+        uint64_t mb, mo;
+        qb_limits(s, b, &mb, &mo);
+        if (over(b->bytes + b->rbytes, bytes, mb)
+            || (objs && over(b->objects + b->robjs, objs, mo)))
+            e = S3_ERR_QUOTA_EXCEEDED;
+        if (e == S3_OK && b->owner[0]) {
+            qu_limits(s, b->owner, &mb, &mo);
+            if (mb || mo) {
+                uint64_t ub = 0, uo = 0;
+                for (size_t i = 0; i < s->qb_n; i++) {
+                    if (strcmp(s->qb[i].owner, b->owner)) continue;
+                    ub += s->qb[i].bytes + s->qb[i].rbytes;
+                    uo += s->qb[i].objects + s->qb[i].robjs;
+                }
+                if (over(ub, bytes, mb) || (objs && over(uo, objs, mo)))
+                    e = S3_ERR_QUOTA_EXCEEDED;
+            }
+        }
+        if (e == S3_OK) { b->rbytes += bytes; b->robjs += objs; }
+        else s->q_rejections++;
+    }
+    pthread_mutex_unlock(&s->q_mu);
+    return e;
+}
+
+static void q_release(s3_store_t *s, const char *bucket, uint64_t bytes, uint32_t objs) {
+    pthread_mutex_lock(&s->q_mu);
+    struct q_bucket *b = qb_find(s, bucket);
+    if (b) {
+        b->rbytes = b->rbytes > bytes ? b->rbytes - bytes : 0;
+        b->robjs  = b->robjs > objs ? b->robjs - objs : 0;
+    }
+    pthread_mutex_unlock(&s->q_mu);
+}
+
+static void add_signed(uint64_t *v, int64_t d) {
+    if (d >= 0) *v += (uint64_t)d;
+    else *v = *v > (uint64_t)(-d) ? *v - (uint64_t)(-d) : 0;
+}
+
+static void q_charge(s3_store_t *s, const char *bucket, int64_t db, int64_t dobj) {
+    if (!db && !dobj) return;
+    pthread_mutex_lock(&s->q_mu);
+    struct q_bucket *b = qb_find(s, bucket);
+    if (b) { add_signed(&b->bytes, db); add_signed(&b->objects, dobj); }
+    pthread_mutex_unlock(&s->q_mu);
+}
+
+static void q_bucket_added(s3_store_t *s, s3_str_t name, const char *owner) {
+    char bn[64];
+    snprintf(bn, sizeof(bn), S3_STR_FMT, S3_STR_ARG(name));
+    pthread_mutex_lock(&s->q_mu);
+    struct q_bucket *b = qb_get(s, bn);
+    if (b) snprintf(b->owner, sizeof(b->owner), "%s", owner ? owner : "");
+    pthread_mutex_unlock(&s->q_mu);
+}
+
+static void q_bucket_removed(s3_store_t *s, s3_str_t name) {
+    char bn[64];
+    snprintf(bn, sizeof(bn), S3_STR_FMT, S3_STR_ARG(name));
+    pthread_mutex_lock(&s->q_mu);
+    struct q_bucket *b = qb_find(s, bn);
+    if (b) *b = s->qb[--s->qb_n];
+    pthread_mutex_unlock(&s->q_mu);
+}
+
+/* Logical usage of one key: the current object plus every version
+ * entry, counting an entry that is the current file's inode (the
+ * link-aside window) once. Caller holds the key's stripe lock. */
+static void key_usage(s3_store_t *s, s3_str_t bucket, const char hex[65],
+                      uint64_t *bytes, uint64_t *objs) {
+    *bytes = 0; *objs = 0;
+    char path[4096], vdir[4300];
+    if (obj_path(s, bucket, hex, path, sizeof(path)) < 0
+        || vdir_path(s, bucket, hex, vdir, sizeof(vdir)) < 0) return;
+    struct stat cst;
+    int have = stat(path, &cst) == 0;
+    s3_obj_meta_t m;
+    if (have) {
+        (*objs)++;
+        if (peek_meta(path, &m) == 0) *bytes += m.size;
+    }
+    size_t n;
+    vname_t *v = vdir_list(vdir, &n);
+    for (size_t i = 0; i < n; i++) {
+        char vp[4400];
+        snprintf(vp, sizeof(vp), "%s/%s", vdir, v[i].name);
+        struct stat vst;
+        if (stat(vp, &vst) < 0) continue;
+        if (have && vst.st_ino == cst.st_ino && vst.st_dev == cst.st_dev) continue;
+        (*objs)++;
+        if (peek_meta(vp, &m) == 0) *bytes += m.size;
+    }
+    free(v);
+}
+
+/* Bytes of the part files in an upload dir. */
+static uint64_t upload_part_bytes(const char *up_dir) {
+    DIR *d = opendir(up_dir);
+    if (!d) return 0;
+    uint64_t sum = 0;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        if (strlen(e->d_name) != 10 || strncmp(e->d_name, "part-", 5)) continue;
+        char p[4400];
+        snprintf(p, sizeof(p), "%s/%s", up_dir, e->d_name);
+        struct stat st;
+        if (stat(p, &st) == 0 && S_ISREG(st.st_mode)) sum += (uint64_t)st.st_size;
+    }
+    closedir(d);
+    return sum;
+}
+
+/* Walk depth levels of subdirectories under dir and call fn on each
+ * regular file at the bottom. */
+static void walk_leaves(const char *dir, int depth,
+                        void (*fn)(const char *path, const char *name, void *ctx), void *ctx) {
+    DIR *d = opendir(dir);
+    if (!d) return;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        if (e->d_name[0] == '.') continue;
+        char p[4400];
+        if (snprintf(p, sizeof(p), "%s/%s", dir, e->d_name) >= (int)sizeof(p)) continue;
+        if (depth > 0) walk_leaves(p, depth - 1, fn, ctx);
+        else fn(p, e->d_name, ctx);
+    }
+    closedir(d);
+}
+
+typedef struct { uint64_t bytes, objs; } q_acc_t;
+
+static void acc_object(const char *path, const char *name, void *ctx) {
+    q_acc_t *a = ctx;
+    if (strlen(name) != 64) return;
+    s3_obj_meta_t m;
+    a->objs++;
+    if (peek_meta(path, &m) == 0) a->bytes += m.size;
+}
+
+static void acc_version(const char *path, const char *name, void *ctx) {
+    q_acc_t *a = ctx;
+    uint8_t vid[16];
+    if (ventry_parse(name, vid) < 0) return;
+    s3_obj_meta_t m;
+    a->objs++;
+    if (peek_meta(path, &m) == 0) a->bytes += m.size;
+}
+
+static void acc_part(const char *path, const char *name, void *ctx) {
+    q_acc_t *a = ctx;
+    if (strlen(name) != 10 || strncmp(name, "part-", 5)) return;
+    struct stat st;
+    if (stat(path, &st) == 0) a->bytes += (uint64_t)st.st_size;
+}
+
+/* Exact usage of a bucket from disk (startup rebuild; scrub). */
+static void q_walk_bucket(s3_store_t *s, const char *name, uint64_t *bytes, uint64_t *objs) {
+    q_acc_t a = { 0, 0 };
+    char p[4200];
+    snprintf(p, sizeof(p), "%s/%s", s->data_dir, name);
+    walk_leaves(p, 2, acc_object, &a);              /* data/<b>/NN/NN/<hex> */
+    snprintf(p, sizeof(p), "%s/%s", s->versions_dir, name);
+    walk_leaves(p, 3, acc_version, &a);             /* versions/<b>/NN/NN/<hex>/<entry> */
+    snprintf(p, sizeof(p), "%s/%s", s->mpu_dir, name);
+    walk_leaves(p, 1, acc_part, &a);                /* mpu/<b>/<upload>/part-NNNNN */
+    *bytes = a.bytes;
+    *objs = a.objs;
+}
+
+static int parse_kv_u64(const char *text, const char *key, uint64_t *out) {
+    size_t kn = strlen(key);
+    for (const char *l = text; l && *l; ) {
+        if (!strncmp(l, key, kn) && l[kn] == '=') {
+            char *end;
+            errno = 0;
+            unsigned long long v = strtoull(l + kn + 1, &end, 10);
+            if (errno || end == l + kn + 1 || (*end && *end != '\n')) return -1;
+            *out = v;
+            return 0;
+        }
+        l = strchr(l, '\n');
+        if (l) l++;
+    }
+    return 1;
+}
+
+static void hex_name(const char *in, char *out, size_t cap) {
+    static const char H[] = "0123456789abcdef";
+    size_t k = 0;
+    for (; *in && k + 3 < cap; in++) {
+        out[k++] = H[(unsigned char)*in >> 4];
+        out[k++] = H[(unsigned char)*in & 15];
+    }
+    out[k] = '\0';
+}
+
+/* Atomic small-file write: tmp + fsync + rename + fsync(dir). */
+static s3_err_t write_file_atomic(const char *dir, const char *final,
+                                  const char *data, size_t n) {
+    char tmp[4700];
+    snprintf(tmp, sizeof(tmp), "%s.tmp.XXXXXX", final);
+    int fd = mkstemp(tmp);
+    if (fd < 0) return map_io_err(errno);
+    if ((n && xwrite(fd, data, n) != (ssize_t)n) || xfsync(fd) < 0) {
+        s3_err_t e = map_io_err(errno);
+        close(fd); unlink(tmp);
+        return e;
+    }
+    close(fd);
+    if (rename(tmp, final) < 0) { s3_err_t e = map_io_err(errno); unlink(tmp); return e; }
+    fsync_dir(dir);
+    return S3_OK;
+}
+
+static void q_load_users(s3_store_t *s) {
+    char ud[4200];
+    snprintf(ud, sizeof(ud), "%s/users", s->root);
+    DIR *d = opendir(ud);
+    if (!d) return;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        size_t nl = strlen(e->d_name);
+        if (nl < 7 || strcmp(e->d_name + nl - 6, ".quota") || (nl - 6) % 2 || nl - 6 > 256)
+            continue;
+        char user[129];
+        size_t un = (nl - 6) / 2, i;
+        for (i = 0; i < un; i++) {
+            int hi = hexval1(e->d_name[2*i]), lo = hexval1(e->d_name[2*i+1]);
+            if (hi < 0 || lo < 0) break;
+            user[i] = (char)(hi << 4 | lo);
+        }
+        if (i != un) continue;
+        user[un] = '\0';
+        if (!store_valid_identity(user)) continue;
+        char p[4400], buf[256];
+        snprintf(p, sizeof(p), "%s/%s", ud, e->d_name);
+        int fd = open(p, O_RDONLY | O_CLOEXEC);
+        if (fd < 0) continue;
+        ssize_t r = read(fd, buf, sizeof(buf) - 1);
+        close(fd);
+        if (r <= 0) continue;
+        buf[r] = '\0';
+        uint64_t mb = 0, mo = 0;
+        if (parse_kv_u64(buf, "max_bytes", &mb) < 0 || parse_kv_u64(buf, "max_objects", &mo) < 0)
+            continue;
+        if (s->qu_n == s->qu_cap) {
+            size_t nc = s->qu_cap ? s->qu_cap * 2 : 8;
+            struct q_user *nu = realloc(s->qu, nc * sizeof(*nu));
+            if (!nu) break;
+            s->qu = nu; s->qu_cap = nc;
+        }
+        struct q_user *u = &s->qu[s->qu_n++];
+        snprintf(u->user, sizeof(u->user), "%s", user);
+        u->max_bytes = mb; u->max_objects = mo;
+    }
+    closedir(d);
+}
+
+static void q_load_bucket_cfg(s3_store_t *s, struct q_bucket *b) {
+    char *t = NULL; size_t n = 0;
+    s3_str_t bn = { b->name, strlen(b->name) };
+    b->has_cfg = 0;
+    if (store_bucket_sidecar_read(s, bn, "quota", 256, &t, &n) != S3_OK) return;
+    uint64_t mb = 0, mo = 0;
+    if (parse_kv_u64(t, "max_bytes", &mb) >= 0 && parse_kv_u64(t, "max_objects", &mo) >= 0) {
+        b->has_cfg = 1; b->max_bytes = mb; b->max_objects = mo;
+    }
+    free(t);
+}
+
+/* Startup: buckets, limits and usage. Usage files written at clean
+ * shutdown are trusted only if the running marker is absent (the last
+ * run closed the store); otherwise every bucket is walked. */
+static void q_load(s3_store_t *s) {
+    char marker[4200];
+    snprintf(marker, sizeof(marker), "%s/.fs3-running", s->root);
+    int clean = access(marker, F_OK) != 0;
+    s3_bucket_info_t *list = NULL;
+    size_t n = 0;
+    if (store_list_buckets(s, &list, &n) != S3_OK) { list = NULL; n = 0; }
+    int walked = 0;
+    for (size_t i = 0; i < n; i++) {
+        s3_str_t bn = { list[i].name, strlen(list[i].name) };
+        s3_bucket_meta_t bm;
+        if (store_bucket_meta(s, bn, &bm) != S3_OK) continue;
+        struct q_bucket *b = qb_get(s, list[i].name);
+        if (!b) break;
+        snprintf(b->owner, sizeof(b->owner), "%s", bm.owner);
+        q_load_bucket_cfg(s, b);
+        int ok = 0;
+        char *t = NULL; size_t tn = 0;
+        if (clean && store_bucket_sidecar_read(s, bn, "usage", 256, &t, &tn) == S3_OK) {
+            const char *idl = strstr(t, "id=");
+            uint64_t ub = 0, uo = 0;
+            if (idl && !strncmp(idl + 3, bm.id, strlen(bm.id)) && idl[3 + strlen(bm.id)] == '\n'
+                && parse_kv_u64(t, "bytes", &ub) == 0 && parse_kv_u64(t, "objects", &uo) == 0) {
+                b->bytes = ub; b->objects = uo; ok = 1;
+            }
+        }
+        free(t);
+        if (!ok) { q_walk_bucket(s, b->name, &b->bytes, &b->objects); walked++; }
+    }
+    if (list) store_buckets_free(list, n);
+    q_load_users(s);
+    if (walked) LOG_I("quota: rebuilt usage of %d bucket(s) from disk%s", walked,
+                      clean ? "" : " (unclean shutdown)");
+    int fd = open(marker, O_WRONLY | O_CREAT | O_CLOEXEC, 0600);
+    if (fd >= 0) { xfsync(fd); close(fd); fsync_dir(s->root); }
+    s->q_ready = 1;
+}
+
+/* Clean shutdown: persist usage, then drop the running marker. */
+static void q_save(s3_store_t *s) {
+    if (!s->q_ready) return;
+    int ok = 1;
+    for (size_t i = 0; i < s->qb_n; i++) {
+        struct q_bucket *b = &s->qb[i];
+        s3_str_t bn = { b->name, strlen(b->name) };
+        s3_bucket_meta_t bm;
+        if (store_bucket_meta(s, bn, &bm) != S3_OK) continue;
+        char buf[256];
+        int len = snprintf(buf, sizeof(buf), "id=%s\nbytes=%" PRIu64 "\nobjects=%" PRIu64 "\n",
+                           bm.id, b->bytes, b->objects);
+        if (store_bucket_sidecar_write(s, bn, "usage", buf, (size_t)len) != S3_OK) ok = 0;
+    }
+    char marker[4200];
+    snprintf(marker, sizeof(marker), "%s/.fs3-running", s->root);
+    if (ok) { unlink(marker); fsync_dir(s->root); }
+}
+
+/* ---- public API ---- */
+
+int store_valid_identity(const char *u) {
+    size_t n = u ? strlen(u) : 0;
+    if (n == 0 || n > 128) return 0;
+    for (size_t i = 0; i < n; i++) {
+        unsigned char ch = (unsigned char)u[i];
+        if (ch <= ' ' || ch >= 0x7f || ch == ':') return 0;
+    }
+    return 1;
+}
+
+void store_set_default_quotas(s3_store_t *s, uint64_t bucket_bytes, uint64_t user_bytes) {
+    pthread_mutex_lock(&s->q_mu);
+    s->q_def_bucket = bucket_bytes;
+    s->q_def_user = user_bytes;
+    pthread_mutex_unlock(&s->q_mu);
+}
+
+uint64_t store_quota_rejections(s3_store_t *s) {
+    pthread_mutex_lock(&s->q_mu);
+    uint64_t v = s->q_rejections;
+    pthread_mutex_unlock(&s->q_mu);
+    return v;
+}
+
+s3_err_t store_bucket_quota_set(s3_store_t *s, s3_str_t bucket,
+                                uint64_t max_bytes, uint64_t max_objects) {
+    if (!s || !valid_bucket_name(bucket)) return S3_ERR_INVALID_BUCKET_NAME;
+    char buf[128];
+    int n = snprintf(buf, sizeof(buf), "max_bytes=%" PRIu64 "\nmax_objects=%" PRIu64 "\n",
+                     max_bytes, max_objects);
+    s3_err_t e = store_bucket_sidecar_write(s, bucket, "quota", buf, (size_t)n);
+    if (e != S3_OK) return e;
+    char bn[64];
+    snprintf(bn, sizeof(bn), S3_STR_FMT, S3_STR_ARG(bucket));
+    pthread_mutex_lock(&s->q_mu);
+    struct q_bucket *b = qb_find(s, bn);
+    if (b) { b->has_cfg = 1; b->max_bytes = max_bytes; b->max_objects = max_objects; }
+    pthread_mutex_unlock(&s->q_mu);
+    return S3_OK;
+}
+
+s3_err_t store_bucket_quota_clear(s3_store_t *s, s3_str_t bucket) {
+    if (!s || !valid_bucket_name(bucket)) return S3_ERR_INVALID_BUCKET_NAME;
+    s3_err_t e = store_bucket_sidecar_delete(s, bucket, "quota");
+    if (e != S3_OK && e != S3_ERR_NO_SUCH_KEY) return e;
+    char bn[64];
+    snprintf(bn, sizeof(bn), S3_STR_FMT, S3_STR_ARG(bucket));
+    pthread_mutex_lock(&s->q_mu);
+    struct q_bucket *b = qb_find(s, bn);
+    if (b) b->has_cfg = 0;
+    pthread_mutex_unlock(&s->q_mu);
+    return S3_OK;
+}
+
+s3_err_t store_bucket_usage(s3_store_t *s, s3_str_t bucket, s3_quota_usage_t *out) {
+    if (!s || !out) return S3_ERR_INVALID_ARGUMENT;
+    memset(out, 0, sizeof(*out));
+    if (!valid_bucket_name(bucket)) return S3_ERR_INVALID_BUCKET_NAME;
+    char bn[64];
+    snprintf(bn, sizeof(bn), S3_STR_FMT, S3_STR_ARG(bucket));
+    pthread_mutex_lock(&s->q_mu);
+    struct q_bucket *b = qb_find(s, bn);
+    if (b) {
+        out->bytes = b->bytes; out->objects = b->objects;
+        out->reserved = b->rbytes;
+        out->has_cfg = b->has_cfg;
+        qb_limits(s, b, &out->max_bytes, &out->max_objects);
+        snprintf(out->owner, sizeof(out->owner), "%s", b->owner);
+    }
+    pthread_mutex_unlock(&s->q_mu);
+    return b ? S3_OK : S3_ERR_NO_SUCH_BUCKET;
+}
+
+static s3_err_t user_quota_path(const s3_store_t *s, const char *user,
+                                char *dir, size_t dcap, char *path, size_t pcap) {
+    if (!store_valid_identity(user)) return S3_ERR_INVALID_ARGUMENT;
+    char hx[260];
+    hex_name(user, hx, sizeof(hx));          /* never a path from the raw name */
+    snprintf(dir, dcap, "%s/users", s->root);
+    if (snprintf(path, pcap, "%s/%s.quota", dir, hx) >= (int)pcap) return S3_ERR_INTERNAL;
+    return S3_OK;
+}
+
+s3_err_t store_user_quota_set(s3_store_t *s, const char *user,
+                              uint64_t max_bytes, uint64_t max_objects) {
+    char dir[4200], path[4600];
+    s3_err_t e = user_quota_path(s, user, dir, sizeof(dir), path, sizeof(path));
+    if (e != S3_OK) return e;
+    if (mkdir_p(dir, 0700) < 0) return map_io_err(errno);
+    char buf[128];
+    int n = snprintf(buf, sizeof(buf), "max_bytes=%" PRIu64 "\nmax_objects=%" PRIu64 "\n",
+                     max_bytes, max_objects);
+    e = write_file_atomic(dir, path, buf, (size_t)n);
+    if (e != S3_OK) return e;
+    pthread_mutex_lock(&s->q_mu);
+    struct q_user *u = qu_find(s, user);
+    if (!u && s->qu_n == s->qu_cap) {
+        size_t nc = s->qu_cap ? s->qu_cap * 2 : 8;
+        struct q_user *nu = realloc(s->qu, nc * sizeof(*nu));
+        if (nu) { s->qu = nu; s->qu_cap = nc; }
+    }
+    if (!u && s->qu_n < s->qu_cap) {
+        u = &s->qu[s->qu_n++];
+        snprintf(u->user, sizeof(u->user), "%s", user);
+    }
+    if (u) { u->max_bytes = max_bytes; u->max_objects = max_objects; }
+    pthread_mutex_unlock(&s->q_mu);
+    return u ? S3_OK : S3_ERR_INTERNAL;
+}
+
+s3_err_t store_user_quota_clear(s3_store_t *s, const char *user) {
+    char dir[4200], path[4600];
+    s3_err_t e = user_quota_path(s, user, dir, sizeof(dir), path, sizeof(path));
+    if (e != S3_OK) return e;
+    if (unlink(path) < 0 && errno != ENOENT) return map_io_err(errno);
+    fsync_dir(dir);
+    pthread_mutex_lock(&s->q_mu);
+    struct q_user *u = qu_find(s, user);
+    if (u) *u = s->qu[--s->qu_n];
+    pthread_mutex_unlock(&s->q_mu);
+    return S3_OK;
+}
+
+s3_err_t store_user_usage(s3_store_t *s, const char *user, s3_quota_usage_t *out) {
+    if (!s || !out || !store_valid_identity(user)) return S3_ERR_INVALID_ARGUMENT;
+    memset(out, 0, sizeof(*out));
+    pthread_mutex_lock(&s->q_mu);
+    for (size_t i = 0; i < s->qb_n; i++) {
+        if (strcmp(s->qb[i].owner, user)) continue;
+        out->bytes += s->qb[i].bytes;
+        out->objects += s->qb[i].objects;
+        out->reserved += s->qb[i].rbytes;
+    }
+    out->has_cfg = qu_find(s, user) != NULL;
+    qu_limits(s, user, &out->max_bytes, &out->max_objects);
+    snprintf(out->owner, sizeof(out->owner), "%s", user);
+    pthread_mutex_unlock(&s->q_mu);
+    return S3_OK;
+}
+
+s3_err_t store_quota_recount(s3_store_t *s, s3_str_t bucket, int64_t *drift_bytes) {
+    if (!s || !valid_bucket_name(bucket)) return S3_ERR_INVALID_BUCKET_NAME;
+    char bn[64];
+    snprintf(bn, sizeof(bn), S3_STR_FMT, S3_STR_ARG(bucket));
+    uint64_t b = 0, o = 0;
+    q_walk_bucket(s, bn, &b, &o);
+    pthread_mutex_lock(&s->q_mu);
+    struct q_bucket *qb = qb_find(s, bn);
+    if (qb) {
+        if (drift_bytes) *drift_bytes = (int64_t)qb->bytes - (int64_t)b;
+        qb->bytes = b; qb->objects = o;
+    }
+    pthread_mutex_unlock(&s->q_mu);
+    return qb ? S3_OK : S3_ERR_NO_SUCH_BUCKET;
+}

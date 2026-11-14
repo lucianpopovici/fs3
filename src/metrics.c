@@ -128,6 +128,37 @@ int metrics_render(const fs3_metrics_t *m, struct s3_store *store,
          "fs3_storage_free_bytes %llu\n",
          (unsigned long long)st.volume_free_bytes);
 
+    EMIT("# HELP fs3_quota_rejections_total Writes refused because a bucket or user quota was reached.\n"
+         "# TYPE fs3_quota_rejections_total counter\n"
+         "fs3_quota_rejections_total %llu\n",
+         (unsigned long long)store_quota_rejections((s3_store_t *)store));
+    /* Per-bucket usage and limits (logical bytes, all versions and
+     * in-flight parts). Bucket names are label-safe ([a-z0-9.-]). */
+    s3_bucket_info_t *bl = NULL;
+    size_t nb = 0;
+    if (store_list_buckets((s3_store_t *)store, &bl, &nb) == S3_OK) {
+        EMIT("# HELP fs3_bucket_bytes Logical bytes stored in a bucket (quota usage).\n"
+             "# TYPE fs3_bucket_bytes gauge\n");
+        for (size_t i = 0; i < nb; i++) {
+            s3_quota_usage_t u;
+            if (store_bucket_usage((s3_store_t *)store, (s3_str_t){ bl[i].name, strlen(bl[i].name) },
+                                   &u) != S3_OK) continue;
+            if (off + 256 > cap) break;
+            EMIT("fs3_bucket_bytes{bucket=\"%s\"} %llu\n", bl[i].name, (unsigned long long)u.bytes);
+        }
+        EMIT("# HELP fs3_bucket_quota_bytes Byte limit of a bucket (0 = unlimited).\n"
+             "# TYPE fs3_bucket_quota_bytes gauge\n");
+        for (size_t i = 0; i < nb; i++) {
+            s3_quota_usage_t u;
+            if (store_bucket_usage((s3_store_t *)store, (s3_str_t){ bl[i].name, strlen(bl[i].name) },
+                                   &u) != S3_OK) continue;
+            if (off + 256 > cap) break;
+            EMIT("fs3_bucket_quota_bytes{bucket=\"%s\"} %llu\n", bl[i].name,
+                 (unsigned long long)u.max_bytes);
+        }
+        store_buckets_free(bl, nb);
+    }
+
 #undef EMIT
     return (int)off;
 }

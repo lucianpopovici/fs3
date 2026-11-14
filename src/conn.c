@@ -217,6 +217,8 @@ static void request_reset(conn_t *c) {
     c->req_start_ns = 0;
     c->bytes_out_body = 0;
     c->metrics_flushed = 0;
+    c->last_err = 0;
+    c->expect_pending = 0;
 
     /* Belt-and-suspenders: by the time we reset, route_dispatch_complete
      * (PUT path) or route_dispatch_send_body (GET path) should have
@@ -715,6 +717,11 @@ static int cb_on_headers_complete(llhttp_t *p) {
     /* Dispatch to the router. For PUT this opens a writer (so on_body
      * can stream into it); for GET/HEAD/DELETE/list, this builds the
      * full response now and transitions to CST_WRITE_RESPONSE. */
+    {
+        const s3_str_t *exh = find_hdr(c, "expect");
+        c->expect_pending = exh && exh->n == 12 && strncasecmp(exh->p, "100-continue", 12) == 0
+                            && (c->req.chunked || c->req.content_length_hint > 0);
+    }
     if (route_dispatch_headers(c) < 0) {
         return -1;
     }
@@ -731,6 +738,7 @@ static int cb_on_headers_complete(llhttp_t *p) {
     if (ex && ex->n == 12 && strncasecmp(ex->p, "100-continue", 12) == 0) {
         static const char cont[] = "HTTP/1.1 100 Continue\r\n\r\n";
         (void)!conn_io_write(c, cont, sizeof(cont) - 1);
+        c->expect_pending = 0;
     }
 
     /* Additional checksums (x-amz-checksum-* header or trailer,

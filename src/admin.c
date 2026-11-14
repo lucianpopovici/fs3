@@ -365,6 +365,75 @@ static int has_sidecar(admin_ctx_t *a, s3_str_t b, const char *name) {
     return 1;
 }
 
+/* ---- Quotas (round 2, item 2) ------------------------------------------- */
+
+/* Non-negative integer field; absent → 0. -1 if present but not one. */
+static int json_u64_field(const json_t *obj, const char *key, uint64_t *out) {
+    const json_t *j = json_get(obj, key);
+    *out = 0;
+    if (!j || j->type == JSON_NULL) return 0;
+    if (j->type != JSON_NUM || !j->str || !j->str[0] || strlen(j->str) > 19) return -1;
+    for (const char *c = j->str; *c; c++) if (*c < '0' || *c > '9') return -1;
+    *out = strtoull(j->str, NULL, 10);
+    return 0;
+}
+
+static void quota_json(const s3_quota_usage_t *u, char *out, size_t cap, size_t *o) {
+    *o += (size_t)snprintf(out + *o, cap - *o,
+        "\"usage\":{\"bytes\":%llu,\"objects\":%llu,\"reserved\":%llu},"
+        "\"quota\":{\"max_bytes\":%llu,\"max_objects\":%llu,\"explicit\":%s}",
+        (unsigned long long)u->bytes, (unsigned long long)u->objects,
+        (unsigned long long)u->reserved, (unsigned long long)u->max_bytes,
+        (unsigned long long)u->max_objects, u->has_cfg ? "true" : "false");
+}
+
+/* GET / PUT {"max_bytes":N,"max_objects":N} / DELETE on a bucket's or
+ * user's quota (user == NULL: bucket b). */
+static char *quota_route(admin_ctx_t *a, const areq_t *rq, s3_str_t b, const char *user,
+                         size_t *rn) {
+    s3_err_t e = S3_OK;
+    char what[200];
+    if (user) snprintf(what, sizeof(what), "user %s", user);
+    else      snprintf(what, sizeof(what), "bucket %.*s", (int)b.n, b.p);
+    if (!strcmp(rq->method, "PUT")) {
+        json_t *j = json_parse(rq->body, rq->body_n, 4, 64);
+        uint64_t mb = 0, mo = 0;
+        int bad = !j || json_u64_field(j, "max_bytes", &mb) < 0
+               || json_u64_field(j, "max_objects", &mo) < 0;
+        json_free(j);
+        if (bad) return err_json(400, "Bad Request",
+                                 "body must be {\"max_bytes\":N,\"max_objects\":N} (0 = unlimited)", rn);
+        e = user ? store_user_quota_set(a->cfg.store, user, mb, mo)
+                 : store_bucket_quota_set(a->cfg.store, b, mb, mo);
+        if (e == S3_OK) {
+            char ev[400];
+            snprintf(ev, sizeof(ev), "quota %s max_bytes=%llu max_objects=%llu", what,
+                     (unsigned long long)mb, (unsigned long long)mo);
+            LOG_I("admin: %s", ev);
+            audit_event("admin-api", ev);
+        }
+    } else if (!strcmp(rq->method, "DELETE")) {
+        e = user ? store_user_quota_clear(a->cfg.store, user)
+                 : store_bucket_quota_clear(a->cfg.store, b);
+        if (e == S3_OK) {
+            char ev[300];
+            snprintf(ev, sizeof(ev), "quota %s cleared", what);
+            audit_event("admin-api", ev);
+        }
+    } else if (strcmp(rq->method, "GET") != 0) {
+        return err_json(405, "Method Not Allowed", "use GET, PUT or DELETE", rn);
+    }
+    if (e != S3_OK) return err_json(500, "Internal Server Error", "cannot write quota", rn);
+    s3_quota_usage_t u;
+    e = user ? store_user_usage(a->cfg.store, user, &u) : store_bucket_usage(a->cfg.store, b, &u);
+    if (e != S3_OK) return err_json(404, "Not Found", "no such bucket", rn);
+    char out[1024];
+    size_t o = (size_t)snprintf(out, sizeof(out), "{");
+    quota_json(&u, out, sizeof(out), &o);
+    snprintf(out + o, sizeof(out) - o, "}\n");
+    return respond(200, "OK", out, rn);
+}
+
 static char *bucket_json(admin_ctx_t *a, const char *name, int detail,
                          char *out, size_t cap, size_t *o) {
     s3_str_t b = { name, strlen(name) };
@@ -378,6 +447,11 @@ static char *bucket_json(admin_ctx_t *a, const char *name, int detail,
     json_put_str(out, cap, o, m.owner);
     *o += (size_t)snprintf(out + *o, cap - *o, ",\"objects\":%llu,\"bytes\":%llu",
                            (unsigned long long)st.objects, (unsigned long long)st.bytes);
+    s3_quota_usage_t qu;
+    if (store_bucket_usage(a->cfg.store, b, &qu) == S3_OK && *o + 300 < cap) {
+        out[(*o)++] = ',';
+        quota_json(&qu, out, cap, o);
+    }
     if (detail) {
         *o += (size_t)snprintf(out + *o, cap - *o, ",\"id\":");
         json_put_str(out, cap, o, m.id);
@@ -414,7 +488,7 @@ static char *buckets_list(admin_ctx_t *a, size_t *rn) {
     size_t nb = 0;
     if (store_list_buckets(a->cfg.store, &bl, &nb) != S3_OK)
         return err_json(500, "Internal Server Error", "cannot list buckets", rn);
-    size_t cap = 512 + nb * 512, o = 0;
+    size_t cap = 512 + nb * 768, o = 0;
     char *out = malloc(cap);
     if (!out) { store_buckets_free(bl, nb); return NULL; }
     o += (size_t)snprintf(out, cap, "{\"buckets\":[");
@@ -469,6 +543,7 @@ static char *bucket_route(admin_ctx_t *a, const areq_t *rq, const char *rest,
         { char ev[1400]; snprintf(ev, sizeof(ev), "bucket %s owner %s", name, owner); audit_event("admin-api", ev); }
         return respond(200, "OK", "{\"ok\":true}\n", rn);
     }
+    if (!strcmp(sub, "quota")) return quota_route(a, rq, b, NULL, rn);
     if (!strncmp(sub, "grants/", 7)) {
         const char *user = sub + 7;
         if (!s3_valid_ident_strict(user))
@@ -541,5 +616,18 @@ char *admin_handle_v1(admin_ctx_t *a, const char *req, size_t n, int via_uds,
         return buckets_list(a, rn);
     }
     if (!strncmp(p, "/v1/buckets/", 12)) return bucket_route(a, &rq, p + 12, rn);
+    if (!strncmp(p, "/v1/users/", 10)) {
+        /* /v1/users/<u>/quota */
+        const char *u = p + 10, *sl = strchr(u, '/');
+        char user[129];
+        size_t un = sl ? (size_t)(sl - u) : 0;
+        if (!sl || strcmp(sl, "/quota") || un == 0 || un >= sizeof(user))
+            return err_json(404, "Not Found", "no such endpoint", rn);
+        memcpy(user, u, un);
+        user[un] = '\0';
+        if (!s3_valid_ident_strict(user))
+            return err_json(400, "Bad Request", "user must match [A-Za-z0-9._@-]{1,128}", rn);
+        return quota_route(a, &rq, S3_STR_NULL, user, rn);
+    }
     return err_json(404, "Not Found", "no such endpoint", rn);
 }

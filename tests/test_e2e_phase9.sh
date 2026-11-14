@@ -14,7 +14,7 @@ LOG=/tmp/fs3-p9-e2e-$$.log
 URL="http://127.0.0.1:$PORT"
 
 cleanup() {
-    [ -n "${SP:-}" ] && kill "$SP" 2>/dev/null || true
+    [ -n "${SP:-}" ] && { kill "$SP" 2>/dev/null; wait "$SP" 2>/dev/null; } || true
     rm -rf "$DATA"
     rm -f /tmp/fs3-p9-$$.*
 }

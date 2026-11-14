@@ -17,7 +17,7 @@ AK=AKIAVERSIONING01
 SK=versioningSecret012345678901234567890123456
 
 cleanup() {
-    [ -n "${SP:-}" ] && kill "$SP" 2>/dev/null || true
+    [ -n "${SP:-}" ] && { kill "$SP" 2>/dev/null; wait "$SP" 2>/dev/null; } || true
     rm -rf "$DATA" "$LOG"
 }
 trap cleanup EXIT

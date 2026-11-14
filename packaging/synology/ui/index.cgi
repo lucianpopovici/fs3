@@ -268,7 +268,8 @@ the LAN instead, set <code>FS3_BIND=0.0.0.0</code> in <code>${CONF_FILE}</code>
 and restart the package.</p>"
 fi
 
-# Bucket stats from the admin listener: "<name> <objects> <bytes>" lines.
+# Bucket stats from the admin listener: "<name> <objects> <bytes> [<quota> <quota-used>]"
+# lines (quota 0 = none).
 BUCKETS_HTML=""
 if BUCKETS_TXT="$(fetch_admin /buckets)"; then
     if [ -n "${BUCKETS_TXT}" ]; then
@@ -283,7 +284,14 @@ if BUCKETS_TXT="$(fetch_admin /buckets)"; then
                 else if (b < 1048576)    hs = sprintf("%.1f KiB", b / 1024)
                 else if (b < 1073741824) hs = sprintf("%.1f MiB", b / 1048576)
                 else                     hs = sprintf("%.2f GiB", b / 1073741824)
-                printf "<tr><td><code>%s</code></td><td>%s</td><td>%s</td></tr>\n", name, $2, hs
+                q = $4 + 0; qu = $5 + 0
+                if (q > 0) {
+                    if      (q < 1048576)    qs = sprintf("%.1f KiB", q / 1024)
+                    else if (q < 1073741824) qs = sprintf("%.1f MiB", q / 1048576)
+                    else                     qs = sprintf("%.2f GiB", q / 1073741824)
+                    qs = sprintf("%d%% of %s", int(qu * 100 / q), qs)
+                } else qs = "&mdash;"
+                printf "<tr><td><code>%s</code></td><td>%s</td><td>%s</td><td>%s</td></tr>\n", name, $2, hs, qs
                 nb++; tobj += $2; tb += b
                 if      (tb < 1024)       ts = sprintf("%d B", tb)
                 else if (tb < 1048576)    ts = sprintf("%.1f KiB", tb / 1024)
@@ -292,10 +300,10 @@ if BUCKETS_TXT="$(fetch_admin /buckets)"; then
             }
             END {
                 if (nb > 1)
-                    printf "<tr class=\"tot\"><td>%d buckets</td><td>%s</td><td>%s</td></tr>\n", nb, tobj, ts
+                    printf "<tr class=\"tot\"><td>%d buckets</td><td>%s</td><td>%s</td><td></td></tr>\n", nb, tobj, ts
             }')"
         BUCKETS_HTML="<table>
-<tr><th>Bucket</th><th>Objects</th><th>Size</th></tr>
+<tr><th>Bucket</th><th>Objects</th><th>Size</th><th>Quota</th></tr>
 ${ROWS}
 </table>"
     else

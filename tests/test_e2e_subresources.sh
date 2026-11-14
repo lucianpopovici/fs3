@@ -14,7 +14,7 @@ LOG=/tmp/fs3-sub-e2e-$$.log
 URL="http://127.0.0.1:$PORT"
 
 cleanup() {
-    [ -n "${SP:-}" ] && kill "$SP" 2>/dev/null || true
+    [ -n "${SP:-}" ] && { kill "$SP" 2>/dev/null; wait "$SP" 2>/dev/null; } || true
     rm -rf "$DATA" "$LOG"
 }
 trap cleanup EXIT

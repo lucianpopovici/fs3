@@ -1219,6 +1219,22 @@ static void emit_object_meta(conn_t *c, s3_reader_t *r, s3_obj_meta_t *m, int ov
     }
 }
 
+/* The body length a client declared: x-amz-decoded-content-length for
+ * aws-chunked, else Content-Length (0 when unknown, e.g. chunked
+ * transfer encoding). Quota reserves it before any byte is stored. */
+static uint64_t declared_body_len(const conn_t *c) {
+    const s3_str_t *d = hdr_get(c, "x-amz-decoded-content-length");
+    if (d) {
+        uint64_t v = 0;
+        for (size_t i = 0; i < d->n && i < 19; i++) {
+            if (d->p[i] < '0' || d->p[i] > '9') return 0;
+            v = v * 10 + (uint64_t)(d->p[i] - '0');
+        }
+        return v;
+    }
+    return c->req.chunked ? 0 : c->req.content_length_hint;
+}
+
 static int handle_object_put_begin(conn_t *c, s3_str_t bucket, s3_str_t key) {
     char ct_buf[1025];
     s3_err_t e = req_content_type(c, ct_buf, NULL);
@@ -1234,6 +1250,8 @@ static int handle_object_put_begin(conn_t *c, s3_str_t bucket, s3_str_t key) {
     s3_writer_t *w;
     e = store_put_begin_opts(c->store, bucket, key, &o, &w);
     free(tlv);
+    if (e == S3_OK && (e = store_put_expect(w, declared_body_len(c))) != S3_OK)
+        store_put_abort(w);
     if (e != S3_OK) {
         return rsp_build_s3_error(c, e, c->req.path, NULL);
     }
@@ -1422,12 +1440,16 @@ static void copy_run(iojob_t *j) {
     cksum_ctx_t k;
     memset(&k, 0, sizeof(k));
     if (cj->ck_algo && cksum_begin(&k, cj->ck_algo) < 0) stream_ok = 0;
+    s3_err_t werr = S3_ERR_INTERNAL;
     while (stream_ok) {
         ssize_t n = store_get_read(cj->r, xbuf, sizeof(xbuf));
         if (n == 0) break;
         if (n > 0 && cj->ck_algo) cksum_update(&k, xbuf, (size_t)n);
-        if (n < 0 || (cj->part ? store_mpu_part_write(cj->w, xbuf, (size_t)n)
-                               : store_put_write(cj->w, xbuf, (size_t)n)) != S3_OK) {
+        s3_err_t we = n < 0 ? S3_ERR_INTERNAL
+                    : cj->part ? store_mpu_part_write(cj->w, xbuf, (size_t)n)
+                               : store_put_write(cj->w, xbuf, (size_t)n);
+        if (we != S3_OK) {
+            werr = we;
             stream_ok = 0;
             break;
         }
@@ -1445,7 +1467,7 @@ static void copy_run(iojob_t *j) {
     if (!stream_ok) {
         if (cj->part) store_mpu_part_abort(cj->w);
         else          store_put_abort(cj->w);
-        cj->err = S3_ERR_INTERNAL;
+        cj->err = werr;
         return;
     }
     if (cj->part) {
@@ -1704,6 +1726,16 @@ static int handle_object_copy(conn_t *c, s3_str_t dst_bucket, s3_str_t dst_key) 
         e = store_put_begin_opts(c->store, dst_bucket, dst_key, &po, &writer);
     }
     free(tlv);
+    if (e == S3_OK) {
+        uint64_t rem = 0;
+        int rfd; off_t roff;
+        store_get_raw(reader, &rfd, &roff, &rem);
+        if ((e = store_put_expect(writer, rem)) != S3_OK) {
+            if (part) store_mpu_part_abort(writer);
+            else      store_put_abort(writer);
+            writer = NULL;
+        }
+    }
     if (e != S3_OK) {
         store_get_close(reader);
         free(src_buf);
@@ -1791,6 +1823,8 @@ static int handle_mpu_upload_part_begin(conn_t *c, s3_str_t bucket, s3_str_t key
     s3_writer_t *w;
     s3_err_t e = store_mpu_part_begin(c->store, bucket, key,
                                        upload_id, part_number, &w);
+    if (e == S3_OK && (e = store_put_expect(w, declared_body_len(c))) != S3_OK)
+        store_mpu_part_abort(w);
     if (e != S3_OK) {
         return rsp_build_s3_error(c, e, c->req.path, NULL);
     }

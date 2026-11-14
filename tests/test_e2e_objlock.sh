@@ -16,7 +16,7 @@ A=AKIAOBJLOCKUSER1; AS=objlockUserSecret0123456789012345678901
 R=AKIAOBJLOCKROOT1; RS=objlockRootSecret0123456789012345678901
 
 cleanup() {
-    [ -n "${SP:-}" ] && kill "$SP" 2>/dev/null || true
+    [ -n "${SP:-}" ] && { kill "$SP" 2>/dev/null; wait "$SP" 2>/dev/null; } || true
     rm -rf "$DATA" "$LOG"
 }
 trap cleanup EXIT

@@ -19,7 +19,7 @@ AK=AKIATLSTEST00001
 SK=tlsTestSecret0123456789012345678901234567
 
 cleanup() {
-    [ -n "${SP:-}" ] && kill "$SP" 2>/dev/null || true
+    [ -n "${SP:-}" ] && { kill "$SP" 2>/dev/null; wait "$SP" 2>/dev/null; } || true
     rm -rf "$DATA" "$LOG" "$T".*
 }
 trap cleanup EXIT

@@ -85,6 +85,8 @@ static void usage(const char *argv0) {
         "      --tls-addr <ip>        TLS bind address (default: --addr)\n"
         "      --tls-cert <pem>       certificate chain; --tls-key <pem> key (mode 0600)\n"
         "                             SIGHUP re-reads both (a bad file keeps the old ones)\n"
+        "      --default-bucket-quota N  byte limit for buckets without their own quota (0 = none)\n"
+        "      --default-user-quota N    byte limit per user, over the buckets they own (0 = none)\n"
         "      --mpu-min-part-size N  minimum size of every multipart part but the last\n"
         "                             (default 5M, as S3; 0 = none)\n"
         "      --audit-log <file>     append one JSON line per request + admin change\n"
@@ -300,6 +302,8 @@ enum {
     OPT_AUDIT_LOG,
     OPT_AUTH_FAIL_LIMIT,
     OPT_MPU_MIN_PART_SIZE,
+    OPT_DEFAULT_BUCKET_QUOTA,
+    OPT_DEFAULT_USER_QUOTA,
 };
 
 #ifndef FS3_MAIN_TESTING
@@ -370,6 +374,7 @@ int main(int argc, char **argv) {
     const char *audit_log = NULL;
     int auth_fail_limit = 20;
     uint64_t mpu_min_part = 5ULL * 1024 * 1024;   /* S3's minimum */
+    uint64_t def_bucket_quota = 0, def_user_quota = 0;   /* 0 = unlimited */
     int tls_port = 0, require_tls = 0, require_signed_payload = 0, tls_max_per_ip = 32;
     const char *tls_addr = NULL, *tls_cert = NULL, *tls_key = NULL;
     char trusted_proxies[1024] = "";
@@ -418,6 +423,8 @@ int main(int argc, char **argv) {
         { "audit-log",        required_argument, NULL, OPT_AUDIT_LOG },
         { "auth-fail-limit",  required_argument, NULL, OPT_AUTH_FAIL_LIMIT },
         { "mpu-min-part-size", required_argument, NULL, OPT_MPU_MIN_PART_SIZE },
+        { "default-bucket-quota", required_argument, NULL, OPT_DEFAULT_BUCKET_QUOTA },
+        { "default-user-quota",   required_argument, NULL, OPT_DEFAULT_USER_QUOTA },
         { "require-signed-payload", no_argument, NULL, OPT_REQUIRE_SIGNED_PAYLOAD },
         { "verbose",          no_argument,       NULL, 'v' },
         { "help",             no_argument,       NULL, 'h' },
@@ -617,6 +624,18 @@ int main(int argc, char **argv) {
                     return 2;
                 }
                 break;
+            case OPT_DEFAULT_BUCKET_QUOTA:
+            case OPT_DEFAULT_USER_QUOTA: {
+                uint64_t v = strcmp(optarg, "0") == 0 ? 0 : parse_size(optarg);
+                if (strcmp(optarg, "0") && v == 0) {
+                    fprintf(stderr, "--default-%s-quota: invalid size '%s'\n",
+                            c == OPT_DEFAULT_BUCKET_QUOTA ? "bucket" : "user", optarg);
+                    return 2;
+                }
+                if (c == OPT_DEFAULT_BUCKET_QUOTA) def_bucket_quota = v;
+                else def_user_quota = v;
+                break;
+            }
             case OPT_AUTH_FAIL_LIMIT:
                 auth_fail_limit = atoi(optarg);
                 if (auth_fail_limit < 0) { fprintf(stderr, "--auth-fail-limit must be >= 0\n"); return 2; }
@@ -745,6 +764,8 @@ int main(int argc, char **argv) {
         .allow_public_write = allow_public_write,
         .max_retention_days = max_retention_days,
         .mpu_min_part_size = mpu_min_part,
+        .default_bucket_quota = def_bucket_quota,
+        .default_user_quota = def_user_quota,
         .tls_port        = (uint16_t)tls_port,
         .tls_addr        = tls_addr,
         .tls_cert        = tls_cert,

@@ -147,6 +147,8 @@ typedef struct conn {
     uint64_t           req_start_ns;
     uint64_t           bytes_out_body;
     int                metrics_flushed;
+    int                expect_pending; /* Expect: 100-continue not answered yet */
+    int                last_err;      /* s3_err_t of the error response, for the audit log */
 
     /* Read buffer: bytes are fed to llhttp via llhttp_execute() */
     char               rbuf[CONN_RBUF_SZ];

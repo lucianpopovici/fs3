@@ -92,6 +92,8 @@ typedef struct {
     /* Longest retention a client may set (S9), days; 0 = default 3650. */
     int                    max_retention_days;
     uint64_t               mpu_min_part_size;   /* Complete: EntityTooSmall below */
+    uint64_t               default_bucket_quota; /* bytes, 0 = unlimited */
+    uint64_t               default_user_quota;
 
     /* Admin API (item 11): /v1 on the metrics listener needs this bearer
      * token (NULL = disabled there); admin_socket adds a Unix-socket

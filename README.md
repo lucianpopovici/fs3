@@ -209,7 +209,9 @@ What's working end-to-end:
   the current key without a version id still works (it adds a version or
   marker). Setting retention needs the owner/`o` permission, not just
   `w`, and is capped by `--max-retention-days` (default 3650) so writers
-  can't fill the volume with undeletable data. A missing lock record
+  can't fill the volume with undeletable data. Locked versions count
+  toward quotas and cannot be deleted to get back under one: that is
+  intended. A missing lock record
   falls back to the bucket default; an unreadable one fails closed.
   Retention trusts the system clock; a backwards jump of more than an
   hour is logged. This is API-level WORM only: root on the NAS can still
@@ -301,6 +303,21 @@ What's working end-to-end:
   and presigned GET/HEAD and answer `400 InvalidRequest` on anonymous
   ones. The website listener serves the caching/encoding headers only.
 
+- **Quotas** — hard limits on logical bytes and object count per bucket
+  and per user (summed over the buckets the user owns). Current objects,
+  noncurrent versions, delete markers and in-flight multipart parts all
+  count, charged to the bucket owner whoever wrote them. Set them with
+  the admin API (`GET/PUT/DELETE /v1/buckets/<b>/quota`,
+  `/v1/users/<u>/quota`, body `{"max_bytes":N,"max_objects":N}`, 0 =
+  unlimited) or defaults `--default-bucket-quota` /
+  `--default-user-quota`. A write that would cross a limit is refused
+  with `403 QuotaExceeded` before any byte is stored (declared length,
+  or as a chunked body streams); an overwrite is checked against its full
+  size. Lowering a quota below usage blocks writes and never deletes data.
+  Usage is kept in memory, written at clean shutdown and rebuilt from
+  disk after a crash. Prometheus: `fs3_bucket_bytes`,
+  `fs3_bucket_quota_bytes`, `fs3_quota_rejections_total`.
+
 - **Listing** — ListObjectsV2 (`continuation-token`, `start-after`,
   `fetch-owner`, `KeyCount`), `encoding-type=url` on both list versions,
   and ListMultipartUploads pagination (`key-marker`, `upload-id-marker`,
@@ -314,7 +331,7 @@ What's working end-to-end:
 
 What's *not* yet wired:
 
-- Per-bucket / per-user quotas, background integrity scrub, key expiry /
+- Background integrity scrub, key expiry /
   disable, SSE-C, seccomp, `FS_IMMUTABLE_FL` for COMPLIANCE versions.
 - Tag-based lifecycle filters, transitions, website routing rules (all
   refused with 501 rather than ignored).

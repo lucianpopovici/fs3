@@ -14,7 +14,7 @@ URL="http://127.0.0.1:$PORT"
 A=AKIALISTALICE001; AS=listAliceSecret01234567890123456789012
 
 cleanup() {
-    [ -n "${SP:-}" ] && kill "$SP" 2>/dev/null || true
+    [ -n "${SP:-}" ] && { kill "$SP" 2>/dev/null; wait "$SP" 2>/dev/null; } || true
     rm -rf "$DATA" "$LOG"
 }
 trap cleanup EXIT

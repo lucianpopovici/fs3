@@ -159,10 +159,16 @@ static int admin_render_buckets(struct s3_store *store,
         s3_bucket_stats_t bs;
         s3_str_t name = { list[i].name, strlen(list[i].name) };
         if (store_bucket_stats(store, name, &bs) != S3_OK) continue;
-        int w = snprintf(buf + off, cap - off, "%s %llu %llu\n",
+        /* 4th column: byte quota (0 = none) and 5th: quota usage
+         * (logical bytes incl. versions and in-flight parts). */
+        s3_quota_usage_t qu;
+        if (store_bucket_usage(store, name, &qu) != S3_OK) memset(&qu, 0, sizeof(qu));
+        int w = snprintf(buf + off, cap - off, "%s %llu %llu %llu %llu\n",
                          list[i].name,
                          (unsigned long long)bs.objects,
-                         (unsigned long long)bs.bytes);
+                         (unsigned long long)bs.bytes,
+                         (unsigned long long)qu.max_bytes,
+                         (unsigned long long)qu.bytes);
         if (w < 0 || (size_t)w >= cap - off) { rc = -1; break; }
         off += (size_t)w;
     }
@@ -464,6 +470,7 @@ server_t *server_create(const server_cfg_t *cfg) {
      * version (item 10). */
     store_set_version_guard(s->store, olock_guard, s->store);
     store_set_mpu_min_part_size(s->store, cfg->mpu_min_part_size);
+    store_set_default_quotas(s->store, cfg->default_bucket_quota, cfg->default_user_quota);
     return s;
 
 fail:

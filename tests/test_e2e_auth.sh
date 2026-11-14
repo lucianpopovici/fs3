@@ -18,7 +18,7 @@ AK=AKIATESTAUTH123
 SK=secretValue1234567890123456789012345678901
 
 cleanup() {
-    [ -n "${SP:-}" ] && kill "$SP" 2>/dev/null || true
+    [ -n "${SP:-}" ] && { kill "$SP" 2>/dev/null; wait "$SP" 2>/dev/null; } || true
     rm -rf "$DATA"
     rm -f /tmp/fs3-auth-body.$$ /tmp/fs3-auth-out.$$
 }

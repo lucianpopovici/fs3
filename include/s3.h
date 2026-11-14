@@ -53,7 +53,8 @@ typedef enum {
     S3_ERR_ENTITY_TOO_SMALL,
     S3_ERR_PRECONDITION_FAILED,
     S3_ERR_INVALID_RANGE,
-    S3_ERR_METADATA_TOO_LARGE,               /* x-amz-copy-source-range outside the source */
+    S3_ERR_METADATA_TOO_LARGE,
+    S3_ERR_QUOTA_EXCEEDED,               /* x-amz-copy-source-range outside the source */
     S3_ERR_MAX
 } s3_err_t;
 

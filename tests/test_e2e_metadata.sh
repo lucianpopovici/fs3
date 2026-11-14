@@ -15,7 +15,7 @@ WURL="http://127.0.0.1:$WPORT"
 A=AKIAMETAALICE001; AS=metaAliceSecret01234567890123456789012
 
 cleanup() {
-    [ -n "${SP:-}" ] && kill "$SP" 2>/dev/null || true
+    [ -n "${SP:-}" ] && { kill "$SP" 2>/dev/null; wait "$SP" 2>/dev/null; } || true
     rm -rf "$DATA" "$LOG"
 }
 trap cleanup EXIT

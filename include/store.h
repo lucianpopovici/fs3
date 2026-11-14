@@ -511,6 +511,38 @@ s3_err_t store_mpu_list_parts(s3_store_t *s, s3_str_t bucket, s3_str_t key,
                               s3_part_info_t **out, size_t *n_out, int *truncated,
                               uint8_t *algo_out, uint8_t *type_out);
 
+/* ---- Quotas (round 2, item 2) ----
+ *
+ * Hard limits on logical bytes and object count per bucket (sidecar
+ * buckets/<b>/quota) and per user (sum over the buckets they own; file
+ * users/<hex(user)>.quota). 0 = unlimited. Without a bucket sidecar the
+ * --default-bucket-quota applies; without a user file the
+ * --default-user-quota. Writes over a limit fail with
+ * S3_ERR_QUOTA_EXCEEDED before bytes reach disk. Lowering a limit below
+ * current usage blocks new writes and never deletes data. */
+typedef struct {
+    uint64_t bytes, objects, reserved;
+    uint64_t max_bytes, max_objects;   /* effective limits */
+    int      has_cfg;                  /* explicit (not default) limit */
+    char     owner[129];
+} s3_quota_usage_t;
+void     store_set_default_quotas(s3_store_t *s, uint64_t bucket_bytes, uint64_t user_bytes);
+s3_err_t store_bucket_quota_set(s3_store_t *s, s3_str_t bucket,
+                                uint64_t max_bytes, uint64_t max_objects);
+s3_err_t store_bucket_quota_clear(s3_store_t *s, s3_str_t bucket);
+s3_err_t store_bucket_usage(s3_store_t *s, s3_str_t bucket, s3_quota_usage_t *out);
+s3_err_t store_user_quota_set(s3_store_t *s, const char *user,
+                              uint64_t max_bytes, uint64_t max_objects);
+s3_err_t store_user_quota_clear(s3_store_t *s, const char *user);
+s3_err_t store_user_usage(s3_store_t *s, const char *user, s3_quota_usage_t *out);
+uint64_t store_quota_rejections(s3_store_t *s);
+/* Recompute a bucket's usage from disk (scrub); *drift = old - new. */
+s3_err_t store_quota_recount(s3_store_t *s, s3_str_t bucket, int64_t *drift_bytes);
+/* Reserve quota for a body of n bytes (declared length) before it
+ * streams; writes past it reserve as they go. */
+s3_err_t store_put_expect(s3_writer_t *w, uint64_t n);
+int      store_valid_identity(const char *u);
+
 /* ---- Multipart GC ----
  *
  * Sweep the MPU staging area and remove any upload whose ctime_ms is

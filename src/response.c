@@ -130,6 +130,7 @@ static const err_entry_t ERR_TABLE[] = {
     { S3_ERR_PRECONDITION_FAILED,        412, "PreconditionFailed",       "At least one of the pre-conditions you specified did not hold." },
     { S3_ERR_INVALID_RANGE,              416, "InvalidRange",             "The requested range is not satisfiable." },
     { S3_ERR_METADATA_TOO_LARGE,         400, "MetadataTooLarge",         "Your metadata headers exceed the maximum allowed metadata size." },
+    { S3_ERR_QUOTA_EXCEEDED,             403, "QuotaExceeded",            "The bucket or user quota would be exceeded." },
     { S3_ERR_MALFORMED_POLICY,           400, "MalformedPolicy",          "Policies must be valid JSON within the supported grammar." },
     { S3_ERR_INSUFFICIENT_STORAGE,       507, "QuotaExceeded",            "There is insufficient storage available to complete the request." },
 };
@@ -295,6 +296,7 @@ int rsp_build_s3_error(conn_t *c, s3_err_t err, s3_str_t resource,
                        const char *request_id) {
     const err_entry_t *te = err_lookup(err);
     metrics_error(c->metrics, err);
+    c->last_err = (int)err;
 
     /* Build the XML body. */
     XMLNode *root = create_node("Error");
@@ -311,7 +313,10 @@ int rsp_build_s3_error(conn_t *c, s3_err_t err, s3_str_t resource,
     free_tree(root);
     if (!body) return -1;
 
-    int keep = c->req.keep_alive && te->http_status < 500;
+    /* Refused before a "100 Continue": the client may never send the
+     * body it announced, and draining it would stall the connection, so
+     * close (RFC 9110 §10.1.1). */
+    int keep = c->req.keep_alive && te->http_status < 500 && !c->expect_pending;
 
     int n = snprintf(c->wbuf, CONN_WBUF_SZ,
         "HTTP/1.1 %d %s\r\n"

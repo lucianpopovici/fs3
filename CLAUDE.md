@@ -41,6 +41,12 @@ implemented on top of phase 12. Quick map of what it added:
 Load-bearing rules added on the way:
 - **Lock order:** a key stripe lock (`key_lock(hex)`) before `ns_mu`, never
   two stripe locks. Every multi-step mutation of one key holds its stripe.
+  `q_mu` (quota counters) is a leaf: take nothing while holding it.
+- **Quota accounting (round 2):** every key mutation measures
+  `key_usage()` before/after under its stripe and charges the delta; a
+  new path that adds or removes files in `data/`, `versions/` or `mpu/`
+  must do the same (or go through `delete_locked`/writer commit).
+  Writers own their reservation; `writer_free` releases it.
 - **Extra response headers** go through `conn_add_header()`; they are
   spliced into whatever head is built (`apply_extra_headers`). Don't add
   new parameters to the head builders.

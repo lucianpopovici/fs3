@@ -16,7 +16,7 @@ AK=AKIAAUDITTEST001
 SK=auditTestSecret01234567890123456789012345
 
 cleanup() {
-    [ -n "${SP:-}" ] && kill "$SP" 2>/dev/null || true
+    [ -n "${SP:-}" ] && { kill "$SP" 2>/dev/null; wait "$SP" 2>/dev/null; } || true
     rm -rf "$DATA" "$LOG" "$AUD" "$AUD".1
 }
 trap cleanup EXIT

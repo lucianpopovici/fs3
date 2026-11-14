@@ -15,7 +15,7 @@ A=AKIAPOLICYALICE1; AS=policyAliceSecret0123456789012345678901
 B=AKIAPOLICYBOB001; BS=policyBobSecret012345678901234567890123
 
 cleanup() {
-    [ -n "${SP:-}" ] && kill "$SP" 2>/dev/null || true
+    [ -n "${SP:-}" ] && { kill "$SP" 2>/dev/null; wait "$SP" 2>/dev/null; } || true
     rm -rf "$DATA" "$LOG"
 }
 trap cleanup EXIT
