@@ -3,6 +3,7 @@
 #include "response.h"
 #include "checksum.h"
 #include "log.h"
+#include "metrics.h"
 #include "xml_parser.h"
 
 #include <stdio.h>
@@ -129,6 +130,18 @@ static const err_entry_t *err_lookup(s3_err_t e) {
         if (ERR_TABLE[i].err == e) return &ERR_TABLE[i];
     }
     return &ERR_TABLE[0];
+}
+
+/* Distinct label per enum value for metrics (several errors share an S3
+ * code, e.g. AccessDenied). */
+const char *s3_err_name(s3_err_t e) {
+    switch (e) {
+    case S3_ERR_PRESIGN_EXPIRED:   return "PresignExpired";
+    case S3_ERR_INVALID_CHECKSUM:  return "InvalidChecksum";
+    case S3_ERR_CHECKSUM_MISMATCH: return "ChecksumMismatch";
+    case S3_ERR_BAD_DIGEST:        return "ContentSHA256Mismatch";
+    default: return err_lookup(e)->s3_code;
+    }
 }
 
 int rsp_status_for_err(s3_err_t err) { return err_lookup(err)->http_status; }
@@ -265,6 +278,7 @@ static char *xml_render_with_decl(const XMLNode *root, size_t *out_len) {
 int rsp_build_s3_error(conn_t *c, s3_err_t err, s3_str_t resource,
                        const char *request_id) {
     const err_entry_t *te = err_lookup(err);
+    metrics_error(c->metrics, err);
 
     /* Build the XML body. */
     XMLNode *root = create_node("Error");

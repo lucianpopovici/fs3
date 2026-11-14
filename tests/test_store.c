@@ -1671,6 +1671,39 @@ static void t_bucket_grants(void) {
     teardown_root();
 }
 
+static int walk_count_cb(void *u, s3_str_t k, const s3_obj_meta_t *m) {
+    (void)k; (void)m; (*(int *)u)++; return 0;
+}
+
+/* ---- Item 5 / S4: lifecycle expiry never deletes a newer PUT --------- */
+static void t_expire_if_unchanged(void) {
+    setup_root();
+    s3_store_t *s;
+    CHECK_EQ(store_open(&s, g_root), S3_OK, "open");
+    s3_str_t b = S3_STR_LIT("lcb"), k = S3_STR_LIT("tmp/a");
+    CHECK_EQ(store_bucket_create(s, b), S3_OK, "create");
+    CHECK_EQ(put(s, "lcb", "tmp/a", "old", 3, "", NULL), S3_OK, "put old");
+    s3_obj_meta_t m1, m2;
+    CHECK_EQ(store_head(s, b, k, &m1), S3_OK, "head old");
+    struct timespec ts = { 0, 5 * 1000000 };
+    nanosleep(&ts, NULL);
+    CHECK_EQ(put(s, "lcb", "tmp/a", "newer", 5, "", NULL), S3_OK, "put new");   /* "mid-sweep" PUT */
+    CHECK_EQ(store_expire_if_unchanged(s, b, k, m1.mtime_ms), S3_ERR_INVALID_REQUEST,
+             "changed object skipped");
+    CHECK_EQ(store_head(s, b, k, &m2), S3_OK, "newer survives");
+    CHECK_EQ(m2.size, 5, "newer content");
+    CHECK_EQ(store_expire_if_unchanged(s, b, k, m2.mtime_ms), S3_OK, "unchanged expires");
+    CHECK_EQ(store_head(s, b, k, &m2), S3_ERR_NO_SUCH_KEY, "gone");
+    CHECK_EQ(store_expire_if_unchanged(s, b, k, m2.mtime_ms), S3_ERR_NO_SUCH_KEY, "absent");
+    /* store_walk_objects visits every object once. */
+    put(s, "lcb", "x1", "1", 1, "", NULL); put(s, "lcb", "x2", "2", 1, "", NULL);
+    int count = 0;
+    CHECK_EQ(store_walk_objects(s, b, walk_count_cb, &count), S3_OK, "walk");
+    CHECK_EQ(count, 2, "walked two");
+    store_close(s);
+    teardown_root();
+}
+
 int main(void) {
     log_init(LOG_WARN);  /* suppress info chatter during tests */
 
@@ -1720,6 +1753,7 @@ int main(void) {
     t_reads_schema_v2_fixture();
     t_rejects_corrupt_header();
     t_bucket_grants();
+    t_expire_if_unchanged();
 
     if (failures == 0) { printf("ALL TESTS PASSED\n"); return 0; }
     printf("%d FAILURES\n", failures);

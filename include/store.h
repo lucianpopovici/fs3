@@ -434,5 +434,29 @@ void     store_mpu_uploads_free(s3_mpu_info_t *list, size_t n);
  * days but it's an admin policy, not a protocol requirement. */
 int      store_mpu_gc(s3_store_t *s, uint64_t now_ms, uint64_t max_age_ms);
 
+/* Per-bucket override for the global MPU GC (item 5): if set, uploads
+ * for which filter(user, bucket, key) returns 1 are governed by a bucket
+ * lifecycle rule and skipped by store_mpu_gc. */
+void     store_set_mpu_gc_filter(s3_store_t *s,
+                                 int (*filter)(void *user, s3_str_t bucket,
+                                               s3_str_t key),
+                                 void *user);
+
+/* ---- Object walk (lifecycle sweeper, scrub) ----
+ *
+ * Calls cb for every current object in `bucket` (unsorted, no key
+ * buffering — O(1) memory). Return non-zero from cb to stop early.
+ * Unreadable files are skipped. */
+typedef int (*store_walk_cb)(void *user, s3_str_t key, const s3_obj_meta_t *m);
+s3_err_t store_walk_objects(s3_store_t *s, s3_str_t bucket,
+                            store_walk_cb cb, void *user);
+
+/* Lifecycle expiry: delete `key` only if its current object still has
+ * mtime_ms — re-checked under the key's stripe lock, so a PUT that lands
+ * during a sweep is never deleted. S3_ERR_INVALID_REQUEST = changed,
+ * skipped. Goes through the normal delete path. */
+s3_err_t store_expire_if_unchanged(s3_store_t *s, s3_str_t bucket,
+                                   s3_str_t key, uint64_t mtime_ms);
+
 #endif
 

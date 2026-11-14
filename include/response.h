@@ -145,6 +145,9 @@ int rsp_build_bucket_versioning(conn_t *c);
 /* Map an s3_err_t to an HTTP status code. */
 int rsp_status_for_err(s3_err_t err);
 
+/* Stable per-enum label (metrics). */
+const char *s3_err_name(s3_err_t e);
+
 /* Map an s3_err_t to an S3 error code string (e.g. "NoSuchBucket"). */
 const char *rsp_code_for_err(s3_err_t err);
 

@@ -56,6 +56,17 @@ typedef struct {
      * startup. Ownerless buckets are otherwise admin-only under auth. */
     const char            *legacy_owner;
 
+    /* Lifecycle sweeper (item 5): runs on an iopool worker once a day at
+     * local hour `lifecycle_hour` (0-23; -1 disables), and at startup if
+     * lifecycle_now. lifecycle_rate caps deletions per second (0 = no
+     * cap). lifecycle_dry_run logs instead of deleting.
+     * lifecycle_time_offset_s shifts the sweeper's clock (tests only). */
+    int                    lifecycle_hour;
+    int                    lifecycle_now;
+    int                    lifecycle_rate;
+    int                    lifecycle_dry_run;
+    long                   lifecycle_time_offset_s;
+
     /* Optional tick callback, invoked from the event loop at most once
      * per second, between event batches (so never concurrently with a
      * request). main.c uses it to act on signal flags — e.g. the SIGHUP

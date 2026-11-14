@@ -149,6 +149,26 @@ What's working end-to-end:
   the practical cap is the directory entry limit, well above any
   realistic in-flight set).
 
+- **Lifecycle rules** — `PUT/GET/DELETE /bucket?lifecycle`:
+  `Filter/Prefix` (also `Filter/And/Prefix` and the legacy `Rule/Prefix`),
+  `Expiration/Days|Date`, `AbortIncompleteMultipartUpload/
+  DaysAfterInitiation`, plus `NoncurrentVersionExpiration` and
+  `ExpiredObjectDeleteMarker` for versioned buckets. Transitions and
+  tag/size filters are refused with `501` rather than silently ignored.
+  The sweeper runs on an I/O worker (never the event loop) once a day at
+  `--lifecycle-hour` (default 03:00 local; `--lifecycle-now` adds a run at
+  startup), deletes at most `--lifecycle-rate` objects per second
+  (default 100), and goes through a guarded delete: the object's header
+  is re-read under its stripe lock and left alone if a PUT replaced it
+  mid-sweep. `--lifecycle-dry-run` logs instead of deleting. A rule
+  whose `Expiration/Date` is already past (it would delete everything it
+  matches at the next sweep) needs the header
+  `x-fs3-confirm-immediate-expiry: true`. A bucket's
+  `AbortIncompleteMultipartUpload` rule overrides the global MPU TTL for
+  the keys it covers. Prometheus: `fs3_lifecycle_expired_total`,
+  `fs3_lifecycle_aborted_mpu_total`, `fs3_lifecycle_runs_total`; every
+  S3 error is also counted in `fs3_errors_total{error=…}`.
+
 - **Multipart upload GC** — periodic in-process sweep, piggybacking
   on the event loop's 1-second `epoll_wait` timeout. Defaults to
   60-second sweep cadence and 24-hour TTL; tunable per CLI via

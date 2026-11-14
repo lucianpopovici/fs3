@@ -11,6 +11,7 @@
 
 #include "server.h"
 #include "action.h"
+#include "lifecycle.h"
 #include "conn.h"
 #include "iopool.h"
 #include "log.h"
@@ -47,6 +48,9 @@ struct server {
      * timeout — once every gc_interval_ms of wall clock, sweep the MPU
      * staging area and reap any upload older than gc_max_age_ms. */
     time_t        gc_last_run;       /* monotonic seconds */
+    int           lc_running;        /* a sweep job is in flight */
+    int           lc_last_yday;      /* day of year of the last scheduled run */
+    int           lc_pending_now;    /* run at the first tick (--lifecycle-now) */
     int           gc_interval_s;     /* sweep cadence */
     uint64_t      gc_max_age_ms;     /* TTL */
     /* Idle-connection sweep (cfg.idle_timeout_s > 0). Runs at most once
@@ -315,6 +319,10 @@ server_t *server_create(const server_cfg_t *cfg) {
                        ? cfg->gc_max_age_ms
                        : (24ULL * 3600 * 1000);
     s->gc_last_run = time(NULL);
+    s->lc_last_yday = -1;
+    s->lc_pending_now = cfg->lifecycle_now;
+    /* Bucket lifecycle abort rules override the global MPU TTL. */
+    store_set_mpu_gc_filter(s->store, lc_mpu_gc_filter, s->store);
     return s;
 
 fail:
@@ -442,6 +450,69 @@ static void accept_new(server_t *s) {
     }
 }
 
+/* ---- Lifecycle sweep job (item 5) ------------------------------------- */
+
+typedef struct {
+    iojob_t     base;
+    server_t   *srv;
+    lc_opts_t   opts;
+    lc_stats_t  stats;
+} lc_job_t;
+
+static void lc_job_run(iojob_t *j) {
+    lc_job_t *lj = (lc_job_t *)j;
+    lc_sweep(lj->srv->store, &lj->opts, &lj->stats);
+}
+
+static void lc_job_done(iojob_t *j) {
+    lc_job_t *lj = (lc_job_t *)j;
+    lj->srv->lc_running = 0;
+    __atomic_fetch_add(&lj->srv->metrics.lifecycle_runs_total, 1, __ATOMIC_RELAXED);
+    LOG_I("lifecycle: %llu bucket(s) with rules, %llu object(s) scanned, "
+          "%llu expired, %llu upload(s) aborted, %llu skipped (changed)%s",
+          (unsigned long long)lj->stats.buckets,
+          (unsigned long long)lj->stats.scanned,
+          (unsigned long long)lj->stats.expired,
+          (unsigned long long)lj->stats.aborted,
+          (unsigned long long)lj->stats.skipped_changed,
+          lj->opts.dry_run ? " [dry run]" : "");
+    free(lj);
+}
+
+static void lc_maybe_start(server_t *s, time_t now) {
+    if (s->lc_running) return;
+    int due = s->lc_pending_now;
+    if (!due && s->cfg.lifecycle_hour >= 0) {
+        struct tm lt;
+        localtime_r(&now, &lt);
+        due = lt.tm_hour == s->cfg.lifecycle_hour && lt.tm_yday != s->lc_last_yday;
+        if (due) s->lc_last_yday = lt.tm_yday;
+    }
+    if (!due) return;
+    s->lc_pending_now = 0;
+    lc_job_t *lj = calloc(1, sizeof(*lj));
+    if (!lj) return;
+    lj->base.run  = lc_job_run;
+    lj->base.done = lc_job_done;
+    lj->srv = s;
+    lj->opts.now_ms = ((int64_t)now + s->cfg.lifecycle_time_offset_s) * 1000;
+    lj->opts.rate_per_s = s->cfg.lifecycle_rate;
+    lj->opts.dry_run = s->cfg.lifecycle_dry_run;
+    lj->opts.expired_total = &s->metrics.lifecycle_expired_total;
+    lj->opts.aborted_total = &s->metrics.lifecycle_aborted_mpu_total;
+    s->lc_running = 1;
+    /* Never walk buckets on the event loop: without a pool (io_threads 0)
+     * the sweep is skipped. */
+    if (!s->pool) {
+        LOG_W("lifecycle: --io-threads 0, sweep skipped (would block the loop)");
+        s->lc_running = 0;
+        free(lj);
+        return;
+    }
+    LOG_I("lifecycle: sweep started");
+    iopool_submit(s->pool, &lj->base);
+}
+
 int server_run(server_t *s) {
     struct epoll_event events[MAX_EVENTS];
 
@@ -473,6 +544,8 @@ int server_run(server_t *s) {
             if (reaped > 0) LOG_I("mpu_gc: reaped %d stale upload(s)", reaped);
             s->gc_last_run = now;
         }
+
+        lc_maybe_start(s, now);
 
         int jobs_ready = 0;
         for (int i = 0; i < n; i++) {

@@ -18,6 +18,7 @@
 #include "action.h"
 #include "checksum.h"
 #include "cors.h"
+#include "lifecycle.h"
 #include "conn.h"
 #include "iopool.h"
 #include "log.h"
@@ -30,6 +31,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/sendfile.h>
+#include <time.h>
 #include <unistd.h>
 
 /* ===================================================================== */
@@ -428,6 +430,8 @@ typedef struct {
 static const cfg_kind_t CFG_KINDS[] = {
     { ACT_GET_BUCKET_CORS, ACT_PUT_BUCKET_CORS, ACT_DELETE_BUCKET_CORS,
       "cors.xml", S3_ERR_NO_SUCH_CORS, "application/xml" },
+    { ACT_GET_BUCKET_LIFECYCLE, ACT_PUT_BUCKET_LIFECYCLE, ACT_DELETE_BUCKET_LIFECYCLE,
+      "lifecycle.xml", S3_ERR_NO_SUCH_LIFECYCLE, "application/xml" },
 };
 
 static const cfg_kind_t *cfg_kind_for(s3_action_t act) {
@@ -438,8 +442,31 @@ static const cfg_kind_t *cfg_kind_for(s3_action_t act) {
 }
 
 /* Validate a config document before it is stored. */
-static s3_err_t cfg_validate(s3_action_t act, const char *body, size_t n) {
+static s3_err_t cfg_validate(conn_t *c, s3_action_t act, const char *body,
+                             size_t n) {
     switch (act) {
+    case ACT_PUT_BUCKET_LIFECYCLE: {
+        s3_err_t e;
+        lc_config_t *lc = lc_parse(body, n, &e);
+        if (!lc) return e;
+        /* S9: an Expiration/Date already in the past deletes everything
+         * the rule matches at the next sweep. Demand an explicit opt-in. */
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        int imm = lc_has_immediate_rule(lc, (int64_t)ts.tv_sec * 1000);
+        lc_free(lc);
+        const s3_str_t *ok = hdr_get(c, "x-fs3-confirm-immediate-expiry");
+        if (imm && !(ok && s3_str_eq_lit(*ok, "true"))) {
+            LOG_W("refusing lifecycle rule with a past Expiration/Date on "
+                  S3_STR_FMT " (send x-fs3-confirm-immediate-expiry: true)",
+                  S3_STR_ARG(c->cfg_bucket));
+            return S3_ERR_INVALID_ARGUMENT;
+        }
+        LOG_W("lifecycle configuration installed on " S3_STR_FMT
+              "%s: matching objects will be deleted by the sweeper",
+              S3_STR_ARG(c->cfg_bucket), imm ? " (immediate expiry confirmed)" : "");
+        return S3_OK;
+    }
     case ACT_PUT_BUCKET_CORS: {
         s3_err_t e;
         cors_config_t *cc = cors_parse(body, n, &e);
@@ -473,7 +500,7 @@ static int cfg_put_finish(conn_t *c) {
     if (!k) return rsp_build_s3_error(c, S3_ERR_INTERNAL, c->req.path, NULL);
     if (c->req_body_len > c->req_body_cap)
         return rsp_build_s3_error(c, S3_ERR_ENTITY_TOO_LARGE, c->req.path, NULL);
-    s3_err_t e = cfg_validate(act, c->req_body_buf, c->req_body_len);
+    s3_err_t e = cfg_validate(c, act, c->req_body_buf, c->req_body_len);
     if (e == S3_OK)
         e = store_bucket_sidecar_write(c->store, c->cfg_bucket, k->sidecar,
                                        c->req_body_buf, c->req_body_len);
@@ -1485,7 +1512,8 @@ static s3_action_t classify_service(const conn_t *c, s3_err_t *err) {
 
 static s3_action_t classify_bucket(const conn_t *c, s3_err_t *err) {
     static const char *const handled[] = {
-        "acl", "location", "versioning", "uploads", "delete", "cors", NULL
+        "acl", "location", "versioning", "uploads", "delete", "cors",
+        "lifecycle", NULL
     };
     int unhandled;
     const char *sub = pick_subresource(c, handled, &unhandled);
@@ -1515,6 +1543,10 @@ static s3_action_t classify_bucket(const conn_t *c, s3_err_t *err) {
         if (get) return ACT_GET_BUCKET_CORS;
         if (put) return ACT_PUT_BUCKET_CORS;
         if (del) return ACT_DELETE_BUCKET_CORS;
+    } else if (!strcmp(sub, "lifecycle")) {
+        if (get) return ACT_GET_BUCKET_LIFECYCLE;
+        if (put) return ACT_PUT_BUCKET_LIFECYCLE;
+        if (del) return ACT_DELETE_BUCKET_LIFECYCLE;
     }
     *err = S3_ERR_METHOD_NOT_ALLOWED;
     return ACT_NONE;

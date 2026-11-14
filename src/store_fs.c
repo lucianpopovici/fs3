@@ -122,6 +122,17 @@ struct s3_store {
      * here. Never held across data writes or fsync of object bytes. */
     pthread_mutex_t ns_mu;
 
+    /* Striped per-object locks (security review S4), indexed by the
+     * first byte of the object's path hash. Held across every multi-step
+     * mutation of one key — PUT/MPU publish, delete, lifecycle expiry
+     * (re-check + unlink), versioning's link-aside + rename — so racing
+     * sequences on the same key serialize. Order: key lock before ns_mu;
+     * never two key locks at once. */
+    pthread_mutex_t key_mu[256];
+
+    int  (*mpu_gc_filter)(void *user, s3_str_t bucket, s3_str_t key);
+    void  *mpu_gc_filter_user;
+
     /* Parsed bucket-config cache (store_sidecar_get). */
     pthread_mutex_t cfg_mu;
     struct store_cfg_ref *cfg_head;
@@ -219,6 +230,15 @@ static void hash_bucket_key(s3_str_t bucket, s3_str_t key, char out[65]) {
         out[i*2 + 1] = hex[raw[i] & 0xF];
     }
     out[64] = '\0';
+}
+
+static int hexnib(char ch) {
+    return ch >= 'a' ? ch - 'a' + 10 : ch - '0';
+}
+
+/* The stripe lock guarding object `hex` (S4). */
+static pthread_mutex_t *key_lock(s3_store_t *s, const char hex[65]) {
+    return &s->key_mu[(hexnib(hex[0]) << 4) | hexnib(hex[1])];
 }
 
 /* Build object directory path: ROOT/data/<bucket>/<xx>/<yy>
@@ -377,6 +397,7 @@ s3_err_t store_open(s3_store_t **out, const char *root) {
     if (!s) return S3_ERR_INTERNAL;
     pthread_mutex_init(&s->ns_mu, NULL);
     pthread_mutex_init(&s->cfg_mu, NULL);
+    for (int i = 0; i < 256; i++) pthread_mutex_init(&s->key_mu[i], NULL);
 
     s->root        = strdup(root);
     s->data_dir    = xstrdup_join(root, "data");
@@ -415,6 +436,7 @@ void store_close(s3_store_t *s) {
     pthread_mutex_destroy(&s->ns_mu);
     cfg_cache_clear(s);
     pthread_mutex_destroy(&s->cfg_mu);
+    for (int i = 0; i < 256; i++) pthread_mutex_destroy(&s->key_mu[i]);
     free(s);
 }
 
@@ -1335,17 +1357,21 @@ s3_err_t store_put_commit(s3_writer_t *w, s3_obj_meta_t *meta_out) {
      * another user. Without this re-check under ns_mu, mkdir_p would
      * resurrect data/<bucket>/, or the object would land in a bucket
      * the uploader doesn't own. */
+    pthread_mutex_t *km = key_lock(w->store, hex);
+    pthread_mutex_lock(km);
     pthread_mutex_lock(&w->store->ns_mu);
     s3_bucket_meta_t bm;
     if (store_bucket_meta(w->store, bucket, &bm) != S3_OK
         || strcmp(bm.id, w->bucket_id) != 0) {
         pthread_mutex_unlock(&w->store->ns_mu);
+    pthread_mutex_unlock(km);
         writer_free(w); return S3_ERR_NO_SUCH_BUCKET;
     }
     if (mkdir_p(dir, 0700) < 0) {
         LOG_E("mkdir_p %s: %s", dir, strerror(errno));
         s3_err_t e = map_io_err(errno);
         pthread_mutex_unlock(&w->store->ns_mu);
+    pthread_mutex_unlock(km);
         writer_free(w); return e;
     }
 
@@ -1354,9 +1380,11 @@ s3_err_t store_put_commit(s3_writer_t *w, s3_obj_meta_t *meta_out) {
         LOG_E("rename %s -> %s: %s", w->tmp_path, path, strerror(errno));
         s3_err_t e = map_io_err(errno);
         pthread_mutex_unlock(&w->store->ns_mu);
+    pthread_mutex_unlock(km);
         writer_free(w); return e;
     }
     pthread_mutex_unlock(&w->store->ns_mu);
+    pthread_mutex_unlock(km);
     /* tmp_path is gone; clear so writer_free doesn't unlink the live file. */
     w->tmp_path[0] = '\0';
 
@@ -1570,7 +1598,13 @@ s3_err_t store_delete(s3_store_t *s, s3_str_t bucket, s3_str_t key) {
     hash_bucket_key(bucket, key, hex);
     char path[4096];
     if (obj_path(s, bucket, hex, path, sizeof(path)) < 0) return S3_ERR_INTERNAL;
-    if (unlink(path) < 0) {
+    pthread_mutex_t *km = key_lock(s, hex);
+    pthread_mutex_lock(km);
+    int urc = unlink(path);
+    int uerr = errno;
+    pthread_mutex_unlock(km);
+    errno = uerr;
+    if (urc < 0) {
         if (errno == ENOENT) {
             /* S3 DELETE is idempotent: deleting a missing key is success. */
             return S3_OK;
@@ -2740,6 +2774,8 @@ s3_err_t store_mpu_complete2(s3_store_t *s, s3_str_t bucket, s3_str_t key,
     char up_dir[4096], up_meta[4200];
     mpu_dir_path(s, bucket, upload_id, up_dir, sizeof(up_dir));
     snprintf(up_meta, sizeof(up_meta), "%s/meta", up_dir);
+    pthread_mutex_t *km = key_lock(s, hex);
+    pthread_mutex_lock(km);
     pthread_mutex_lock(&s->ns_mu);
     s3_err_t pe = S3_OK;
     if (!store_bucket_exists(s, bucket))          pe = S3_ERR_NO_SUCH_BUCKET;
@@ -2748,6 +2784,7 @@ s3_err_t store_mpu_complete2(s3_store_t *s, s3_str_t bucket, s3_str_t key,
              || rename(tmp_path, target_path) < 0) pe = map_io_err(errno);
     else                                          rm_rf(up_dir);
     pthread_mutex_unlock(&s->ns_mu);
+    pthread_mutex_unlock(km);
     if (pe != S3_OK) {
         unlink(tmp_path); free(stored_ct); cksum_free(&comp); cksum_free(&full);
         return pe;
@@ -2940,6 +2977,19 @@ int store_mpu_gc(s3_store_t *s, uint64_t now_ms, uint64_t max_age_ms) {
             if (ctime_ms == 0) continue;  /* unknown age — skip conservatively */
             if (now_ms < ctime_ms) continue;
             if (now_ms - ctime_ms < max_age_ms) continue;
+            if (s->mpu_gc_filter) {
+                /* A bucket lifecycle AbortIncompleteMultipartUpload rule
+                 * covering this key overrides the global TTL. */
+                char *k = NULL; size_t kn = 0;
+                s3_str_t bn = { be->d_name, strlen(be->d_name) };
+                if (mpu_read_meta(s, bn, ue->d_name, &k, &kn, NULL, NULL, NULL) == S3_OK
+                    && k) {
+                    int skip = s->mpu_gc_filter(s->mpu_gc_filter_user, bn,
+                                                (s3_str_t){ k, kn });
+                    free(k);
+                    if (skip) continue;
+                }
+            }
 
             LOG_I("mpu_gc: reaping stale upload %s (age=%" PRIu64 "ms)",
                   ue->d_name, now_ms - ctime_ms);
@@ -2951,4 +3001,87 @@ int store_mpu_gc(s3_store_t *s, uint64_t now_ms, uint64_t max_age_ms) {
     }
     closedir(bd);
     return removed;
+}
+
+/* ===================================================================== */
+/* Object walk + lifecycle expiry                                         */
+/* ===================================================================== */
+
+void store_set_mpu_gc_filter(s3_store_t *s,
+                             int (*filter)(void *user, s3_str_t bucket,
+                                           s3_str_t key),
+                             void *user) {
+    if (!s) return;
+    s->mpu_gc_filter = filter;
+    s->mpu_gc_filter_user = user;
+}
+
+s3_err_t store_walk_objects(s3_store_t *s, s3_str_t bucket,
+                            store_walk_cb cb, void *user) {
+    if (!s || !cb) return S3_ERR_INVALID_ARGUMENT;
+    if (!valid_bucket_name(bucket)) return S3_ERR_INVALID_BUCKET_NAME;
+    if (!store_bucket_exists(s, bucket)) return S3_ERR_NO_SUCH_BUCKET;
+    char dp[4096];
+    snprintf(dp, sizeof(dp), "%s/" S3_STR_FMT, s->data_dir, S3_STR_ARG(bucket));
+    DIR *d1 = opendir(dp);
+    if (!d1) return S3_OK;
+    struct dirent *e1;
+    int stop = 0;
+    while (!stop && (e1 = readdir(d1)) != NULL) {
+        if (e1->d_name[0] == '.') continue;
+        char p2[4400];
+        snprintf(p2, sizeof(p2), "%s/%s", dp, e1->d_name);
+        DIR *d2 = opendir(p2);
+        if (!d2) continue;
+        struct dirent *e2;
+        while (!stop && (e2 = readdir(d2)) != NULL) {
+            if (e2->d_name[0] == '.') continue;
+            char p3[4700];
+            snprintf(p3, sizeof(p3), "%s/%s", p2, e2->d_name);
+            DIR *d3 = opendir(p3);
+            if (!d3) continue;
+            struct dirent *e3;
+            while (!stop && (e3 = readdir(d3)) != NULL) {
+                if (e3->d_name[0] == '.') continue;
+                char fp[5000];
+                snprintf(fp, sizeof(fp), "%s/%s", p3, e3->d_name);
+                list_entry_t ent;
+                if (load_entry(fp, &ent) < 0) continue;
+                stop = cb(user, (s3_str_t){ ent.key, ent.key_len }, &ent.meta);
+                free(ent.key);
+            }
+            closedir(d3);
+        }
+        closedir(d2);
+    }
+    closedir(d1);
+    return S3_OK;
+}
+
+s3_err_t store_expire_if_unchanged(s3_store_t *s, s3_str_t bucket,
+                                   s3_str_t key, uint64_t mtime_ms) {
+    if (!s) return S3_ERR_INVALID_ARGUMENT;
+    if (!valid_bucket_name(bucket)) return S3_ERR_INVALID_BUCKET_NAME;
+    if (!valid_key(key)) return S3_ERR_INVALID_ARGUMENT;
+    char hex[65], path[4096], dir[4096];
+    hash_bucket_key(bucket, key, hex);
+    if (obj_path(s, bucket, hex, path, sizeof(path)) < 0
+        || obj_dir(s, bucket, hex, dir, sizeof(dir)) < 0)
+        return S3_ERR_INTERNAL;
+    pthread_mutex_t *km = key_lock(s, hex);
+    pthread_mutex_lock(km);
+    s3_err_t e = S3_OK;
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        e = errno == ENOENT ? S3_ERR_NO_SUCH_KEY : S3_ERR_INTERNAL;
+    } else {
+        s3_obj_meta_t m;
+        e = read_header(fd, NULL, &m);
+        close(fd);
+        if (e == S3_OK && m.mtime_ms != mtime_ms) e = S3_ERR_INVALID_REQUEST;
+        if (e == S3_OK && unlink(path) < 0) e = map_io_err(errno);
+    }
+    pthread_mutex_unlock(km);
+    if (e == S3_OK) fsync_dir(dir);
+    return e;
 }

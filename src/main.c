@@ -59,6 +59,12 @@ static void usage(const char *argv0) {
         "      --presign-max-expires N  longest accepted presigned-URL lifetime in\n"
         "                             seconds (default 86400; at most 604800)\n"
         "      --no-presign-admin     refuse presigned URLs signed by an --admin user\n"
+        "      --lifecycle-hour H     run the lifecycle sweeper daily at local hour H\n"
+        "                             (default 3; -1 = never)\n"
+        "      --lifecycle-now        also run a sweep right after startup\n"
+        "      --lifecycle-rate N     max lifecycle deletions per second (default 100; 0 = no cap)\n"
+        "      --lifecycle-dry-run    log what the sweeper would delete, delete nothing\n"
+        "      --lifecycle-time-offset S  shift the sweeper's clock by S seconds (testing)\n"
         "  -v, --verbose              debug logging\n"
         "  -h, --help                 this help\n",
         argv0);
@@ -219,6 +225,11 @@ enum {
     OPT_LEGACY_OWNER,
     OPT_PRESIGN_MAX_EXPIRES,
     OPT_NO_PRESIGN_ADMIN,
+    OPT_LIFECYCLE_HOUR,
+    OPT_LIFECYCLE_NOW,
+    OPT_LIFECYCLE_RATE,
+    OPT_LIFECYCLE_DRY_RUN,
+    OPT_LIFECYCLE_TIME_OFFSET,
 };
 
 #ifndef FS3_MAIN_TESTING
@@ -249,6 +260,9 @@ int main(int argc, char **argv) {
     const char *legacy_owner = NULL;
     long presign_max_expires = 86400;   /* 24 h; AWS allows 7 days */
     int no_presign_admin = 0;
+    int lifecycle_hour = 3, lifecycle_now = 0, lifecycle_rate = 100;
+    int lifecycle_dry_run = 0;
+    long lifecycle_time_offset = 0;
     sigv4_verifier_t *auth = NULL;
     reload_ctx_t reload_ctx = {0};
 
@@ -271,6 +285,11 @@ int main(int argc, char **argv) {
         { "mpu-gc-max-age",   required_argument, NULL, OPT_MPU_GC_MAX_AGE },
         { "presign-max-expires", required_argument, NULL, OPT_PRESIGN_MAX_EXPIRES },
         { "no-presign-admin", no_argument,       NULL, OPT_NO_PRESIGN_ADMIN },
+        { "lifecycle-hour",   required_argument, NULL, OPT_LIFECYCLE_HOUR },
+        { "lifecycle-now",    no_argument,       NULL, OPT_LIFECYCLE_NOW },
+        { "lifecycle-rate",   required_argument, NULL, OPT_LIFECYCLE_RATE },
+        { "lifecycle-dry-run", no_argument,      NULL, OPT_LIFECYCLE_DRY_RUN },
+        { "lifecycle-time-offset", required_argument, NULL, OPT_LIFECYCLE_TIME_OFFSET },
         { "verbose",          no_argument,       NULL, 'v' },
         { "help",             no_argument,       NULL, 'h' },
         { 0 },
@@ -412,6 +431,25 @@ int main(int argc, char **argv) {
             case OPT_NO_PRESIGN_ADMIN:
                 no_presign_admin = 1;
                 break;
+            case OPT_LIFECYCLE_HOUR:
+                lifecycle_hour = atoi(optarg);
+                if (lifecycle_hour < -1 || lifecycle_hour > 23) {
+                    fprintf(stderr, "--lifecycle-hour must be 0..23 (-1 = off)\n");
+                    return 2;
+                }
+                break;
+            case OPT_LIFECYCLE_NOW:     lifecycle_now = 1; break;
+            case OPT_LIFECYCLE_DRY_RUN: lifecycle_dry_run = 1; break;
+            case OPT_LIFECYCLE_RATE:
+                lifecycle_rate = atoi(optarg);
+                if (lifecycle_rate < 0) {
+                    fprintf(stderr, "--lifecycle-rate must be >= 0\n");
+                    return 2;
+                }
+                break;
+            case OPT_LIFECYCLE_TIME_OFFSET:
+                lifecycle_time_offset = atol(optarg);
+                break;
             default:  usage(argv[0]); return 2;
         }
     }
@@ -465,6 +503,11 @@ int main(int argc, char **argv) {
         .metrics_port   = (uint16_t)metrics_port,
         .io_threads     = io_threads,
         .legacy_owner   = legacy_owner,
+        .lifecycle_hour = lifecycle_hour,
+        .lifecycle_now  = lifecycle_now,
+        .lifecycle_rate = lifecycle_rate,
+        .lifecycle_dry_run = lifecycle_dry_run,
+        .lifecycle_time_offset_s = lifecycle_time_offset,
         .tick_cb        = reload_tick,
         .tick_user      = &reload_ctx,
     };
