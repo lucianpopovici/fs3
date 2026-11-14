@@ -2058,93 +2058,77 @@ s3_err_t store_list_begin(s3_store_t *s, s3_str_t bucket,
     return S3_OK;
 }
 
+/* What entry e is for this listing: -1 skip, 0 a plain key, 1 a
+ * rolled-up common prefix of *ptotal bytes. A rollup is skipped when it
+ * was just emitted, or when it sorts at or before the marker — the
+ * marker is then inside (or is) that prefix, which an earlier page
+ * already returned (NextMarker/continuation token of a delimiter
+ * listing is the last CommonPrefix). */
+static int list_classify(const s3_lister_t *l, const list_entry_t *e, size_t *ptotal) {
+    if (l->marker.n > 0) {
+        size_t mn = l->marker.n < e->key_len ? l->marker.n : e->key_len;
+        int c = memcmp(e->key, l->marker.p, mn);
+        if (c < 0) return -1;
+        if (c == 0 && e->key_len <= l->marker.n) return -1;
+    }
+    if (!starts_with(e->key, e->key_len, l->prefix)) return -1;
+    if (l->delimiter.n == 0) return 0;
+    const char *after = e->key + l->prefix.n;
+    size_t after_n = e->key_len - l->prefix.n;
+    const char *hit = NULL;
+    if (l->delimiter.n == 1) {
+        hit = memchr(after, l->delimiter.p[0], after_n);
+    } else {
+        for (size_t i = 0; i + l->delimiter.n <= after_n; i++) {
+            if (memcmp(after + i, l->delimiter.p, l->delimiter.n) == 0) { hit = after + i; break; }
+        }
+    }
+    if (!hit) return 0;
+    size_t total = (size_t)(hit - e->key) + l->delimiter.n;
+    if (l->last_prefix && l->last_prefix_len == total
+        && memcmp(l->last_prefix, e->key, total) == 0)
+        return -1;                                  /* already emitted */
+    if (l->marker.n >= total && memcmp(l->marker.p, e->key, total) == 0)
+        return -1;                                  /* rollup ≤ marker */
+    *ptotal = total;
+    return 1;
+}
+
 s3_err_t store_list_next(s3_lister_t *l, s3_str_t *key_out,
                          s3_obj_meta_t *meta_out, int *is_prefix_out) {
     if (!l || !key_out) return S3_ERR_INVALID_ARGUMENT;
 
     while (l->cursor < l->n_items) {
+        size_t total = 0;
         if (l->emitted >= l->max_keys) {
-            /* We hit max_keys. Are there any more matching items still
-             * available? If so, mark truncated. We need to scan ahead
-             * once to find out — at most one matching item is enough. */
+            /* At max_keys: truncated iff one more item would be emitted. */
             for (size_t i = l->cursor; i < l->n_items; i++) {
-                list_entry_t *e2 = &l->items[i];
-                /* Apply same filters used in the main loop. */
-                if (l->marker.n > 0) {
-                    size_t mn = l->marker.n < e2->key_len ? l->marker.n : e2->key_len;
-                    int c = memcmp(e2->key, l->marker.p, mn);
-                    if (c < 0) continue;
-                    if (c == 0 && e2->key_len <= l->marker.n) continue;
-                }
-                if (!starts_with(e2->key, e2->key_len, l->prefix)) continue;
-                /* For delimiter, we also need to ensure the rolled-up
-                 * prefix would be different from last_prefix. Simplification:
-                 * any further matching key counts as "more available". This
-                 * may overestimate truncation in rare delimiter-rollup
-                 * cases but never under-reports. */
-                l->truncated = 1;
-                break;
+                if (list_classify(l, &l->items[i], &total) >= 0) { l->truncated = 1; break; }
             }
             return S3_ERR_NO_SUCH_KEY;
         }
 
         list_entry_t *e = &l->items[l->cursor++];
-
-        /* Marker: skip keys lexicographically <= marker. */
-        if (l->marker.n > 0) {
-            size_t mn = l->marker.n < e->key_len ? l->marker.n : e->key_len;
-            int c = memcmp(e->key, l->marker.p, mn);
-            if (c < 0) continue;
-            if (c == 0 && e->key_len <= l->marker.n) continue;
-        }
-
-        /* Prefix filter. */
-        if (!starts_with(e->key, e->key_len, l->prefix)) continue;
-
-        /* Delimiter handling: roll up keys sharing a prefix up to next
-         * occurrence of delimiter (after l->prefix). */
-        if (l->delimiter.n > 0) {
-            const char *after = e->key + l->prefix.n;
-            size_t after_n = e->key_len - l->prefix.n;
-            const char *hit = NULL;
-            if (l->delimiter.n == 1) {
-                hit = memchr(after, l->delimiter.p[0], after_n);
-            } else {
-                /* Multi-char delimiter; rare. Naive scan. */
-                for (size_t i = 0; i + l->delimiter.n <= after_n; i++) {
-                    if (memcmp(after + i, l->delimiter.p, l->delimiter.n) == 0) {
-                        hit = after + i; break;
-                    }
-                }
+        int kind = list_classify(l, e, &total);
+        if (kind < 0) continue;
+        if (kind == 1) {
+            if (total + 1 > l->ret_cap) {
+                char *nb = realloc(l->ret_buf, total + 1);
+                if (!nb) return S3_ERR_INTERNAL;
+                l->ret_buf = nb; l->ret_cap = total + 1;
             }
-            if (hit) {
-                size_t prefix_total = (size_t)(hit - e->key) + l->delimiter.n;
-                if (l->last_prefix && l->last_prefix_len == prefix_total
-                    && memcmp(l->last_prefix, e->key, prefix_total) == 0) {
-                    continue;  /* already emitted this rollup */
-                }
-                /* Save the rollup as the value to return. */
-                if (prefix_total + 1 > l->ret_cap) {
-                    char *nb = realloc(l->ret_buf, prefix_total + 1);
-                    if (!nb) return S3_ERR_INTERNAL;
-                    l->ret_buf = nb; l->ret_cap = prefix_total + 1;
-                }
-                memcpy(l->ret_buf, e->key, prefix_total);
-                l->ret_buf[prefix_total] = '\0';
-
-                /* Update last-prefix dedupe tracker. */
-                char *np = realloc(l->last_prefix, prefix_total);
-                if (!np) return S3_ERR_INTERNAL;
-                l->last_prefix = np;
-                memcpy(l->last_prefix, e->key, prefix_total);
-                l->last_prefix_len = prefix_total;
-
-                key_out->p = l->ret_buf;
-                key_out->n = prefix_total;
-                if (is_prefix_out) *is_prefix_out = 1;
-                l->emitted++;
-                return S3_OK;
-            }
+            memcpy(l->ret_buf, e->key, total);
+            l->ret_buf[total] = '\0';
+            char *np = realloc(l->last_prefix, total);
+            if (!np) return S3_ERR_INTERNAL;
+            l->last_prefix = np;
+            memcpy(l->last_prefix, e->key, total);
+            l->last_prefix_len = total;
+            key_out->p = l->ret_buf;
+            key_out->n = total;
+            if (is_prefix_out) *is_prefix_out = 1;
+            l->emitted++;
+            return S3_OK;
         }
 
         /* Plain key. Copy into ret_buf. */

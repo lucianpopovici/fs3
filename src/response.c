@@ -349,8 +349,44 @@ int rsp_build_s3_error(conn_t *c, s3_err_t err, s3_str_t resource,
 /* ListBucketResult                                                       */
 /* ===================================================================== */
 
+/* encoding-type=url: percent-encode everything but unreserved and '/'. */
+static void xml_text_child_enc(XMLNode *parent, const char *name, const char *p, size_t n,
+                               int enc) {
+    if (!enc) { xml_text_child_n(parent, name, p, n); return; }
+    char *o = malloc(n * 3 + 1);
+    if (!o) return;
+    size_t k = 0;
+    static const char hx[] = "0123456789ABCDEF";
+    for (size_t i = 0; i < n; i++) {
+        unsigned char ch = (unsigned char)p[i];
+        if ((ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9')
+            || ch == '-' || ch == '_' || ch == '.' || ch == '~' || ch == '/') {
+            o[k++] = (char)ch;
+        } else {
+            o[k++] = '%'; o[k++] = hx[ch >> 4]; o[k++] = hx[ch & 15];
+        }
+    }
+    xml_text_child_n(parent, name, o, k);
+    free(o);
+}
+
+static void xml_owner(XMLNode *parent, const char *owner) {
+    XMLNode *o = create_node("Owner");
+    if (!o || add_child(parent, o) < 0) { free_tree(o); return; }
+    xml_text_child(o, "ID", owner && owner[0] ? owner : "fs3");
+    xml_text_child(o, "DisplayName", owner && owner[0] ? owner : "fs3");
+}
+
 int rsp_build_list_bucket(conn_t *c, s3_str_t bucket,
                           const s3_list_opts_t *opts, s3_lister_t *l) {
+    return rsp_build_list_bucket_ex(c, bucket, opts, l, NULL);
+}
+
+int rsp_build_list_bucket_ex(conn_t *c, s3_str_t bucket, const s3_list_opts_t *opts,
+                             s3_lister_t *l, const rsp_list_ext_t *x) {
+    rsp_list_ext_t none = { 0 };
+    if (!x) x = &none;
+    int enc = x->url_encode;
     XMLNode *root = create_node("ListBucketResult");
     if (!root) { store_list_close(l); return -1; }
     if (add_attr(root, "xmlns", "http://s3.amazonaws.com/doc/2006-03-01/") < 0) {
@@ -358,33 +394,34 @@ int rsp_build_list_bucket(conn_t *c, s3_str_t bucket,
     }
 
     xml_text_child_n(root, "Name", bucket.p, bucket.n);
-    if (opts->prefix.n > 0) {
-        xml_text_child_n(root, "Prefix", opts->prefix.p, opts->prefix.n);
+    xml_text_child_enc(root, "Prefix", opts->prefix.p ? opts->prefix.p : "", opts->prefix.n, enc);
+    if (x->v2) {
+        if (x->start_after.n)
+            xml_text_child_enc(root, "StartAfter", x->start_after.p, x->start_after.n, enc);
+        if (x->cont_token.n)
+            xml_text_child_n(root, "ContinuationToken", x->cont_token.p, x->cont_token.n);
     } else {
-        xml_text_child(root, "Prefix", "");
+        xml_text_child_enc(root, "Marker", opts->marker.p ? opts->marker.p : "", opts->marker.n, enc);
     }
-    if (opts->marker.n > 0) {
-        xml_text_child_n(root, "Marker", opts->marker.p, opts->marker.n);
-    }
-    if (opts->delimiter.n > 0) {
-        xml_text_child_n(root, "Delimiter",
-                         opts->delimiter.p, opts->delimiter.n);
-    }
+    if (opts->delimiter.n > 0)
+        xml_text_child_enc(root, "Delimiter", opts->delimiter.p, opts->delimiter.n, enc);
+    if (enc) xml_text_child(root, "EncodingType", "url");
 
     int max_keys = opts->max_keys > 0 ? opts->max_keys : 1000;
     char mkbuf[16]; snprintf(mkbuf, sizeof(mkbuf), "%d", max_keys);
     xml_text_child(root, "MaxKeys", mkbuf);
 
-    /* Iterate the lister, appending Contents and CommonPrefixes nodes.
-     * The lister enforces max_keys internally; we ask it whether
-     * iteration stopped because of the cap (truncated) or because the
-     * bucket was exhausted. */
-    char last_key[1024]; size_t last_key_len = 0;
+    /* The lister enforces max_keys and reports whether more remain. The
+     * last key or prefix emitted is the next page's marker. */
+    char last_key[1025]; size_t last_key_len = 0;
+    int key_count = 0;
+    int want_owner = x->v2 ? x->fetch_owner : 1;
 
     for (;;) {
         s3_str_t k; s3_obj_meta_t m; int isp = 0;
         s3_err_t e = store_list_next(l, &k, &m, &isp);
         if (e != S3_OK) break;
+        key_count++;
 
         if (isp) {
             XMLNode *cp = create_node("CommonPrefixes");
@@ -392,17 +429,14 @@ int rsp_build_list_bucket(conn_t *c, s3_str_t bucket,
                 if (cp) free_tree(cp);
                 free_tree(root); store_list_close(l); return -1;
             }
-            xml_text_child_n(cp, "Prefix", k.p, k.n);
-            if (k.n < sizeof(last_key)) {
-                memcpy(last_key, k.p, k.n); last_key_len = k.n;
-            }
+            xml_text_child_enc(cp, "Prefix", k.p, k.n, enc);
         } else {
             XMLNode *contents = create_node("Contents");
             if (!contents || add_child(root, contents) < 0) {
                 if (contents) free_tree(contents);
                 free_tree(root); store_list_close(l); return -1;
             }
-            xml_text_child_n(contents, "Key", k.p, k.n);
+            xml_text_child_enc(contents, "Key", k.p, k.n, enc);
 
             char ts[32]; rsp_format_iso8601(m.mtime_ms, ts);
             xml_text_child(contents, "LastModified", ts);
@@ -414,20 +448,28 @@ int rsp_build_list_bucket(conn_t *c, s3_str_t bucket,
             char szbuf[24]; snprintf(szbuf, sizeof(szbuf),
                                      "%llu", (unsigned long long)m.size);
             xml_text_child(contents, "Size", szbuf);
-
+            if (want_owner) xml_owner(contents, x->owner);
             xml_text_child(contents, "StorageClass", "STANDARD");
-
-            if (k.n < sizeof(last_key)) {
-                memcpy(last_key, k.p, k.n); last_key_len = k.n;
-            }
+        }
+        if (k.n < sizeof(last_key)) {
+            memcpy(last_key, k.p, k.n); last_key_len = k.n;
         }
     }
     int truncated = store_list_truncated(l);
     store_list_close(l);
 
     xml_text_child(root, "IsTruncated", truncated ? "true" : "false");
-    if (truncated && opts->delimiter.n > 0 && last_key_len > 0) {
-        xml_text_child_n(root, "NextMarker", last_key, last_key_len);
+    if (x->v2) {
+        char kc[16]; snprintf(kc, sizeof(kc), "%d", key_count);
+        xml_text_child(root, "KeyCount", kc);
+        if (truncated && last_key_len > 0) {
+            /* Opaque to clients: base64 of the last key/prefix returned. */
+            char tok[1400];
+            base64_encode((const uint8_t *)last_key, last_key_len, tok);
+            xml_text_child(root, "NextContinuationToken", tok);
+        }
+    } else if (truncated && opts->delimiter.n > 0 && last_key_len > 0) {
+        xml_text_child_enc(root, "NextMarker", last_key, last_key_len, enc);
     }
 
     /* Render. Small responses fit inline in wbuf; large responses spill
@@ -866,6 +908,14 @@ int rsp_build_bucket_versioning_state(conn_t *c, int state) {
 int rsp_build_list_mpu_uploads(conn_t *c, s3_str_t bucket, s3_str_t prefix,
                                 const s3_mpu_info_t *uploads,
                                 size_t n_uploads) {
+    rsp_mpu_page_t pg = { 0 };
+    pg.max = 1000;
+    return rsp_build_list_mpu_uploads2(c, bucket, prefix, uploads, n_uploads, &pg);
+}
+
+int rsp_build_list_mpu_uploads2(conn_t *c, s3_str_t bucket, s3_str_t prefix,
+                                const s3_mpu_info_t *uploads, size_t n_uploads,
+                                const rsp_mpu_page_t *pg) {
     XMLNode *root = create_node("ListMultipartUploadsResult");
     if (!root) return -1;
     if (add_attr(root, "xmlns", "http://s3.amazonaws.com/doc/2006-03-01/") < 0) {
@@ -879,10 +929,17 @@ int rsp_build_list_mpu_uploads(conn_t *c, s3_str_t bucket, s3_str_t prefix,
         XMLNode *p = create_node("Prefix");
         if (p) add_child(root, p);
     }
-    /* fs3 doesn't paginate this listing yet — IsTruncated is always
-     * false. If you have >1000 in-flight uploads that's a separate
-     * problem. */
-    xml_text_child(root, "IsTruncated", "false");
+    xml_text_child_n(root, "KeyMarker", pg->key_marker.p ? pg->key_marker.p : "", pg->key_marker.n);
+    xml_text_child_n(root, "UploadIdMarker", pg->upload_id_marker.p ? pg->upload_id_marker.p : "",
+                     pg->upload_id_marker.n);
+    if (n_uploads) {
+        xml_text_child(root, "NextKeyMarker", uploads[n_uploads - 1].key);
+        xml_text_child(root, "NextUploadIdMarker", uploads[n_uploads - 1].upload_id);
+    }
+    char mx[16];
+    snprintf(mx, sizeof(mx), "%d", pg->max);
+    xml_text_child(root, "MaxUploads", mx);
+    xml_text_child(root, "IsTruncated", pg->truncated ? "true" : "false");
 
     for (size_t i = 0; i < n_uploads; i++) {
         XMLNode *u = create_node("Upload");

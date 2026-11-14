@@ -74,6 +74,19 @@ int rsp_build_s3_error(conn_t *c, s3_err_t err,
 
 /* Build a ListBucketResult XML body for the given bucket and listing
  * options. The lister is consumed (closed by this function). */
+/* ListObjects variants: v2 (list-type=2) adds KeyCount, StartAfter,
+ * Continuation/NextContinuationToken and Owner only with fetch-owner;
+ * url_encode (encoding-type=url) percent-encodes keys and prefixes. */
+typedef struct {
+    int         v2;
+    int         url_encode;
+    int         fetch_owner;
+    s3_str_t    start_after;
+    s3_str_t    cont_token;      /* as received, echoed */
+    const char *owner;           /* bucket owner, "" → "fs3" */
+} rsp_list_ext_t;
+int rsp_build_list_bucket_ex(conn_t *c, s3_str_t bucket, const s3_list_opts_t *opts,
+                             s3_lister_t *l, const rsp_list_ext_t *x);
 int rsp_build_list_bucket(conn_t *c, s3_str_t bucket,
                           const s3_list_opts_t *opts, s3_lister_t *l);
 
@@ -107,6 +120,14 @@ int rsp_build_list_parts(conn_t *c, s3_str_t bucket, s3_str_t key,
                          const char *upload_id, uint32_t marker, size_t max,
                          const s3_part_info_t *parts, size_t n, int truncated,
                          uint8_t algo, uint8_t type);
+typedef struct {
+    s3_str_t key_marker, upload_id_marker;
+    int      max;
+    int      truncated;
+} rsp_mpu_page_t;
+int rsp_build_list_mpu_uploads2(conn_t *c, s3_str_t bucket, s3_str_t prefix,
+                                const s3_mpu_info_t *uploads, size_t n_uploads,
+                                const rsp_mpu_page_t *pg);
 int rsp_build_list_mpu_uploads(conn_t *c, s3_str_t bucket, s3_str_t prefix,
                                 const s3_mpu_info_t *uploads,
                                 size_t n_uploads);

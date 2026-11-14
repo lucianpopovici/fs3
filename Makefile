@@ -141,6 +141,8 @@ test: check-test-deps $(TEST_BINS) fs3
 	@./tests/test_e2e_parts.sh
 	@echo "=== test_e2e_metadata (round 2: user metadata, std headers, response-*) ==="
 	@./tests/test_e2e_metadata.sh
+	@echo "=== test_e2e_listing (round 2: ListObjectsV2 / ListMultipartUploads pagination) ==="
+	@./tests/test_e2e_listing.sh
 	@echo "=== test_e2e_phase9 (range / bulk-delete / bucket-subresources) ==="
 	@./tests/test_e2e_phase9.sh
 	@echo "=== test_e2e_phase10 (object copy / ?acl stub) ==="

@@ -11,6 +11,9 @@
   `response-*` overrides; `x-amz-metadata-directive`. A self-copy
   without `REPLACE` is now `400 InvalidRequest` (S3 behaviour).
 - Fix: `Connection: close` from a client was ignored (wrong llhttp flag).
+- ListObjectsV2 pagination (was capped at the first 1000 keys),
+  `encoding-type=url`, ListMultipartUploads pagination; delimiter
+  listings no longer repeat a CommonPrefix on the next page.
 
 - Object files are now written in on-disk **schema 4** (adds stored size,
   a CRC64NVME over the on-disk payload, a TLV area for metadata, and

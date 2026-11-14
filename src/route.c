@@ -7,7 +7,7 @@
  *
  * Query string matters for some bucket ops:
  *   GET /<bucket>?location            → location subresource (TODO)
- *   GET /<bucket>?list-type=2&...     → ListObjectsV2 (treated as list)
+ *   GET /<bucket>?list-type=2&...     → ListObjectsV2
  *   GET /<bucket>?prefix=&delimiter=  → ListObjectsV1
  *
  * For simplicity right now we treat any GET on /<bucket> (with or
@@ -839,6 +839,12 @@ static int max_keys_param(const conn_t *c, const char *name) {
     return mk;
 }
 
+static int mpu_info_cmp(const void *a, const void *b) {
+    const s3_mpu_info_t *x = a, *y = b;
+    int c = strcmp(x->key, y->key);
+    return c ? c : strcmp(x->upload_id, y->upload_id);
+}
+
 static int handle_bucket(conn_t *c, s3_str_t bucket, s3_action_t act) {
     switch (act) {
     case ACT_GET_BUCKET_ACL:
@@ -915,21 +921,72 @@ static int handle_bucket(conn_t *c, s3_str_t bucket, s3_action_t act) {
         s3_err_t e = store_list_mpu_uploads(c->store, bucket, prefix,
                                             &ups, &n_ups);
         if (e != S3_OK) return rsp_build_s3_error(c, e, c->req.path, NULL);
-        int rc = rsp_build_list_mpu_uploads(c, bucket, prefix, ups, n_ups);
+        /* Pagination: sorted by (key, upload id); entries after
+         * (key-marker, upload-id-marker), at most max-uploads (≤ 1000). */
+        qsort(ups, n_ups, sizeof(*ups), mpu_info_cmp);
+        rsp_mpu_page_t pg = { 0 };
+        pg.key_marker = q_val(c, "key-marker");
+        pg.upload_id_marker = q_val(c, "upload-id-marker");
+        pg.max = max_keys_param(c, "max-uploads");
+        if (pg.max <= 0) pg.max = 1000;
+        size_t first = 0;
+        while (first < n_ups) {
+            const s3_mpu_info_t *u = &ups[first];
+            size_t kn = strlen(u->key);
+            int ck = memcmp(u->key, pg.key_marker.p ? pg.key_marker.p : "",
+                            kn < pg.key_marker.n ? kn : pg.key_marker.n);
+            if (ck == 0) ck = kn < pg.key_marker.n ? -1 : kn > pg.key_marker.n;
+            if (ck > 0) break;
+            if (ck == 0 && pg.upload_id_marker.n
+                && strncmp(u->upload_id, pg.upload_id_marker.p, pg.upload_id_marker.n) > 0)
+                break;
+            first++;
+        }
+        size_t cnt = n_ups - first;
+        if (cnt > (size_t)pg.max) { cnt = (size_t)pg.max; pg.truncated = 1; }
+        int rc = rsp_build_list_mpu_uploads2(c, bucket, prefix, ups + first, cnt, &pg);
         store_mpu_uploads_free(ups, n_ups);
         return rc;
     }
 
     case ACT_LIST_OBJECTS: {
         s3_list_opts_t opts = { 0 };
+        rsp_list_ext_t x = { 0 };
         opts.prefix    = q_val(c, "prefix");
         opts.delimiter = q_val(c, "delimiter");
-        opts.marker    = q_val(c, "marker");
         opts.max_keys  = max_keys_param(c, "max-keys");
+        s3_str_t lt = q_val(c, "list-type"), et = q_val(c, "encoding-type");
+        if (lt.p && !s3_str_eq_lit(lt, "2"))
+            return rsp_build_s3_error(c, S3_ERR_INVALID_ARGUMENT, c->req.path, NULL);
+        if (et.p && !s3_str_eq_lit(et, "url"))
+            return rsp_build_s3_error(c, S3_ERR_INVALID_ARGUMENT, c->req.path, NULL);
+        x.url_encode = et.p != NULL;
+        x.v2 = lt.p != NULL;
+        if (x.v2) {
+            /* ListObjectsV2: the continuation token (base64 of the last
+             * key/prefix of the previous page) wins over start-after. */
+            x.start_after = q_val(c, "start-after");
+            x.cont_token  = q_val(c, "continuation-token");
+            s3_str_t fo = q_val(c, "fetch-owner");
+            x.fetch_owner = fo.p && s3_str_eq_lit(fo, "true");
+            opts.marker = x.start_after;
+            if (x.cont_token.p) {
+                char *dec = scratch_alloc(c, 1025);
+                int dn = dec ? base64_decode(x.cont_token.p, x.cont_token.n,
+                                             (uint8_t *)dec, 1024) : -1;
+                if (dn <= 0)
+                    return rsp_build_s3_error(c, S3_ERR_INVALID_ARGUMENT, c->req.path, NULL);
+                opts.marker = (s3_str_t){ dec, (size_t)dn };
+            }
+        } else {
+            opts.marker = q_val(c, "marker");
+        }
+        s3_bucket_meta_t bm;
+        if (store_bucket_meta(c->store, bucket, &bm) == S3_OK) x.owner = bm.owner;
         s3_lister_t *l;
         s3_err_t e = store_list_begin(c->store, bucket, &opts, &l);
         if (e != S3_OK) return rsp_build_s3_error(c, e, c->req.path, NULL);
-        return rsp_build_list_bucket(c, bucket, &opts, l);
+        return rsp_build_list_bucket_ex(c, bucket, &opts, l, &x);
     }
 
     default: {
