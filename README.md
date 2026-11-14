@@ -149,6 +149,30 @@ What's working end-to-end:
   the practical cap is the directory entry limit, well above any
   realistic in-flight set).
 
+- **Bucket policies** (strict IAM JSON subset) — `PUT/GET/DELETE
+  /bucket?policy` (owner/admin only, ≤ 20 KB). Grammar: `Version`
+  `2012-10-17`; statements with `Effect`, `Principal` (`"*"` or
+  `{"AWS": user | arn:aws:iam:::user/<u> | "*"}`), `Action`/`NotAction`
+  (`s3:*` patterns), `Resource` naming *this* bucket (`arn:aws:s3:::b`,
+  `arn:aws:s3:::b/prefix*`) and `Condition` (`StringEquals`,
+  `StringNotEquals`, `StringLike`, `IpAddress`, `NotIpAddress`, `Bool` on
+  `aws:SourceIp`, `aws:SecureTransport`, `s3:prefix`, `aws:username`).
+  Anything else — `NotPrincipal`, unknown keys or operators, duplicate JSON
+  keys, other buckets — is `400 MalformedPolicy`. Evaluation: explicit
+  Deny wins (owner and admins included); then owner, admin, grant or a
+  matching Allow; otherwise deny. Anonymous requests get in only through
+  an Allow with `Principal "*"` — that is how a public-read bucket works
+  (fs3 must run without `--require-auth` for unsigned requests to reach
+  the policy). Lockout rule: the owner and admins can always read,
+  replace or delete the policy. Public policies need `--allow-public`;
+  public *write* additionally needs `--allow-public-write`. Bulk delete
+  evaluates each key. `aws:SourceIp`/`aws:SecureTransport` come from the
+  connection, or from `X-Forwarded-For`/`X-Forwarded-Proto` only when the
+  peer is listed in `--trusted-proxy` (e.g. `127.0.0.1` behind DSM).
+  Behind the DSM proxy every peer is 127.0.0.1 and any local process or
+  host-network container can forge those headers, so treat
+  `aws:SourceIp` as advisory there.
+
 - **Versioning** — `PUT/GET /bucket?versioning` (Enabled / Suspended;
   never back to Unset; MFA delete → 501). The current version stays at
   `data/...`, so unversioned GET and listing are as fast as before;

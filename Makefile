@@ -74,9 +74,11 @@ $(XML_DIR)/%.o: $(XML_DIR)/%.c
 
 # ----- Tests --------------------------------------------------------
 
-TEST_BINS := tests/test_json tests/test_config_fuzz tests/test_chunk_fuzz tests/test_checksum tests/test_store tests/test_conn tests/test_xml tests/test_xml_legacy tests/test_xml_fuzz tests/test_sigv4 tests/test_credfile
+TEST_BINS := tests/test_policy tests/test_json tests/test_config_fuzz tests/test_chunk_fuzz tests/test_checksum tests/test_store tests/test_conn tests/test_xml tests/test_xml_legacy tests/test_xml_fuzz tests/test_sigv4 tests/test_credfile
 
 test: $(TEST_BINS) fs3
+	@echo "=== test_policy (+50000 fuzz iterations) ==="
+	@./tests/test_policy 50000
 	@echo "=== test_json (+50000 fuzz iterations) ==="
 	@./tests/test_json 50000
 	@echo "=== test_config_fuzz (50000 iterations) ==="
@@ -119,6 +121,8 @@ test: $(TEST_BINS) fs3
 	@./tests/test_e2e_subresources.sh
 	@echo "=== test_e2e_checksum (item 1: trailers + x-amz-checksum-*) ==="
 	@./tests/test_e2e_checksum.sh
+	@echo "=== test_e2e_policy (item 9: bucket policies) ==="
+	@./tests/test_e2e_policy.sh
 	@echo "=== test_e2e_versioning (item 8: versioning) ==="
 	@./tests/test_e2e_versioning.sh
 	@echo "=== test_e2e_admin (item 11: admin API) ==="
@@ -137,6 +141,10 @@ test: $(TEST_BINS) fs3
 FUZZ_CFG_OBJS := src/cors.o src/lifecycle.o src/website.o src/store_fs.o src/checksum.o src/log.o $(XML_OBJS)
 tests/test_config_fuzz: tests/test_config_fuzz.c tests/fuzz_targets.h $(FUZZ_CFG_OBJS)
 	$(CC) $(CFLAGS) $(INCLUDES) -Itests tests/test_config_fuzz.c $(FUZZ_CFG_OBJS) \
+	    $(LDFLAGS) -o $@
+
+tests/test_policy: tests/test_policy.c src/policy.o src/json.o src/action.o
+	$(CC) $(CFLAGS) $(INCLUDES) tests/test_policy.c src/policy.o src/json.o src/action.o \
 	    $(LDFLAGS) -o $@
 
 tests/test_json: tests/test_json.c src/json.o
