@@ -30,7 +30,7 @@ INCLUDES   := -Iinclude -I$(LLHTTP_DIR)/include -I$(XML_DIR)
 # Server objects
 SRV_SRCS := src/main.c src/server.c src/conn.c src/log.c src/store_fs.c \
             src/route.c src/response.c src/sigv4.c src/metrics.c \
-            src/iopool.c src/action.c src/checksum.c src/query.c
+            src/iopool.c src/action.c src/checksum.c src/query.c src/cors.c
 SRV_OBJS := $(SRV_SRCS:.c=.o)
 
 LLHTTP_OBJS := $(LLHTTP_DIR)/src/api.o $(LLHTTP_DIR)/src/http.o \
@@ -74,9 +74,11 @@ $(XML_DIR)/%.o: $(XML_DIR)/%.c
 
 # ----- Tests --------------------------------------------------------
 
-TEST_BINS := tests/test_chunk_fuzz tests/test_checksum tests/test_store tests/test_conn tests/test_xml tests/test_xml_legacy tests/test_xml_fuzz tests/test_sigv4 tests/test_credfile
+TEST_BINS := tests/test_config_fuzz tests/test_chunk_fuzz tests/test_checksum tests/test_store tests/test_conn tests/test_xml tests/test_xml_legacy tests/test_xml_fuzz tests/test_sigv4 tests/test_credfile
 
 test: $(TEST_BINS) fs3
+	@echo "=== test_config_fuzz (50000 iterations) ==="
+	@./tests/test_config_fuzz 50000
 	@echo "=== test_chunk_fuzz (50000 iterations) ==="
 	@./tests/test_chunk_fuzz 50000
 	@echo "=== test_checksum ==="
@@ -115,10 +117,17 @@ test: $(TEST_BINS) fs3
 	@./tests/test_e2e_subresources.sh
 	@echo "=== test_e2e_checksum (item 1: trailers + x-amz-checksum-*) ==="
 	@./tests/test_e2e_checksum.sh
+	@echo "=== test_e2e_cors (item 4: CORS) ==="
+	@./tests/test_e2e_cors.sh
 	@echo "=== test_e2e_presign (item 2: presigned URLs) ==="
 	@./tests/test_e2e_presign.sh
 	@echo "=== test_ui_cgi (DSM tile admin console) ==="
 	@./tests/test_ui_cgi.sh
+
+FUZZ_CFG_OBJS := src/cors.o $(XML_OBJS)
+tests/test_config_fuzz: tests/test_config_fuzz.c tests/fuzz_targets.h $(FUZZ_CFG_OBJS)
+	$(CC) $(CFLAGS) $(INCLUDES) -Itests tests/test_config_fuzz.c $(FUZZ_CFG_OBJS) \
+	    $(LDFLAGS) -o $@
 
 tests/test_chunk_fuzz: tests/test_chunk_fuzz.c src/sigv4.o src/query.o src/log.o
 	$(CC) $(CFLAGS) $(INCLUDES) tests/test_chunk_fuzz.c src/sigv4.o \

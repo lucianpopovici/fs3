@@ -81,6 +81,10 @@ int rsp_build_initiate_mpu(conn_t *c, s3_str_t bucket, s3_str_t key,
 /* Build a CompleteMultipartUploadResult XML body, 200 OK.
  * etag is the multipart-style ETag returned by store_mpu_complete
  * (e.g. "abc...-3"); we wrap it in quotes per S3 convention. */
+/* Arbitrary body (takes ownership of `body`, a malloc'd buffer). */
+int rsp_build_raw(conn_t *c, int status, const char *reason,
+                  const char *content_type, char *body, size_t blen);
+
 int rsp_build_complete_mpu(conn_t *c, s3_str_t bucket, s3_str_t key,
                            const char *etag);
 /* With the object's checksum element (m may be NULL). */

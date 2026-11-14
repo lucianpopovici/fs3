@@ -182,6 +182,16 @@ store_cfg_ref_t *store_sidecar_get(s3_store_t *s, s3_str_t bucket,
                                    const char *name, size_t max,
                                    store_cfg_parse_fn parse,
                                    store_cfg_free_fn release);
+/* Like store_sidecar_get, but an entry (including "no such bucket/file")
+ * validated within the last ttl_ms is returned without touching disk.
+ * For unauthenticated paths (CORS preflight, website) so they cannot
+ * drive per-request disk I/O or tell missing buckets from missing
+ * config apart by timing. */
+store_cfg_ref_t *store_sidecar_get_ttl(s3_store_t *s, s3_str_t bucket,
+                                       const char *name, size_t max,
+                                       store_cfg_parse_fn parse,
+                                       store_cfg_free_fn release,
+                                       unsigned ttl_ms);
 void            *store_cfg_obj(const store_cfg_ref_t *r);
 void             store_sidecar_put(s3_store_t *s, store_cfg_ref_t *r);
 

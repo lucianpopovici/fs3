@@ -156,6 +156,20 @@ What's working end-to-end:
   sweep is conservative: staging dirs whose `meta` file is missing
   or has an unparseable `ctime_ms=` line are left alone.
 
+- **CORS** — `PUT/GET/DELETE /bucket?cors` with a validated
+  `CORSConfiguration` (≤ 100 rules, at most one `*` per origin, methods
+  GET/PUT/POST/DELETE/HEAD), stored as `buckets/<b>/cors.xml`. Browser
+  preflights (`OPTIONS`) are answered without SigV4; matching requests —
+  including error responses — get `Access-Control-Allow-Origin`,
+  `-Methods`, `-Expose-Headers` and `Vary: Origin`.
+  `Access-Control-Allow-Credentials` is never sent. Preflights read the
+  config through a 1-second cache, so they cause no per-request disk I/O
+  and a missing bucket answers exactly like a bucket without a matching
+  rule. Every response carries `X-Content-Type-Options: nosniff`, and
+  anonymous or presigned GETs carry `Content-Security-Policy: sandbox`.
+  Serve fs3 on its own hostname, never the DSM hostname on another port:
+  cookies are not port-scoped.
+
 - **Strict subresource routing** — every request is classified into one
   S3 operation from its method, path and query subresource. A recognised
   S3 subresource fs3 does not implement (`?tagging`, `?retention`,

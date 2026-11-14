@@ -740,7 +740,10 @@ s3_err_t store_bucket_delete(s3_store_t *s, s3_str_t name) {
 /* ===================================================================== */
 
 struct store_cfg_ref {
-    char      key[33 + 1 + 64 + 1 + 32];  /* "<id or :name>/<sidecar>" */
+    char      key[33 + 1 + 64 + 1 + 32];  /* "<id or :name or ?name>/<sidecar>" */
+    char      bname[64];      /* bucket name, for TTL lookups */
+    char      sname[32];      /* sidecar name */
+    uint64_t  checked_ms;     /* last validation (monotonic) */
     dev_t     dev;
     ino_t     ino;
     int64_t   mtime_ns;
@@ -860,42 +863,112 @@ static void cfg_evict_locked(s3_store_t *s, struct store_cfg_ref **pp) {
     cfg_unref_locked(r);
 }
 
+static uint64_t mono_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
+}
+
+/* Insert r at the head, first evicting entries for the same bucket name +
+ * sidecar (stale positives, negatives) and bounding the cache. */
+static void cfg_insert_locked(s3_store_t *s, struct store_cfg_ref *r) {
+    struct store_cfg_ref **q = &s->cfg_head;
+    while (*q) {
+        if (strcmp((*q)->bname, r->bname) == 0 && strcmp((*q)->sname, r->sname) == 0)
+            cfg_evict_locked(s, q);
+        else
+            q = &(*q)->next;
+    }
+    if (s->cfg_count >= 1024) {
+        q = &s->cfg_head;
+        size_t i = 0;
+        while (*q && i < 512) { q = &(*q)->next; i++; }
+        while (*q) cfg_evict_locked(s, q);
+    }
+    r->next = s->cfg_head;
+    s->cfg_head = r;
+    s->cfg_count++;
+}
+
 store_cfg_ref_t *store_sidecar_get(s3_store_t *s, s3_str_t bucket,
                                    const char *name, size_t max,
                                    store_cfg_parse_fn parse,
                                    store_cfg_free_fn release) {
+    return store_sidecar_get_ttl(s, bucket, name, max, parse, release, 0);
+}
+
+store_cfg_ref_t *store_sidecar_get_ttl(s3_store_t *s, s3_str_t bucket,
+                                       const char *name, size_t max,
+                                       store_cfg_parse_fn parse,
+                                       store_cfg_free_fn release,
+                                       unsigned ttl_ms) {
     char path[4200];
-    if (!s || sidecar_path(s, bucket, name, path, sizeof(path)) < 0) return NULL;
+    if (!s || bucket.n >= 64 || strlen(name) >= 32
+        || sidecar_path(s, bucket, name, path, sizeof(path)) < 0) return NULL;
+    char bname[64];
+    memcpy(bname, bucket.p, bucket.n);
+    bname[bucket.n] = '\0';
+    uint64_t now = mono_ms();
+
+    if (ttl_ms) {
+        /* Recently validated (positive or negative): no disk access. */
+        pthread_mutex_lock(&s->cfg_mu);
+        for (struct store_cfg_ref *r = s->cfg_head; r; r = r->next) {
+            if (strcmp(r->bname, bname) || strcmp(r->sname, name)) continue;
+            if (now - r->checked_ms >= ttl_ms) break;
+            if (!r->obj) { pthread_mutex_unlock(&s->cfg_mu); return NULL; }
+            r->refs++;
+            pthread_mutex_unlock(&s->cfg_mu);
+            return r;
+        }
+        pthread_mutex_unlock(&s->cfg_mu);
+    }
+
     s3_bucket_meta_t bm;
-    if (store_bucket_meta(s, bucket, &bm) != S3_OK) return NULL;
+    int have_bucket = store_bucket_meta(s, bucket, &bm) == S3_OK;
     char key[sizeof(((struct store_cfg_ref *)0)->key)];
-    if (bm.id[0])
+    if (!have_bucket)
+        snprintf(key, sizeof(key), "?%s/%s", bname, name);
+    else if (bm.id[0])
         snprintf(key, sizeof(key), "%s/%s", bm.id, name);
     else
-        snprintf(key, sizeof(key), ":%.*s/%s", (int)bucket.n, bucket.p, name);
+        snprintf(key, sizeof(key), ":%s/%s", bname, name);
 
     struct stat st;
-    int have = stat(path, &st) == 0 && S_ISREG(st.st_mode);
+    int have = have_bucket && stat(path, &st) == 0 && S_ISREG(st.st_mode);
     int64_t mns = have ? (int64_t)st.st_mtim.tv_sec * 1000000000LL + st.st_mtim.tv_nsec : 0;
 
     pthread_mutex_lock(&s->cfg_mu);
-    struct store_cfg_ref **pp = &s->cfg_head;
-    while (*pp) {
-        struct store_cfg_ref *r = *pp;
-        if (strcmp(r->key, key) == 0) {
-            if (have && r->dev == st.st_dev && r->ino == st.st_ino
-                && r->mtime_ns == mns && r->size == st.st_size) {
-                r->refs++;
-                pthread_mutex_unlock(&s->cfg_mu);
-                return r->obj ? r : (store_sidecar_put(s, r), NULL);
-            }
-            cfg_evict_locked(s, pp);
-            continue;
+    for (struct store_cfg_ref *r = s->cfg_head; r; r = r->next) {
+        if (strcmp(r->key, key) != 0) continue;
+        if (have && r->obj && r->dev == st.st_dev && r->ino == st.st_ino
+            && r->mtime_ns == mns && r->size == st.st_size) {
+            r->refs++;
+            r->checked_ms = now;
+            pthread_mutex_unlock(&s->cfg_mu);
+            return r;
         }
-        pp = &r->next;
+        break;
+    }
+    if (!have) {
+        /* Remember the absence only when asked to (TTL lookups). */
+        if (ttl_ms) {
+            struct store_cfg_ref *neg = calloc(1, sizeof(*neg));
+            if (neg) {
+                snprintf(neg->key, sizeof(neg->key), "%s", key);
+                snprintf(neg->bname, sizeof(neg->bname), "%s", bname);
+                snprintf(neg->sname, sizeof(neg->sname), "%s", name);
+                neg->release = release;
+                neg->refs = 1;
+                neg->cached = 1;
+                neg->checked_ms = now;
+                cfg_insert_locked(s, neg);
+            }
+        }
+        pthread_mutex_unlock(&s->cfg_mu);
+        return NULL;
     }
     pthread_mutex_unlock(&s->cfg_mu);
-    if (!have) return NULL;
 
     /* Parse outside the lock. */
     char *data = NULL;
@@ -907,26 +980,18 @@ store_cfg_ref_t *store_sidecar_get(s3_store_t *s, s3_str_t bucket,
     struct store_cfg_ref *r = calloc(1, sizeof(*r));
     if (!r) { if (obj) release(obj); return NULL; }
     snprintf(r->key, sizeof(r->key), "%s", key);
+    snprintf(r->bname, sizeof(r->bname), "%s", bname);
+    snprintf(r->sname, sizeof(r->sname), "%s", name);
     r->dev = st.st_dev; r->ino = st.st_ino; r->mtime_ns = mns; r->size = st.st_size;
     r->obj = obj;
     r->release = release;
-    r->refs = 2;               /* cache + caller */
+    r->refs = obj ? 2 : 1;     /* cache (+ caller) */
     r->cached = 1;
-
+    r->checked_ms = now;
     pthread_mutex_lock(&s->cfg_mu);
-    /* Bound the cache: drop the oldest entries beyond 1024. */
-    if (s->cfg_count >= 1024) {
-        struct store_cfg_ref **q = &s->cfg_head;
-        size_t i = 0;
-        while (*q && i < 512) { q = &(*q)->next; i++; }
-        while (*q) cfg_evict_locked(s, q);
-    }
-    r->next = s->cfg_head;
-    s->cfg_head = r;
-    s->cfg_count++;
+    cfg_insert_locked(s, r);
     pthread_mutex_unlock(&s->cfg_mu);
-    if (!obj) { store_sidecar_put(s, r); return NULL; }
-    return r;
+    return obj ? r : NULL;
 }
 
 /* ---- Grants ---------------------------------------------------------- */

@@ -37,6 +37,10 @@ int route_dispatch_send_body(conn_t *c);
  * hook to short-circuit dispatch). Returns 0 on success, -1 on error. */
 int route_build_error(conn_t *c, s3_err_t err);
 
+/* Add CORS response headers for an actual (non-preflight) request whose
+ * Origin matches the bucket's CORS rules. No-op without Origin. */
+void route_cors_decorate(conn_t *c);
+
 /* Classify the request into one S3 operation (ACT_NONE with *err set if
  * it is refused: 501 for unimplemented subresources, 405, 400). */
 s3_action_t route_classify(const conn_t *c, s3_str_t bucket, s3_str_t key,

@@ -195,6 +195,8 @@ static void request_reset(conn_t *c) {
     c->mpu_upload_id[0] = '\0';
     c->delete_pending = 0;
     c->delete_bucket = (s3_str_t){0};
+    c->cfg_act = 0;
+    c->cfg_bucket = (s3_str_t){0};
     c->copy_pending = 0;
     c->copy_bucket = (s3_str_t){0};
     c->copy_key = (s3_str_t){0};
@@ -532,8 +534,16 @@ static int cb_on_headers_complete(llhttp_t *p) {
      * bucket names, so the path can't shadow a real bucket. */
     int is_health = (c->req.path.n == 8
                      && memcmp(c->req.path.p, "/_health", 8) == 0);
+    /* CORS preflights are never signed by browsers (item 4). */
+    int is_preflight = s3_str_eq_lit(c->req.method, "OPTIONS");
 
-    if (c->auth && !is_health) {
+    /* Every response: no MIME sniffing (S7). CORS headers for a matching
+     * Origin are added before auth so even auth errors carry them —
+     * otherwise browsers hide the S3 error body. */
+    conn_add_header(c, "X-Content-Type-Options", "nosniff");
+    if (!is_preflight) route_cors_decorate(c);
+
+    if (c->auth && !is_health && !is_preflight) {
         /* Look up authorization header. If missing and auth not strictly
          * required, fall through. */
         const s3_str_t *auth_h = NULL;
@@ -613,6 +623,7 @@ static int cb_on_headers_complete(llhttp_t *p) {
     if (ce != S3_OK) {
         abort_writer(c);
         c->mpu_complete_pending = c->delete_pending = c->copy_pending = 0;
+        c->cfg_act = 0;
         if (route_build_error(c, ce) < 0) return -1;
         return 0;
     }
@@ -680,6 +691,7 @@ static int cb_on_body(llhttp_t *p, const char *at, size_t len) {
         c->mpu_complete_pending = 0;
         c->delete_pending = 0;
         c->copy_pending = 0;
+        c->cfg_act = 0;
         if (route_build_error(c, S3_ERR_ENTITY_TOO_LARGE) < 0) return -1;
         return 0;
     }
@@ -695,6 +707,7 @@ static int cb_on_body(llhttp_t *p, const char *at, size_t len) {
             sigv4_chunk_free(c->chunk_decoder);
             c->chunk_decoder = NULL;
             c->mpu_complete_pending = c->delete_pending = c->copy_pending = 0;
+            c->cfg_act = 0;
             s3_err_t fe = c->sig_verified ? S3_ERR_SIGNATURE_DOES_NOT_MATCH
                                           : S3_ERR_INVALID_REQUEST;
             if (route_build_error(c, fe) < 0) {
@@ -746,6 +759,7 @@ static int cb_on_message_complete(llhttp_t *p) {
             LOG_D("chunk finish failed on %s", c->peer);
             abort_writer(c);
             c->mpu_complete_pending = c->delete_pending = c->copy_pending = 0;
+            c->cfg_act = 0;
             if (route_build_error(c, fe) < 0) {
                 return -1;
             }
@@ -783,6 +797,7 @@ static int cb_on_message_complete(llhttp_t *p) {
             LOG_D("checksum mismatch on %s", c->peer);
             abort_writer(c);
             c->mpu_complete_pending = c->delete_pending = c->copy_pending = 0;
+            c->cfg_act = 0;
             if (route_build_error(c, ce) < 0) return -1;
             c->request_dispatched = 1;
             return HPE_PAUSED;

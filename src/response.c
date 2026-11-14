@@ -114,6 +114,13 @@ static const err_entry_t ERR_TABLE[] = {
     { S3_ERR_INVALID_CHECKSUM,           400, "InvalidRequest",           "The checksum value or algorithm you specified is invalid." },
     { S3_ERR_AUTH_QUERY_PARAMS,          400, "AuthorizationQueryParametersError", "The presigned URL parameters are invalid or out of range." },
     { S3_ERR_PRESIGN_EXPIRED,            403, "AccessDenied",             "Request has expired" },
+    { S3_ERR_CORS_FORBIDDEN,             403, "AccessForbidden",          "CORSResponse: This CORS request is not allowed." },
+    { S3_ERR_NO_SUCH_CORS,               404, "NoSuchCORSConfiguration",  "The CORS configuration does not exist." },
+    { S3_ERR_NO_SUCH_LIFECYCLE,          404, "NoSuchLifecycleConfiguration", "The lifecycle configuration does not exist." },
+    { S3_ERR_NO_SUCH_WEBSITE,            404, "NoSuchWebsiteConfiguration", "The specified bucket does not have a website configuration." },
+    { S3_ERR_NO_SUCH_POLICY,             404, "NoSuchBucketPolicy",       "The bucket policy does not exist." },
+    { S3_ERR_NO_SUCH_OBJECT_LOCK,        404, "ObjectLockConfigurationNotFoundError", "Object Lock configuration does not exist for this bucket." },
+    { S3_ERR_MALFORMED_POLICY,           400, "MalformedPolicy",          "Policies must be valid JSON within the supported grammar." },
     { S3_ERR_INSUFFICIENT_STORAGE,       507, "QuotaExceeded",            "There is insufficient storage available to complete the request." },
 };
 
@@ -451,6 +458,34 @@ static int ship_xml_200(conn_t *c, char *body, size_t blen) {
         c->req.keep_alive ? "keep-alive" : "close");
     if (n < 0 || n >= CONN_WBUF_SZ) { free(body); return -1; }
 
+    if ((size_t)n + blen <= CONN_WBUF_SZ) {
+        memcpy(c->wbuf + n, body, blen);
+        free(body);
+        c->wlen = (size_t)n + blen;
+    } else {
+        c->wlen = (size_t)n;
+        free(c->ext_body);
+        c->ext_body = body;
+        c->ext_body_len = blen;
+        c->ext_body_pos = 0;
+    }
+    c->wpos = 0;
+    c->state = CST_WRITE_RESPONSE;
+    return 0;
+}
+
+int rsp_build_raw(conn_t *c, int status, const char *reason,
+                  const char *content_type, char *body, size_t blen) {
+    int n = snprintf(c->wbuf, CONN_WBUF_SZ,
+        "HTTP/1.1 %d %s\r\n"
+        "Server: fs3/0.2\r\n"
+        "Content-Type: %s\r\n"
+        "Content-Length: %zu\r\n"
+        "Connection: %s\r\n"
+        "\r\n",
+        status, reason, content_type, blen,
+        c->req.keep_alive ? "keep-alive" : "close");
+    if (n < 0 || n >= CONN_WBUF_SZ) { free(body); return -1; }
     if ((size_t)n + blen <= CONN_WBUF_SZ) {
         memcpy(c->wbuf + n, body, blen);
         free(body);

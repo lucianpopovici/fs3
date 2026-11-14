@@ -267,6 +267,12 @@ typedef struct conn {
     s3_str_t           copy_bucket;
     s3_str_t           copy_key;
 
+    /* Bucket config PUT (?cors, ?lifecycle, ?website, ?policy, ...):
+     * body buffered into req_body_buf, handled at message-complete.
+     * cfg_act is the s3_action_t (0 = none). */
+    int                cfg_act;
+    s3_str_t           cfg_bucket;      /* points into req_scratch */
+
     /* Bulk-delete context (POST /<bucket>?delete) */
     int                delete_pending;
     s3_str_t           delete_bucket;   /* points into req_scratch */

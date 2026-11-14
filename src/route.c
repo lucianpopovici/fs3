@@ -17,6 +17,7 @@
 #include "route.h"
 #include "action.h"
 #include "checksum.h"
+#include "cors.h"
 #include "conn.h"
 #include "iopool.h"
 #include "log.h"
@@ -411,6 +412,209 @@ static int handle_bulk_delete_finish(conn_t *c, s3_str_t bucket) {
 /* Bucket-level (PATH = "/bucket" or "/bucket/")                          */
 /* ===================================================================== */
 
+/* ===================================================================== */
+/* Bucket configuration subresources (?cors, ?lifecycle, ?website, ...)   */
+/* ===================================================================== */
+
+#define CFG_BODY_CAP (64 * 1024)
+
+typedef struct {
+    s3_action_t get, put, del;
+    const char *sidecar;
+    s3_err_t    missing;
+    const char *content_type;
+} cfg_kind_t;
+
+static const cfg_kind_t CFG_KINDS[] = {
+    { ACT_GET_BUCKET_CORS, ACT_PUT_BUCKET_CORS, ACT_DELETE_BUCKET_CORS,
+      "cors.xml", S3_ERR_NO_SUCH_CORS, "application/xml" },
+};
+
+static const cfg_kind_t *cfg_kind_for(s3_action_t act) {
+    for (size_t i = 0; i < sizeof(CFG_KINDS) / sizeof(*CFG_KINDS); i++)
+        if (CFG_KINDS[i].get == act || CFG_KINDS[i].put == act
+            || CFG_KINDS[i].del == act) return &CFG_KINDS[i];
+    return NULL;
+}
+
+/* Validate a config document before it is stored. */
+static s3_err_t cfg_validate(s3_action_t act, const char *body, size_t n) {
+    switch (act) {
+    case ACT_PUT_BUCKET_CORS: {
+        s3_err_t e;
+        cors_config_t *cc = cors_parse(body, n, &e);
+        if (!cc) return e;
+        cors_free(cc);
+        return S3_OK;
+    }
+    default:
+        return S3_ERR_NOT_IMPLEMENTED;
+    }
+}
+
+static int cfg_put_begin(conn_t *c, s3_str_t bucket, s3_action_t act) {
+    if (!store_bucket_exists(c->store, bucket))
+        return rsp_build_s3_error(c, S3_ERR_NO_SUCH_BUCKET, c->req.path, NULL);
+    free(c->req_body_buf);
+    c->req_body_buf = malloc(CFG_BODY_CAP);
+    if (!c->req_body_buf)
+        return rsp_build_s3_error(c, S3_ERR_INTERNAL, c->req.path, NULL);
+    c->req_body_len = 0;
+    c->req_body_cap = CFG_BODY_CAP;
+    c->cfg_act = (int)act;
+    c->cfg_bucket = bucket;
+    return 0;
+}
+
+static int cfg_put_finish(conn_t *c) {
+    s3_action_t act = (s3_action_t)c->cfg_act;
+    c->cfg_act = 0;
+    const cfg_kind_t *k = cfg_kind_for(act);
+    if (!k) return rsp_build_s3_error(c, S3_ERR_INTERNAL, c->req.path, NULL);
+    if (c->req_body_len > c->req_body_cap)
+        return rsp_build_s3_error(c, S3_ERR_ENTITY_TOO_LARGE, c->req.path, NULL);
+    s3_err_t e = cfg_validate(act, c->req_body_buf, c->req_body_len);
+    if (e == S3_OK)
+        e = store_bucket_sidecar_write(c->store, c->cfg_bucket, k->sidecar,
+                                       c->req_body_buf, c->req_body_len);
+    if (e != S3_OK) return rsp_build_s3_error(c, e, c->req.path, NULL);
+    return rsp_build_status(c, 200, "OK");
+}
+
+static int cfg_get(conn_t *c, s3_str_t bucket, const cfg_kind_t *k) {
+    char *data = NULL;
+    size_t n = 0;
+    s3_err_t e = store_bucket_sidecar_read(c->store, bucket, k->sidecar,
+                                           CFG_BODY_CAP, &data, &n);
+    if (e == S3_ERR_NO_SUCH_KEY) e = k->missing;
+    if (e != S3_OK) return rsp_build_s3_error(c, e, c->req.path, NULL);
+    return rsp_build_raw(c, 200, "OK", k->content_type, data, n);
+}
+
+static int cfg_delete(conn_t *c, s3_str_t bucket, const cfg_kind_t *k) {
+    s3_err_t e = store_bucket_sidecar_delete(c->store, bucket, k->sidecar);
+    if (e != S3_OK) return rsp_build_s3_error(c, e, c->req.path, NULL);
+    return rsp_build_status(c, 204, "No Content");
+}
+
+/* ===================================================================== */
+/* CORS (item 4)                                                          */
+/* ===================================================================== */
+
+/* Unauthenticated paths read CORS config through a 1 s TTL cache, so a
+ * flood of preflights causes no per-request disk I/O and a missing
+ * bucket looks exactly like a bucket without a matching rule (S7). */
+#define CORS_CACHE_TTL_MS 1000
+
+static store_cfg_ref_t *cors_ref(conn_t *c, s3_str_t bucket) {
+    return store_sidecar_get_ttl(c->store, bucket, "cors.xml", CORS_MAX_BYTES,
+                                 cors_parse_cb, cors_free_cb, CORS_CACHE_TTL_MS);
+}
+
+static void cors_methods_str(int m, char *out, size_t cap) {
+    snprintf(out, cap, "%s%s%s%s%s",
+             m & CORS_GET ? "GET, " : "", m & CORS_PUT ? "PUT, " : "",
+             m & CORS_POST ? "POST, " : "", m & CORS_DELETE ? "DELETE, " : "",
+             m & CORS_HEAD ? "HEAD, " : "");
+    size_t n = strlen(out);
+    if (n >= 2) out[n - 2] = '\0';
+}
+
+/* Allow-Origin value: "*" only if the matching rule's origin is exactly
+ * "*" (credentials are never allowed, so this is safe); otherwise echo. */
+static void cors_allow_origin(conn_t *c, const cors_rule_t *r, s3_str_t origin) {
+    int any = 0;
+    for (size_t i = 0; i < r->n_origins; i++)
+        if (strcmp(r->origins[i], "*") == 0) any = 1;
+    char o[512];
+    snprintf(o, sizeof(o), "%.*s", (int)(origin.n < 500 ? origin.n : 500), origin.p);
+    conn_add_header(c, "Access-Control-Allow-Origin", any ? "*" : o);
+    conn_add_header(c, "Vary", "Origin");
+}
+
+/* Bucket name from the raw path's first segment (decoded), or 0. */
+static int path_bucket(const conn_t *c, char out[64], s3_str_t *b) {
+    s3_str_t p = c->req.path;
+    if (p.n < 2 || p.p[0] != '/') return 0;
+    size_t i = 1, o = 0;
+    while (i < p.n && p.p[i] != '/') {
+        if (o >= 63) return 0;
+        out[o++] = p.p[i++];
+    }
+    size_t n = pct_decode(out, o);
+    *b = (s3_str_t){ out, n };
+    return n > 0;
+}
+
+void route_cors_decorate(conn_t *c) {
+    const s3_str_t *origin = hdr_get(c, "origin");
+    if (!origin || origin->n == 0) return;
+    char bb[64];
+    s3_str_t bucket;
+    if (!path_bucket(c, bb, &bucket)) return;
+    store_cfg_ref_t *r = cors_ref(c, bucket);
+    if (!r) return;
+    const cors_rule_t *rule = cors_match(store_cfg_obj(r), *origin,
+                                         cors_method_bit(c->req.method),
+                                         S3_STR_NULL);
+    if (rule) {
+        cors_allow_origin(c, rule, *origin);
+        char m[64];
+        cors_methods_str(rule->methods, m, sizeof(m));
+        conn_add_header(c, "Access-Control-Allow-Methods", m);
+        if (rule->n_expose) {
+            char ex[1024] = "";
+            size_t o = 0;
+            for (size_t i = 0; i < rule->n_expose && o < sizeof(ex) - 2; i++)
+                o += (size_t)snprintf(ex + o, sizeof(ex) - o, "%s%s",
+                                      i ? ", " : "", rule->expose[i]);
+            conn_add_header(c, "Access-Control-Expose-Headers", ex);
+        }
+    }
+    store_sidecar_put(c->store, r);
+}
+
+/* OPTIONS /bucket[/key] — unauthenticated, never touches objects. */
+static int handle_preflight(conn_t *c, s3_str_t bucket) {
+    const s3_str_t *origin = hdr_get(c, "origin");
+    const s3_str_t *rm = hdr_get(c, "access-control-request-method");
+    if (!origin || !rm || bucket.n == 0)
+        return rsp_build_s3_error(c, S3_ERR_INVALID_REQUEST, c->req.path, NULL);
+    const s3_str_t *rh = hdr_get(c, "access-control-request-headers");
+    store_cfg_ref_t *r = cors_ref(c, bucket);
+    const cors_rule_t *rule = r ? cors_match(store_cfg_obj(r), *origin,
+                                             cors_method_bit(*rm),
+                                             rh ? *rh : S3_STR_NULL) : NULL;
+    if (!rule) {
+        if (r) store_sidecar_put(c->store, r);
+        return rsp_build_s3_error(c, S3_ERR_CORS_FORBIDDEN, S3_STR_NULL, NULL);
+    }
+    cors_allow_origin(c, rule, *origin);
+    char m[64];
+    cors_methods_str(rule->methods, m, sizeof(m));
+    conn_add_header(c, "Access-Control-Allow-Methods", m);
+    if (rh && rh->n) {
+        char hv[1024];
+        snprintf(hv, sizeof(hv), "%.*s", (int)(rh->n < 1000 ? rh->n : 1000), rh->p);
+        conn_add_header(c, "Access-Control-Allow-Headers", hv);
+    }
+    if (rule->max_age >= 0) {
+        char ma[24];
+        snprintf(ma, sizeof(ma), "%ld", rule->max_age);
+        conn_add_header(c, "Access-Control-Max-Age", ma);
+    }
+    if (rule->n_expose) {
+        char ex[1024] = "";
+        size_t o = 0;
+        for (size_t i = 0; i < rule->n_expose && o < sizeof(ex) - 2; i++)
+            o += (size_t)snprintf(ex + o, sizeof(ex) - o, "%s%s",
+                                  i ? ", " : "", rule->expose[i]);
+        conn_add_header(c, "Access-Control-Expose-Headers", ex);
+    }
+    store_sidecar_put(c->store, r);
+    return rsp_build_status(c, 200, "OK");
+}
+
 static int max_keys_param(const conn_t *c, const char *name) {
     s3_str_t v = q_val(c, name);
     int mk = 0;
@@ -489,8 +693,13 @@ static int handle_bucket(conn_t *c, s3_str_t bucket, s3_action_t act) {
         return rsp_build_list_bucket(c, bucket, &opts, l);
     }
 
-    default:
+    default: {
+        const cfg_kind_t *k = cfg_kind_for(act);
+        if (k && act == k->put) return cfg_put_begin(c, bucket, act);
+        if (k && act == k->get) return cfg_get(c, bucket, k);
+        if (k && act == k->del) return cfg_delete(c, bucket, k);
         return rsp_build_s3_error(c, S3_ERR_NOT_IMPLEMENTED, c->req.path, NULL);
+    }
     }
 }
 
@@ -698,6 +907,10 @@ static int handle_object_get(conn_t *c, s3_str_t bucket, s3_str_t key,
     if (e != S3_OK) {
         return rsp_build_s3_error(c, e, c->req.path, NULL);
     }
+    /* S7: an uploaded HTML object opened via a presigned or anonymous URL
+     * must not run as an active page on this origin. */
+    if (!c->id.user[0] || c->id.presigned)
+        conn_add_header(c, "Content-Security-Policy", "sandbox");
 
     /* Parse optional Range header. */
     const s3_str_t *range_hdr = hdr_get(c, "range");
@@ -727,6 +940,7 @@ static int handle_object_get(conn_t *c, s3_str_t bucket, s3_str_t key,
      * (x-amz-checksum-mode: ENABLED) and never on a ranged GET. */
     const s3_str_t *cmode = hdr_get(c, "x-amz-checksum-mode");
     if (cmode && ieq_lit(*cmode, "ENABLED")) add_checksum_headers(c, &m);
+
     if (rsp_build_object_head(c, &m, head_only) < 0) {
         store_get_close(r);
         return -1;
@@ -1271,7 +1485,7 @@ static s3_action_t classify_service(const conn_t *c, s3_err_t *err) {
 
 static s3_action_t classify_bucket(const conn_t *c, s3_err_t *err) {
     static const char *const handled[] = {
-        "acl", "location", "versioning", "uploads", "delete", NULL
+        "acl", "location", "versioning", "uploads", "delete", "cors", NULL
     };
     int unhandled;
     const char *sub = pick_subresource(c, handled, &unhandled);
@@ -1297,6 +1511,10 @@ static s3_action_t classify_bucket(const conn_t *c, s3_err_t *err) {
         if (get) return ACT_LIST_MPU_UPLOADS;
     } else if (!strcmp(sub, "delete")) {
         if (post) return ACT_DELETE_OBJECTS;
+    } else if (!strcmp(sub, "cors")) {
+        if (get) return ACT_GET_BUCKET_CORS;
+        if (put) return ACT_PUT_BUCKET_CORS;
+        if (del) return ACT_DELETE_BUCKET_CORS;
     }
     *err = S3_ERR_METHOD_NOT_ALLOWED;
     return ACT_NONE;
@@ -1411,6 +1629,8 @@ int route_dispatch_headers(conn_t *c) {
     if (parse_path(c->req.path, path_scratch, c->req.path.n, &bucket, &key) < 0) {
         return rsp_build_s3_error(c, S3_ERR_INVALID_REQUEST, c->req.path, NULL);
     }
+
+    if (method_is(c, "OPTIONS")) return handle_preflight(c, bucket);
 
     s3_err_t ce;
     s3_action_t act = route_classify(c, bucket, key, &ce);
@@ -1545,6 +1765,7 @@ int route_dispatch_complete(conn_t *c) {
         c->delete_pending = 0;
         return handle_bulk_delete_finish(c, c->delete_bucket);
     }
+    if (c->cfg_act) return cfg_put_finish(c);
     /* Non-streaming requests already built their response in
      * route_dispatch_headers. Nothing more to do here. */
     return 0;

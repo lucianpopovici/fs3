@@ -38,6 +38,13 @@ typedef enum {
     S3_ERR_INVALID_CHECKSUM,            /* malformed checksum header/trailer */
     S3_ERR_AUTH_QUERY_PARAMS,           /* bad presigned-URL parameters */
     S3_ERR_PRESIGN_EXPIRED,             /* presigned URL past X-Amz-Expires */
+    S3_ERR_CORS_FORBIDDEN,              /* preflight did not match a rule */
+    S3_ERR_NO_SUCH_CORS,                /* GET ?cors with none set */
+    S3_ERR_NO_SUCH_LIFECYCLE,
+    S3_ERR_NO_SUCH_WEBSITE,
+    S3_ERR_NO_SUCH_POLICY,
+    S3_ERR_NO_SUCH_OBJECT_LOCK,
+    S3_ERR_MALFORMED_POLICY,
     S3_ERR_MAX
 } s3_err_t;
 
