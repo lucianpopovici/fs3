@@ -25,6 +25,7 @@
  */
 
 #include "conn.h"
+#include <openssl/crypto.h>
 #include "action.h"
 #include "iopool.h"
 #include "log.h"
@@ -101,6 +102,8 @@ void conn_destroy(conn_t *c) {
     /* A job still running on the pool owns its writer/reader; detach it
      * so its done() cleans up without touching this (freed) conn. */
     if (c->job) c->job->conn = NULL;
+    OPENSSL_cleanse(c->ssec_key, sizeof(c->ssec_key));
+    OPENSSL_cleanse(c->ssec_src_key, sizeof(c->ssec_src_key));
     /* Release any handler-owned state (request was abandoned mid-flight). */
     if (c->put_writer) store_put_abort(c->put_writer);
     if (c->get_reader) store_get_close(c->get_reader);
@@ -220,6 +223,9 @@ static void request_reset(conn_t *c) {
     c->last_err = 0;
     c->expect_pending = 0;
     c->deny_reason = NULL;
+    OPENSSL_cleanse(c->ssec_key, sizeof(c->ssec_key));
+    OPENSSL_cleanse(c->ssec_src_key, sizeof(c->ssec_src_key));
+    c->ssec_on = c->ssec_src_on = 0;
 
     /* Belt-and-suspenders: by the time we reset, route_dispatch_complete
      * (PUT path) or route_dispatch_send_body (GET path) should have
@@ -260,6 +266,16 @@ static ssize_t conn_io_write(conn_t *c, const void *buf, size_t n) {
 
 ssize_t conn_io_send_body(conn_t *c, struct s3_reader *r, size_t max) {
     if (c->ssl) return tls_send_body(c, r, max);
+    if (store_reader_transformed(r)) {
+        /* SSE-C behind a trusted https proxy: decrypt, then write; bytes
+         * the socket didn't take are re-read on the next call. */
+        char buf[16 * 1024];
+        ssize_t n = store_get_read(r, buf, max && max < sizeof(buf) ? max : sizeof(buf));
+        if (n <= 0) return n;
+        ssize_t w = write(c->fd, buf, (size_t)n);
+        if (w < n) store_get_rewind(r, (uint64_t)(n - (w > 0 ? w : 0)));
+        return w;
+    }
     return store_get_sendfile(r, c->fd, max);
 }
 

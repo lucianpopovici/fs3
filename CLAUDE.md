@@ -65,8 +65,15 @@ user metadata, ListObjectsV2, quotas (`q_*` in store_fs.c) and the
 integrity scrub (`src/scrub.c`, `store_scrub_file`) and key hygiene
 (`sigv4_cred_attrs_t`, read-only check at the top of `authz()`),
 seccomp (`src/sandbox.c`) and reflink fast paths (`clone_range`,
-`store_writer_clone`). Not done yet: dedup, compression, SSE-C,
-`FS_IMMUTABLE_FL` hardening.
+`store_writer_clone`), dedup (`dedup_commit`, `cas/`), Btrfs
+compression (`set_compr_flag`) and SSE-C (`src/ssec.c`, writer/reader
+transform in store_fs.c). Not done yet: `FS_IMMUTABLE_FL` hardening.
+
+- **Writer byte counts:** `data_written` is plaintext (quota, data_size),
+  `stored_written` is on disk (stored_size, part records). Any new path
+  that puts bytes into a writer must advance both (see `writer_feed`,
+  `store_writer_clone`). Run `tests/test_e2e_reflink.sh` with
+  `FS3_REFLINK_DIR` on a Btrfs loopback; it skips otherwise.
 
 - **seccomp is on by default.** A new syscall in a runtime path (not
   startup) kills the server with SIGSYS; the test harness says so. Add it

@@ -23,6 +23,8 @@
 #include "policy.h"
 #include "objlock.h"
 #include "objmeta.h"
+#include "ssec.h"
+#include "sigv4.h"
 #include "xml_parser.h"
 #include "conn.h"
 #include "iopool.h"
@@ -31,6 +33,8 @@
 #include "store.h"
 
 #include <ctype.h>
+#include <openssl/crypto.h>
+#include <openssl/evp.h>
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1132,6 +1136,60 @@ static int submit_commit(conn_t *c, int is_part) {
 }
 
 /* ===================================================================== */
+/* SSE-C request headers (round 2, item 8)                                */
+/* ===================================================================== */
+
+/* Parse one SSE-C header set ("x-amz-server-side-encryption-customer-"
+ * or the copy-source variant). *on = 0 when none of the three is sent.
+ * All three are required together, only over TLS (native, or a trusted
+ * proxy that says https), and each must be signed. */
+static s3_err_t parse_ssec_set(conn_t *c, const char *prefix, uint8_t key[32], int *on,
+                               char md5_b64[32]) {
+    char na[128], nk[128], nm[128];
+    snprintf(na, sizeof(na), "%salgorithm", prefix);
+    snprintf(nk, sizeof(nk), "%skey", prefix);
+    snprintf(nm, sizeof(nm), "%skey-md5", prefix);
+    const s3_str_t *ha = hdr_get(c, na), *hk = hdr_get(c, nk), *hm = hdr_get(c, nm);
+    *on = 0;
+    if (!ha && !hk && !hm) return S3_OK;
+    if (!ha || !hk || !hm || !s3_str_eq_lit(*ha, "AES256")) return S3_ERR_INVALID_ARGUMENT;
+    /* A key sent in clear over the LAN is worse than no encryption. */
+    if (!c->secure) return S3_ERR_INVALID_REQUEST;
+    if (c->auth && c->sig_verified
+        && (!sigv4_header_signed(c, na) || !sigv4_header_signed(c, nk) || !sigv4_header_signed(c, nm)))
+        return S3_ERR_ACCESS_DENIED;
+    uint8_t md5[16], got[16];
+    if (base64_decode(hk->p, hk->n, key, 32) != 32
+        || base64_decode(hm->p, hm->n, md5, sizeof(md5)) != 16) {
+        OPENSSL_cleanse(key, 32);
+        return S3_ERR_INVALID_ARGUMENT;
+    }
+    unsigned int gl = 16;
+    EVP_Digest(key, 32, got, &gl, EVP_md5(), NULL);
+    if (CRYPTO_memcmp(got, md5, 16) != 0) { OPENSSL_cleanse(key, 32); return S3_ERR_INVALID_ARGUMENT; }
+    if (md5_b64) {
+        if (hm->n >= 32) { OPENSSL_cleanse(key, 32); return S3_ERR_INVALID_ARGUMENT; }
+        memcpy(md5_b64, hm->p, hm->n);
+        md5_b64[hm->n] = '\0';
+    }
+    *on = 1;
+    return S3_OK;
+}
+
+#define SSEC_HDR "x-amz-server-side-encryption-customer-"
+#define SSEC_SRC_HDR "x-amz-copy-source-server-side-encryption-customer-"
+
+static s3_err_t req_ssec(conn_t *c) {
+    return parse_ssec_set(c, SSEC_HDR, c->ssec_key, &c->ssec_on, c->ssec_md5);
+}
+
+static void echo_ssec(conn_t *c) {
+    if (!c->ssec_on) return;
+    conn_add_header(c, "x-amz-server-side-encryption-customer-algorithm", "AES256");
+    conn_add_header(c, "x-amz-server-side-encryption-customer-key-MD5", c->ssec_md5);
+}
+
+/* ===================================================================== */
 /* User metadata and standard object headers (round 2, item 1e)           */
 /* ===================================================================== */
 
@@ -1252,11 +1310,15 @@ static int handle_object_put_begin(conn_t *c, s3_str_t bucket, s3_str_t key) {
     if (e == S3_OK) e = req_meta_tlv(c, &tlv, &tlv_n);
     if (e != S3_OK) return rsp_build_s3_error(c, e, c->req.path, NULL);
 
+    if (e == S3_OK) e = req_ssec(c);
+    if (e != S3_OK) { free(tlv); return rsp_build_s3_error(c, e, c->req.path, NULL); }
     store_put_opts_t o = { 0 };
     o.content_type = ct_buf;
     o.tlv = tlv;
     o.tlv_len = tlv_n;
     o.size_hint = declared_body_len(c);
+    o.ssec_key = c->ssec_on ? c->ssec_key : NULL;
+    echo_ssec(c);
     s3_writer_t *w;
     e = store_put_begin_opts(c->store, bucket, key, &o, &w);
     free(tlv);
@@ -1363,6 +1425,23 @@ static int handle_object_get(conn_t *c, s3_str_t bucket, s3_str_t key,
      * must not run as an active page on this origin. */
     if (!c->is_web && (!c->id.user[0] || c->id.presigned))
         conn_add_header(c, "Content-Security-Policy", "sandbox");
+    /* SSE-C (item 8). */
+    {
+        int is_ssec = (m.flags & S3_OBJF_SSEC) != 0;
+        if (is_ssec && c->is_web) {           /* never served on the website */
+            store_get_close(r);
+            return rsp_build_s3_error(c, S3_ERR_NO_SUCH_KEY, c->req.path, NULL);
+        }
+        s3_err_t se = c->is_web ? S3_OK : req_ssec(c);
+        if (se == S3_OK && is_ssec && !c->ssec_on) se = S3_ERR_INVALID_REQUEST;
+        if (se == S3_OK && !is_ssec && c->ssec_on) se = S3_ERR_INVALID_REQUEST;
+        if (se == S3_OK && is_ssec) se = store_reader_ssec(c->store, bucket, r, c->ssec_key);
+        if (se != S3_OK) {
+            store_get_close(r);
+            return rsp_build_s3_error(c, se, c->req.path, NULL);
+        }
+        echo_ssec(c);
+    }
     emit_object_meta(c, r, &m, ovr);
 
     /* Parse optional Range header. */
@@ -1676,6 +1755,22 @@ static int handle_object_copy(conn_t *c, s3_str_t dst_bucket, s3_str_t dst_key) 
         free(src_buf);
         return rsp_build_s3_error(c, e, c->req.path, NULL);
     }
+    /* SSE-C (item 8): the source is decrypted with the copy-source key,
+     * the destination sealed with its own (re-keying), either optional. */
+    {
+        int src_ssec = (src_meta.flags & S3_OBJF_SSEC) != 0;
+        e = parse_ssec_set(c, SSEC_SRC_HDR, c->ssec_src_key, &c->ssec_src_on, NULL);
+        if (e == S3_OK) e = req_ssec(c);
+        if (e == S3_OK && src_ssec != c->ssec_src_on) e = S3_ERR_INVALID_REQUEST;
+        if (e == S3_OK && src_ssec)
+            e = store_reader_ssec(c->store, src_bucket, reader, c->ssec_src_key);
+        if (e != S3_OK) {
+            store_get_close(reader);
+            free(src_buf);
+            return rsp_build_s3_error(c, e, c->req.path, NULL);
+        }
+        echo_ssec(c);
+    }
 
     e = copy_source_conditions(c, &src_meta);
     int part = c->copy_part;
@@ -1708,7 +1803,8 @@ static int handle_object_copy(conn_t *c, s3_str_t dst_bucket, s3_str_t dst_key) 
         int replace = md && ieq_lit(*md, "REPLACE");
         if (md && !replace && !ieq_lit(*md, "COPY")) e = S3_ERR_INVALID_ARGUMENT;
         else if (hdr_get(c, "x-amz-tagging-directive")) e = S3_ERR_NOT_IMPLEMENTED;
-        else if (!replace && !has_src_vid && s3_str_eq(src_bucket, dst_bucket)
+        else if (!replace && !has_src_vid && !c->ssec_on && !c->ssec_src_on
+                 && s3_str_eq(src_bucket, dst_bucket)
                  && s3_str_eq(src_key, dst_key))
             e = S3_ERR_INVALID_REQUEST;
         else if (replace) {
@@ -1735,14 +1831,15 @@ static int handle_object_copy(conn_t *c, s3_str_t dst_bucket, s3_str_t dst_key) 
     /* Open dest writer: a part of the upload, or an object. */
     s3_writer_t *writer = NULL;
     if (part) {
-        e = store_mpu_part_begin(c->store, dst_bucket, dst_key, c->mpu_upload_id,
-                                 part, &writer);
+        e = store_mpu_part_begin_ssec(c->store, dst_bucket, dst_key, c->mpu_upload_id,
+                                      part, c->ssec_on ? c->ssec_key : NULL, &writer);
     } else {
         store_put_opts_t po = { 0 };
         po.content_type = ct;
         po.tlv = tlv;
         po.tlv_len = tlv_n;
         po.size_hint = src_meta.size;
+        po.ssec_key = c->ssec_on ? c->ssec_key : NULL;
         e = store_put_begin_opts(c->store, dst_bucket, dst_key, &po, &writer);
     }
     free(tlv);
@@ -1819,7 +1916,17 @@ static int handle_mpu_initiate(conn_t *c, s3_str_t bucket, s3_str_t key) {
     uint8_t *tlv = NULL;
     size_t tlv_n = 0;
     s3_err_t e = req_meta_tlv(c, &tlv, &tlv_n);
-    if (e != S3_OK) return rsp_build_s3_error(c, e, c->req.path, NULL);
+    if (e == S3_OK) e = req_ssec(c);
+    if (e == S3_OK && c->ssec_on) {
+        /* The upload's salt and key check travel in its meta and end up
+         * in the object header at Complete. */
+        ssec_info_t si;
+        uint8_t *t2 = realloc(tlv, tlv_n + 6 + SSEC_TLV_PAYLOAD);
+        if (!t2 || ssec_info_new(c->ssec_key, &si) < 0) { e = S3_ERR_INTERNAL; if (t2) tlv = t2; }
+        else { tlv = t2; tlv_n += ssec_tlv_encode(&si, tlv + tlv_n); }
+    }
+    if (e != S3_OK) { free(tlv); return rsp_build_s3_error(c, e, c->req.path, NULL); }
+    echo_ssec(c);
     char upload_id[33];
     e = store_mpu_create_tlv(c->store, bucket, key, ct_present ? ct_buf : NULL,
                              algo, type, tlv, tlv_n, upload_id);
@@ -1841,8 +1948,11 @@ static int handle_mpu_initiate(conn_t *c, s3_str_t bucket, s3_str_t key) {
 static int handle_mpu_upload_part_begin(conn_t *c, s3_str_t bucket, s3_str_t key,
                                          int part_number, const char *upload_id) {
     s3_writer_t *w;
-    s3_err_t e = store_mpu_part_begin(c->store, bucket, key,
-                                       upload_id, part_number, &w);
+    s3_err_t e = req_ssec(c);
+    if (e == S3_OK)
+        e = store_mpu_part_begin_ssec(c->store, bucket, key, upload_id, part_number,
+                                      c->ssec_on ? c->ssec_key : NULL, &w);
+    if (e == S3_OK) echo_ssec(c);
     if (e == S3_OK && (e = store_put_expect(w, declared_body_len(c))) != S3_OK)
         store_mpu_part_abort(w);
     if (e != S3_OK) {

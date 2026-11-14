@@ -85,10 +85,11 @@ void audit_request(const conn_t *c, int status, uint64_t bytes_in,
     if (o + 200 < sizeof(line))
         o += (size_t)snprintf(line + o, sizeof(line) - o,
             ",\"status\":%d,\"bytes_in\":%llu,\"bytes_out\":%llu,\"ms\":%.1f,"
-            "\"presigned\":%s,\"tls\":%s,\"web\":%s}\n",
+            "\"presigned\":%s,\"tls\":%s,\"web\":%s%s}\n",
             status, (unsigned long long)bytes_in, (unsigned long long)bytes_out,
             dur_s >= 0 ? dur_s * 1000 : -1.0, c->id.presigned ? "true" : "false",
-            c->secure ? "true" : "false", c->is_web ? "true" : "false");
+            c->secure ? "true" : "false", c->is_web ? "true" : "false",
+            (c->ssec_on || c->ssec_src_on) ? ",\"ssec\":true" : "");
     emit(line, o);
 }
 

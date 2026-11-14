@@ -107,6 +107,7 @@ typedef struct {
     size_t      tlv_len;
     int         no_dedup;      /* never pool this object (SSE-C) */
     uint64_t    size_hint;     /* declared body length, 0 = unknown */
+    const uint8_t *ssec_key;   /* SSE-C: 32-byte customer key, NULL = none */
 } store_put_opts_t;
 
 /* ---- Lifecycle ---- */
@@ -345,6 +346,11 @@ ssize_t  store_get_sendfile(s3_reader_t *r, int out_fd, size_t max);
  * if the range falls outside the object body. */
 s3_err_t store_get_seek(s3_reader_t *r, uint64_t first, uint64_t last);
 void     store_get_close(s3_reader_t *r);
+/* SSE-C (item 8): switch an opened SSE-C object to decrypting reads with
+ * the customer key. S3_ERR_ACCESS_DENIED: wrong key; S3_ERR_INVALID_REQUEST:
+ * not an SSE-C object. Decrypting readers have no sendfile/raw access. */
+s3_err_t store_reader_ssec(s3_store_t *s, s3_str_t bucket, s3_reader_t *r, const uint8_t key[32]);
+int      store_reader_transformed(const s3_reader_t *r);
 /* The object's schema-4 TLV area (malloc'd copy, re-validated; NULL/0 if
  * none). Caller frees. */
 s3_err_t store_reader_tlv(const s3_reader_t *r, uint8_t **out, size_t *n_out);
@@ -352,6 +358,8 @@ s3_err_t store_reader_tlv(const s3_reader_t *r, uint8_t **out, size_t *n_out);
  * the next body byte and how many remain. store_get_advance consumes n. */
 void     store_get_raw(const s3_reader_t *r, int *fd, off_t *off, uint64_t *remaining);
 void     store_get_advance(s3_reader_t *r, uint64_t n);
+/* Step back n bytes (a socket took less than was read). */
+void     store_get_rewind(s3_reader_t *r, uint64_t n);
 
 /* ---- HEAD / DELETE ---- */
 
@@ -425,6 +433,12 @@ s3_err_t store_mpu_part_begin(s3_store_t *s, s3_str_t bucket, s3_str_t key,
                               const char *upload_id, int part_number,
                               s3_writer_t **out);
 s3_err_t store_mpu_part_write(s3_writer_t *w, const void *buf, size_t n);
+/* SSE-C (item 8): parts of an SSE-C upload need its key (wrong key:
+ * S3_ERR_ACCESS_DENIED; missing, or a key for a plain upload:
+ * S3_ERR_INVALID_REQUEST). */
+s3_err_t store_mpu_part_begin_ssec(s3_store_t *s, s3_str_t bucket, s3_str_t key,
+                                   const char *upload_id, int part_number,
+                                   const uint8_t *ssec_key, s3_writer_t **out);
 /* On success, fills *etag_hex_out with 32 hex chars (NUL-terminated). */
 s3_err_t store_mpu_part_commit(s3_writer_t *w, char etag_hex_out[33]);
 void     store_mpu_part_abort(s3_writer_t *w);

@@ -37,6 +37,7 @@
 
 #include "store.h"
 #include "checksum.h"
+#include "ssec.h"
 #include "log.h"
 
 #include <dirent.h>
@@ -1511,6 +1512,16 @@ struct s3_writer {
     uint64_t    q_rbytes;
     uint32_t    q_robjs;
 
+    /* SSE-C (item 8): plaintext is buffered into segments and sealed;
+     * md5/pcrc/stored_written cover the ciphertext on disk. */
+    int         ssec;
+    uint8_t     ssec_kobj[32];
+    uint32_t    ssec_part;
+    uint64_t    ssec_idx;
+    uint8_t    *ssec_buf;           /* SSEC_SEG plaintext + SSEC_TAG */
+    size_t      ssec_len;
+    uint64_t    stored_written;     /* on-disk payload bytes */
+
     /* Dedup: SHA-256 of the payload and where its TLV slot sits. */
     EVP_MD_CTX *sha;
     uint64_t    sha_off;
@@ -1523,6 +1534,8 @@ static void     q_charge(s3_store_t *s, const char *bucket, int64_t dbytes, int6
 static void     key_usage(s3_store_t *s, s3_str_t bucket, const char hex[65],
                           uint64_t *bytes, uint64_t *objs);
 static uint64_t upload_part_bytes(const char *up_dir);
+static s3_err_t writer_ssec_on(s3_writer_t *w, const uint8_t key[32], const ssec_info_t *info,
+                               uint32_t part);
 
 /* Grow the writer's reservation to cover `total` bytes. */
 static s3_err_t writer_reserve_to(s3_writer_t *w, uint64_t total) {
@@ -1554,6 +1567,8 @@ static void writer_free(s3_writer_t *w) {
     if (!w) return;
     writer_release_quota(w);
     if (w->sha) EVP_MD_CTX_free(w->sha);
+    OPENSSL_cleanse(w->ssec_kobj, sizeof(w->ssec_kobj));
+    if (w->ssec_buf) { OPENSSL_cleanse(w->ssec_buf, SSEC_SEG + SSEC_TAG); free(w->ssec_buf); }
     cksum_free(&w->pcrc);
     if (w->fd >= 0) close(w->fd);
     if (w->tmp_path[0]) unlink(w->tmp_path);
@@ -1605,6 +1620,13 @@ s3_err_t store_put_begin_opts(s3_store_t *s, s3_str_t bucket, s3_str_t key,
             writer_free(w); return S3_ERR_NO_SUCH_BUCKET;
         }
         memcpy(w->bucket_id, bm.id, sizeof(w->bucket_id));
+    }
+    /* SSE-C (item 8): per-object salt and key check go into the header. */
+    ssec_info_t ssec_si;
+    if (opts->ssec_key) {
+        s3_err_t se = ssec_info_new(opts->ssec_key, &ssec_si) < 0 ? S3_ERR_INTERNAL
+                    : writer_ssec_on(w, opts->ssec_key, &ssec_si, 0);
+        if (se != S3_OK) { writer_free(w); return se; }
     }
     /* Quota: room for one more object before any byte is written. */
     if (q_reserve(s, (snprintf(w->q_bucket, sizeof(w->q_bucket), S3_STR_FMT,
@@ -1661,7 +1683,8 @@ s3_err_t store_put_begin_opts(s3_store_t *s, s3_str_t bucket, s3_str_t key,
         writer_free(w);
         return e;
     }
-    if (s->fs_compress && compress_worth_it(s, w->content_type_dup, w->key_dup, key.n, opts->size_hint))
+    if (s->fs_compress && !w->ssec
+        && compress_worth_it(s, w->content_type_dup, w->key_dup, key.n, opts->size_hint))
         (void)set_compr_flag(w->fd);
 
     /* Reserve header space by writing the (incomplete) header, then the
@@ -1671,7 +1694,16 @@ s3_err_t store_put_begin_opts(s3_store_t *s, s3_str_t bucket, s3_str_t key,
     const uint8_t *tlv = opts->tlv;
     size_t tlv_n = opts->tlv_len;
     uint8_t *tlv2 = NULL;
-    if (s->dedup_mode && s->reflink && s->pad_headers && !opts->no_dedup
+    if (w->ssec) {
+        /* SSE-C objects are never pooled; their header carries the SSEC TLV. */
+        if (tlv_n + 6 + SSEC_TLV_PAYLOAD > OBJ_MAX_TLV
+            || !(tlv2 = malloc(tlv_n + 6 + SSEC_TLV_PAYLOAD))) {
+            writer_free(w); return S3_ERR_INVALID_ARGUMENT;
+        }
+        if (tlv_n) memcpy(tlv2, tlv, tlv_n);
+        tlv_n += ssec_tlv_encode(&ssec_si, tlv2 + tlv_n);
+        tlv = tlv2;
+    } else if (s->dedup_mode && s->reflink && s->pad_headers && !opts->no_dedup
         && tlv_n + 38 <= OBJ_MAX_TLV) {
         tlv2 = malloc(tlv_n + 38);
         w->sha = EVP_MD_CTX_new();
@@ -1710,20 +1742,15 @@ s3_err_t store_put_begin_opts(s3_store_t *s, s3_str_t bucket, s3_str_t key,
     return S3_OK;
 }
 
-s3_err_t store_put_write(s3_writer_t *w, const void *buf, size_t n) {
-    if (!w || w->finalized) return S3_ERR_INVALID_ARGUMENT;
-    if (n == 0) return S3_OK;
-    if (writer_reserve_to(w, w->data_written + n) != S3_OK) return S3_ERR_QUOTA_EXCEEDED;
-
+/* On-disk payload bytes: written, and hashed for the ETag and payload CRC. */
+static s3_err_t writer_emit(s3_writer_t *w, const void *buf, size_t n) {
     if (EVP_DigestUpdate(w->md5_ctx, buf, n) != 1) return S3_ERR_INTERNAL;
     if (w->pcrc.algo) cksum_update(&w->pcrc, buf, n);
-    if (w->sha) EVP_DigestUpdate(w->sha, buf, n);
-
     const char *p = buf;
     size_t left = n;
     while (left > 0) {
         ssize_t r = xwrite(w->fd, p, left);
-        if (r > 0) { p += r; left -= (size_t)r; w->data_written += (uint64_t)r; continue; }
+        if (r > 0) { p += r; left -= (size_t)r; w->stored_written += (uint64_t)r; continue; }
         if (r < 0 && errno == EINTR) continue;
         LOG_W("put_write: %s", strerror(errno));
         return map_io_err(errno);
@@ -1731,11 +1758,64 @@ s3_err_t store_put_write(s3_writer_t *w, const void *buf, size_t n) {
     return S3_OK;
 }
 
+static s3_err_t ssec_seal_buf(s3_writer_t *w, int final) {
+    if (ssec_seal(w->ssec_kobj, w->ssec_part, w->ssec_idx, final, w->bucket_id,
+                  w->ssec_buf, w->ssec_len, w->ssec_buf) < 0)
+        return S3_ERR_INTERNAL;
+    s3_err_t e = writer_emit(w, w->ssec_buf, w->ssec_len + SSEC_TAG);
+    w->ssec_idx++;
+    w->ssec_len = 0;
+    return e;
+}
+
+/* Plaintext in. SSE-C: a full segment is sealed only when more data
+ * arrives, so the last one is always sealed as final at commit. */
+static s3_err_t writer_feed(s3_writer_t *w, const void *buf, size_t n) {
+    if (!w->ssec) {
+        s3_err_t e = writer_emit(w, buf, n);
+        if (e == S3_OK) w->data_written += n;
+        return e;
+    }
+    const uint8_t *p = buf;
+    while (n) {
+        if (w->ssec_len == SSEC_SEG) {
+            s3_err_t e = ssec_seal_buf(w, 0);
+            if (e != S3_OK) return e;
+        }
+        size_t take = SSEC_SEG - w->ssec_len < n ? SSEC_SEG - w->ssec_len : n;
+        memcpy(w->ssec_buf + w->ssec_len, p, take);
+        w->ssec_len += take; p += take; n -= take;
+        w->data_written += take;
+    }
+    return S3_OK;
+}
+
+/* Turn on SSE-C for a writer (salt already chosen). */
+static s3_err_t writer_ssec_on(s3_writer_t *w, const uint8_t key[32], const ssec_info_t *info,
+                               uint32_t part) {
+    if (strlen(w->bucket_id) != 32) return S3_ERR_INVALID_REQUEST;   /* pre-isolation bucket */
+    w->ssec_buf = malloc(SSEC_SEG + SSEC_TAG);
+    if (!w->ssec_buf || ssec_derive(key, info->salt, w->ssec_kobj) < 0) return S3_ERR_INTERNAL;
+    w->ssec = 1;
+    w->ssec_part = part;
+    return S3_OK;
+}
+
+s3_err_t store_put_write(s3_writer_t *w, const void *buf, size_t n) {
+    if (!w || w->finalized) return S3_ERR_INVALID_ARGUMENT;
+    if (n == 0) return S3_OK;
+    if (writer_reserve_to(w, w->data_written + n) != S3_OK) return S3_ERR_QUOTA_EXCEEDED;
+    if (w->sha) EVP_DigestUpdate(w->sha, buf, n);
+    return writer_feed(w, buf, n);
+}
+
 s3_err_t store_put_commit(s3_writer_t *w, s3_obj_meta_t *meta_out) {
     if (!w || w->finalized) return S3_ERR_INVALID_ARGUMENT;
     w->finalized = 1;
 
-    /* Finalize MD5 and timestamp. */
+    if (w->ssec && ssec_seal_buf(w, 1) != S3_OK) { writer_free(w); return S3_ERR_INTERNAL; }
+    /* Finalize MD5 (of the on-disk payload: ciphertext for SSE-C, so no
+     * plaintext digest is kept) and timestamp. */
     unsigned int mlen = 16;
     if (EVP_DigestFinal_ex(w->md5_ctx, w->hdr.etag, &mlen) != 1) {
         writer_free(w); return S3_ERR_INTERNAL;
@@ -1758,7 +1838,15 @@ s3_err_t store_put_commit(s3_writer_t *w, s3_obj_meta_t *meta_out) {
     }
 
     /* Pwrite the finalized header back at offset 0. */
-    w->ext4.stored_size = w->data_written;
+    w->ext4.stored_size = w->stored_written;
+    if (w->ssec) {
+        /* Checksums were verified over the plaintext while it streamed;
+         * storing them would leak a plaintext digest at rest. */
+        w->ext.flags |= S3_OBJF_SSEC;
+        w->ext.cksum_algo = w->ext.cksum_type = 0;
+        w->ext.cksum_parts = 0;
+        memset(w->ext.cksum, 0, sizeof(w->ext.cksum));
+    }
     if (w->pcrc.algo) {
         uint8_t d[CKSUM_MAX_DIGEST]; size_t dn;
         if (cksum_final(&w->pcrc, d, &dn) == 0 && dn == 8) {
@@ -1900,12 +1988,29 @@ void store_put_abort(s3_writer_t *w) {
 /* Streaming GET                                                          */
 /* ===================================================================== */
 
+typedef struct {
+    uint32_t part;           /* nonce part number (0 for a single PUT) */
+    uint64_t plain, poff;    /* plaintext length / offset */
+    uint64_t coff;           /* ciphertext offset from data_off */
+} rd_part_t;
+
 struct s3_reader {
     int      fd;
     uint32_t tlv_off, tlv_len;  /* schema-4 TLV area (0 if none) */
     uint64_t data_off;       /* file offset where data begins */
-    uint64_t data_size;      /* total data length */
+    uint64_t data_size;      /* total data length (plaintext) */
     uint64_t pos;            /* bytes already returned to caller */
+    /* SSE-C decrypt state (item 8); all reads are plaintext offsets. */
+    int        ssec;
+    uint8_t    kobj[32];
+    char       bucket_id[33];
+    rd_part_t *parts;
+    size_t     n_parts;
+    uint8_t   *seg;          /* decrypted segment cache */
+    size_t     seg_len;
+    size_t     seg_part;
+    uint64_t   seg_idx;
+    int        seg_valid;
 };
 
 /* Read and validate an object file's header. The share holding the data
@@ -2042,8 +2147,11 @@ s3_err_t store_get_open(s3_store_t *s, s3_str_t bucket, s3_str_t key,
     return store_get_open_version(s, bucket, key, NULL, out, meta_out);
 }
 
+static ssize_t ssec_read(s3_reader_t *r, void *buf, size_t n);
+
 ssize_t store_get_read(s3_reader_t *r, void *buf, size_t n) {
     if (!r) { errno = EINVAL; return -1; }
+    if (r->ssec) return ssec_read(r, buf, n);
     if (r->pos >= r->data_size) return 0;
     uint64_t avail = r->data_size - r->pos;
     if ((uint64_t)n > avail) n = (size_t)avail;
@@ -2053,7 +2161,7 @@ ssize_t store_get_read(s3_reader_t *r, void *buf, size_t n) {
 }
 
 ssize_t store_get_sendfile(s3_reader_t *r, int out_fd, size_t max) {
-    if (!r) { errno = EINVAL; return -1; }
+    if (!r || r->ssec) { errno = EINVAL; return -1; }    /* transformed: read path */
     if (r->pos >= r->data_size) return 0;
     uint64_t avail = r->data_size - r->pos;
     size_t want = max ? (max < avail ? max : (size_t)avail) : (size_t)avail;
@@ -2072,6 +2180,9 @@ s3_err_t store_get_seek(s3_reader_t *r, uint64_t first, uint64_t last) {
 
 void store_get_close(s3_reader_t *r) {
     if (!r) return;
+    OPENSSL_cleanse(r->kobj, sizeof(r->kobj));
+    if (r->seg) { OPENSSL_cleanse(r->seg, SSEC_SEG + SSEC_TAG); free(r->seg); }
+    free(r->parts);
     if (r->fd >= 0) close(r->fd);
     free(r);
 }
@@ -2850,6 +2961,12 @@ static s3_err_t mpu_read_meta2(const s3_store_t *s, s3_str_t bucket,
 s3_err_t store_mpu_part_begin(s3_store_t *s, s3_str_t bucket, s3_str_t key,
                               const char *upload_id, int part_number,
                               s3_writer_t **out) {
+    return store_mpu_part_begin_ssec(s, bucket, key, upload_id, part_number, NULL, out);
+}
+
+s3_err_t store_mpu_part_begin_ssec(s3_store_t *s, s3_str_t bucket, s3_str_t key,
+                                   const char *upload_id, int part_number,
+                                   const uint8_t *ssec_key, s3_writer_t **out) {
     if (!s || !upload_id || !out) return S3_ERR_INVALID_ARGUMENT;
     if (part_number < 1 || part_number > 10000) return S3_ERR_INVALID_ARGUMENT;
     if (!valid_bucket_name(bucket)) return S3_ERR_INVALID_BUCKET_NAME;
@@ -2880,6 +2997,30 @@ s3_err_t store_mpu_part_begin(s3_store_t *s, s3_str_t bucket, s3_str_t key,
     w->mpu_algo = mpu_algo;
     if (cksum_begin(&w->pcrc, S3_CKSUM_CRC64NVME) < 0) { writer_free(w); return S3_ERR_INTERNAL; }
 
+    /* SSE-C (item 8): an SSE-C upload needs the same key on every part;
+     * a plain upload refuses one. */
+    {
+        uint8_t *mt = NULL; size_t mtn = 0;
+        char *k2 = NULL, *c2 = NULL;
+        mpu_read_meta2(s, bucket, upload_id, &k2, NULL, &c2, NULL, NULL, &mt, &mtn);
+        free(k2); free(c2);
+        ssec_info_t si;
+        int r = ssec_tlv_find(mt, mtn, &si);
+        free(mt);
+        s3_err_t se = S3_OK;
+        if (r < 0) se = S3_ERR_INTERNAL;
+        else if (r == 1 && !ssec_key) se = S3_ERR_INVALID_REQUEST;
+        else if (r == 0 && ssec_key) se = S3_ERR_INVALID_REQUEST;
+        else if (r == 1 && !ssec_key_matches(ssec_key, &si)) se = S3_ERR_ACCESS_DENIED;
+        if (se == S3_OK && r == 1) {
+            s3_bucket_meta_t bm;
+            if (store_bucket_meta(s, bucket, &bm) == S3_OK)
+                memcpy(w->bucket_id, bm.id, sizeof(w->bucket_id));
+            se = writer_ssec_on(w, ssec_key, &si, (uint32_t)part_number);
+        }
+        if (se != S3_OK) { writer_free(w); return se; }
+    }
+
     snprintf(w->q_bucket, sizeof(w->q_bucket), S3_STR_FMT, S3_STR_ARG(bucket));
     if (q_reserve(s, w->q_bucket, 0, 0) != S3_OK) {
         writer_free(w); return S3_ERR_QUOTA_EXCEEDED;
@@ -2902,7 +3043,8 @@ s3_err_t store_mpu_part_begin(s3_store_t *s, s3_str_t bucket, s3_str_t key,
         writer_free(w);
         return e;
     }
-    if (s->fs_compress && compress_worth_it(s, NULL, key.p, key.n, 0)) (void)set_compr_flag(w->fd);
+    if (s->fs_compress && !w->ssec && compress_worth_it(s, NULL, key.p, key.n, 0))
+        (void)set_compr_flag(w->fd);
 
     w->md5_ctx = EVP_MD_CTX_new();
     if (!w->md5_ctx
@@ -2919,25 +3061,14 @@ s3_err_t store_mpu_part_write(s3_writer_t *w, const void *buf, size_t n) {
     if (!w || w->finalized || !w->is_part) return S3_ERR_INVALID_ARGUMENT;
     if (n == 0) return S3_OK;
     if (writer_reserve_to(w, w->data_written + n) != S3_OK) return S3_ERR_QUOTA_EXCEEDED;
-    ssize_t off = 0;
-    while ((size_t)off < n) {
-        ssize_t r = xwrite(w->fd, (const char *)buf + off, n - (size_t)off);
-        if (r < 0) {
-            if (errno == EINTR) continue;
-            return map_io_err(errno);
-        }
-        off += r;
-    }
-    EVP_DigestUpdate(w->md5_ctx, buf, n);
-    if (w->pcrc.algo) cksum_update(&w->pcrc, buf, n);
-    w->data_written += n;
-    return S3_OK;
+    return writer_feed(w, buf, n);
 }
 
 s3_err_t store_mpu_part_commit(s3_writer_t *w, char etag_hex_out[33]) {
     if (!w || w->finalized || !w->is_part) return S3_ERR_INVALID_ARGUMENT;
     w->finalized = 1;
 
+    if (w->ssec && ssec_seal_buf(w, 1) != S3_OK) { writer_free(w); return S3_ERR_INTERNAL; }
     uint8_t mac[16];
     unsigned int mac_n = 16;
     if (EVP_DigestFinal_ex(w->md5_ctx, mac, &mac_n) != 1) {
@@ -2969,13 +3100,13 @@ s3_err_t store_mpu_part_commit(s3_writer_t *w, char etag_hex_out[33]) {
     memcpy(rec.magic, PART_REC_MAGIC, 8);
     rec.version = 1;
     memcpy(rec.md5, mac, 16);
-    rec.size = w->data_written;
+    rec.size = w->stored_written;       /* on disk (ciphertext for SSE-C) */
     {
         struct timespec ts;
         clock_gettime(CLOCK_REALTIME, &ts);
         rec.mtime_ms = (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
     }
-    if (w->ext.cksum_algo) {
+    if (w->ext.cksum_algo && !w->ssec) {   /* SSE-C: no plaintext digest at rest */
         rec.ck_algo = w->ext.cksum_algo;
         rec.ck_n = (uint8_t)cksum_digest_len(w->ext.cksum_algo);
         memcpy(rec.ck, w->ext.cksum, rec.ck_n);
@@ -3011,7 +3142,7 @@ s3_err_t store_mpu_part_commit(s3_writer_t *w, char etag_hex_out[33]) {
     int rename_errno = errno;
     if (rc == 0) {
         /* Parts count toward the quota while the upload is in flight. */
-        q_charge(w->store, w->q_bucket, (int64_t)w->data_written - (int64_t)old_part, 0);
+        q_charge(w->store, w->q_bucket, (int64_t)w->stored_written - (int64_t)old_part, 0);
         writer_release_quota(w);
     }
     pthread_mutex_unlock(&w->store->ns_mu);
@@ -3184,6 +3315,14 @@ s3_err_t store_mpu_complete2(s3_store_t *s, s3_str_t bucket, s3_str_t key,
     int key_ok = stored_key_n == key.n && memcmp(stored_key, key.p, key.n) == 0;
     free(stored_key);
     if (!key_ok) { free(stored_ct); free(mpu_tlv); return S3_ERR_NO_SUCH_UPLOAD; }
+    /* SSE-C upload (item 8): parts are ciphertext; no checksums are kept
+     * (they would be plaintext digests); the object gets a part table. */
+    ssec_info_t ssec_si;
+    int is_ssec = ssec_tlv_find(mpu_tlv, mpu_tlv_n, &ssec_si) == 1;
+    if (is_ssec) mpu_algo = 0;
+    ssec_part_t *ssec_pt = NULL;
+    uint8_t *tlv_out = NULL;
+    uint64_t plain_total = 0;
 
     part_snap_t *ps = calloc(n_parts, sizeof(*ps));
     cksum_ctx_t comp, full;
@@ -3267,6 +3406,7 @@ s3_err_t store_mpu_complete2(s3_store_t *s, s3_str_t bucket, s3_str_t key,
             crc_ok = 0;
         }
         total_size += p->rec.size;
+        plain_total += is_ssec ? ssec_plain_len(p->rec.size, ssec_si.seg) : p->rec.size;
     }
     uint8_t mp_md5[16];
     unsigned int mp_md5_n = 16;
@@ -3295,9 +3435,26 @@ s3_err_t store_mpu_complete2(s3_store_t *s, s3_str_t bucket, s3_str_t key,
     memset(&ext4, 0, sizeof(ext4));
     size_t ct_n = stored_ct ? strlen(stored_ct) : 0;
     hdr.part_count = (uint16_t)n_parts;
-    hdr.data_size = total_size;
+    hdr.data_size = plain_total;
     memcpy(hdr.etag, mp_md5, 16);
     ext4.stored_size = total_size;
+    const uint8_t *obj_tlv = mpu_tlv;
+    size_t obj_tlv_n = mpu_tlv_n;
+    if (is_ssec) {
+        ssec_pt = malloc(n_parts * sizeof(*ssec_pt));
+        tlv_out = malloc(mpu_tlv_n + 6 + 12 * n_parts);
+        if (!ssec_pt || !tlv_out || mpu_tlv_n + 6 + 12 * n_parts > OBJ_MAX_TLV) {
+            e = S3_ERR_INTERNAL; goto out;
+        }
+        for (size_t i = 0; i < n_parts; i++) {
+            ssec_pt[i].part = (uint32_t)parts[i].part_number;
+            ssec_pt[i].plain = ssec_plain_len(ps[i].rec.size, ssec_si.seg);
+        }
+        memcpy(tlv_out, mpu_tlv, mpu_tlv_n);
+        obj_tlv_n = mpu_tlv_n + ssec_parttable_encode(ssec_pt, n_parts, tlv_out + mpu_tlv_n);
+        obj_tlv = tlv_out;
+        ext.flags |= S3_OBJF_SSEC;
+    }
     int versioning = bucket_versioning(s, bucket);
     if (versioning == S3_VERSIONING_ENABLED && random_vid(ext.version_id) < 0) {
         e = S3_ERR_INTERNAL; goto out;
@@ -3306,7 +3463,7 @@ s3_err_t store_mpu_complete2(s3_store_t *s, s3_str_t bucket, s3_str_t key,
     clock_gettime(CLOCK_REALTIME, &ts);
     hdr.mtime_ms = (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
     if (obj_write_prefix(s, tfd, &hdr, &ext, &ext4, stored_ct, ct_n,
-                         key.p, key.n, mpu_tlv, mpu_tlv_n) < 0) {
+                         key.p, key.n, obj_tlv, obj_tlv_n) < 0) {
         e = map_io_err(errno); goto out;
     }
     /* Reflink fast path (item 6a): clone each part's extents into the
@@ -3433,6 +3590,8 @@ out:
     cksum_free(&full);
     free(stored_ct);
     free(mpu_tlv);
+    free(ssec_pt);
+    free(tlv_out);
     return e;
 }
 
@@ -3468,6 +3627,15 @@ s3_err_t store_mpu_list_parts(s3_store_t *s, s3_str_t bucket, s3_str_t key,
     if (!key_ok) return S3_ERR_NO_SUCH_UPLOAD;
     if (algo_out) *algo_out = algo;
     if (type_out) *type_out = type;
+    int list_ssec = 0;
+    {
+        uint8_t *mt = NULL; size_t mtn = 0;
+        char *k2 = NULL, *c2 = NULL;
+        ssec_info_t si;
+        if (mpu_read_meta2(s, bucket, upload_id, &k2, NULL, &c2, NULL, NULL, &mt, &mtn) == S3_OK)
+            list_ssec = ssec_tlv_find(mt, mtn, &si) == 1;
+        free(k2); free(c2); free(mt);
+    }
 
     char dir[4096];
     if (snprintf(dir, sizeof(dir), "%s/" S3_STR_FMT "/%s", s->mpu_dir,
@@ -3524,7 +3692,7 @@ s3_err_t store_mpu_list_parts(s3_store_t *s, s3_str_t bucket, s3_str_t key,
         s3_part_info_t *pi = &arr[n++];
         memset(pi, 0, sizeof(*pi));
         pi->part_number = pn;
-        pi->size = ps.rec.size;
+        pi->size = list_ssec ? ssec_plain_len(ps.rec.size, SSEC_SEG) : ps.rec.size;
         pi->mtime_ms = ps.rec.mtime_ms;
         static const char hx[] = "0123456789abcdef";
         for (int i = 0; i < 16; i++) {
@@ -4629,6 +4797,10 @@ void store_get_raw(const s3_reader_t *r, int *fd, off_t *off, uint64_t *remainin
     *remaining = r->pos < r->data_size ? r->data_size - r->pos : 0;
 }
 
+void store_get_rewind(s3_reader_t *r, uint64_t n) {
+    r->pos = n > r->pos ? 0 : r->pos - n;
+}
+
 void store_get_advance(s3_reader_t *r, uint64_t n) {
     r->pos += n;
     if (r->pos > r->data_size) r->pos = r->data_size;
@@ -5505,7 +5677,7 @@ s3_err_t store_scrub_file(s3_store_t *s, const char *path, int kind, const char 
 s3_err_t store_writer_clone(s3_writer_t *w, s3_reader_t *r,
                             void (*extra)(void *ctx, const void *p, size_t n), void *ctx) {
     if (!w || !r || w->finalized) return S3_ERR_INVALID_ARGUMENT;
-    if (!w->store->reflink) return S3_ERR_NOT_IMPLEMENTED;
+    if (!w->store->reflink || w->ssec || r->ssec) return S3_ERR_NOT_IMPLEMENTED;
     uint64_t len = r->pos < r->data_size ? r->data_size - r->pos : 0;
     uint64_t soff = r->data_off + r->pos;
     uint64_t doff = (w->is_part ? 0 : w->hdr.header_size) + w->data_written;
@@ -5528,6 +5700,7 @@ s3_err_t store_writer_clone(s3_writer_t *w, s3_reader_t *r,
         done += (uint64_t)n;
     }
     w->data_written += len;
+    w->stored_written += len;          /* not transformed: plaintext == on disk */
     r->pos += len;
     return S3_OK;
 }
@@ -5696,4 +5869,90 @@ int store_object_content_sha256(const char *path, uint8_t out[32]) {
     }
     close(fd);
     return found;
+}
+
+/* ===================================================================== */
+/* SSE-C read side (round 2, item 8)                                      */
+/* ===================================================================== */
+
+int store_reader_transformed(const s3_reader_t *r) { return r && r->ssec; }
+
+s3_err_t store_reader_ssec(s3_store_t *s, s3_str_t bucket, s3_reader_t *r, const uint8_t key[32]) {
+    if (!s || !r || !key) return S3_ERR_INVALID_ARGUMENT;
+    uint8_t *t = NULL; size_t tn = 0;
+    if (store_reader_tlv(r, &t, &tn) != S3_OK) return S3_ERR_INTERNAL;
+    ssec_info_t si;
+    int found = ssec_tlv_find(t, tn, &si);
+    if (found <= 0) { free(t); return found < 0 ? S3_ERR_INTERNAL : S3_ERR_INVALID_REQUEST; }
+    if (!ssec_key_matches(key, &si)) { free(t); return S3_ERR_ACCESS_DENIED; }
+    ssec_part_t *pt = NULL; size_t pn = 0;
+    int ptf = ssec_parttable_find(t, tn, &pt, &pn);
+    free(t);
+    if (ptf < 0) return S3_ERR_INTERNAL;
+    s3_bucket_meta_t bm;
+    if (store_bucket_meta(s, bucket, &bm) != S3_OK || strlen(bm.id) != 32) { free(pt); return S3_ERR_INTERNAL; }
+    size_t k = ptf == 1 ? pn : 1;
+    r->parts = calloc(k, sizeof(*r->parts));
+    r->seg = malloc(SSEC_SEG + SSEC_TAG);
+    if (!r->parts || !r->seg) { free(pt); return S3_ERR_INTERNAL; }
+    uint64_t poff = 0, coff = 0;
+    for (size_t i = 0; i < k; i++) {
+        r->parts[i].part = ptf == 1 ? pt[i].part : 0;
+        r->parts[i].plain = ptf == 1 ? pt[i].plain : r->data_size;
+        r->parts[i].poff = poff;
+        r->parts[i].coff = coff;
+        poff += r->parts[i].plain;
+        coff += ssec_cipher_len(r->parts[i].plain, si.seg);
+    }
+    free(pt);
+    struct stat st;
+    /* The geometry must account for exactly the stored payload. */
+    if (poff != r->data_size || fstat(r->fd, &st) < 0
+        || (uint64_t)st.st_size != r->data_off + coff)
+        return S3_ERR_INTERNAL;
+    r->n_parts = k;
+    if (ssec_derive(key, si.salt, r->kobj) < 0) return S3_ERR_INTERNAL;
+    memcpy(r->bucket_id, bm.id, 33);
+    r->ssec = 1;
+    return S3_OK;
+}
+
+/* Decrypt (and authenticate) the segment holding plaintext offset pos. */
+static int ssec_load(s3_reader_t *r, uint64_t pos, size_t *pi_out, uint64_t *in_seg) {
+    size_t pi = 0;
+    while (pi + 1 < r->n_parts && pos >= r->parts[pi + 1].poff) pi++;
+    rd_part_t *p = &r->parts[pi];
+    uint64_t rel = pos - p->poff, idx = rel / SSEC_SEG;
+    uint64_t nseg = p->plain ? (p->plain + SSEC_SEG - 1) / SSEC_SEG : 1;
+    *pi_out = pi;
+    *in_seg = rel % SSEC_SEG;
+    if (r->seg_valid && r->seg_part == pi && r->seg_idx == idx) return 0;
+    size_t plen = idx + 1 < nseg ? SSEC_SEG : (size_t)(p->plain - idx * SSEC_SEG);
+    uint64_t off = r->data_off + p->coff + idx * (SSEC_SEG + SSEC_TAG);
+    size_t clen = plen + SSEC_TAG;
+    if (pread(r->fd, r->seg, clen, (off_t)off) != (ssize_t)clen) return -1;
+    r->seg_valid = 0;
+    if (ssec_open(r->kobj, p->part, idx, idx + 1 == nseg, r->bucket_id, r->seg, clen, r->seg) < 0)
+        return -1;                          /* tampered or truncated: never return bytes */
+    r->seg_len = plen;
+    r->seg_part = pi;
+    r->seg_idx = idx;
+    r->seg_valid = 1;
+    return 0;
+}
+
+static ssize_t ssec_read(s3_reader_t *r, void *buf, size_t n) {
+    size_t done = 0;
+    while (done < n && r->pos < r->data_size) {
+        size_t pi; uint64_t in;
+        if (ssec_load(r, r->pos, &pi, &in) < 0) { errno = EIO; return done ? (ssize_t)done : -1; }
+        size_t avail = r->seg_len - (size_t)in;
+        uint64_t left = r->data_size - r->pos;
+        size_t take = n - done < avail ? n - done : avail;
+        if (take > left) take = (size_t)left;
+        memcpy((uint8_t *)buf + done, r->seg + in, take);
+        done += take;
+        r->pos += take;
+    }
+    return (ssize_t)done;
 }

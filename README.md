@@ -356,6 +356,9 @@ What's working end-to-end:
   the part records), and CopyObject / UploadPartCopy clone the source
   extent when both payloads are block-aligned; anything misaligned falls
   back to a copy. `fs3_reflink_clones_total` counts clones.
+  `tests/test_e2e_reflink.sh` needs a Btrfs/XFS directory in
+  `FS3_REFLINK_DIR` (a loopback image works) and skips without one; CI
+  should provide one, or run with `FS3_TEST_STRICT=1`.
 
 - **Whole-object dedup** (opt-in, needs reflink) — `--dedup owner|global`
   hashes PUT bodies (SHA-256, stored as a `CONTENT_SHA256` TLV) and
@@ -379,6 +382,24 @@ What's working end-to-end:
   uncompressed sizes to `stat`/`du`; use `compsize <data dir>` to see the
   savings. On DSM, the shared folder's own compression setting may be the
   simpler switch. Application-level zstd (for ext4) is not implemented.
+
+- **SSE-C** (customer-provided keys) — `x-amz-server-side-encryption-customer-*`
+  on PUT, GET, HEAD, CreateMultipartUpload, UploadPart, CopyObject and
+  UploadPartCopy (with the copy-source variants: re-keying and
+  decrypt-on-copy work). Only over native TLS or a trusted proxy that says
+  https (`400 InvalidRequest` otherwise), and the three headers must be
+  signed. The key is never stored: per object, a random salt gives
+  `k_obj = HKDF-SHA256(key, salt, "fs3-ssec-v1")`, and the payload is
+  sealed in 64 KiB AES-256-GCM segments (nonce = part number ‖ segment
+  index, AAD = bucket id ‖ final flag) so ranges decrypt only the
+  segments they touch and truncation, reordering or splicing fail
+  authentication. A key check value (HMAC, not the key MD5) refuses a
+  wrong key (`403`) before any data is read; a missing key is `400`.
+  ETags are MD5s of the ciphertext, and client checksums are verified over
+  the plaintext but not stored. SSE-C objects are never deduplicated,
+  compressed or served by the website listener; the scrub verifies their
+  ciphertext without the key. The audit log marks them `"ssec":true` and
+  never holds key material.
 
 - **Integrity scrub** — a background pass (every `--scrub-interval-days`,
   default 30; `--scrub-now`; admin API `POST /v1/scrub`, progress at
@@ -411,7 +432,7 @@ What's working end-to-end:
 
 What's *not* yet wired:
 
-- SSE-C, application-level compression (ext4), `FS_IMMUTABLE_FL` for
+- Application-level compression (ext4), `FS_IMMUTABLE_FL` for
   COMPLIANCE versions.
 - Tag-based lifecycle filters, transitions, website routing rules (all
   refused with 501 rather than ignored).

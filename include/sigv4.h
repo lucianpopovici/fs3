@@ -132,6 +132,10 @@ typedef struct {
     int  read_only;                        /* key carries "ro" (item 4) */
 } sigv4_id_t;
 
+/* 1 if `lc_name` is among the request's SignedHeaders (header mode or
+ * presigned X-Amz-SignedHeaders). */
+int sigv4_header_signed(const struct conn *c, const char *lc_name);
+
 /* sigv4_verify, also filling *id_out (if non-NULL) on S3_OK. */
 s3_err_t sigv4_verify_id(const sigv4_verifier_t *v, const struct conn *c,
                          sigv4_id_t *id_out);

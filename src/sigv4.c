@@ -1029,6 +1029,21 @@ static s3_err_t verify_params(const sigv4_verifier_t *v, const conn_t *c,
     return S3_OK;
 }
 
+int sigv4_header_signed(const conn_t *c, const char *lc_name) {
+    auth_params_t p;
+    if (!c || extract_auth_params(c, &p) != S3_OK) return 0;
+    size_t ln = strlen(lc_name);
+    const char *h = p.ap.signed_headers.p;
+    size_t n = p.ap.signed_headers.n, i = 0;
+    while (i < n) {
+        size_t st = i;
+        while (i < n && h[i] != ';') i++;
+        if (i - st == ln && strncasecmp(h + st, lc_name, ln) == 0) return 1;
+        i++;
+    }
+    return 0;
+}
+
 s3_err_t sigv4_verify_id(const sigv4_verifier_t *v, const conn_t *c,
                          sigv4_id_t *id_out) {
     g_deny_reason = NULL;

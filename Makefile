@@ -38,7 +38,7 @@ INCLUDES   := -Iinclude -I$(LLHTTP_DIR)/include -I$(XML_DIR)
 # Server objects
 SRV_SRCS := src/main.c src/server.c src/conn.c src/log.c src/store_fs.c \
             src/route.c src/response.c src/sigv4.c src/metrics.c \
-            src/iopool.c src/action.c src/checksum.c src/query.c src/cors.c src/lifecycle.c src/website.c src/json.c src/admin.c src/policy.c src/objlock.c src/tls.c src/audit.c src/objmeta.c src/scrub.c src/sandbox.c
+            src/iopool.c src/action.c src/checksum.c src/query.c src/cors.c src/lifecycle.c src/website.c src/json.c src/admin.c src/policy.c src/objlock.c src/tls.c src/audit.c src/objmeta.c src/scrub.c src/sandbox.c src/ssec.c
 SRV_OBJS := $(SRV_SRCS:.c=.o)
 
 LLHTTP_OBJS := $(LLHTTP_DIR)/src/api.o $(LLHTTP_DIR)/src/http.o \
@@ -93,7 +93,7 @@ $(XML_DIR)/%.o: $(XML_DIR)/%.c
 
 # ----- Tests --------------------------------------------------------
 
-TEST_BINS := tests/test_sandbox tests/test_objmeta tests/test_policy tests/test_json tests/test_config_fuzz tests/test_chunk_fuzz tests/test_checksum tests/test_store tests/test_conn tests/test_xml tests/test_xml_legacy tests/test_xml_fuzz tests/test_sigv4 tests/test_credfile
+TEST_BINS := tests/test_ssec tests/test_sandbox tests/test_objmeta tests/test_policy tests/test_json tests/test_config_fuzz tests/test_chunk_fuzz tests/test_checksum tests/test_store tests/test_conn tests/test_xml tests/test_xml_legacy tests/test_xml_fuzz tests/test_sigv4 tests/test_credfile
 
 # Fail fast, with the install line, if a test dependency is missing —
 # otherwise e.g. a missing awscrt shows up as checksum "server bugs".
@@ -113,6 +113,8 @@ test: check-test-deps $(TEST_BINS) fs3
 	@./tests/test_config_fuzz 50000
 	@echo "=== test_chunk_fuzz (50000 iterations) ==="
 	@./tests/test_chunk_fuzz 50000
+	@echo "=== test_ssec (+50000 fuzz iterations) ==="
+	@./tests/test_ssec 50000
 	@echo "=== test_sandbox (seccomp filter) ==="
 	@./tests/test_sandbox
 	@echo "=== test_objmeta (+50000 fuzz iterations) ==="
@@ -153,6 +155,8 @@ test: check-test-deps $(TEST_BINS) fs3
 	@./tests/test_e2e_keys.sh
 	@echo "=== test_e2e_reflink (round 2: reflink fast paths; needs FS3_REFLINK_DIR) ==="
 	@./tests/test_e2e_reflink.sh
+	@echo "=== test_e2e_ssec (round 2: SSE-C over TLS) ==="
+	@./tests/test_e2e_ssec.sh
 	@echo "=== test_e2e_phase9 (range / bulk-delete / bucket-subresources) ==="
 	@./tests/test_e2e_phase9.sh
 	@echo "=== test_e2e_phase10 (object copy / ?acl stub) ==="
@@ -190,7 +194,7 @@ test: check-test-deps $(TEST_BINS) fs3
 	@echo "=== test_ui_cgi (DSM tile admin console) ==="
 	@./tests/test_ui_cgi.sh
 
-FUZZ_CFG_OBJS := src/cors.o src/lifecycle.o src/website.o src/store_fs.o src/checksum.o src/log.o $(XML_OBJS)
+FUZZ_CFG_OBJS := src/cors.o src/lifecycle.o src/website.o src/store_fs.o src/ssec.o src/checksum.o src/log.o $(XML_OBJS)
 tests/test_config_fuzz: tests/test_config_fuzz.c tests/fuzz_targets.h $(FUZZ_CFG_OBJS)
 	$(CC) $(CFLAGS) $(INCLUDES) -Itests tests/test_config_fuzz.c $(FUZZ_CFG_OBJS) \
 	    $(LDFLAGS) -o $@
@@ -206,6 +210,9 @@ tests/test_chunk_fuzz: tests/test_chunk_fuzz.c src/sigv4.o src/query.o src/log.o
 	$(CC) $(CFLAGS) $(INCLUDES) tests/test_chunk_fuzz.c src/sigv4.o \
 	    src/query.o src/log.o $(LDFLAGS) -o $@
 
+tests/test_ssec: tests/test_ssec.c src/ssec.o
+	$(CC) $(CFLAGS) $(INCLUDES) tests/test_ssec.c src/ssec.o $(LDFLAGS) -o $@
+
 tests/test_sandbox: tests/test_sandbox.c src/sandbox.o src/log.o
 	$(CC) $(CFLAGS) $(INCLUDES) tests/test_sandbox.c src/sandbox.o src/log.o $(LDFLAGS) -lpthread -o $@
 
@@ -216,9 +223,9 @@ tests/test_checksum: tests/test_checksum.c src/checksum.o
 	$(CC) $(CFLAGS) $(INCLUDES) tests/test_checksum.c src/checksum.o \
 	    $(LDFLAGS) -o $@
 
-tests/test_store: tests/test_store.c src/store_fs.o src/log.o src/checksum.o
+tests/test_store: tests/test_store.c src/store_fs.o src/ssec.o src/log.o src/checksum.o
 	$(CC) $(CFLAGS) $(INCLUDES) tests/test_store.c \
-	    src/store_fs.o src/log.o src/checksum.o $(LDFLAGS) -o $@
+	    src/store_fs.o src/ssec.o src/log.o src/checksum.o $(LDFLAGS) -o $@
 
 # Everything but main.o/server.o: conn.c pulls in routing, the store,
 # SigV4, responses and metrics.
@@ -249,7 +256,7 @@ tests/test_sigv4: tests/test_sigv4.c src/sigv4.c src/query.c
 # test_credfile needs the FS3_MAIN_TESTING macro to expose main.c's
 # credentials-file parser and exclude main()/on_signal, so it can supply
 # its own main() without pulling in server.c's dependency chain.
-tests/test_credfile: tests/test_credfile.c src/main.c src/sigv4.c src/log.c src/query.c src/sandbox.c
+tests/test_credfile: tests/test_credfile.c src/main.c src/sigv4.c src/log.c src/query.c src/sandbox.c src/ssec.c
 	$(CC) $(CFLAGS) $(INCLUDES) -DFS3_MAIN_TESTING \
 	    tests/test_credfile.c src/main.c src/sigv4.c src/log.c src/query.c src/sandbox.c \
 	    $(LDFLAGS) -o $@
