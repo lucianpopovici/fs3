@@ -80,6 +80,15 @@ typedef struct {
     /* Comma-separated proxy IPs whose X-Forwarded-For/-Proto are trusted
      * (aws:SourceIp, aws:SecureTransport). */
     const char            *trusted_proxies;
+    /* Native TLS listener (item 7; FS3_TLS builds). tls_port 0 = off;
+     * plain and TLS listeners can coexist. */
+    uint16_t               tls_port;
+    const char            *tls_addr;
+    const char            *tls_cert;
+    const char            *tls_key;
+    int                    require_tls;             /* SigV4 on plain only from loopback */
+    int                    tls_max_per_ip;          /* default 32 */
+    int                    require_signed_payload;  /* S2 */
     /* Longest retention a client may set (S9), days; 0 = default 3650. */
     int                    max_retention_days;
 
@@ -108,5 +117,8 @@ void      server_destroy(server_t *s);
  * Returns 0 on graceful shutdown, -1 on fatal error. */
 int       server_run(server_t *s);
 void      server_stop(server_t *s);
+/* Re-read the TLS certificate/key (SIGHUP). A bad file keeps the live
+ * context; existing connections keep the context they started with. */
+void      server_tls_reload(server_t *s);
 
 #endif

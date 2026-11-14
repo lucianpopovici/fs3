@@ -236,6 +236,17 @@ typedef struct conn {
      * from anyone else they are ignored. */
     const char        *trusted_proxies;   /* comma-separated IPs, server-lifetime */
     int                conn_tls;          /* this connection is TLS (native) */
+    /* Native TLS state (FS3_TLS builds; unused otherwise). */
+    void              *ssl;               /* SSL* */
+    int                tls_handshaking;
+    int                tls_want_write;    /* last TLS op needs EPOLLOUT */
+    char              *tls_buf;           /* body bounce buffer (no kTLS) */
+    size_t             tls_buf_len, tls_buf_pos;
+    /* --require-tls: SigV4 on a plain listener only from loopback. */
+    int                require_tls;
+    /* --require-signed-payload (S2): refuse unsigned payloads unless the
+     * request is over TLS / from a trusted proxy that says https. */
+    int                require_signed_payload;
     char               client_ip[64];
     int                secure;
 
@@ -335,6 +346,10 @@ int     conn_parse_query(conn_t *c);
 const conn_qparam_t *conn_query_get(const conn_t *c, const char *name);
 /* Number of parameters named `name`. */
 int     conn_query_count(const conn_t *c, const char *name);
+
+/* Body bytes to the socket: sendfile, or the TLS path. */
+struct s3_reader;
+ssize_t conn_io_send_body(conn_t *c, struct s3_reader *r, size_t max);
 
 /* Fill c->client_ip / c->secure from the peer and, for a trusted proxy,
  * X-Forwarded-For (rightmost entry) / X-Forwarded-Proto. */

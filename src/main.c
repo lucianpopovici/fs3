@@ -76,6 +76,17 @@ static void usage(const char *argv0) {
         "      --allow-public-write   also allow public policies that grant writes\n"
         "      --trusted-proxy <ip>   honour X-Forwarded-For/-Proto from this proxy\n"
         "                             (repeatable; e.g. 127.0.0.1 behind DSM)\n"
+        "      --tls-port <num>       native TLS listener (make TLS=1 builds); plain and\n"
+        "                             TLS listeners can run together\n"
+        "      --tls-addr <ip>        TLS bind address (default: --addr)\n"
+        "      --tls-cert <pem>       certificate chain; --tls-key <pem> key (mode 0600)\n"
+        "                             SIGHUP re-reads both (a bad file keeps the old ones)\n"
+        "      --tls-max-per-ip N     concurrent TLS connections per client IP (default 32);\n"
+        "                             at most 64 handshakes in flight overall\n"
+        "      --require-tls          refuse signed requests over plain HTTP unless\n"
+        "                             from loopback or a trusted proxy saying https\n"
+        "      --require-signed-payload  refuse UNSIGNED-PAYLOAD / unsigned trailer\n"
+        "                             uploads and presigned writes unless over TLS\n"
         "      --max-retention-days N longest object-lock retention clients may set\n"
         "                             (default 3650)\n"
         "      --admin-token-file <f> bearer token for the /v1 admin API on the metrics\n"
@@ -200,7 +211,11 @@ static int do_reload(void *user);
 static void reload_tick(void *user) {
     if (!g_reload) return;
     g_reload = 0;
-    (void)do_reload(user);
+    reload_ctx_t *r = user;
+    if (r->cred_file) (void)do_reload(user);
+#ifndef FS3_MAIN_TESTING
+    server_tls_reload(g_server);
+#endif
 }
 
 /* Build-then-swap credential reload; also called by the admin API after
@@ -265,6 +280,13 @@ enum {
     OPT_ALLOW_PUBLIC_WRITE,
     OPT_TRUSTED_PROXY,
     OPT_MAX_RETENTION_DAYS,
+    OPT_TLS_PORT,
+    OPT_TLS_ADDR,
+    OPT_TLS_CERT,
+    OPT_TLS_KEY,
+    OPT_REQUIRE_TLS,
+    OPT_REQUIRE_SIGNED_PAYLOAD,
+    OPT_TLS_MAX_PER_IP,
 };
 
 #ifndef FS3_MAIN_TESTING
@@ -332,6 +354,8 @@ int main(int argc, char **argv) {
     const char *admin_socket = NULL;
     int allow_public_write = 0;
     int max_retention_days = 3650;
+    int tls_port = 0, require_tls = 0, require_signed_payload = 0, tls_max_per_ip = 32;
+    const char *tls_addr = NULL, *tls_cert = NULL, *tls_key = NULL;
     char trusted_proxies[1024] = "";
     sigv4_verifier_t *auth = NULL;
     reload_ctx_t reload_ctx = {0};
@@ -369,6 +393,13 @@ int main(int argc, char **argv) {
         { "allow-public-write", no_argument,     NULL, OPT_ALLOW_PUBLIC_WRITE },
         { "trusted-proxy",    required_argument, NULL, OPT_TRUSTED_PROXY },
         { "max-retention-days", required_argument, NULL, OPT_MAX_RETENTION_DAYS },
+        { "tls-port",         required_argument, NULL, OPT_TLS_PORT },
+        { "tls-addr",         required_argument, NULL, OPT_TLS_ADDR },
+        { "tls-cert",         required_argument, NULL, OPT_TLS_CERT },
+        { "tls-key",          required_argument, NULL, OPT_TLS_KEY },
+        { "require-tls",      no_argument,       NULL, OPT_REQUIRE_TLS },
+        { "tls-max-per-ip",   required_argument, NULL, OPT_TLS_MAX_PER_IP },
+        { "require-signed-payload", no_argument, NULL, OPT_REQUIRE_SIGNED_PAYLOAD },
         { "verbose",          no_argument,       NULL, 'v' },
         { "help",             no_argument,       NULL, 'h' },
         { 0 },
@@ -551,6 +582,22 @@ int main(int argc, char **argv) {
             }
             case OPT_ALLOW_PUBLIC: allow_public = 1; break;
             case OPT_ADMIN_SOCKET: admin_socket = optarg; break;
+            case OPT_TLS_PORT:
+                tls_port = atoi(optarg);
+                if (tls_port < 1 || tls_port > 65535) {
+                    fprintf(stderr, "--tls-port must be 1..65535\n");
+                    return 2;
+                }
+                break;
+            case OPT_TLS_ADDR: tls_addr = optarg; break;
+            case OPT_TLS_CERT: tls_cert = optarg; break;
+            case OPT_TLS_KEY:  tls_key = optarg; break;
+            case OPT_REQUIRE_TLS: require_tls = 1; break;
+            case OPT_TLS_MAX_PER_IP:
+                tls_max_per_ip = atoi(optarg);
+                if (tls_max_per_ip < 1) { fprintf(stderr, "--tls-max-per-ip must be >= 1\n"); return 2; }
+                break;
+            case OPT_REQUIRE_SIGNED_PAYLOAD: require_signed_payload = 1; break;
             case OPT_MAX_RETENTION_DAYS:
                 max_retention_days = atoi(optarg);
                 if (max_retention_days < 1 || max_retention_days > 36500) {
@@ -578,6 +625,20 @@ int main(int argc, char **argv) {
         }
     }
     if (auth) sigv4_set_presign_policy(auth, presign_max_expires, no_presign_admin);
+    if (tls_port) {
+        if (!tls_cert || !tls_key) {
+            fprintf(stderr, "--tls-port needs --tls-cert and --tls-key\n");
+            return 2;
+        }
+        /* S8: the private key must be 0600 and ours. */
+        struct stat kst;
+        if (stat(tls_key, &kst) < 0 || !S_ISREG(kst.st_mode) || (kst.st_mode & 077)
+            || kst.st_uid != geteuid()) {
+            fprintf(stderr, "%s: TLS key must be a regular file, mode 0600, owned by "
+                            "the service user\n", tls_key);
+            return 2;
+        }
+    }
 
     if (require_auth && !auth) {
         fprintf(stderr, "--require-auth requires at least one --auth credential\n");
@@ -638,6 +699,13 @@ int main(int argc, char **argv) {
         .allow_public    = allow_public,
         .allow_public_write = allow_public_write,
         .max_retention_days = max_retention_days,
+        .tls_port        = (uint16_t)tls_port,
+        .tls_addr        = tls_addr,
+        .tls_cert        = tls_cert,
+        .tls_key         = tls_key,
+        .require_tls     = require_tls,
+        .tls_max_per_ip  = tls_max_per_ip,
+        .require_signed_payload = require_signed_payload,
         .trusted_proxies = trusted_proxies[0] ? trusted_proxies : NULL,
         .admin_token     = admin_token[0] ? admin_token : NULL,
         .admin_socket    = admin_socket,

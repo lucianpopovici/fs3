@@ -3950,3 +3950,14 @@ s3_err_t store_lock_write(s3_store_t *s, s3_str_t bucket, s3_str_t key,
     fsync_dir(dir);
     return S3_OK;
 }
+
+void store_get_raw(const s3_reader_t *r, int *fd, off_t *off, uint64_t *remaining) {
+    *fd = r->fd;
+    *off = (off_t)(r->data_off + r->pos);
+    *remaining = r->pos < r->data_size ? r->data_size - r->pos : 0;
+}
+
+void store_get_advance(s3_reader_t *r, uint64_t n) {
+    r->pos += n;
+    if (r->pos > r->data_size) r->pos = r->data_size;
+}

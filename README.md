@@ -435,6 +435,29 @@ DSM tile's credential form has an optional *User* field: to rotate a key
 without losing access to your buckets, add the new key with the same user,
 then remove the old one (replacing a key's secret keeps its user).
 
+### Native TLS (optional)
+
+The DSM reverse proxy (below) remains the recommended setup. To run fs3
+standalone off DSM, build with `make TLS=1` (or `make fs3-tls` for a
+separate binary; switching TLS on/off needs `make clean`, like DEBUG)
+and start with `--tls-port 9443 --tls-cert chain.pem --tls-key key.pem`.
+Plain and TLS listeners can coexist. Policy: TLS 1.2+ only, TLS 1.2
+limited to ECDHE + AES-GCM/ChaCha20-Poly1305, groups X25519/P-256/P-384,
+no renegotiation, server cipher preference, no session tickets, ALPN
+`http/1.1` only. The key file must be mode 0600 and owned by the service
+user. SIGHUP re-reads the certificate; a bad file keeps the live one and
+existing connections keep theirs. Handshakes are bounded (64 in flight,
+`--tls-max-per-ip`, default 32) and stalled handshakes hit
+`--idle-timeout`. Bodies go through `SSL_sendfile` when the kernel has
+kTLS, otherwise `pread` → `SSL_write` via a 64 KiB buffer — the path
+used on the DS1515+ (kernel 3.10). `--require-tls` refuses signed
+requests over plain HTTP except from loopback or a trusted proxy that
+says https; `--require-signed-payload` refuses `UNSIGNED-PAYLOAD`,
+unsigned-trailer and presigned uploads unless the request is over TLS.
+Client-certificate (mTLS) authentication is intentionally not offered: a
+certificate alone must not grant an S3 identity. The default and SPK
+static builds stay libcrypto-only.
+
 ### HTTPS via the DSM reverse proxy
 
 fs3 speaks plain HTTP only. SigV4 authenticates requests but does not

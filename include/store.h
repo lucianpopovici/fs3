@@ -283,6 +283,10 @@ ssize_t  store_get_sendfile(s3_reader_t *r, int out_fd, size_t max);
  * if the range falls outside the object body. */
 s3_err_t store_get_seek(s3_reader_t *r, uint64_t first, uint64_t last);
 void     store_get_close(s3_reader_t *r);
+/* For zero-copy senders (SSL_sendfile): the file, the absolute offset of
+ * the next body byte and how many remain. store_get_advance consumes n. */
+void     store_get_raw(const s3_reader_t *r, int *fd, off_t *off, uint64_t *remaining);
+void     store_get_advance(s3_reader_t *r, uint64_t n);
 
 /* ---- HEAD / DELETE ---- */
 

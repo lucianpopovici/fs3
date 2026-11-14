@@ -2395,7 +2395,7 @@ int route_dispatch_complete(conn_t *c) {
 int route_dispatch_send_body(conn_t *c) {
     if (!c->get_reader) return 0;
     /* Send up to a chunk per call so we don't block too long. */
-    ssize_t n = store_get_sendfile(c->get_reader, c->fd, 1 << 20);  /* 1 MiB */
+    ssize_t n = conn_io_send_body(c, c->get_reader, 1 << 20);  /* 1 MiB */
     if (n < 0) {
         if (errno == EAGAIN || errno == EWOULDBLOCK) return 1;
         LOG_W("sendfile fd=%d: %s", c->fd, strerror(errno));

@@ -16,6 +16,13 @@ CFLAGS  := -std=c11 -O2 -g -Wall -Wextra -Wpedantic \
            -MMD -MP
 LDFLAGS := -lcrypto -pthread
 
+# make TLS=1: native TLS listener (links libssl). Switching TLS on/off
+# needs `make clean`, like DEBUG.
+ifeq ($(TLS),1)
+  CFLAGS  += -DFS3_TLS
+  LDFLAGS := -lssl $(LDFLAGS)
+endif
+
 ifeq ($(DEBUG),1)
   CFLAGS  := $(filter-out -O2,$(CFLAGS)) -O0 \
              -fsanitize=address,undefined -fno-omit-frame-pointer
@@ -30,7 +37,7 @@ INCLUDES   := -Iinclude -I$(LLHTTP_DIR)/include -I$(XML_DIR)
 # Server objects
 SRV_SRCS := src/main.c src/server.c src/conn.c src/log.c src/store_fs.c \
             src/route.c src/response.c src/sigv4.c src/metrics.c \
-            src/iopool.c src/action.c src/checksum.c src/query.c src/cors.c src/lifecycle.c src/website.c src/json.c src/admin.c src/policy.c src/objlock.c
+            src/iopool.c src/action.c src/checksum.c src/query.c src/cors.c src/lifecycle.c src/website.c src/json.c src/admin.c src/policy.c src/objlock.c src/tls.c
 SRV_OBJS := $(SRV_SRCS:.c=.o)
 
 LLHTTP_OBJS := $(LLHTTP_DIR)/src/api.o $(LLHTTP_DIR)/src/http.o \
@@ -59,6 +66,16 @@ fs3: $(OBJS)
 fs3-static: $(OBJS)
 	$(CC) $(OBJS) -o $@ -Wl,-Bstatic -l:libcrypto.a -Wl,-Bdynamic -lpthread -ldl
 	strip $@
+
+# TLS-enabled binary built in one compiler invocation (no .o reuse), so
+# the TLS e2e suite never mixes FS3_TLS and non-TLS objects.
+ALL_C_SRCS := $(SRV_SRCS) $(LLHTTP_OBJS:.o=.c) $(XML_OBJS:.o=.c)
+comma := ,
+TLS_SAN := $(if $(filter 1,$(DEBUG)),-O0 -fsanitize=address$(comma)undefined -fno-omit-frame-pointer,-O2)
+fs3-tls: $(ALL_C_SRCS) $(wildcard include/*.h)
+	$(CC) $(filter-out -O2 -MMD -MP,$(CFLAGS)) -DFS3_TLS $(INCLUDES) -fsyntax-only src/tls.c src/conn.c src/server.c
+	$(CC) -std=c11 -g -D_GNU_SOURCE -DFS3_TLS -pthread $(TLS_SAN) $(INCLUDES) \
+	    $(ALL_C_SRCS) -o $@ -lssl -lcrypto -pthread
 
 # Our code: strict warnings
 src/%.o: src/%.c
@@ -121,6 +138,8 @@ test: $(TEST_BINS) fs3
 	@./tests/test_e2e_subresources.sh
 	@echo "=== test_e2e_checksum (item 1: trailers + x-amz-checksum-*) ==="
 	@./tests/test_e2e_checksum.sh
+	@echo "=== test_e2e_tls (item 7: native TLS, fs3-tls build) ==="
+	@./tests/test_e2e_tls.sh
 	@echo "=== test_e2e_objlock (item 10: object lock) ==="
 	@./tests/test_e2e_objlock.sh
 	@echo "=== test_e2e_policy (item 9: bucket policies) ==="
@@ -199,7 +218,7 @@ tests/test_credfile: tests/test_credfile.c src/main.c src/sigv4.c src/log.c src/
 	    $(LDFLAGS) -o $@
 
 clean:
-	rm -f fs3 $(OBJS) $(OBJS:.o=.d) $(TEST_BINS) tests/*.d
+	rm -f fs3 fs3-tls $(OBJS) $(OBJS:.o=.d) $(TEST_BINS) tests/*.d
 
 # Auto-include compiler-generated dependency files so header changes
 # correctly invalidate object files. Created via -MMD -MP above.

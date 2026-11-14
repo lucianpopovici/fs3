@@ -14,6 +14,7 @@
 #include "lifecycle.h"
 #include "admin.h"
 #include "objlock.h"
+#include "tls.h"
 #include "conn.h"
 #include "iopool.h"
 #include "log.h"
@@ -42,6 +43,8 @@ struct server {
     server_cfg_t  cfg;
     int           listen_fd;
     int           web_fd;       /* website listener, -1 if off */
+    int           tls_fd;       /* native TLS listener, -1 if off */
+    tls_ctx_t    *tls;
     int           admin_fd;     /* -1 unless cfg.metrics_port > 0 */
     int           admin_uds_fd; /* -1 unless cfg.admin_socket */
     admin_ctx_t  *admin;
@@ -276,6 +279,7 @@ server_t *server_create(const server_cfg_t *cfg) {
     s->cfg = *cfg;
     s->listen_fd = -1;
     s->web_fd = -1;
+    s->tls_fd = -1;
     s->admin_uds_fd = -1;
     s->admin_fd = -1;
     s->epoll_fd = -1;
@@ -356,6 +360,23 @@ server_t *server_create(const server_cfg_t *cfg) {
             LOG_E("epoll_ctl ADD iopool: %s", strerror(errno));
             goto fail;
         }
+    }
+
+    /* Native TLS listener (item 7). */
+    if (cfg->tls_port > 0) {
+        if (!tls_available()) {
+            LOG_E("--tls-port: this binary was built without TLS (make TLS=1)");
+            goto fail;
+        }
+        s->tls = tls_ctx_new(cfg->tls_cert, cfg->tls_key);
+        if (!s->tls) goto fail;
+        s->tls_fd = listen_socket(cfg->tls_addr ? cfg->tls_addr : cfg->bind_addr,
+                                  cfg->tls_port, cfg->backlog);
+        if (s->tls_fd < 0) goto fail;
+        struct epoll_event tev = { .events = EPOLLIN, .data.ptr = &s->tls_fd };
+        if (epoll_ctl(s->epoll_fd, EPOLL_CTL_ADD, s->tls_fd, &tev) < 0) goto fail;
+        LOG_I("TLS listener on %s:%u", cfg->tls_addr ? cfg->tls_addr : cfg->bind_addr,
+              cfg->tls_port);
     }
 
     /* Admin API (item 11). */
@@ -466,6 +487,8 @@ void server_destroy(server_t *s) {
     iopool_destroy(s->pool);
     if (s->listen_fd >= 0) close(s->listen_fd);
     if (s->web_fd >= 0) close(s->web_fd);
+    if (s->tls_fd >= 0) close(s->tls_fd);
+    tls_ctx_free(s->tls);
     if (s->admin_uds_fd >= 0) {
         close(s->admin_uds_fd);
         if (s->cfg.admin_socket) unlink(s->cfg.admin_socket);
@@ -521,6 +544,36 @@ static void close_conn(server_t *s, conn_t *c) {
     s->n_conns--;
 }
 
+/* Handshake-flood bounds (S8): at most this many TLS handshakes in
+ * flight, and this many TLS connections per client address. */
+#define TLS_MAX_HANDSHAKES 64
+
+static int tls_admission(server_t *s, const struct sockaddr_in *sa) {
+    int hs = 0, same = 0;
+    char ip[64];
+    inet_ntop(AF_INET, &sa->sin_addr, ip, sizeof(ip));
+    size_t ipn = strlen(ip);
+    for (conn_t *c = s->conns_head; c; c = c->list_next) {
+        if (!c->conn_tls) continue;
+        if (c->tls_handshaking) hs++;
+        if (!strncmp(c->peer, ip, ipn) && c->peer[ipn] == ':') same++;
+    }
+    int per_ip = s->cfg.tls_max_per_ip > 0 ? s->cfg.tls_max_per_ip : 32;
+    return hs < TLS_MAX_HANDSHAKES && same < per_ip;
+}
+
+void server_tls_reload(server_t *s) {
+    if (!s || !s->tls || !s->cfg.tls_cert) return;
+    tls_ctx_t *n = tls_ctx_new(s->cfg.tls_cert, s->cfg.tls_key);
+    if (!n) {
+        LOG_E("TLS reload failed; keeping the current certificate");
+        return;
+    }
+    tls_ctx_free(s->tls);
+    s->tls = n;
+    LOG_I("TLS certificate reloaded");
+}
+
 static void accept_new(server_t *s, int lfd, int is_web) {
     for (;;) {
         struct sockaddr_in sa;
@@ -536,6 +589,12 @@ static void accept_new(server_t *s, int lfd, int is_web) {
 
         if (s->n_conns >= s->cfg.max_conns) {
             LOG_W("conn cap reached (%d), rejecting", s->cfg.max_conns);
+            close(fd);
+            continue;
+        }
+        int is_tls = lfd == s->tls_fd;
+        if (is_tls && !tls_admission(s, &sa)) {
+            LOG_W("TLS handshake/per-IP cap reached, rejecting");
             close(fd);
             continue;
         }
@@ -562,6 +621,14 @@ static void accept_new(server_t *s, int lfd, int is_web) {
         c->allow_public = s->cfg.allow_public;
         c->allow_public_write = s->cfg.allow_public_write;
         c->trusted_proxies = s->cfg.trusted_proxies;
+        c->require_tls = s->cfg.require_tls;
+        c->require_signed_payload = s->cfg.require_signed_payload;
+        if (is_tls && tls_conn_attach(c, s->tls) < 0) {
+            LOG_E("TLS attach failed");
+            close(fd);
+            conn_destroy(c);
+            continue;
+        }
         c->max_retention_ms = (uint64_t)(s->cfg.max_retention_days > 0
                                          ? s->cfg.max_retention_days : 3650) * 86400000ULL;
 
@@ -701,6 +768,10 @@ int server_run(server_t *s) {
             /* Listening socket */
             if (e->data.ptr == NULL) {
                 if (e->events & EPOLLIN) accept_new(s, s->listen_fd, 0);
+                continue;
+            }
+            if (e->data.ptr == (void *)&s->tls_fd) {
+                if (e->events & EPOLLIN) accept_new(s, s->tls_fd, 0);
                 continue;
             }
             /* Website listener (marker: &s->web_fd). */

@@ -32,6 +32,7 @@
 #include "route.h"
 #include "sigv4.h"
 #include "store.h"
+#include "tls.h"
 
 #include <ctype.h>
 #include <errno.h>
@@ -106,12 +107,15 @@ void conn_destroy(conn_t *c) {
     if (c->chunk_decoder) sigv4_chunk_free(c->chunk_decoder);
     cksum_free(&c->cksum);
     cksum_free(&c->md5);
+    tls_conn_free(c);
     free(c->ext_body);
     free(c->req_body_buf);
     free(c);
 }
 
 int conn_wants_write(const conn_t *c) {
+    if (c->ssl && (c->tls_want_write || (c->tls_handshaking && c->tls_want_write)))
+        return 1;
     if (c->state == CST_WRITE_RESPONSE && c->wpos < c->wlen) return 1;
     if (c->state == CST_WRITE_RESPONSE
         && c->ext_body && c->ext_body_pos < c->ext_body_len) return 1;
@@ -126,6 +130,7 @@ int conn_hup_can_close(const conn_t *c) {
      * read reaches EOF itself. */
     return !conn_wants_write(c)
         && c->rlen == 0
+        && tls_pending(c) == 0
         && !c->read_yielded
         && c->state != CST_WAIT_JOB
         && c->state != CST_WRITE_RESPONSE;
@@ -232,6 +237,25 @@ static void request_reset(conn_t *c) {
     c->cksum_from_trailer = 0;
     c->xhdr_len = 0;
     c->xhdr_done = 0;
+}
+
+/* ------------------------------------------------------------------------- */
+/* Socket I/O indirection (item 7): plain syscalls, or the TLS backend       */
+/* ------------------------------------------------------------------------- */
+
+static ssize_t conn_io_read(conn_t *c, void *buf, size_t n) {
+    if (c->ssl) return tls_read(c, buf, n);
+    return read(c->fd, buf, n);
+}
+
+static ssize_t conn_io_write(conn_t *c, const void *buf, size_t n) {
+    if (c->ssl) return tls_write(c, buf, n);
+    return write(c->fd, buf, n);
+}
+
+ssize_t conn_io_send_body(conn_t *c, struct s3_reader *r, size_t max) {
+    if (c->ssl) return tls_send_body(c, r, max);
+    return store_get_sendfile(r, c->fd, max);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -601,6 +625,13 @@ static int cb_on_headers_complete(llhttp_t *p) {
                 break;
             }
         }
+        int is_loop = !strcmp(c->client_ip, "127.0.0.1") || !strcmp(c->client_ip, "::1");
+        if ((auth_h || sigv4_has_presign(c)) && c->require_tls && !c->conn_tls
+            && !c->secure && !is_loop) {
+            /* --require-tls: no credentials over plain HTTP from afar. */
+            if (route_build_error(c, S3_ERR_ACCESS_DENIED) < 0) return -1;
+            return 0;
+        }
         if (auth_h || sigv4_has_presign(c) || c->auth_required) {
             s3_err_t e = sigv4_verify_id(c->auth, c, &c->id);
             if (e != S3_OK) {
@@ -610,6 +641,18 @@ static int cb_on_headers_complete(llhttp_t *p) {
                 return 0;
             }
             c->sig_verified = 1;
+            /* S2: unsigned payloads are only authenticated by TLS. */
+            if (c->require_signed_payload && !c->secure) {
+                const s3_str_t *ph = find_hdr(c, "x-amz-content-sha256");
+                int unsigned_body = c->id.presigned
+                    || (ph && (s3_str_eq_lit(*ph, "UNSIGNED-PAYLOAD")
+                               || s3_str_eq_lit(*ph, "STREAMING-UNSIGNED-PAYLOAD-TRAILER")));
+                if (unsigned_body && !s3_str_eq_lit(c->req.method, "GET")
+                    && !s3_str_eq_lit(c->req.method, "HEAD")) {
+                    if (route_build_error(c, S3_ERR_ACCESS_DENIED) < 0) return -1;
+                    return 0;
+                }
+            }
             /* Verified. If the client declared a real body hash (not
              * UNSIGNED-PAYLOAD and not the streaming literal), set up
              * streaming verification so we catch the case where the
@@ -672,7 +715,7 @@ static int cb_on_headers_complete(llhttp_t *p) {
     const s3_str_t *ex = find_hdr(c, "expect");
     if (ex && ex->n == 12 && strncasecmp(ex->p, "100-continue", 12) == 0) {
         static const char cont[] = "HTTP/1.1 100 Continue\r\n\r\n";
-        (void)!write(c->fd, cont, sizeof(cont) - 1);
+        (void)!conn_io_write(c, cont, sizeof(cont) - 1);
     }
 
     /* Additional checksums (x-amz-checksum-* header or trailer,
@@ -946,10 +989,22 @@ static int request_parked(const conn_t *c) {
     return c->state == CST_WRITE_RESPONSE || c->state == CST_WAIT_JOB;
 }
 
+/* Drive a pending TLS handshake. 1 = done (go on), 0 = wait, -1 = drop. */
+static int tls_step(conn_t *c) {
+    if (!c->ssl || !c->tls_handshaking) return 1;
+    return tls_handshake(c);
+}
+
 int conn_on_readable(conn_t *c) {
     size_t budget = CONN_READ_BUDGET;
     c->read_yielded = 0;
     if (c->state == CST_WAIT_JOB) return 0;
+    int hs = tls_step(c);
+    if (hs <= 0) return hs;
+    /* A TLS write that wanted to read first (key update) can go on now. */
+    if (c->ssl && c->tls_want_write == 0 && c->state == CST_WRITE_RESPONSE
+        && conn_wants_write(c) && conn_on_writable(c) < 0)
+        return -1;
     for (;;) {
         if (c->rlen >= sizeof(c->rbuf)) {
             /* Buffer full. If we're still parsing headers it means the
@@ -968,12 +1023,18 @@ int conn_on_readable(conn_t *c) {
         }
 
         if (budget == 0) {
-            c->read_yielded = 1;
-            return 0;
+            /* Decrypted bytes inside OpenSSL never wake epoll: drain them
+             * (at most one TLS record) before yielding. */
+            size_t pend = tls_pending(c);
+            if (pend) budget = pend;
+            else {
+                c->read_yielded = 1;
+                return 0;
+            }
         }
         size_t want = sizeof(c->rbuf) - c->rlen;
         if (want > budget) want = budget;
-        ssize_t n = read(c->fd, c->rbuf + c->rlen, want);
+        ssize_t n = conn_io_read(c, c->rbuf + c->rlen, want);
         if (n > 0) {
             budget -= (size_t)n;
             c->rlen += (size_t)n;
@@ -1017,6 +1078,10 @@ int conn_on_readable(conn_t *c) {
 int conn_on_writable(conn_t *c) {
     /* Nothing to send until the job's done() has built the response. */
     if (c->state == CST_WAIT_JOB) return 0;
+    {
+        int hs = tls_step(c);
+        if (hs <= 0) return hs;
+    }
 
     if (c->state == CST_WRITE_RESPONSE && c->wpos == 0 && !c->xhdr_done
         && apply_extra_headers(c) < 0) {
@@ -1026,7 +1091,7 @@ int conn_on_writable(conn_t *c) {
 
     /* Drain wbuf (the response head, plus inline body for small responses). */
     while (c->state == CST_WRITE_RESPONSE && c->wpos < c->wlen) {
-        ssize_t n = write(c->fd, c->wbuf + c->wpos, c->wlen - c->wpos);
+        ssize_t n = conn_io_write(c, c->wbuf + c->wpos, c->wlen - c->wpos);
         if (n > 0) {
             c->wpos += (size_t)n;
             continue;
@@ -1041,7 +1106,7 @@ int conn_on_writable(conn_t *c) {
      * a ListBucketResult with many entries). */
     while (c->state == CST_WRITE_RESPONSE
            && c->ext_body && c->ext_body_pos < c->ext_body_len) {
-        ssize_t n = write(c->fd,
+        ssize_t n = conn_io_write(c,
                           c->ext_body + c->ext_body_pos,
                           c->ext_body_len - c->ext_body_pos);
         if (n > 0) { c->ext_body_pos += (size_t)n; continue; }
@@ -1087,6 +1152,9 @@ int conn_on_writable(conn_t *c) {
         if (consumed < 0) return 0;
         rbuf_consume(c, (size_t)consumed);
     }
+    /* Pipelined requests already decrypted by OpenSSL won't wake epoll. */
+    if (c->state == CST_READ_HEADERS && tls_pending(c) && conn_on_readable(c) < 0)
+        return -1;
 
     /* If peer already closed write-side and there's nothing buffered
      * and no new request started, we're done. */

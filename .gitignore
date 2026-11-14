@@ -72,3 +72,4 @@ __pycache__/
 fs3-*.tar.gz
 fs3-static
 packaging/synology/*.spk
+fs3-tls
