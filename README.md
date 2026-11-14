@@ -74,6 +74,25 @@ What's working end-to-end:
   announced in `x-amz-trailer`. In open mode (no auth) aws-chunked bodies
   are still de-framed, so chunk headers never end up in the object.
 
+- **Presigned URLs** (query-string SigV4) — `X-Amz-Algorithm`,
+  `-Credential`, `-Date`, `-Expires`, `-SignedHeaders`, `-Signature` in
+  the query, as produced by `boto3.generate_presigned_url` and
+  `aws s3 presign`; body hash `UNSIGNED-PAYLOAD` unless
+  `X-Amz-Content-Sha256` is in the query. Lifetime is capped by
+  `--presign-max-expires` (default 24 h; AWS's own 7-day ceiling always
+  applies); expired URLs get `403 AccessDenied` "Request has expired".
+  `--no-presign-admin` stops `--admin` identities from minting bearer
+  URLs. A presigned URL never grants more than its signer has. Behind
+  the DSM reverse proxy the client signs for the public host; the proxy
+  preserves `Host`, so this works unchanged — but note that the DSM
+  nginx access log records full presigned URLs, which are bearer
+  credentials until they expire.
+- **SigV4 hardening** (header and query mode) — `host` and every
+  `x-amz-*` request header must be signed (an unsigned
+  `x-amz-copy-source` on a presigned PUT is refused), the credential
+  scope must be service `s3` with the date of `X-Amz-Date`, and
+  duplicate `Authorization` / auth query parameters are rejected.
+
 - **Multipart upload** — `POST ?uploads`, `PUT ?partNumber=N&uploadId=ID`,
   `POST ?uploadId=ID` (Complete), `DELETE ?uploadId=ID` (Abort).
   Upload state lives at `<root>/mpu/<bucket>/<upload_id>/`: a small
