@@ -85,6 +85,7 @@ static void usage(const char *argv0) {
         "      --tls-addr <ip>        TLS bind address (default: --addr)\n"
         "      --tls-cert <pem>       certificate chain; --tls-key <pem> key (mode 0600)\n"
         "                             SIGHUP re-reads both (a bad file keeps the old ones)\n"
+        "      --key-max-age-days N   keys created by the admin API expire after N days (0 = never)\n"
         "      --scrub-interval-days N  integrity scrub every N days (default 30; 0 = only on demand)\n"
         "      --scrub-now            start a scrub pass right after startup\n"
         "      --scrub-rate N         scrub read rate in bytes/s (default 20M; 0 = unthrottled)\n"
@@ -138,37 +139,82 @@ static int valid_identity(const char *u) {
     return 1;
 }
 
-/* Parse "access:secret[:user]" and add it to the verifier. Without a
- * user, the access key is the identity that owns buckets. Returns 0 on
- * success. The input string is not modified. */
+/* Parse the optional fourth field: comma-separated "created=N",
+ * "expires=N" (epoch seconds), "ro", "disabled". Strict: an unknown,
+ * repeated or empty attribute refuses the line (and so the file). */
+static int parse_cred_attrs(const char *s, sigv4_cred_attrs_t *a) {
+    memset(a, 0, sizeof(*a));
+    unsigned seen = 0;
+    if (!*s) return -1;
+    while (*s) {
+        const char *e = strchr(s, ',');
+        size_t n = e ? (size_t)(e - s) : strlen(s);
+        unsigned bit;
+        if (n == 2 && !strncmp(s, "ro", 2))            { bit = 1; a->read_only = 1; }
+        else if (n == 8 && !strncmp(s, "disabled", 8)) { bit = 2; a->disabled = 1; }
+        else if (n > 8 && !strncmp(s, "created=", 8))  bit = 4;
+        else if (n > 8 && !strncmp(s, "expires=", 8))  bit = 8;
+        else return -1;
+        if (seen & bit) return -1;
+        seen |= bit;
+        if (bit >= 4) {
+            int64_t v = 0;
+            if (n - 8 > 12) return -1;
+            for (size_t i = 8; i < n; i++) {
+                if (s[i] < '0' || s[i] > '9') return -1;
+                v = v * 10 + (s[i] - '0');
+            }
+            if (bit == 4) a->created = v; else a->expires = v;
+        }
+        if (!e) break;
+        s = e + 1;
+        if (!*s) return -1;                      /* trailing comma */
+    }
+    return 0;
+}
+
+/* Parse "access:secret[:user[:attrs]]" and add it to the verifier.
+ * Without a user, the access key is the identity that owns buckets
+ * (also when the user field is empty before attributes: "ak:sk::ro").
+ * Returns 0 on success. The input string is not modified. */
 static int parse_and_add_cred(sigv4_verifier_t *v, const char *spec) {
     const char *c1 = strchr(spec, ':');
     const char *c2 = c1 ? strchr(c1 + 1, ':') : NULL;
+    const char *c3 = c2 ? strchr(c2 + 1, ':') : NULL;
     if (!c1 || c1 == spec || c1[1] == 0 || c1[1] == ':'
-        || (c2 && c2[1] == 0)) {
+        || (c2 && c2[1] == 0) || (c3 && c3[1] == 0)) {
         fprintf(stderr, "invalid credential: expected "
-                        "<access_key>:<secret_key>[:<user>]\n");
+                        "<access_key>:<secret_key>[:<user>[:<attributes>]]\n");
         return -1;
     }
     char *ak = strndup(spec, (size_t)(c1 - spec));
     char *sk = c2 ? strndup(c1 + 1, (size_t)(c2 - c1 - 1)) : strdup(c1 + 1);
-    const char *user = c2 ? c2 + 1 : NULL;
+    char *user = c2 ? (c3 ? strndup(c2 + 1, (size_t)(c3 - c2 - 1)) : strdup(c2 + 1)) : NULL;
+    sigv4_cred_attrs_t attrs;
+    memset(&attrs, 0, sizeof(attrs));
     int rc = -1;
-    if (!ak || !sk) goto out;
+    if (!ak || !sk || (c2 && !user)) goto out;
+    if (c3 && parse_cred_attrs(c3 + 1, &attrs) < 0) {
+        fprintf(stderr, "invalid credential: unknown or malformed attribute in '%s' "
+                        "(allowed: created=N, expires=N, ro, disabled)\n", c3 + 1);
+        goto out;
+    }
+    if (user && !*user && c3) { free(user); user = NULL; }
     if (!valid_identity(user ? user : ak)) {
         fprintf(stderr, "invalid credential: user (or access key used as "
                         "user) must be 1-%d printable characters without "
                         "spaces or ':'\n", SIGV4_USER_MAX);
         goto out;
     }
-    if (sigv4_add_cred_user(v, ak, sk, user) != 0) {
+    if (sigv4_add_cred_ex(v, ak, sk, user, &attrs) != 0) {
         fprintf(stderr, "failed to add credential (duplicate or OOM)\n");
         goto out;
     }
     rc = 0;
 out:
     free(ak);
-    free(sk);
+    if (sk) { memset(sk, 0, strlen(sk)); free(sk); }
+    free(user);
     return rc;
 }
 
@@ -222,11 +268,18 @@ typedef struct {
 } reload_ctx_t;
 
 static int do_reload(void *user);
+static void keys_state_flush(const sigv4_verifier_t *v);
 
 static void reload_tick(void *user) {
+    reload_ctx_t *r = user;
+    static time_t last_flush;
+    time_t now = time(NULL);
+    if (r->live && now - last_flush >= 300) {
+        if (last_flush) keys_state_flush(r->live);
+        last_flush = now;
+    }
     if (!g_reload) return;
     g_reload = 0;
-    reload_ctx_t *r = user;
     if (r->cred_file) (void)do_reload(user);
 #ifndef FS3_MAIN_TESTING
     server_tls_reload(g_server);
@@ -264,6 +317,45 @@ static int do_reload(void *user) {
     sigv4_destroy(scratch);  /* now holds (and zeroes) the old list */
     LOG_I("SIGHUP: credentials reloaded from %s", r->cred_file);
     return 0;
+}
+
+/* ---- keys.state: last-used time per access key (item 4) ------------------
+ *
+ * Kept out of the credentials file (which admins edit and which holds the
+ * secrets): <data_root>/keys.state, "<access_key> <epoch s>" per line,
+ * written tmp + fsync + rename every few minutes and at shutdown. */
+static char g_keys_state[4200];
+
+static void keys_state_load(sigv4_verifier_t *v) {
+    FILE *f = fopen(g_keys_state, "re");
+    if (!f) return;
+    char ak[200];
+    long long t;
+    while (fscanf(f, "%199s %lld", ak, &t) == 2)
+        if (t > 0) sigv4_set_last_used(v, ak, (int64_t)t);
+    fclose(f);
+}
+
+typedef struct { FILE *f; } ks_ctx_t;
+static void ks_line(void *ctx, const char *ak, const char *user,
+                    const sigv4_cred_attrs_t *a, int64_t last_used) {
+    (void)user; (void)a;
+    if (last_used > 0) fprintf(((ks_ctx_t *)ctx)->f, "%s %lld\n", ak, (long long)last_used);
+}
+
+static void keys_state_flush(const sigv4_verifier_t *v) {
+    if (!v || !g_keys_state[0]) return;
+    char tmp[4300];
+    snprintf(tmp, sizeof(tmp), "%s.tmp", g_keys_state);
+    int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    if (fd < 0) return;
+    FILE *f = fdopen(fd, "w");
+    if (!f) { close(fd); unlink(tmp); return; }
+    ks_ctx_t c = { f };
+    sigv4_foreach_cred(v, ks_line, &c);
+    if (fflush(f) != 0 || fsync(fileno(f)) < 0) { fclose(f); unlink(tmp); return; }
+    fclose(f);
+    if (rename(tmp, g_keys_state) < 0) unlink(tmp);
 }
 
 enum {
@@ -308,6 +400,7 @@ enum {
     OPT_MPU_MIN_PART_SIZE,
     OPT_DEFAULT_BUCKET_QUOTA,
     OPT_SCRUB_INTERVAL_DAYS,
+    OPT_KEY_MAX_AGE_DAYS,
     OPT_SCRUB_NOW,
     OPT_SCRUB_RATE,
     OPT_SCRUB_FAIL_READS,
@@ -384,6 +477,7 @@ int main(int argc, char **argv) {
     uint64_t mpu_min_part = 5ULL * 1024 * 1024;   /* S3's minimum */
     uint64_t def_bucket_quota = 0, def_user_quota = 0;   /* 0 = unlimited */
     int scrub_interval_days = 30, scrub_now = 0, scrub_fail_reads = 0;
+    int key_max_age_days = 0;
     uint64_t scrub_rate = 20ULL * 1024 * 1024;           /* 20 MiB/s */
     int tls_port = 0, require_tls = 0, require_signed_payload = 0, tls_max_per_ip = 32;
     const char *tls_addr = NULL, *tls_cert = NULL, *tls_key = NULL;
@@ -435,6 +529,7 @@ int main(int argc, char **argv) {
         { "mpu-min-part-size", required_argument, NULL, OPT_MPU_MIN_PART_SIZE },
         { "default-bucket-quota", required_argument, NULL, OPT_DEFAULT_BUCKET_QUOTA },
         { "scrub-interval-days", required_argument, NULL, OPT_SCRUB_INTERVAL_DAYS },
+        { "key-max-age-days", required_argument, NULL, OPT_KEY_MAX_AGE_DAYS },
         { "scrub-now",        no_argument,       NULL, OPT_SCRUB_NOW },
         { "scrub-rate",       required_argument, NULL, OPT_SCRUB_RATE },
         { "scrub-fail-reads", no_argument,       NULL, OPT_SCRUB_FAIL_READS },
@@ -646,6 +741,13 @@ int main(int argc, char **argv) {
                 }
                 break;
             case OPT_SCRUB_NOW:        scrub_now = 1; break;
+            case OPT_KEY_MAX_AGE_DAYS:
+                key_max_age_days = atoi(optarg);
+                if (key_max_age_days < 0 || key_max_age_days > 36500) {
+                    fprintf(stderr, "--key-max-age-days must be 0..36500\n");
+                    return 2;
+                }
+                break;
             case OPT_SCRUB_FAIL_READS: scrub_fail_reads = 1; break;
             case OPT_SCRUB_RATE:
                 scrub_rate = strcmp(optarg, "0") == 0 ? 0 : parse_size(optarg);
@@ -800,6 +902,7 @@ int main(int argc, char **argv) {
         .scrub_now = scrub_now,
         .scrub_rate = scrub_rate,
         .scrub_fail_reads = scrub_fail_reads,
+        .key_max_age_days = key_max_age_days,
         .tls_port        = (uint16_t)tls_port,
         .tls_addr        = tls_addr,
         .tls_cert        = tls_cert,
@@ -817,6 +920,10 @@ int main(int argc, char **argv) {
         .tick_user      = &reload_ctx,
     };
 
+    if (auth) {
+        snprintf(g_keys_state, sizeof(g_keys_state), "%s/keys.state", data_root);
+        keys_state_load(auth);
+    }
     g_server = server_create(&cfg);
     if (!g_server) {
         LOG_E("server_create failed");
@@ -827,6 +934,7 @@ int main(int argc, char **argv) {
     int rc = server_run(g_server);
     server_destroy(g_server);
     g_server = NULL;
+    keys_state_flush(auth);
     sigv4_destroy(auth);
     return rc < 0 ? 1 : 0;
 }

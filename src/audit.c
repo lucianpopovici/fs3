@@ -78,6 +78,10 @@ void audit_request(const conn_t *c, int status, uint64_t bytes_in,
         o += (size_t)snprintf(line + o, sizeof(line) - o, ",\"error\":");
         json_put_str(line, sizeof(line), &o, s3_err_name((s3_err_t)c->last_err));
     }
+    if (c->deny_reason && o + 100 < sizeof(line)) {
+        o += (size_t)snprintf(line + o, sizeof(line) - o, ",\"deny\":");
+        json_put_str(line, sizeof(line), &o, c->deny_reason);
+    }
     if (o + 200 < sizeof(line))
         o += (size_t)snprintf(line + o, sizeof(line) - o,
             ",\"status\":%d,\"bytes_in\":%llu,\"bytes_out\":%llu,\"ms\":%.1f,"

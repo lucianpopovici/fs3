@@ -84,6 +84,8 @@ typedef struct cred {
     char       *user;           /* owner identity; defaults to access_key */
     uint8_t    *secret_key;     /* not NUL-terminated, as bytes */
     size_t      secret_len;
+    sigv4_cred_attrs_t attrs;   /* expiry, disabled, read-only (item 4) */
+    int64_t     last_used;      /* atomic; epoch s of the last verified request */
     struct cred *next;
 } cred_t;
 
@@ -136,6 +138,15 @@ void sigv4_destroy(sigv4_verifier_t *v) {
 
 void sigv4_swap_creds(sigv4_verifier_t *a, sigv4_verifier_t *b) {
     if (!a || !b) return;
+    /* Last-used times live only in memory (and keys.state): carry them
+     * across a reload by access key. */
+    for (cred_t *n = b->creds; n; n = n->next)
+        for (cred_t *o = a->creds; o; o = o->next)
+            if (!strcmp(n->access_key, o->access_key)) {
+                int64_t t = __atomic_load_n(&o->last_used, __ATOMIC_RELAXED);
+                if (t > n->last_used) n->last_used = t;
+                break;
+            }
     cred_t *tmp = a->creds;
     a->creds = b->creds;
     b->creds = tmp;
@@ -151,6 +162,11 @@ int sigv4_add_cred_user(sigv4_verifier_t *v,
                         const char *access_key,
                         const char *secret_key,
                         const char *user) {
+    return sigv4_add_cred_ex(v, access_key, secret_key, user, NULL);
+}
+
+int sigv4_add_cred_ex(sigv4_verifier_t *v, const char *access_key, const char *secret_key,
+                      const char *user, const sigv4_cred_attrs_t *attrs) {
     if (!v || !access_key || !secret_key) return -1;
     if (!user || !*user) user = access_key;
     if (strlen(user) > SIGV4_USER_MAX) return -1;
@@ -170,6 +186,7 @@ int sigv4_add_cred_user(sigv4_verifier_t *v,
     }
     memcpy(c->secret_key, secret_key, sn);
     c->secret_len = sn;
+    if (attrs) c->attrs = *attrs;
     c->next = v->creds;
     v->creds = c;
     return 0;
@@ -206,6 +223,32 @@ void sigv4_set_presign_policy(sigv4_verifier_t *v, int64_t max_expires,
 void sigv4_set_max_skew(sigv4_verifier_t *v, int max_skew) {
     if (v && max_skew > 0) v->max_skew = max_skew;
 }
+
+int64_t sigv4_now(const sigv4_verifier_t *v) {
+    return v && v->fixed_now ? v->fixed_now : (int64_t)time(NULL);
+}
+
+void sigv4_foreach_cred(const sigv4_verifier_t *v, sigv4_cred_cb cb, void *ctx) {
+    if (!v || !cb) return;
+    for (const cred_t *c = v->creds; c; c = c->next)
+        cb(ctx, c->access_key, c->user, &c->attrs,
+           __atomic_load_n(&c->last_used, __ATOMIC_RELAXED));
+}
+
+void sigv4_set_last_used(sigv4_verifier_t *v, const char *ak, int64_t t) {
+    if (!v || !ak) return;
+    for (cred_t *c = v->creds; c; c = c->next)
+        if (!strcmp(c->access_key, ak)) {
+            if (t > __atomic_load_n(&c->last_used, __ATOMIC_RELAXED))
+                __atomic_store_n(&c->last_used, t, __ATOMIC_RELAXED);
+            return;
+        }
+}
+
+/* Why the last refused verify on this thread was refused (audit log
+ * only; the client sees the same AccessDenied for all of these). */
+static __thread const char *g_deny_reason;
+const char *sigv4_last_deny_reason(void) { return g_deny_reason; }
 
 static const cred_t *cred_lookup(const sigv4_verifier_t *v,
                                  const char *ak, size_t ak_len) {
@@ -922,8 +965,20 @@ static s3_err_t verify_params(const sigv4_verifier_t *v, const conn_t *c,
         if (delta > v->max_skew) return S3_ERR_REQUEST_TIME_TOO_SKEWED;
     }
 
+    /* Unknown, disabled and expired keys get the same AccessDenied after
+     * the same HMAC work (no timing or error-code oracle); the real
+     * reason goes to the audit log only. */
+    static const uint8_t dummy_secret[40] = "fs3-unknown-key-dummy-secret-0123456789";
+    static const cred_t dummy = { .access_key = "", .user = "",
+                                  .secret_key = (uint8_t *)dummy_secret,
+                                  .secret_len = sizeof(dummy_secret) };
+    const char *deny = NULL;
     const cred_t *cr = cred_lookup(v, p->ap.access_key.p, p->ap.access_key.n);
-    if (!cr) return S3_ERR_ACCESS_DENIED;
+    if (!cr) { deny = "unknown_key"; cr = &dummy; }
+    else if (cr->attrs.disabled) deny = "key_disabled";
+    else if (cr->attrs.expires && now >= cr->attrs.expires) deny = "key_expired";
+    else if (p->is_presigned && cr->attrs.expires && req_t + p->expires > cr->attrs.expires)
+        deny = "presign_outlives_key";      /* a URL may not outlive its key */
 
     char *cr_buf = malloc(CR_BUF_SZ);
     if (!cr_buf) return S3_ERR_INTERNAL;
@@ -952,9 +1007,10 @@ static s3_err_t verify_params(const sigv4_verifier_t *v, const conn_t *c,
     hex_encode(mac, 32, want);
     OPENSSL_cleanse(mac, sizeof(mac));
 
-    if (p->signature.n != 64) return S3_ERR_SIGNATURE_DOES_NOT_MATCH;
-    if (CRYPTO_memcmp(want, p->signature.p, 64) != 0)
-        return S3_ERR_SIGNATURE_DOES_NOT_MATCH;
+    int sig_ok = p->signature.n == 64 && CRYPTO_memcmp(want, p->signature.p, 64) == 0;
+    if (deny) { g_deny_reason = deny; return S3_ERR_ACCESS_DENIED; }
+    if (!sig_ok) return S3_ERR_SIGNATURE_DOES_NOT_MATCH;
+    __atomic_store_n(&((cred_t *)cr)->last_used, now, __ATOMIC_RELAXED);
 
     int admin = is_admin(v, cr->user);
     /* --no-presign-admin: admin identities cannot mint bearer URLs. */
@@ -968,12 +1024,14 @@ static s3_err_t verify_params(const sigv4_verifier_t *v, const conn_t *c,
                  cr->access_key);
         id_out->is_admin = admin;
         id_out->presigned = p->is_presigned;
+        id_out->read_only = cr->attrs.read_only;
     }
     return S3_OK;
 }
 
 s3_err_t sigv4_verify_id(const sigv4_verifier_t *v, const conn_t *c,
                          sigv4_id_t *id_out) {
+    g_deny_reason = NULL;
     if (!v || !c) return S3_ERR_ACCESS_DENIED;
     auth_params_t p;
     s3_err_t e = extract_auth_params(c, &p);

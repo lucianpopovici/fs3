@@ -318,6 +318,24 @@ What's working end-to-end:
   disk after a crash. Prometheus: `fs3_bucket_bytes`,
   `fs3_bucket_quota_bytes`, `fs3_quota_rejections_total`.
 
+- **Key hygiene** — a credentials line may carry a fourth field of
+  attributes: `AKIA…:secret:alice:created=1763107200,expires=1794643200,ro,disabled`
+  (strict: an unknown attribute refuses the file and keeps the live
+  keys). A disabled or expired key gets exactly the answer an unknown key
+  gets, after the same HMAC work; the audit log records the real reason
+  (`"deny":"key_disabled"`, `key_expired`, `unknown_key`,
+  `presign_outlives_key`). Presigned URLs die with their key and may not
+  be signed to outlive it. `ro` keys can read and list (including bucket
+  config) but never write, delete, create buckets or change config, even
+  for an admin user. Last-used times are kept in `<data>/keys.state`
+  (flushed every 5 minutes and at shutdown, carried across SIGHUP), never
+  in the credentials file. Admin API: `POST /v1/keys` takes `expires` and
+  `read_only` (default expiry `--key-max-age-days`), `PATCH /v1/keys/<ak>`
+  sets `disabled`/`expires`/`read_only` at once, `GET /v1/keys` shows
+  them with `last_used`. Metrics `fs3_keys_expiring_soon`,
+  `fs3_keys_unused_90d`; both in the DSM console, which keeps a key's
+  attributes when its secret is replaced.
+
 - **Integrity scrub** — a background pass (every `--scrub-interval-days`,
   default 30; `--scrub-now`; admin API `POST /v1/scrub`, progress at
   `GET /v1/scrub`) re-reads every object, noncurrent version and
@@ -349,13 +367,12 @@ What's working end-to-end:
 
 What's *not* yet wired:
 
-- Key expiry /
-  disable, SSE-C, seccomp, `FS_IMMUTABLE_FL` for COMPLIANCE versions.
+- SSE-C, seccomp, `FS_IMMUTABLE_FL` for COMPLIANCE versions.
 - Tag-based lifecycle filters, transitions, website routing rules (all
   refused with 501 rather than ignored).
 - Replication, server-side encryption, STS.
 
-**Upgrading:** the object header (schema 3), version and lock trees are
+**Upgrading:** the object header (schema 4 since round 2), version and lock trees are
 one-way migrations — an older fs3 cannot read data written by this one.
 See `packaging/synology/CHANGELOG.md`.
 

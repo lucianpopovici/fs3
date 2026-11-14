@@ -13,6 +13,7 @@
 #include "action.h"
 #include "lifecycle.h"
 #include "scrub.h"
+#include "sigv4.h"
 #include "admin.h"
 #include "objlock.h"
 #include "tls.h"
@@ -149,6 +150,33 @@ static void admin_respond(int fd, const char *status, const char *ctype,
  *   <name> <objects> <bytes>\n
  * Easy to consume from shell (the DSM tile's CGI) and from scripts.
  * Returns bytes written, or -1 if cap was too small. */
+/* fs3_keys_expiring_soon (enabled keys expiring within 7 days) and
+ * fs3_keys_unused_90d (no verified request for 90 days — counted from
+ * the creation time when a key was never used). */
+typedef struct { int64_t now; uint64_t soon, unused; } key_stats_t;
+static void key_stats_cb(void *ctx, const char *ak, const char *user,
+                         const sigv4_cred_attrs_t *a, int64_t last_used) {
+    (void)ak; (void)user;
+    key_stats_t *k = ctx;
+    if (!a->disabled && a->expires && a->expires > k->now && a->expires - k->now <= 7 * 86400)
+        k->soon++;
+    int64_t ref = last_used ? last_used : a->created;
+    if (!a->disabled && ref && ref < k->now - 90 * 86400) k->unused++;
+}
+
+static int render_key_metrics(const sigv4_verifier_t *v, char *out, size_t cap) {
+    if (!v) return 0;
+    key_stats_t k = { sigv4_now(v), 0, 0 };
+    sigv4_foreach_cred(v, key_stats_cb, &k);
+    int n = snprintf(out, cap,
+        "# HELP fs3_keys_expiring_soon Enabled access keys expiring within 7 days.\n"
+        "# TYPE fs3_keys_expiring_soon gauge\nfs3_keys_expiring_soon %llu\n"
+        "# HELP fs3_keys_unused_90d Enabled access keys with no verified request for 90 days.\n"
+        "# TYPE fs3_keys_unused_90d gauge\nfs3_keys_unused_90d %llu\n",
+        (unsigned long long)k.soon, (unsigned long long)k.unused);
+    return n > 0 && (size_t)n < cap ? n : -1;
+}
+
 static int admin_render_buckets(struct s3_store *store,
                                 char *buf, size_t cap) {
     s3_bucket_info_t *list = NULL;
@@ -213,7 +241,8 @@ static void admin_serve_fd(server_t *s, int fd, int via_uds) {
     if (r <= 0) return;
 
     if (strncmp(req, "GET /v1/", 8) == 0 || strncmp(req, "POST /v1/", 9) == 0
-        || strncmp(req, "PUT /v1/", 8) == 0 || strncmp(req, "DELETE /v1/", 11) == 0) {
+        || strncmp(req, "PUT /v1/", 8) == 0 || strncmp(req, "DELETE /v1/", 11) == 0
+        || strncmp(req, "PATCH /v1/", 10) == 0) {
         size_t rn = 0;
         char *resp = s->admin ? admin_handle_v1(s->admin, req, (size_t)r, via_uds, &rn) : NULL;
         if (resp) {
@@ -244,6 +273,10 @@ static void admin_serve_fd(server_t *s, int fd, int via_uds) {
         if (blen >= 0) {
             int sn = scrub_metrics(s->scrub, body + blen, sizeof(body) - (size_t)blen);
             blen = sn < 0 ? -1 : blen + sn;
+        }
+        if (blen >= 0) {
+            int kn = render_key_metrics(s->cfg.auth, body + blen, sizeof(body) - (size_t)blen);
+            blen = kn < 0 ? -1 : blen + kn;
         }
         if (blen < 0) {
             admin_respond(fd, "500 Internal Server Error",
@@ -406,6 +439,8 @@ server_t *server_create(const server_cfg_t *cfg) {
     {
         admin_cfg_t ac = {
             .scrub = s->scrub,
+            .auth = cfg->auth,
+            .key_max_age_days = cfg->key_max_age_days,
             .store = s->store, .token = cfg->admin_token,
             .cred_file = cfg->admin_cred_file,
             .reload = cfg->admin_reload, .reload_user = cfg->admin_reload_user,

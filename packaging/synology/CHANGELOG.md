@@ -18,6 +18,10 @@
 - Background integrity scrub (`--scrub-interval-days`, `--scrub-rate`,
   `--scrub-now`, `--scrub-fail-reads`, admin `POST/GET /v1/scrub`, new
   `scrub/` dir with `state` and `corrupt.log`, `fs3_scrub_*` metrics).
+- Key expiry, disable, read-only keys and last-used times (fourth field
+  of a credentials line, `PATCH /v1/keys/<ak>`, `--key-max-age-days`,
+  `keys.state`). **No downgrade** once a credentials line carries
+  attributes: an older fs3 refuses the file (`:` in the user field).
 - Audit log lines carry the S3 error code (`"error":"…"`).
 - Fix: a request refused before `100 Continue` now closes the connection
   (botocore stalled 60 s on the next request).

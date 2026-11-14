@@ -147,6 +147,8 @@ test: check-test-deps $(TEST_BINS) fs3
 	@./tests/test_e2e_quota.sh
 	@echo "=== test_e2e_scrub (round 2: integrity scrub) ==="
 	@./tests/test_e2e_scrub.sh
+	@echo "=== test_e2e_keys (round 2: key expiry / disable / read-only / last-used) ==="
+	@./tests/test_e2e_keys.sh
 	@echo "=== test_e2e_phase9 (range / bulk-delete / bucket-subresources) ==="
 	@./tests/test_e2e_phase9.sh
 	@echo "=== test_e2e_phase10 (object copy / ?acl stub) ==="

@@ -197,6 +197,16 @@ page=$(cgi_get)
 check_has   "page shows a key's user" "$page" "<code>bob</code>"
 check_has   "page marks a key that is its own user" "$page" "testkey (the key itself)"
 check_lacks "page never shows secrets" "$page" "rotsecret-3"
+# Key attributes (round 2, item 4): a secret change keeps them, and the
+# page shows a status column without leaking the attributes as a user.
+sed -i 's/^rotkey:rotsecret-3:bob$/rotkey:rotsecret-3:bob:created=1763107200,ro,disabled/' "$CRED"
+out=$(cgi_post "action=addkey&ak=rotkey&sk=rotsecret-5&tok=$TOKEN")
+check_eq  "replacing the secret keeps the attributes" \
+          "$(grep -c '^rotkey:rotsecret-5:bob:created=1763107200,ro,disabled$' "$CRED" || true)" "1"
+page=$(cgi_get)
+check_has   "status column: disabled + read-only" "$page" "disabled read-only"
+check_has   "user shown without attributes" "$page" "<code>bob</code>"
+check_lacks "attributes not shown as part of the user" "$page" "bob:created"
 out=$(cgi_post "action=delkey&ak=rotkey&tok=$TOKEN")
 check_has "key with user removed" "$out" "m=removed"
 check_eq  "back to two keys" "$(wc -l < "$CRED" | tr -d ' ')" "2"

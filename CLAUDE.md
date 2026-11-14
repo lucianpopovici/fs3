@@ -62,8 +62,9 @@ Load-bearing rules added on the way:
 
 Round 2 (Nov 2026) added part records, ListParts, UploadPartCopy,
 user metadata, ListObjectsV2, quotas (`q_*` in store_fs.c) and the
-integrity scrub (`src/scrub.c`, `store_scrub_file`). Not done yet: key
-expiry/disable, SSE-C, `FS_IMMUTABLE_FL` hardening, seccomp.
+integrity scrub (`src/scrub.c`, `store_scrub_file`) and key hygiene
+(`sigv4_cred_attrs_t`, read-only check at the top of `authz()`). Not
+done yet: SSE-C, `FS_IMMUTABLE_FL` hardening, seccomp.
 
 ## First five minutes on a fresh box
 

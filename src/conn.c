@@ -219,6 +219,7 @@ static void request_reset(conn_t *c) {
     c->metrics_flushed = 0;
     c->last_err = 0;
     c->expect_pending = 0;
+    c->deny_reason = NULL;
 
     /* Belt-and-suspenders: by the time we reset, route_dispatch_complete
      * (PUT path) or route_dispatch_send_body (GET path) should have
@@ -652,6 +653,7 @@ static int cb_on_headers_complete(llhttp_t *p) {
             else if (e == S3_OK)
                 throttle_ok(c->client_ip);
             if (e != S3_OK) {
+                c->deny_reason = sigv4_last_deny_reason();   /* audit log only */
                 LOG_D("sigv4 verify failed (err=%d) on %s",
                       (int)e, c->peer);
                 if (route_build_error(c, e) < 0) return -1;

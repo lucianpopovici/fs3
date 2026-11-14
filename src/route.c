@@ -256,6 +256,15 @@ s3_err_t authz(conn_t *c, s3_str_t bucket, s3_str_t key, s3_action_t act) {
     if (!ai) return S3_ERR_ACCESS_DENIED;          /* default deny */
     if (!c->auth) return S3_OK;                    /* open mode */
     int anon = !c->id.user[0];
+    /* Read-only key (item 4): before grants and policies, and for admin
+     * users too. Writes, bucket creation and config changes are refused;
+     * reads, listings and config reads are not. */
+    if (!anon && c->id.read_only) {
+        int read_method = s3_str_eq_lit(c->req.method, "GET") || s3_str_eq_lit(c->req.method, "HEAD");
+        if ((ai->perm & PERM_W) || act == ACT_CREATE_BUCKET || act == ACT_DELETE_BUCKET
+            || (!read_method && (ai->perm & PERM_O)))
+            return S3_ERR_ACCESS_DENIED;
+    }
     if (act == ACT_LIST_BUCKETS || act == ACT_CREATE_BUCKET)
         return anon ? S3_ERR_ACCESS_DENIED : S3_OK;
     s3_bucket_meta_t m;

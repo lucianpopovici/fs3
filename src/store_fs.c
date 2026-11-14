@@ -2138,7 +2138,7 @@ s3_err_t store_list_begin(s3_store_t *s, s3_str_t bucket,
         store_list_close(l);
         return S3_ERR_INTERNAL;
     }
-    qsort(l->items, l->n_items, sizeof(list_entry_t), cmp_entries);
+    if (l->n_items) qsort(l->items, l->n_items, sizeof(list_entry_t), cmp_entries);
     *out = l;
     return S3_OK;
 }

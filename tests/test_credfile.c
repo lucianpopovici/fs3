@@ -182,7 +182,91 @@ static void t_load_file_empty_fails(void) {
     cleanup_file();
 }
 
+/* ---------------------------------------------------------------- */
+/* Key attributes (round 2, item 4): fourth field                    */
+/* ---------------------------------------------------------------- */
+
+typedef struct { const char *ak; sigv4_cred_attrs_t a; const char *user; int found; } attr_probe_t;
+static void probe_cb(void *ctx, const char *ak, const char *user,
+                     const sigv4_cred_attrs_t *a, int64_t last_used) {
+    (void)last_used;
+    attr_probe_t *p = ctx;
+    if (!strcmp(ak, p->ak)) { p->a = *a; p->user = user; p->found = 1; }
+}
+static attr_probe_t probe(sigv4_verifier_t *v, const char *ak) {
+    attr_probe_t p = { ak, { 0 }, NULL, 0 };
+    sigv4_foreach_cred(v, probe_cb, &p);
+    return p;
+}
+
+static void t_attrs_parsed(void) {
+    sigv4_verifier_t *v = sigv4_create();
+    CHECK(main_test_parse_and_add_cred(v,
+          "AKIAATTR0000000001:secretvalue:alice:created=1763107200,expires=1794643200,ro,disabled") == 0,
+          "all attributes accepted");
+    attr_probe_t p = probe(v, "AKIAATTR0000000001");
+    CHECK(p.found && p.a.created == 1763107200 && p.a.expires == 1794643200
+          && p.a.read_only && p.a.disabled, "attribute values");
+    CHECK(p.found && !strcmp(p.user, "alice"), "user before the attributes");
+    sigv4_destroy(v);
+}
+
+static void t_attrs_empty_user_defaults(void) {
+    sigv4_verifier_t *v = sigv4_create();
+    CHECK(main_test_parse_and_add_cred(v, "AKIAATTR0000000002:secretvalue::ro") == 0,
+          "ak:sk::ro accepted");
+    attr_probe_t p = probe(v, "AKIAATTR0000000002");
+    CHECK(p.found && p.a.read_only && !strcmp(p.user, "AKIAATTR0000000002"),
+          "empty user before attributes = the access key");
+    sigv4_destroy(v);
+}
+
+static void t_attrs_strict(void) {
+    const char *bad[] = {
+        "AKIAATTR0000000003:secretvalue:alice:readonly",       /* unknown */
+        "AKIAATTR0000000003:secretvalue:alice:ro,ro",          /* repeated */
+        "AKIAATTR0000000003:secretvalue:alice:ro,",            /* trailing comma */
+        "AKIAATTR0000000003:secretvalue:alice:,ro",            /* empty token */
+        "AKIAATTR0000000003:secretvalue:alice:expires=",       /* no value */
+        "AKIAATTR0000000003:secretvalue:alice:expires=12x",    /* not a number */
+        "AKIAATTR0000000003:secretvalue:alice:expires=99999999999999", /* too long */
+        "AKIAATTR0000000003:secretvalue:alice:",               /* empty field */
+        "AKIAATTR0000000003:secretvalue:alice:ro:extra",       /* fifth field */
+        NULL };
+    for (int i = 0; bad[i]; i++) {
+        sigv4_verifier_t *v = sigv4_create();
+        CHECK(main_test_parse_and_add_cred(v, bad[i]) == -1, bad[i]);
+        sigv4_destroy(v);
+    }
+}
+
+static void t_attrs_file_fails_closed(void) {
+    write_file("AKIAATTR0000000004:secretvalue:alice\n"
+               "AKIAATTR0000000005:secretvalue:bob:bogus=1\n");
+    sigv4_verifier_t *v = sigv4_create();
+    CHECK(main_test_load_credentials_file(v, g_path) == -1,
+          "file with an unknown attribute refused as a whole");
+    sigv4_destroy(v);
+    cleanup_file();
+}
+
+static void t_attrs_legacy_lines_unchanged(void) {
+    write_file("AKIAATTR0000000006:secretvalue\nAKIAATTR0000000007:secretvalue:carol\n");
+    sigv4_verifier_t *v = sigv4_create();
+    CHECK(main_test_load_credentials_file(v, g_path) == 0, "legacy lines load");
+    attr_probe_t p = probe(v, "AKIAATTR0000000007");
+    CHECK(p.found && !p.a.read_only && !p.a.disabled && !p.a.expires && !p.a.created,
+          "legacy line has no attributes");
+    sigv4_destroy(v);
+    cleanup_file();
+}
+
 int main(void) {
+    t_attrs_parsed();
+    t_attrs_empty_user_defaults();
+    t_attrs_strict();
+    t_attrs_file_fails_closed();
+    t_attrs_legacy_lines_unchanged();
     t_cred_no_user_defaults_to_access_key();
     t_cred_with_explicit_user();
     t_cred_no_colon_rejected();
