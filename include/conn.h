@@ -20,6 +20,7 @@
 #include "llhttp.h"
 #include "s3.h"
 #include "sigv4.h"
+#include "checksum.h"
 
 #define CONN_RBUF_SZ          (16 * 1024)
 #define CONN_WBUF_SZ          (16 * 1024)
@@ -31,6 +32,7 @@
  * re-fire EPOLLIN on the next wait; the cap just stops one fast uploader
  * from starving every other connection. */
 #define CONN_READ_BUDGET      (256 * 1024)
+#define CONN_XHDR_SZ          2048          /* extra response headers */
 
 typedef enum {
     CST_READ_HEADERS,    /* feeding bytes to llhttp; headers not yet complete */
@@ -219,6 +221,29 @@ typedef struct conn {
      * with verified data. */
     struct sigv4_chunk_decoder *chunk_decoder;
 
+    /* The request's signature was verified (header or presigned). */
+    int                sig_verified;
+
+    /* Additional-checksum verification (item 1). cksum runs over the
+     * decoded body bytes delivered to the router; the expected value
+     * comes from an x-amz-checksum-<algo> header or, for aws-chunked
+     * trailers, from the decoder at end of body. md5 does the same for
+     * Content-MD5. Inactive when .algo == 0. */
+    cksum_ctx_t        cksum;
+    int                cksum_algo;
+    int                cksum_from_trailer;
+    uint8_t            cksum_expect[CKSUM_MAX_DIGEST];
+    cksum_ctx_t        md5;
+    uint8_t            md5_expect[16];
+
+    /* Extra response headers ("Name: value\r\n"...), spliced into
+     * whatever response head is built for this request when it starts
+     * going out (conn_on_writable). Used for checksum echoes, CORS,
+     * version ids, ... so the many head builders need no new params. */
+    char               xhdr[CONN_XHDR_SZ];
+    size_t             xhdr_len;
+    int                xhdr_done;
+
     /* Multipart upload context.
      *  mpu_is_part_upload — when true, c->put_writer was created via
      *      store_mpu_part_begin and route_dispatch_complete should call
@@ -279,5 +304,12 @@ int     conn_parse_query(conn_t *c);
 const conn_qparam_t *conn_query_get(const conn_t *c, const char *name);
 /* Number of parameters named `name`. */
 int     conn_query_count(const conn_t *c, const char *name);
+
+/* Queue an extra response header for the current request. Returns 0, or
+ * -1 if the extra-header buffer is full (the header is dropped). */
+int     conn_add_header(conn_t *c, const char *name, const char *value);
+/* Drop queued extra headers (e.g. when a success response turns into an
+ * error after they were added). */
+void    conn_clear_headers(conn_t *c);
 
 #endif

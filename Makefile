@@ -30,7 +30,7 @@ INCLUDES   := -Iinclude -I$(LLHTTP_DIR)/include -I$(XML_DIR)
 # Server objects
 SRV_SRCS := src/main.c src/server.c src/conn.c src/log.c src/store_fs.c \
             src/route.c src/response.c src/sigv4.c src/metrics.c \
-            src/iopool.c src/action.c
+            src/iopool.c src/action.c src/checksum.c src/query.c
 SRV_OBJS := $(SRV_SRCS:.c=.o)
 
 LLHTTP_OBJS := $(LLHTTP_DIR)/src/api.o $(LLHTTP_DIR)/src/http.o \
@@ -74,9 +74,13 @@ $(XML_DIR)/%.o: $(XML_DIR)/%.c
 
 # ----- Tests --------------------------------------------------------
 
-TEST_BINS := tests/test_store tests/test_conn tests/test_xml tests/test_xml_legacy tests/test_xml_fuzz tests/test_sigv4 tests/test_credfile
+TEST_BINS := tests/test_chunk_fuzz tests/test_checksum tests/test_store tests/test_conn tests/test_xml tests/test_xml_legacy tests/test_xml_fuzz tests/test_sigv4 tests/test_credfile
 
 test: $(TEST_BINS) fs3
+	@echo "=== test_chunk_fuzz (50000 iterations) ==="
+	@./tests/test_chunk_fuzz 50000
+	@echo "=== test_checksum ==="
+	@./tests/test_checksum
 	@echo "=== test_store ==="
 	@./tests/test_store
 	@echo "=== test_conn ==="
@@ -109,12 +113,22 @@ test: $(TEST_BINS) fs3
 	@./tests/test_e2e_isolation.sh
 	@echo "=== test_e2e_subresources (S0: unimplemented subresources → 501) ==="
 	@./tests/test_e2e_subresources.sh
+	@echo "=== test_e2e_checksum (item 1: trailers + x-amz-checksum-*) ==="
+	@./tests/test_e2e_checksum.sh
 	@echo "=== test_ui_cgi (DSM tile admin console) ==="
 	@./tests/test_ui_cgi.sh
 
-tests/test_store: tests/test_store.c src/store_fs.o src/log.o
+tests/test_chunk_fuzz: tests/test_chunk_fuzz.c src/sigv4.o src/query.o src/log.o
+	$(CC) $(CFLAGS) $(INCLUDES) tests/test_chunk_fuzz.c src/sigv4.o \
+	    src/query.o src/log.o $(LDFLAGS) -o $@
+
+tests/test_checksum: tests/test_checksum.c src/checksum.o
+	$(CC) $(CFLAGS) $(INCLUDES) tests/test_checksum.c src/checksum.o \
+	    $(LDFLAGS) -o $@
+
+tests/test_store: tests/test_store.c src/store_fs.o src/log.o src/checksum.o
 	$(CC) $(CFLAGS) $(INCLUDES) tests/test_store.c \
-	    src/store_fs.o src/log.o $(LDFLAGS) -o $@
+	    src/store_fs.o src/log.o src/checksum.o $(LDFLAGS) -o $@
 
 # Everything but main.o/server.o: conn.c pulls in routing, the store,
 # SigV4, responses and metrics.
@@ -138,16 +152,16 @@ tests/test_xml_fuzz: $(XML_DIR)/tests/test_fuzz.c $(XML_DIR)/xml_parser.o
 # test_sigv4 needs the SIGV4_TESTING macro to expose internal helpers,
 # so we recompile sigv4.c instead of using the cached .o from the
 # server build.
-tests/test_sigv4: tests/test_sigv4.c src/sigv4.c
-	$(CC) $(CFLAGS) $(INCLUDES) -DSIGV4_TESTING tests/test_sigv4.c src/sigv4.c \
+tests/test_sigv4: tests/test_sigv4.c src/sigv4.c src/query.c
+	$(CC) $(CFLAGS) $(INCLUDES) -DSIGV4_TESTING tests/test_sigv4.c src/sigv4.c src/query.c \
 	    $(LDFLAGS) -o $@
 
 # test_credfile needs the FS3_MAIN_TESTING macro to expose main.c's
 # credentials-file parser and exclude main()/on_signal, so it can supply
 # its own main() without pulling in server.c's dependency chain.
-tests/test_credfile: tests/test_credfile.c src/main.c src/sigv4.c src/log.c
+tests/test_credfile: tests/test_credfile.c src/main.c src/sigv4.c src/log.c src/query.c
 	$(CC) $(CFLAGS) $(INCLUDES) -DFS3_MAIN_TESTING \
-	    tests/test_credfile.c src/main.c src/sigv4.c src/log.c \
+	    tests/test_credfile.c src/main.c src/sigv4.c src/log.c src/query.c \
 	    $(LDFLAGS) -o $@
 
 clean:

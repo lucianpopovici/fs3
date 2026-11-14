@@ -83,6 +83,12 @@ int rsp_build_initiate_mpu(conn_t *c, s3_str_t bucket, s3_str_t key,
  * (e.g. "abc...-3"); we wrap it in quotes per S3 convention. */
 int rsp_build_complete_mpu(conn_t *c, s3_str_t bucket, s3_str_t key,
                            const char *etag);
+/* With the object's checksum element (m may be NULL). */
+int rsp_build_complete_mpu2(conn_t *c, s3_str_t bucket, s3_str_t key,
+                            const char *etag, const s3_obj_meta_t *m);
+/* base64 checksum value as sent in x-amz-checksum-*: "<b64>" or, for
+ * composite multipart checksums, "<b64>-<parts>". */
+void rsp_format_checksum(const s3_obj_meta_t *m, char out[64]);
 
 /* Build a ListAllMyBucketsResult XML body, 200 OK. */
 int rsp_build_list_all_my_buckets(conn_t *c,

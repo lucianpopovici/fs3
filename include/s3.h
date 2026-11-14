@@ -34,6 +34,10 @@ typedef enum {
     S3_ERR_MALFORMED_XML,               /* XML body could not be parsed */
     S3_ERR_INSUFFICIENT_STORAGE,        /* volume full (ENOSPC/EDQUOT) or free
                                            space below --min-free-bytes */
+    S3_ERR_CHECKSUM_MISMATCH,           /* x-amz-checksum-* / Content-MD5 mismatch */
+    S3_ERR_INVALID_CHECKSUM,            /* malformed checksum header/trailer */
+    S3_ERR_AUTH_QUERY_PARAMS,           /* bad presigned-URL parameters */
+    S3_ERR_PRESIGN_EXPIRED,             /* presigned URL past X-Amz-Expires */
     S3_ERR_MAX
 } s3_err_t;
 

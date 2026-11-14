@@ -21,6 +21,7 @@
 #include "s3.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
 
@@ -624,6 +625,126 @@ static void t_body_hash_mismatch(void) {
 
 /* ---------------------------------------------------------------- */
 
+/* ---------------------------------------------------------------- */
+/* Presigned URLs (item 2) — AWS docs example: examplebucket/test.txt */
+/* ---------------------------------------------------------------- */
+
+#define PRESIGN_Q "X-Amz-Algorithm=AWS4-HMAC-SHA256" \
+    "&X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20130524%2Fus-east-1%2Fs3%2Faws4_request" \
+    "&X-Amz-Date=20130524T000000Z&X-Amz-Expires=86400&X-Amz-SignedHeaders=host" \
+    "&X-Amz-Signature=aeeed9bbccd4d02ee5c0109b86d86835f995330da4c265957d157751f604d404"
+
+static conn_t *presign_conn(const char *query, const char *extra_k,
+                            const char *extra_v) {
+    conn_t *c = calloc(1, sizeof(*c));
+    c->req.method = (s3_str_t){ "GET", 3 };
+    c->req.path   = (s3_str_t){ "/test.txt", 9 };
+    c->req.query  = (s3_str_t){ query, strlen(query) };
+    c->req.headers[0].k = S3_STR_LIT("host");
+    c->req.headers[0].v = S3_STR_LIT("examplebucket.s3.amazonaws.com");
+    c->req.n_headers = 1;
+    if (extra_k) {
+        c->req.headers[1].k = (s3_str_t){ extra_k, strlen(extra_k) };
+        c->req.headers[1].v = (s3_str_t){ extra_v, strlen(extra_v) };
+        c->req.n_headers = 2;
+    }
+    conn_parse_query(c);
+    return c;
+}
+
+static s3_err_t presign_verify(int64_t now, const char *query,
+                               const char *extra_k, const char *extra_v,
+                               int max_expires, int admin, sigv4_id_t *id) {
+    sigv4_verifier_t *v = sigv4_create();
+    sigv4_add_cred_user(v, "AKIAIOSFODNN7EXAMPLE",
+                        "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY", "alice");
+    if (admin) sigv4_add_admin(v, "alice");
+    sigv4_set_presign_policy(v, max_expires, admin == 2);
+    sigv4_set_clock(v, now);
+    conn_t *c = presign_conn(query, extra_k, extra_v);
+    sigv4_id_t tmp;
+    s3_err_t e = sigv4_verify_id(v, c, id ? id : &tmp);
+    free(c);
+    sigv4_destroy(v);
+    return e;
+}
+
+static void t_presign_aws_example(void) {
+    const int64_t t0 = 1369353600;   /* 20130524T000000Z */
+    sigv4_id_t id = {0};
+    CHECK(presign_verify(t0 + 100, PRESIGN_Q, NULL, NULL, 604800, 0, &id) == S3_OK,
+          "AWS presigned example verifies");
+    CHECK(id.presigned == 1, "presigned flag set");
+    CHECK_EQ_STR(id.user, (int)strlen(id.user), "alice", "presign user");
+    CHECK(presign_verify(t0 + 86400, PRESIGN_Q, NULL, NULL, 604800, 0, NULL) == S3_OK,
+          "valid at the last second");
+    CHECK(presign_verify(t0 + 86401, PRESIGN_Q, NULL, NULL, 604800, 0, NULL)
+          == S3_ERR_PRESIGN_EXPIRED, "expired");
+    CHECK(presign_verify(t0 - 3600, PRESIGN_Q, NULL, NULL, 604800, 0, NULL)
+          == S3_ERR_REQUEST_TIME_TOO_SKEWED, "not yet valid");
+    CHECK(presign_verify(t0 + 100, PRESIGN_Q, NULL, NULL, 3600, 0, NULL)
+          == S3_ERR_AUTH_QUERY_PARAMS, "expires above --presign-max-expires");
+}
+
+static void t_presign_rejections(void) {
+    const int64_t t0 = 1369353600 + 100;
+    /* Tampered X-Amz-Expires: signature no longer matches. */
+    static const char tampered[] = "X-Amz-Algorithm=AWS4-HMAC-SHA256"
+        "&X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20130524%2Fus-east-1%2Fs3%2Faws4_request"
+        "&X-Amz-Date=20130524T000000Z&X-Amz-Expires=86399&X-Amz-SignedHeaders=host"
+        "&X-Amz-Signature=aeeed9bbccd4d02ee5c0109b86d86835f995330da4c265957d157751f604d404";
+    CHECK(presign_verify(t0, tampered, NULL, NULL, 604800, 0, NULL)
+          == S3_ERR_SIGNATURE_DOES_NOT_MATCH, "tampered expires");
+    CHECK(presign_verify(t0, PRESIGN_Q "&X-Amz-Signature=00", NULL, NULL, 604800, 0, NULL)
+          == S3_ERR_AUTH_QUERY_PARAMS, "duplicate X-Amz-Signature");
+    CHECK(presign_verify(t0, PRESIGN_Q "&X-Amz-Security-Token=x", NULL, NULL, 604800, 0, NULL)
+          == S3_ERR_NOT_IMPLEMENTED, "STS token not implemented");
+    CHECK(presign_verify(t0, PRESIGN_Q, "authorization", "AWS4-HMAC-SHA256 x", 604800, 0, NULL)
+          == S3_ERR_INVALID_ARGUMENT, "Authorization + X-Amz-Signature");
+    CHECK(presign_verify(t0, PRESIGN_Q, "x-amz-copy-source", "/other/key", 604800, 0, NULL)
+          == S3_ERR_ACCESS_DENIED, "unsigned x-amz-* header refused");
+    static const char long_exp[] = "X-Amz-Algorithm=AWS4-HMAC-SHA256"
+        "&X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20130524%2Fus-east-1%2Fs3%2Faws4_request"
+        "&X-Amz-Date=20130524T000000Z&X-Amz-Expires=604801&X-Amz-SignedHeaders=host"
+        "&X-Amz-Signature=aeeed9bbccd4d02ee5c0109b86d86835f995330da4c265957d157751f604d404";
+    CHECK(presign_verify(t0, long_exp, NULL, NULL, 604800, 0, NULL)
+          == S3_ERR_AUTH_QUERY_PARAMS, "expires > 7 days");
+    CHECK(presign_verify(t0, PRESIGN_Q, NULL, NULL, 604800, 1, NULL) == S3_OK,
+          "admin presign allowed by default");
+    CHECK(presign_verify(t0, PRESIGN_Q, NULL, NULL, 604800, 2, NULL)
+          == S3_ERR_ACCESS_DENIED, "--no-presign-admin");
+    static const char wrong_svc[] = "X-Amz-Algorithm=AWS4-HMAC-SHA256"
+        "&X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20130524%2Fus-east-1%2Fiam%2Faws4_request"
+        "&X-Amz-Date=20130524T000000Z&X-Amz-Expires=86400&X-Amz-SignedHeaders=host"
+        "&X-Amz-Signature=aeeed9bbccd4d02ee5c0109b86d86835f995330da4c265957d157751f604d404";
+    CHECK(presign_verify(t0, wrong_svc, NULL, NULL, 604800, 0, NULL)
+          == S3_ERR_ACCESS_DENIED, "scope service must be s3");
+    static const char no_host[] = "X-Amz-Algorithm=AWS4-HMAC-SHA256"
+        "&X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20130524%2Fus-east-1%2Fs3%2Faws4_request"
+        "&X-Amz-Date=20130524T000000Z&X-Amz-Expires=86400&X-Amz-SignedHeaders=range"
+        "&X-Amz-Signature=aeeed9bbccd4d02ee5c0109b86d86835f995330da4c265957d157751f604d404";
+    CHECK(presign_verify(t0, no_host, "range", "bytes=0-1", 604800, 0, NULL)
+          == S3_ERR_ACCESS_DENIED, "host must be signed");
+}
+
+/* S1: scope date must match X-Amz-Date; duplicate Authorization refused. */
+static void t_header_scope_and_duplicates(void) {
+    sigv4_verifier_t *v = sigv4_create();
+    sigv4_add_cred(v, "AKIAIOSFODNN7EXAMPLE",
+                   "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY");
+    sigv4_set_clock(v, 1369353600);
+    conn_t c = {0};
+    set_aws_s3_get_example_headers(&c);
+    c.req.headers[4] = c.req.headers[3];      /* second Authorization */
+    c.req.n_headers = 5;
+    CHECK(sigv4_verify(v, &c) == S3_ERR_ACCESS_DENIED, "duplicate Authorization");
+    set_aws_s3_get_example_headers(&c);
+    c.req.headers[2].v = S3_STR_LIT("20130525T000000Z");
+    sigv4_set_clock(v, 1369353600 + 86400);
+    CHECK(sigv4_verify(v, &c) == S3_ERR_ACCESS_DENIED, "scope date != x-amz-date");
+    sigv4_destroy(v);
+}
+
 int main(void) {
     t_sha256_empty();
     t_sha256_abc();
@@ -653,6 +774,9 @@ int main(void) {
     t_body_hash_single_chunk();
     t_body_hash_multiple_chunks();
     t_body_hash_mismatch();
+    t_presign_aws_example();
+    t_presign_rejections();
+    t_header_scope_and_duplicates();
 
     fprintf(stderr, "===== %d passed, %d failed =====\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;

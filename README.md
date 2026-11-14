@@ -53,8 +53,26 @@ What's working end-to-end:
   signature has been verified, and any chunk-level failure aborts
   the in-flight PUT before commit. The decoder is a small state
   machine that handles arbitrarily-split feeds (a CRLF can land
-  across two `on_body` callbacks). Trailer variants
-  (`STREAMING-...-TRAILER`) remain unimplemented.
+  across two `on_body` callbacks).
+
+- **Trailer variants and additional checksums** — both
+  `STREAMING-UNSIGNED-PAYLOAD-TRAILER` and
+  `STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER` (trailer signature
+  verified), which AWS SDKs send by default since early 2025 (boto3 ≥
+  1.36, JS v3, Java v2, Go v2). `x-amz-checksum-{crc32,crc32c,sha1,
+  sha256,crc64nvme}` is verified over the decoded body whether it comes
+  as a header or a trailer, and `Content-MD5` is checked too; a mismatch
+  aborts the upload before commit (`400 BadDigest`, nothing on disk). The
+  checksum is stored in the object header (schema 3), echoed on the PUT
+  response, and returned on GET/HEAD with `x-amz-checksum-mode: ENABLED`
+  (never on ranged GETs). Multipart uploads created with
+  `x-amz-checksum-algorithm` verify every part and store a COMPOSITE
+  (`base64(algo(part digests))-N`) or FULL_OBJECT checksum (CRC64NVME is
+  always full-object). CRC32/CRC32C/CRC64NVME are table-driven (no zlib;
+  CRC32C uses SSE4.2 when the CPU has it). Decoder bounds: 16 hex digits
+  per chunk size, 256-byte trailer lines, at most 4 trailers, only names
+  announced in `x-amz-trailer`. In open mode (no auth) aws-chunked bodies
+  are still de-framed, so chunk headers never end up in the object.
 
 - **Multipart upload** — `POST ?uploads`, `PUT ?partNumber=N&uploadId=ID`,
   `POST ?uploadId=ID` (Complete), `DELETE ?uploadId=ID` (Abort).
@@ -118,8 +136,7 @@ What's working end-to-end:
 
 What's *not* yet wired:
 
-- Streaming chunked SigV4 with trailers (`STREAMING-...-TRAILER`,
-  used when SDKs send `x-amz-checksum-sha256` after the body).
+- `ListParts` (`GET /bucket/key?uploadId=`) answers 501.
 - Bucket subresources: location, versioning, lifecycle, CORS, etc.
 
 ## Layout
@@ -341,5 +358,4 @@ The natural next pieces, in rough order:
    `--range` invocations and other clients (e.g. video players,
    `dd skip=`) do.
 2. **Bucket subresources**: location, versioning, lifecycle, CORS, etc.
-3. **SigV4 trailer variants** (`STREAMING-...-TRAILER`, used when
-   AWS SDKs send checksums after the body).
+3. ~~SigV4 trailer variants~~ — done (see Status).

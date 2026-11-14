@@ -56,6 +56,9 @@ static void usage(const char *argv0) {
         "                             (default 4; 0 = run them on the event loop)\n"
         "      --mpu-gc-interval N    seconds between MPU GC sweeps (default 60)\n"
         "      --mpu-gc-max-age N     seconds before a stale MPU is reaped (default 86400)\n"
+        "      --presign-max-expires N  longest accepted presigned-URL lifetime in\n"
+        "                             seconds (default 86400; at most 604800)\n"
+        "      --no-presign-admin     refuse presigned URLs signed by an --admin user\n"
         "  -v, --verbose              debug logging\n"
         "  -h, --help                 this help\n",
         argv0);
@@ -214,6 +217,8 @@ enum {
     OPT_IO_THREADS,
     OPT_ADMIN,
     OPT_LEGACY_OWNER,
+    OPT_PRESIGN_MAX_EXPIRES,
+    OPT_NO_PRESIGN_ADMIN,
 };
 
 #ifndef FS3_MAIN_TESTING
@@ -242,6 +247,8 @@ int main(int argc, char **argv) {
     const char *admins[32];
     int n_admins = 0;
     const char *legacy_owner = NULL;
+    long presign_max_expires = 86400;   /* 24 h; AWS allows 7 days */
+    int no_presign_admin = 0;
     sigv4_verifier_t *auth = NULL;
     reload_ctx_t reload_ctx = {0};
 
@@ -262,6 +269,8 @@ int main(int argc, char **argv) {
         { "legacy-owner",     required_argument, NULL, OPT_LEGACY_OWNER },
         { "mpu-gc-interval",  required_argument, NULL, OPT_MPU_GC_INTERVAL },
         { "mpu-gc-max-age",   required_argument, NULL, OPT_MPU_GC_MAX_AGE },
+        { "presign-max-expires", required_argument, NULL, OPT_PRESIGN_MAX_EXPIRES },
+        { "no-presign-admin", no_argument,       NULL, OPT_NO_PRESIGN_ADMIN },
         { "verbose",          no_argument,       NULL, 'v' },
         { "help",             no_argument,       NULL, 'h' },
         { 0 },
@@ -393,9 +402,20 @@ int main(int argc, char **argv) {
                     return 2;
                 }
                 break;
+            case OPT_PRESIGN_MAX_EXPIRES:
+                presign_max_expires = atol(optarg);
+                if (presign_max_expires < 1 || presign_max_expires > 604800) {
+                    fprintf(stderr, "--presign-max-expires must be 1..604800\n");
+                    return 2;
+                }
+                break;
+            case OPT_NO_PRESIGN_ADMIN:
+                no_presign_admin = 1;
+                break;
             default:  usage(argv[0]); return 2;
         }
     }
+    if (auth) sigv4_set_presign_policy(auth, presign_max_expires, no_presign_admin);
 
     if (require_auth && !auth) {
         fprintf(stderr, "--require-auth requires at least one --auth credential\n");

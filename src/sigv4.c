@@ -97,12 +97,15 @@ struct sigv4_verifier {
     admin_t  *admins;           /* not swapped by sigv4_swap_creds */
     int64_t   fixed_now;        /* 0 = real clock */
     int       max_skew;         /* seconds */
+    int64_t   presign_max_expires; /* seconds; 0 = AWS max (7 days) */
+    int       no_presign_admin; /* refuse presigned URLs signed by admins */
 };
 
 sigv4_verifier_t *sigv4_create(void) {
     sigv4_verifier_t *v = calloc(1, sizeof(*v));
     if (!v) return NULL;
     v->max_skew = 900;          /* 15 minutes — AWS default */
+    v->presign_max_expires = 86400;  /* 24 h (AWS allows 7 days) */
     return v;
 }
 
@@ -191,6 +194,13 @@ static int is_admin(const sigv4_verifier_t *v, const char *user) {
 
 void sigv4_set_clock(sigv4_verifier_t *v, int64_t fixed_now) {
     if (v) v->fixed_now = fixed_now;
+}
+
+void sigv4_set_presign_policy(sigv4_verifier_t *v, int64_t max_expires,
+                              int no_admin) {
+    if (!v) return;
+    v->presign_max_expires = max_expires;
+    v->no_presign_admin = no_admin;
 }
 
 void sigv4_set_max_skew(sigv4_verifier_t *v, int max_skew) {
@@ -345,7 +355,8 @@ static int qpair_cmp(const void *a, const void *b) {
 
 /* Build canonical query string into `out`. Returns bytes written or -1.
  * Uses a temporary heap buffer (the input may need decode + re-encode). */
-static int build_canonical_query(s3_str_t query, char *out, size_t cap) {
+static int build_canonical_query(s3_str_t query, const char *exclude,
+                                 char *out, size_t cap) {
     if (query.n == 0) return 0;
 
     /* Worst case: every byte triples after re-encode, plus the original.
@@ -394,6 +405,11 @@ static int build_canonical_query(s3_str_t query, char *out, size_t cap) {
         if (v_n < 0) goto oom;
         char *v = scratch + scratch_used;
         scratch_used += (size_t)v_n;
+
+        /* Presigned URLs: X-Amz-Signature is not part of what was signed. */
+        if (exclude && (size_t)k_n == strlen(exclude)
+            && memcmp(k, exclude, (size_t)k_n) == 0)
+            continue;
 
         if (pair_n == pair_cap) {
             pair_cap *= 2;
@@ -514,7 +530,7 @@ static int copy_signed_headers(s3_str_t signed_headers, char *out, size_t cap) {
 /* Build the full canonical request into `out`. Returns bytes written
  * or -1 on overflow. */
 static int build_canonical_request(const conn_t *c, s3_str_t signed_headers,
-                                   s3_str_t body_hash,
+                                   s3_str_t body_hash, const char *q_exclude,
                                    char *out, size_t cap) {
     size_t o = 0;
     int n;
@@ -533,7 +549,7 @@ static int build_canonical_request(const conn_t *c, s3_str_t signed_headers,
     out[o++] = '\n';
 
     /* Canonical query string */
-    n = build_canonical_query(c->req.query, out + o, cap - o);
+    n = build_canonical_query(c->req.query, q_exclude, out + o, cap - o);
     if (n < 0) return -1;
     o += (size_t)n;
     if (o + 1 > cap) return -1;
@@ -648,6 +664,35 @@ typedef struct {
     s3_str_t signature;
 } auth_parts_t;
 
+/* Credential = ak/yyyymmdd/region/service/aws4_request. Fills the
+ * access_key/date/region/service/scope fields of `out`. */
+static int parse_credential(s3_str_t cred, auth_parts_t *out) {
+    s3_str_t parts[5] = { S3_STR_NULL };
+    int np = 0;
+    size_t p = 0;
+    while (p < cred.n && np < 5) {
+        size_t s = p;
+        while (p < cred.n && cred.p[p] != '/') p++;
+        parts[np++] = (s3_str_t){ cred.p + s, p - s };
+        if (p < cred.n) p++;
+    }
+    if (np != 5 || p != cred.n) return -1;
+    if (!s3_str_eq_lit(parts[4], "aws4_request")) return -1;
+    if (parts[0].n == 0) return -1;
+    if (parts[1].n != 8) return -1;     /* yyyymmdd */
+    for (size_t d = 0; d < 8; d++) {
+        if (parts[1].p[d] < '0' || parts[1].p[d] > '9') return -1;
+    }
+    out->access_key = parts[0];
+    out->date       = parts[1];
+    out->region     = parts[2];
+    out->service    = parts[3];
+    /* scope = "date/region/service/aws4_request" */
+    out->scope      = (s3_str_t){ cred.p + parts[0].n + 1,
+                                  cred.n - parts[0].n - 1 };
+    return 0;
+}
+
 /* Returns 0 on success, -1 on malformed. Pieces point into auth.p. */
 static int parse_authorization(s3_str_t auth, auth_parts_t *out) {
     static const char prefix[] = "AWS4-HMAC-SHA256 ";
@@ -687,33 +732,7 @@ static int parse_authorization(s3_str_t auth, auth_parts_t *out) {
 
     if (cred.n == 0 || sh.n == 0 || sig.n == 0) return -1;
 
-    /* Credential = ak/date/region/service/aws4_request. Split on '/'. */
-    s3_str_t parts[5] = { S3_STR_NULL };
-    int np = 0;
-    size_t p = 0;
-    while (p < cred.n && np < 5) {
-        size_t s = p;
-        while (p < cred.n && cred.p[p] != '/') p++;
-        parts[np++] = (s3_str_t){ cred.p + s, p - s };
-        if (p < cred.n) p++;
-    }
-    if (np != 5) return -1;
-    if (!s3_str_eq_lit(parts[4], "aws4_request")) return -1;
-    if (parts[1].n != 8) return -1;     /* yyyymmdd */
-    for (size_t d = 0; d < 8; d++) {
-        if (parts[1].p[d] < '0' || parts[1].p[d] > '9') return -1;
-    }
-
-    out->access_key     = parts[0];
-    out->date           = parts[1];
-    out->region         = parts[2];
-    out->service        = parts[3];
-    /* scope = "date/region/service/aws4_request" — the portion of cred
-     * after the access key. */
-    out->scope          = (s3_str_t){
-        cred.p + parts[0].n + 1,
-        cred.n - parts[0].n - 1,
-    };
+    if (parse_credential(cred, out) < 0) return -1;
     out->signed_headers = sh;
     out->signature      = sig;
     return 0;
@@ -759,97 +778,207 @@ s3_err_t sigv4_verify(const sigv4_verifier_t *v, const conn_t *c) {
     return sigv4_verify_id(v, c, NULL);
 }
 
-s3_err_t sigv4_verify_id(const sigv4_verifier_t *v, const conn_t *c,
-                         sigv4_id_t *id_out) {
-    if (!v || !c) return S3_ERR_ACCESS_DENIED;
+/* Everything needed to verify one request's signature, from either the
+ * Authorization header or a presigned URL's X-Amz-* query parameters. */
+typedef struct {
+    auth_parts_t ap;           /* credential pieces + signed headers */
+    s3_str_t     signature;
+    s3_str_t     amz_date;
+    s3_str_t     body_hash;
+    int64_t      expires;      /* presigned: X-Amz-Expires seconds */
+    int          is_presigned;
+} auth_params_t;
 
-    /* 1. Authorization header */
-    const s3_str_t *auth_h = hdr_lookup(c, "authorization");
-    if (!auth_h) return S3_ERR_ACCESS_DENIED;
+static int count_headers(const conn_t *c, const char *lc_name) {
+    int n = 0;
+    for (size_t i = 0; i < c->req.n_headers; i++)
+        if (s3_str_eq_lit(c->req.headers[i].k, lc_name)) n++;
+    return n;
+}
 
-    auth_parts_t ap;
-    if (parse_authorization(*auth_h, &ap) < 0) return S3_ERR_ACCESS_DENIED;
+static int parse_uint(s3_str_t v, int64_t max, int64_t *out) {
+    if (v.n == 0 || v.n > 18) return -1;
+    int64_t x = 0;
+    for (size_t i = 0; i < v.n; i++) {
+        if (v.p[i] < '0' || v.p[i] > '9') return -1;
+        x = x * 10 + (v.p[i] - '0');
+    }
+    if (x > max) return -1;
+    *out = x;
+    return 0;
+}
 
-    /* 2. Required: x-amz-date and host */
-    const s3_str_t *date_h = hdr_lookup(c, "x-amz-date");
-    if (!date_h) return S3_ERR_ACCESS_DENIED;
-    const s3_str_t *host_h = hdr_lookup(c, "host");
-    if (!host_h) return S3_ERR_ACCESS_DENIED;
+int sigv4_has_presign(const conn_t *c) {
+    return conn_query_get(c, "X-Amz-Signature") != NULL;
+}
 
-    /* 3. Skew check */
-    int64_t now = v->fixed_now ? v->fixed_now : (int64_t)time(NULL);
-    int64_t req_t;
-    if (parse_amz_date(*date_h, &req_t) < 0) return S3_ERR_ACCESS_DENIED;
-    int64_t delta = req_t > now ? req_t - now : now - req_t;
-    if (delta > v->max_skew) return S3_ERR_REQUEST_TIME_TOO_SKEWED;
-
-    /* 4. Body hash header. The S3 SigV4 contract is:
-     *    - If x-amz-content-sha256 is present, use its value verbatim
-     *      (which may be a hex hash, "UNSIGNED-PAYLOAD", or
-     *      "STREAMING-AWS4-HMAC-SHA256-PAYLOAD").
-     *    - If absent, AWS SDKs use SHA-256("") (i.e. the empty-body
-     *      hash). botocore for example does this for GET/HEAD/DELETE
-     *      requests with no body. We mirror that. */
+/* Fill *p from the Authorization header or the presign query (never
+ * both). Values point into the request; nothing is verified yet beyond
+ * shape. */
+static s3_err_t extract_auth_params(const conn_t *c, auth_params_t *p) {
     static const s3_str_t empty_sha256 = {
         "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", 64
     };
-    const s3_str_t *bh_h = hdr_lookup(c, "x-amz-content-sha256");
-    s3_str_t body_hash = bh_h ? *bh_h : empty_sha256;
+    memset(p, 0, sizeof(*p));
+    int n_auth = count_headers(c, "authorization");
+    int presign = sigv4_has_presign(c);
+    if (n_auth > 0 && presign) return S3_ERR_INVALID_ARGUMENT;
+    /* Duplicates are a parser-differential risk with the proxy. */
+    if (n_auth > 1 || count_headers(c, "x-amz-date") > 1
+        || count_headers(c, "x-amz-content-sha256") > 1
+        || count_headers(c, "host") > 1)
+        return S3_ERR_ACCESS_DENIED;
 
-    /* The trailer variants of chunked SigV4 are not implemented. The
-     * regular STREAMING-AWS4-HMAC-SHA256-PAYLOAD is supported via the
-     * sigv4_chunk_* API: we verify the seed signature here using the
-     * literal as the body hash (per AWS spec), and conn.c sets up a
-     * chunk decoder for the body bytes. */
-    if (s3_str_eq_lit(body_hash, "STREAMING-UNSIGNED-PAYLOAD-TRAILER")
-        || s3_str_eq_lit(body_hash, "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER")) {
-        return S3_ERR_NOT_IMPLEMENTED;
+    if (!presign) {
+        const s3_str_t *auth_h = hdr_lookup(c, "authorization");
+        if (!auth_h) return S3_ERR_ACCESS_DENIED;
+        if (parse_authorization(*auth_h, &p->ap) < 0) return S3_ERR_ACCESS_DENIED;
+        p->signature = p->ap.signature;
+        const s3_str_t *date_h = hdr_lookup(c, "x-amz-date");
+        if (!date_h) return S3_ERR_ACCESS_DENIED;
+        p->amz_date = *date_h;
+        /* If x-amz-content-sha256 is absent, AWS SDKs sign SHA-256("")
+         * (botocore does this for GET/HEAD/DELETE). Mirror that. */
+        const s3_str_t *bh_h = hdr_lookup(c, "x-amz-content-sha256");
+        p->body_hash = bh_h ? *bh_h : empty_sha256;
+        return S3_OK;
     }
 
-    /* 5. Credential lookup */
-    const cred_t *cr = cred_lookup(v, ap.access_key.p, ap.access_key.n);
+    static const char *const qnames[] = {
+        "X-Amz-Algorithm", "X-Amz-Credential", "X-Amz-Date", "X-Amz-Expires",
+        "X-Amz-SignedHeaders", "X-Amz-Signature", "X-Amz-Content-Sha256",
+        "X-Amz-Security-Token",
+    };
+    for (size_t i = 0; i < sizeof(qnames) / sizeof(*qnames); i++)
+        if (conn_query_count(c, qnames[i]) > 1) return S3_ERR_AUTH_QUERY_PARAMS;
+    if (conn_query_get(c, "X-Amz-Security-Token")) return S3_ERR_NOT_IMPLEMENTED;
+
+    const conn_qparam_t *alg  = conn_query_get(c, "X-Amz-Algorithm");
+    const conn_qparam_t *cred = conn_query_get(c, "X-Amz-Credential");
+    const conn_qparam_t *date = conn_query_get(c, "X-Amz-Date");
+    const conn_qparam_t *exp  = conn_query_get(c, "X-Amz-Expires");
+    const conn_qparam_t *sh   = conn_query_get(c, "X-Amz-SignedHeaders");
+    const conn_qparam_t *sig  = conn_query_get(c, "X-Amz-Signature");
+    const conn_qparam_t *bh   = conn_query_get(c, "X-Amz-Content-Sha256");
+    if (!alg || !cred || !date || !exp || !sh || !sig)
+        return S3_ERR_AUTH_QUERY_PARAMS;
+    if (!s3_str_eq_lit(alg->v, "AWS4-HMAC-SHA256")) return S3_ERR_AUTH_QUERY_PARAMS;
+    if (parse_credential(cred->v, &p->ap) < 0) return S3_ERR_AUTH_QUERY_PARAMS;
+    if (parse_uint(exp->v, 1000000000, &p->expires) < 0
+        || p->expires < 1 || p->expires > 604800)
+        return S3_ERR_AUTH_QUERY_PARAMS;
+    if (sh->v.n == 0) return S3_ERR_AUTH_QUERY_PARAMS;
+    p->ap.signed_headers = sh->v;
+    p->signature = sig->v;
+    p->amz_date = date->v;
+    p->body_hash = bh ? bh->v : S3_STR_LIT("UNSIGNED-PAYLOAD");
+    p->is_presigned = 1;
+    return S3_OK;
+}
+
+/* Is `name` (lowercase) one of the semicolon-separated signed headers? */
+static int header_is_signed(s3_str_t signed_headers, s3_str_t name) {
+    size_t i = 0;
+    while (i < signed_headers.n) {
+        size_t s = i;
+        while (i < signed_headers.n && signed_headers.p[i] != ';') i++;
+        if (i - s == name.n && memcmp(signed_headers.p + s, name.p, name.n) == 0)
+            return 1;
+        if (i < signed_headers.n) i++;
+    }
+    return 0;
+}
+
+static s3_err_t verify_params(const sigv4_verifier_t *v, const conn_t *c,
+                              const auth_params_t *p, sigv4_id_t *id_out) {
+    /* S1: host must be signed (or a captured request replays against
+     * another vhost/bucket mapping), and so must every x-amz-* header —
+     * an unsigned x-amz-copy-source on a presigned PUT would otherwise
+     * copy anything the signer can read. */
+    if (!hdr_lookup(c, "host")) return S3_ERR_ACCESS_DENIED;
+    if (!header_is_signed(p->ap.signed_headers, S3_STR_LIT("host")))
+        return S3_ERR_ACCESS_DENIED;
+    for (size_t i = 0; i < c->req.n_headers; i++) {
+        s3_str_t k = c->req.headers[i].k;
+        if (k.n >= 6 && memcmp(k.p, "x-amz-", 6) == 0
+            && !header_is_signed(p->ap.signed_headers, k))
+            return S3_ERR_ACCESS_DENIED;
+    }
+    /* Scope: service s3, date = date part of X-Amz-Date. */
+    if (!s3_str_eq_lit(p->ap.service, "s3")) return S3_ERR_ACCESS_DENIED;
+    if (p->amz_date.n < 8 || memcmp(p->amz_date.p, p->ap.date.p, 8) != 0)
+        return S3_ERR_ACCESS_DENIED;
+
+    int64_t now = v->fixed_now ? v->fixed_now : (int64_t)time(NULL);
+    int64_t req_t;
+    if (parse_amz_date(p->amz_date, &req_t) < 0) return S3_ERR_ACCESS_DENIED;
+    if (p->is_presigned) {
+        int64_t max = v->presign_max_expires > 0 ? v->presign_max_expires : 604800;
+        if (p->expires > max) return S3_ERR_AUTH_QUERY_PARAMS;
+        if (req_t > now + v->max_skew) return S3_ERR_REQUEST_TIME_TOO_SKEWED;
+        if (now > req_t + p->expires) return S3_ERR_PRESIGN_EXPIRED;
+    } else {
+        int64_t delta = req_t > now ? req_t - now : now - req_t;
+        if (delta > v->max_skew) return S3_ERR_REQUEST_TIME_TOO_SKEWED;
+    }
+
+    const cred_t *cr = cred_lookup(v, p->ap.access_key.p, p->ap.access_key.n);
     if (!cr) return S3_ERR_ACCESS_DENIED;
 
-    /* 6. Build canonical request. */
     char *cr_buf = malloc(CR_BUF_SZ);
     if (!cr_buf) return S3_ERR_INTERNAL;
-    int cr_n = build_canonical_request(c, ap.signed_headers, body_hash,
+    int cr_n = build_canonical_request(c, p->ap.signed_headers, p->body_hash,
+                                       p->is_presigned ? "X-Amz-Signature" : NULL,
                                        cr_buf, CR_BUF_SZ);
     if (cr_n < 0) { free(cr_buf); return S3_ERR_ACCESS_DENIED; }
 
-    /* 7. Hash canonical request → string-to-sign → signature */
     uint8_t cr_hash[32];
     sha256(cr_buf, (size_t)cr_n, cr_hash);
     free(cr_buf);
 
     char sts[STS_BUF_SZ];
-    int sts_n = build_string_to_sign(*date_h, ap.scope, cr_hash, sts, sizeof(sts));
+    int sts_n = build_string_to_sign(p->amz_date, p->ap.scope, cr_hash,
+                                     sts, sizeof(sts));
     if (sts_n < 0) return S3_ERR_INTERNAL;
 
     uint8_t k_signing[32];
     derive_signing_key(cr->secret_key, cr->secret_len,
-                       ap.date, ap.region, ap.service, k_signing);
-
+                       p->ap.date, p->ap.region, p->ap.service, k_signing);
     uint8_t mac[32];
     hmac_sha256(k_signing, 32, sts, (size_t)sts_n, mac);
     OPENSSL_cleanse(k_signing, sizeof(k_signing));
 
-    /* 8. Hex-encode and constant-time compare */
     char want[64];
     hex_encode(mac, 32, want);
     OPENSSL_cleanse(mac, sizeof(mac));
 
-    if (ap.signature.n != 64) return S3_ERR_SIGNATURE_DOES_NOT_MATCH;
-    if (CRYPTO_memcmp(want, ap.signature.p, 64) != 0) {
+    if (p->signature.n != 64) return S3_ERR_SIGNATURE_DOES_NOT_MATCH;
+    if (CRYPTO_memcmp(want, p->signature.p, 64) != 0)
         return S3_ERR_SIGNATURE_DOES_NOT_MATCH;
-    }
+
+    int admin = is_admin(v, cr->user);
+    /* --no-presign-admin: admin identities cannot mint bearer URLs. */
+    if (p->is_presigned && admin && v->no_presign_admin)
+        return S3_ERR_ACCESS_DENIED;
     /* Copied out: a SIGHUP reload may free this cred before the request
      * that verified it is finished. */
     if (id_out) {
         snprintf(id_out->user, sizeof(id_out->user), "%s", cr->user);
-        id_out->is_admin = is_admin(v, cr->user);
+        snprintf(id_out->access_key, sizeof(id_out->access_key), "%s",
+                 cr->access_key);
+        id_out->is_admin = admin;
+        id_out->presigned = p->is_presigned;
     }
     return S3_OK;
+}
+
+s3_err_t sigv4_verify_id(const sigv4_verifier_t *v, const conn_t *c,
+                         sigv4_id_t *id_out) {
+    if (!v || !c) return S3_ERR_ACCESS_DENIED;
+    auth_params_t p;
+    s3_err_t e = extract_auth_params(c, &p);
+    if (e != S3_OK) return e;
+    return verify_params(v, c, &p, id_out);
 }
 
 /* ===================================================================== */
@@ -896,49 +1025,61 @@ void sigv4_body_hash_free(void *ctx) {
 /* Returns 1 if the request is using STREAMING-AWS4-HMAC-SHA256-PAYLOAD,
  * 0 otherwise. */
 int sigv4_is_chunked(const conn_t *c) {
-    const s3_str_t *bh = hdr_lookup(c, "x-amz-content-sha256");
-    if (!bh) return 0;
-    return s3_str_eq_lit(*bh, "STREAMING-AWS4-HMAC-SHA256-PAYLOAD");
+    return sigv4_stream_mode(c) == SIGV4_STREAM_SIGNED;
 }
 
-/* Decoder state machine. Each chunk goes:
- *   READ_SIZE   — accumulating hex digits and ';' before the sig
- *   READ_SIG    — accumulating the 64 hex chars of chunk-signature
- *   READ_CRLF1  — \r\n after the chunk header
- *   READ_DATA   — chunk_size bytes of data
- *   READ_CRLF2  — \r\n after the chunk data
- *   DONE        — final 0-length chunk seen
- *   ERROR       — sticky error state
+sigv4_stream_mode_t sigv4_stream_mode(const conn_t *c) {
+    const s3_str_t *bh = hdr_lookup(c, "x-amz-content-sha256");
+    if (!bh) return SIGV4_STREAM_NONE;
+    if (s3_str_eq_lit(*bh, "STREAMING-AWS4-HMAC-SHA256-PAYLOAD"))
+        return SIGV4_STREAM_SIGNED;
+    if (s3_str_eq_lit(*bh, "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER"))
+        return SIGV4_STREAM_SIGNED_TRAILER;
+    if (s3_str_eq_lit(*bh, "STREAMING-UNSIGNED-PAYLOAD-TRAILER"))
+        return SIGV4_STREAM_UNSIGNED_TRAILER;
+    return SIGV4_STREAM_NONE;
+}
+
+/* aws-chunked decoder. Line-oriented: chunk-size lines and trailer lines
+ * are accumulated (bounded) up to '\n' and must end in "\r\n"; data is
+ * streamed through without buffering.
  *
- * The chunk header line is bounded: hex digits ≤ 16 chars, plus ';',
- * plus "chunk-signature=", plus 64 hex chars = ~85 bytes. We use a
- * 128-byte line buffer.
+ *   SIZE_LINE  "<hex>[;chunk-signature=<64hex>]\r\n"
+ *   DATA       chunk_size bytes
+ *   DATA_CRLF  "\r\n"
+ *   after the zero-size chunk:
+ *     SIGNED:            FINAL_CRLF "\r\n" → DONE
+ *     *_TRAILER:         TRAILER_LINE* until an empty line → DONE
  *
- * Per-chunk signature verification:
- *   string-to-sign:
- *     AWS4-HMAC-SHA256-PAYLOAD\n
- *     <amz-date>\n
- *     <scope>\n
- *     <prev-signature>\n
- *     <SHA256("") hex>\n
- *     <SHA256(chunk-data) hex>
+ * Signed chunks: string-to-sign
+ *     AWS4-HMAC-SHA256-PAYLOAD\n<date>\n<scope>\n<prev-sig>\n
+ *     SHA256("")\nSHA256(chunk-data)
+ * Signed trailer: string-to-sign
+ *     AWS4-HMAC-SHA256-TRAILER\n<date>\n<scope>\n<prev-sig>\n
+ *     SHA256(<name>:<value>\n ...)
  *
- * The data hash is built incrementally as data arrives, finalized at
- * the end of the chunk, then the signature is checked.
- */
+ * Bounds (security review S2): size line ≤ 128 bytes and ≤ 16 hex
+ * digits, single chunk ≤ 2^40, trailer line ≤ 256 bytes, ≤ 4 trailers,
+ * only names announced in x-amz-trailer. */
+
+#define CHUNK_LINE_MAX     256
+#define CHUNK_MAX_TRAILERS 4
+#define CHUNK_MAX_SIZE     (1ull << 40)
 
 typedef enum {
-    CST_SIZE = 0,
-    CST_SIG,
-    CST_CRLF1,
+    CST_SIZE_LINE = 0,
     CST_DATA,
-    CST_CRLF2,
-    CST_CRLF2_HALF,        /* saw \r at end of buffer; expect \n next */
+    CST_DATA_CRLF,
+    CST_FINAL_CRLF,
+    CST_TRAILER_LINE,
     CST_DONE,
     CST_ERROR,
 } chunk_state_t;
 
 struct sigv4_chunk_decoder {
+    sigv4_stream_mode_t mode;
+    int      verify;                /* check chunk/trailer signatures */
+
     /* Crypto state (immutable after begin) */
     uint8_t  signing_key[32];
     char     amz_date[16];
@@ -947,87 +1088,84 @@ struct sigv4_chunk_decoder {
     size_t   scope_n;
 
     /* Rolling state */
-    char     prev_sig[64];          /* "previous signature" — seed → chunk1 → chunk2 ... */
+    char     prev_sig[64];
     chunk_state_t state;
-    char     line[128];             /* chunk-header line accumulator */
+    char     line[CHUNK_LINE_MAX];
     size_t   line_n;
-    uint64_t chunk_size;            /* current chunk's data size */
-    uint64_t chunk_remaining;       /* bytes of data still to read in current chunk */
-    char     chunk_sig[64];         /* claimed signature for current chunk */
-    int      chunk_sig_n;           /* position in chunk_sig as we accumulate */
-    EVP_MD_CTX *data_hash_ctx;      /* SHA-256 of current chunk's data */
+    int      crlf_seen;             /* bytes of a 2-byte CRLF consumed */
+    uint64_t chunk_size;
+    uint64_t chunk_remaining;
+    char     chunk_sig[64];
+    EVP_MD_CTX *data_hash_ctx;
     int      seen_terminator;
-    uint64_t expected_decoded;      /* x-amz-decoded-content-length, 0 = unbounded */
-    uint64_t total_decoded;         /* sum of chunk_size seen */
+    uint64_t expected_decoded;
+    uint64_t total_decoded;
 
-    /* Forwarding callback */
+    /* Trailers */
+    char     allowed[CHUNK_MAX_TRAILERS][64];   /* from x-amz-trailer */
+    int      n_allowed;
+    char     tname[CHUNK_MAX_TRAILERS][64];
+    char     tval[CHUNK_MAX_TRAILERS][CHUNK_LINE_MAX];
+    size_t   tval_n[CHUNK_MAX_TRAILERS];
+    int      n_trailers;
+    EVP_MD_CTX *trailer_hash_ctx;   /* SHA-256 of canonical trailers */
+    int      trailer_sig_ok;
+
     sigv4_chunk_data_cb on_data;
     void               *user;
 };
 
-/* Parse "<hex>;chunk-signature=<64-hex>" from `line`. Returns 0 ok, -1 bad. */
-static int parse_chunk_header(const char *line, size_t n,
-                              uint64_t *out_size, char out_sig[64]) {
-    /* Find ';' */
+static int hexdig(char ch) {
+    if (ch >= '0' && ch <= '9') return ch - '0';
+    if (ch >= 'a' && ch <= 'f') return ch - 'a' + 10;
+    if (ch >= 'A' && ch <= 'F') return ch - 'A' + 10;
+    return -1;
+}
+
+static int is_hex64(const char *p) {
+    for (int j = 0; j < 64; j++) if (hexdig(p[j]) < 0) return 0;
+    return 1;
+}
+
+/* Parse a chunk-size line (CRLF stripped). Signed modes need exactly
+ * ";chunk-signature=<64 hex>"; the unsigned mode takes a bare size and
+ * ignores any chunk extensions. */
+static int parse_size_line(sigv4_chunk_decoder_t *d, const char *line, size_t n) {
     size_t i = 0;
     while (i < n && line[i] != ';') i++;
-    if (i == n) return -1;
-
-    /* Parse hex size */
     if (i == 0 || i > 16) return -1;
     uint64_t sz = 0;
     for (size_t j = 0; j < i; j++) {
-        char ch = line[j];
-        int v;
-        if      (ch >= '0' && ch <= '9') v = ch - '0';
-        else if (ch >= 'a' && ch <= 'f') v = ch - 'a' + 10;
-        else if (ch >= 'A' && ch <= 'F') v = ch - 'A' + 10;
-        else return -1;
+        int v = hexdig(line[j]);
+        if (v < 0) return -1;
         sz = (sz << 4) | (uint64_t)v;
     }
-
-    /* Expect ";chunk-signature=" */
-    static const char tag[] = ";chunk-signature=";
-    if (n - i < sizeof(tag) - 1 + 64) return -1;
-    if (memcmp(line + i, tag, sizeof(tag) - 1) != 0) return -1;
-    if (n - i - (sizeof(tag) - 1) != 64) return -1;
-    memcpy(out_sig, line + i + sizeof(tag) - 1, 64);
-
-    /* Validate hex chars in signature */
-    for (int j = 0; j < 64; j++) {
-        char ch = out_sig[j];
-        if (!((ch >= '0' && ch <= '9')
-              || (ch >= 'a' && ch <= 'f')
-              || (ch >= 'A' && ch <= 'F'))) return -1;
+    if (sz > CHUNK_MAX_SIZE) return -1;
+    if (d->mode == SIGV4_STREAM_UNSIGNED_TRAILER) {
+        d->chunk_size = sz;
+        return 0;
     }
-
-    *out_size = sz;
+    static const char tag[] = ";chunk-signature=";
+    if (n - i != sizeof(tag) - 1 + 64) return -1;
+    if (memcmp(line + i, tag, sizeof(tag) - 1) != 0) return -1;
+    const char *sig = line + i + sizeof(tag) - 1;
+    if (!is_hex64(sig)) return -1;
+    memcpy(d->chunk_sig, sig, 64);
+    d->chunk_size = sz;
     return 0;
 }
 
-/* Compute the chunk signature for the current chunk and compare with
- * d->chunk_sig. Returns 1 if matched, 0 otherwise. d->data_hash_ctx
- * is finalized as a side effect; caller should re-init if needed. */
+/* Verify the current chunk's signature (data hash finalized here). */
 static int verify_chunk_sig(sigv4_chunk_decoder_t *d) {
-    /* Constants: SHA-256("") in hex */
     static const char EMPTY_HASH[64] =
         "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
-
-    /* Finalize data hash. */
     uint8_t data_mac[32];
     char    data_hex[64];
     unsigned int n = 32;
     EVP_DigestFinal_ex(d->data_hash_ctx, data_mac, &n);
+    if (!d->verify) return 1;
     hex_encode(data_mac, 32, data_hex);
 
-    /* Build string-to-sign:
-     *   AWS4-HMAC-SHA256-PAYLOAD\n
-     *   <amz_date>\n
-     *   <scope>\n
-     *   <prev_sig>\n
-     *   <empty_hash>\n
-     *   <data_hex>
-     */
     char sts[512];
     int o = 0;
     static const char prefix[] = "AWS4-HMAC-SHA256-PAYLOAD\n";
@@ -1042,18 +1180,111 @@ static int verify_chunk_sig(sigv4_chunk_decoder_t *d) {
     sts[o++] = '\n';
     memcpy(sts + o, data_hex, 64);                o += 64;
 
-    /* HMAC */
     uint8_t mac[32];
     hmac_sha256(d->signing_key, 32, sts, (size_t)o, mac);
     char want[64];
     hex_encode(mac, 32, want);
-
     int ok = (CRYPTO_memcmp(want, d->chunk_sig, 64) == 0);
-    if (ok) {
-        /* Roll prev_sig forward for the next chunk. */
-        memcpy(d->prev_sig, d->chunk_sig, 64);
-    }
+    if (ok) memcpy(d->prev_sig, d->chunk_sig, 64);
     return ok;
+}
+
+static int verify_trailer_sig(sigv4_chunk_decoder_t *d, const char *sig) {
+    uint8_t th[32];
+    unsigned int n = 32;
+    EVP_DigestFinal_ex(d->trailer_hash_ctx, th, &n);
+    if (!d->verify) return 1;
+    char th_hex[64];
+    hex_encode(th, 32, th_hex);
+    char sts[512];
+    int o = 0;
+    static const char prefix[] = "AWS4-HMAC-SHA256-TRAILER\n";
+    memcpy(sts + o, prefix, sizeof(prefix) - 1); o += (int)sizeof(prefix) - 1;
+    memcpy(sts + o, d->amz_date, d->amz_date_n);  o += (int)d->amz_date_n;
+    sts[o++] = '\n';
+    memcpy(sts + o, d->scope, d->scope_n);        o += (int)d->scope_n;
+    sts[o++] = '\n';
+    memcpy(sts + o, d->prev_sig, 64);             o += 64;
+    sts[o++] = '\n';
+    memcpy(sts + o, th_hex, 64);                  o += 64;
+    uint8_t mac[32];
+    hmac_sha256(d->signing_key, 32, sts, (size_t)o, mac);
+    char want[64];
+    hex_encode(mac, 32, want);
+    return CRYPTO_memcmp(want, sig, 64) == 0;
+}
+
+/* A complete trailer line (CRLF stripped). Empty line ends the stream. */
+static int handle_trailer_line(sigv4_chunk_decoder_t *d, const char *line,
+                               size_t n) {
+    if (n == 0) {
+        if (d->mode == SIGV4_STREAM_SIGNED_TRAILER && !d->trailer_sig_ok)
+            return -1;
+        d->state = CST_DONE;
+        return 0;
+    }
+    if (d->trailer_sig_ok) return -1;     /* nothing after the signature */
+    const char *colon = memchr(line, ':', n);
+    if (!colon || colon == line) return -1;
+    size_t kn = (size_t)(colon - line);
+    if (kn >= sizeof(d->tname[0])) return -1;
+    char name[64];
+    for (size_t i = 0; i < kn; i++) {
+        char ch = line[i];
+        name[i] = (ch >= 'A' && ch <= 'Z') ? (char)(ch + 32) : ch;
+    }
+    name[kn] = '\0';
+    const char *v = colon + 1;
+    size_t vn = n - kn - 1;
+    while (vn && (*v == ' ' || *v == '\t')) { v++; vn--; }
+    while (vn && (v[vn-1] == ' ' || v[vn-1] == '\t')) vn--;
+
+    if (strcmp(name, "x-amz-trailer-signature") == 0) {
+        if (d->mode != SIGV4_STREAM_SIGNED_TRAILER) return -1;
+        if (vn != 64 || !is_hex64(v)) return -1;
+        if (!verify_trailer_sig(d, v)) return -1;
+        d->trailer_sig_ok = 1;
+        return 0;
+    }
+    int allowed = 0;
+    for (int i = 0; i < d->n_allowed; i++)
+        if (strcmp(d->allowed[i], name) == 0) allowed = 1;
+    if (!allowed || d->n_trailers >= CHUNK_MAX_TRAILERS) return -1;
+    for (int i = 0; i < d->n_trailers; i++)
+        if (strcmp(d->tname[i], name) == 0) return -1;   /* duplicate */
+    int t = d->n_trailers++;
+    memcpy(d->tname[t], name, kn + 1);
+    memcpy(d->tval[t], v, vn);
+    d->tval_n[t] = vn;
+    /* Canonical form for the trailer signature: "name:value\n". */
+    EVP_DigestUpdate(d->trailer_hash_ctx, name, kn);
+    EVP_DigestUpdate(d->trailer_hash_ctx, ":", 1);
+    EVP_DigestUpdate(d->trailer_hash_ctx, v, vn);
+    EVP_DigestUpdate(d->trailer_hash_ctx, "\n", 1);
+    return 0;
+}
+
+/* Parse x-amz-trailer: "name[, name...]" into d->allowed. */
+static int load_allowed_trailers(sigv4_chunk_decoder_t *d, const conn_t *c) {
+    const s3_str_t *h = hdr_lookup(c, "x-amz-trailer");
+    if (!h) return 0;
+    size_t i = 0;
+    while (i < h->n) {
+        while (i < h->n && (h->p[i] == ' ' || h->p[i] == ',')) i++;
+        size_t s = i;
+        while (i < h->n && h->p[i] != ',') i++;
+        size_t e = i;
+        while (e > s && h->p[e-1] == ' ') e--;
+        if (e == s) continue;
+        if (d->n_allowed >= CHUNK_MAX_TRAILERS || e - s >= 64) return -1;
+        char *dst = d->allowed[d->n_allowed++];
+        for (size_t j = s; j < e; j++) {
+            char ch = h->p[j];
+            dst[j - s] = (ch >= 'A' && ch <= 'Z') ? (char)(ch + 32) : ch;
+        }
+        dst[e - s] = '\0';
+    }
+    return 0;
 }
 
 sigv4_chunk_decoder_t *sigv4_chunk_begin(const sigv4_verifier_t *v,
@@ -1061,44 +1292,94 @@ sigv4_chunk_decoder_t *sigv4_chunk_begin(const sigv4_verifier_t *v,
                                           uint64_t expected_decoded,
                                           sigv4_chunk_data_cb on_data,
                                           void *user) {
-    if (!v || !c) return NULL;
+    return sigv4_chunk_begin_mode(v, c, SIGV4_STREAM_SIGNED, 1,
+                                  expected_decoded, on_data, user);
+}
 
-    /* Re-parse Authorization to get scope, amz_date, signature. The
-     * verifier already accepted these, so this should always succeed. */
-    const s3_str_t *auth_h = hdr_lookup(c, "authorization");
-    const s3_str_t *date_h = hdr_lookup(c, "x-amz-date");
-    if (!auth_h || !date_h) return NULL;
-    auth_parts_t ap;
-    if (parse_authorization(*auth_h, &ap) < 0) return NULL;
-    if (ap.signature.n != 64 || date_h->n > sizeof(((sigv4_chunk_decoder_t*)0)->amz_date))
-        return NULL;
-    if (ap.scope.n > sizeof(((sigv4_chunk_decoder_t*)0)->scope))
-        return NULL;
-    const cred_t *cr = cred_lookup(v, ap.access_key.p, ap.access_key.n);
-    if (!cr) return NULL;
+sigv4_chunk_decoder_t *sigv4_chunk_begin_mode(const sigv4_verifier_t *v,
+                                              const conn_t *c,
+                                              sigv4_stream_mode_t mode,
+                                              int verify,
+                                              uint64_t expected_decoded,
+                                              sigv4_chunk_data_cb on_data,
+                                              void *user) {
+    if (!c || mode == SIGV4_STREAM_NONE) return NULL;
+    if (mode == SIGV4_STREAM_UNSIGNED_TRAILER) verify = 0;
 
     sigv4_chunk_decoder_t *d = calloc(1, sizeof(*d));
     if (!d) return NULL;
-    d->state = CST_SIZE;
+    d->mode = mode;
+    d->verify = verify;
+    d->state = CST_SIZE_LINE;
     d->on_data = on_data;
     d->user = user;
     d->expected_decoded = expected_decoded;
-    memcpy(d->amz_date, date_h->p, date_h->n);
-    d->amz_date_n = date_h->n;
-    memcpy(d->scope, ap.scope.p, ap.scope.n);
-    d->scope_n = ap.scope.n;
-    memcpy(d->prev_sig, ap.signature.p, 64);
 
-    derive_signing_key(cr->secret_key, cr->secret_len,
-                       ap.date, ap.region, ap.service, d->signing_key);
+    if (verify) {
+        if (!v) { free(d); return NULL; }
+        /* The verifier already accepted these, so this should succeed. */
+        auth_params_t p;
+        if (extract_auth_params(c, &p) != 0
+            || p.signature.n != 64 || p.amz_date.n > sizeof(d->amz_date)
+            || p.ap.scope.n > sizeof(d->scope)) {
+            free(d); return NULL;
+        }
+        const cred_t *cr = cred_lookup(v, p.ap.access_key.p, p.ap.access_key.n);
+        if (!cr) { free(d); return NULL; }
+        memcpy(d->amz_date, p.amz_date.p, p.amz_date.n);
+        d->amz_date_n = p.amz_date.n;
+        memcpy(d->scope, p.ap.scope.p, p.ap.scope.n);
+        d->scope_n = p.ap.scope.n;
+        memcpy(d->prev_sig, p.signature.p, 64);
+        derive_signing_key(cr->secret_key, cr->secret_len,
+                           p.ap.date, p.ap.region, p.ap.service,
+                           d->signing_key);
+    }
+    if (load_allowed_trailers(d, c) < 0) { sigv4_chunk_free(d); return NULL; }
 
     d->data_hash_ctx = EVP_MD_CTX_new();
-    if (!d->data_hash_ctx
-        || EVP_DigestInit_ex(d->data_hash_ctx, EVP_sha256(), NULL) != 1) {
+    d->trailer_hash_ctx = EVP_MD_CTX_new();
+    if (!d->data_hash_ctx || !d->trailer_hash_ctx
+        || EVP_DigestInit_ex(d->data_hash_ctx, EVP_sha256(), NULL) != 1
+        || EVP_DigestInit_ex(d->trailer_hash_ctx, EVP_sha256(), NULL) != 1) {
         sigv4_chunk_free(d);
         return NULL;
     }
     return d;
+}
+
+#define FAIL() do { d->state = CST_ERROR; return -1; } while (0)
+
+/* Accumulate a CRLF-terminated line. Returns 1 when a full line is in
+ * d->line (CRLF stripped, length d->line_n), 0 if more input is needed,
+ * -1 on overflow / bare LF. */
+static int take_line(sigv4_chunk_decoder_t *d, const char *data, size_t len,
+                     size_t *i) {
+    while (*i < len) {
+        char ch = data[(*i)++];
+        if (ch == '\n') {
+            if (d->line_n == 0 || d->line[d->line_n - 1] != '\r') return -1;
+            d->line_n--;
+            return 1;
+        }
+        if (d->line_n >= sizeof(d->line)) return -1;
+        d->line[d->line_n++] = ch;
+    }
+    return 0;
+}
+
+/* Consume the rest of a 2-byte CRLF. Returns 1 done, 0 need more, -1 bad. */
+static int take_crlf(sigv4_chunk_decoder_t *d, const char *data, size_t len,
+                     size_t *i) {
+    while (*i < len && d->crlf_seen < 2) {
+        char want = d->crlf_seen == 0 ? '\r' : '\n';
+        if (data[*i] != want) return -1;
+        (*i)++;
+        d->crlf_seen++;
+    }
+    if (d->crlf_seen < 2) return 0;
+    d->crlf_seen = 0;
+    return 1;
 }
 
 int sigv4_chunk_feed(sigv4_chunk_decoder_t *d, const char *data, size_t len) {
@@ -1106,92 +1387,65 @@ int sigv4_chunk_feed(sigv4_chunk_decoder_t *d, const char *data, size_t len) {
     size_t i = 0;
     while (i < len) {
         switch (d->state) {
-        case CST_SIZE:
-        case CST_SIG: {
-            /* Both states accumulate into d->line until we see \r. */
-            while (i < len && data[i] != '\r') {
-                if (d->line_n >= sizeof(d->line)) {
-                    d->state = CST_ERROR; return -1;
-                }
-                d->line[d->line_n++] = data[i++];
-            }
-            if (i < len && data[i] == '\r') {
-                /* Header complete. Parse it. */
-                if (parse_chunk_header(d->line, d->line_n,
-                                       &d->chunk_size, d->chunk_sig) < 0) {
-                    d->state = CST_ERROR; return -1;
-                }
-                d->line_n = 0;
-                d->state = CST_CRLF1;
-                i++;  /* consume \r, expect \n next */
-            }
-            break;
-        }
-        case CST_CRLF1:
-            if (data[i] != '\n') { d->state = CST_ERROR; return -1; }
-            i++;
+        case CST_SIZE_LINE: {
+            int r = take_line(d, data, len, &i);
+            if (r < 0) FAIL();
+            if (r == 0) return 0;
+            if (parse_size_line(d, d->line, d->line_n) < 0) FAIL();
+            d->line_n = 0;
             d->chunk_remaining = d->chunk_size;
             d->total_decoded += d->chunk_size;
-            /* Reset data hash for this chunk. */
+            if (d->expected_decoded && d->total_decoded > d->expected_decoded)
+                FAIL();
             EVP_DigestInit_ex(d->data_hash_ctx, EVP_sha256(), NULL);
             if (d->chunk_size == 0) {
-                /* Terminator chunk: no data, just verify sig and consume \r\n. */
-                if (!verify_chunk_sig(d)) {
-                    d->state = CST_ERROR; return -1;
-                }
+                if (d->mode != SIGV4_STREAM_UNSIGNED_TRAILER
+                    && !verify_chunk_sig(d)) FAIL();
                 d->seen_terminator = 1;
-                d->state = CST_CRLF2;
+                d->state = d->mode == SIGV4_STREAM_SIGNED ? CST_FINAL_CRLF
+                                                          : CST_TRAILER_LINE;
             } else {
                 d->state = CST_DATA;
             }
             break;
-
+        }
         case CST_DATA: {
             size_t take = len - i;
             if ((uint64_t)take > d->chunk_remaining) take = (size_t)d->chunk_remaining;
-            EVP_DigestUpdate(d->data_hash_ctx, data + i, take);
-            if (d->on_data && d->on_data(d->user, data + i, take) < 0) {
-                d->state = CST_ERROR; return -1;
-            }
+            if (d->mode != SIGV4_STREAM_UNSIGNED_TRAILER)
+                EVP_DigestUpdate(d->data_hash_ctx, data + i, take);
+            if (d->on_data && d->on_data(d->user, data + i, take) < 0) FAIL();
             i += take;
             d->chunk_remaining -= take;
             if (d->chunk_remaining == 0) {
-                /* Verify chunk signature now (data hash is finalized inside). */
-                if (!verify_chunk_sig(d)) {
-                    d->state = CST_ERROR; return -1;
-                }
-                d->state = CST_CRLF2;
+                if (d->mode != SIGV4_STREAM_UNSIGNED_TRAILER
+                    && !verify_chunk_sig(d)) FAIL();
+                d->state = CST_DATA_CRLF;
             }
             break;
         }
-
-        case CST_CRLF2: {
-            if (data[i] != '\r') { d->state = CST_ERROR; return -1; }
-            i++;
-            if (i >= len) {
-                /* \r consumed, but \n hasn't arrived yet. */
-                d->state = CST_CRLF2_HALF;
-                return 0;
-            }
-            if (data[i] != '\n') { d->state = CST_ERROR; return -1; }
-            i++;
-            d->state = d->seen_terminator ? CST_DONE : CST_SIZE;
+        case CST_DATA_CRLF:
+        case CST_FINAL_CRLF: {
+            int r = take_crlf(d, data, len, &i);
+            if (r < 0) FAIL();
+            if (r == 0) return 0;
+            d->state = d->state == CST_FINAL_CRLF ? CST_DONE : CST_SIZE_LINE;
             break;
         }
-
-        case CST_CRLF2_HALF:
-            if (data[i] != '\n') { d->state = CST_ERROR; return -1; }
-            i++;
-            d->state = d->seen_terminator ? CST_DONE : CST_SIZE;
+        case CST_TRAILER_LINE: {
+            int r = take_line(d, data, len, &i);
+            if (r < 0) FAIL();
+            if (r == 0) return 0;
+            if (handle_trailer_line(d, d->line, d->line_n) < 0) FAIL();
+            d->line_n = 0;
             break;
-
+        }
         case CST_DONE:
-            /* Extra bytes after terminator — ignore (some clients send
-             * an extra \r\n). We could be strict but it costs nothing
-             * to be tolerant here. */
+            /* Tolerate a stray trailing CRLF some clients send; anything
+             * else after the end of the stream is an error. */
+            if (data[i] != '\r' && data[i] != '\n') FAIL();
             i++;
             break;
-
         case CST_ERROR:
             return -1;
         }
@@ -1199,9 +1453,11 @@ int sigv4_chunk_feed(sigv4_chunk_decoder_t *d, const char *data, size_t len) {
     return 0;
 }
 
+#undef FAIL
+
 int sigv4_chunk_finish(sigv4_chunk_decoder_t *d) {
     if (!d) return -1;
-    if (d->state == CST_ERROR) return -1;
+    if (d->state != CST_DONE) return -1;
     if (!d->seen_terminator) return -1;
     if (d->expected_decoded != 0
         && d->total_decoded != d->expected_decoded) {
@@ -1210,9 +1466,22 @@ int sigv4_chunk_finish(sigv4_chunk_decoder_t *d) {
     return 0;
 }
 
+const char *sigv4_chunk_trailer(const sigv4_chunk_decoder_t *d,
+                                const char *name, size_t *len_out) {
+    if (!d) return NULL;
+    for (int i = 0; i < d->n_trailers; i++) {
+        if (strcmp(d->tname[i], name) == 0) {
+            *len_out = d->tval_n[i];
+            return d->tval[i];
+        }
+    }
+    return NULL;
+}
+
 void sigv4_chunk_free(sigv4_chunk_decoder_t *d) {
     if (!d) return;
     if (d->data_hash_ctx) EVP_MD_CTX_free(d->data_hash_ctx);
+    if (d->trailer_hash_ctx) EVP_MD_CTX_free(d->trailer_hash_ctx);
     OPENSSL_cleanse(d->signing_key, sizeof(d->signing_key));
     free(d);
 }
@@ -1249,12 +1518,12 @@ int sigv4_test_canonical_request_from_conn(
     const char *body_hash_lit, char *out, size_t cap) {
     s3_str_t sh = { signed_headers_lit, strlen(signed_headers_lit) };
     s3_str_t bh = { body_hash_lit, strlen(body_hash_lit) };
-    return build_canonical_request(c, sh, bh, out, cap);
+    return build_canonical_request(c, sh, bh, NULL, out, cap);
 }
 
 int sigv4_test_canon_query(const char *q, size_t q_n, char *out, size_t cap) {
     s3_str_t s = { q, q_n };
-    return build_canonical_query(s, out, cap);
+    return build_canonical_query(s, NULL, out, cap);
 }
 
 int sigv4_test_pct_encode(const char *in, size_t in_n, char *out, size_t cap) {

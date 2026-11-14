@@ -16,6 +16,7 @@
 
 #include "route.h"
 #include "action.h"
+#include "checksum.h"
 #include "conn.h"
 #include "iopool.h"
 #include "log.h"
@@ -122,6 +123,42 @@ static const s3_str_t *hdr_get(const conn_t *c, const char *lc_name) {
         }
     }
     return NULL;
+}
+
+/* Queue x-amz-checksum-<algo> (+ type) response headers for m. */
+static void add_checksum_headers(conn_t *c, const s3_obj_meta_t *m) {
+    if (!m->cksum_algo) return;
+    char v[64];
+    rsp_format_checksum(m, v);
+    conn_add_header(c, cksum_header_name(m->cksum_algo), v);
+    conn_add_header(c, "x-amz-checksum-type",
+                    m->cksum_type == S3_CKSUM_TYPE_COMPOSITE ? "COMPOSITE"
+                                                             : "FULL_OBJECT");
+}
+
+/* Echo the request's verified additional checksum (PUT, UploadPart). */
+static void echo_request_checksum(conn_t *c) {
+    if (!c->cksum_algo) return;
+    s3_obj_meta_t m;
+    memset(&m, 0, sizeof(m));
+    m.cksum_algo = (uint8_t)c->cksum_algo;
+    memcpy(m.cksum, c->cksum_expect, sizeof(m.cksum));
+    char v[64];
+    rsp_format_checksum(&m, v);
+    conn_add_header(c, cksum_header_name(m.cksum_algo), v);
+}
+
+static int ieq_lit(s3_str_t a, const char *b) {
+    size_t n = strlen(b);
+    if (a.n != n) return 0;
+    for (size_t i = 0; i < n; i++) {
+        char x = a.p[i];
+        if (x >= 'A' && x <= 'Z') x = (char)(x + 32);
+        char y = b[i];
+        if (y >= 'A' && y <= 'Z') y = (char)(y + 32);
+        if (x != y) return 0;
+    }
+    return 1;
 }
 
 /* Method comparison. */
@@ -522,6 +559,7 @@ static void commit_done(iojob_t *j) {
                 char etag[35]; rsp_format_etag(cj->meta.etag, etag);
                 snprintf(extra, sizeof(extra), "ETag: %s\r\n", etag);
             }
+            echo_request_checksum(c);
             rc = rsp_build_status_with_headers(c, 200, "OK", extra);
         }
         job_respond(c, rc);
@@ -673,7 +711,10 @@ static int handle_object_get(conn_t *c, s3_str_t bucket, s3_str_t key,
         return 0;
     }
 
-    /* Full GET / HEAD */
+    /* Full GET / HEAD. The stored checksum goes out only on request
+     * (x-amz-checksum-mode: ENABLED) and never on a ranged GET. */
+    const s3_str_t *cmode = hdr_get(c, "x-amz-checksum-mode");
+    if (cmode && ieq_lit(*cmode, "ENABLED")) add_checksum_headers(c, &m);
     if (rsp_build_object_head(c, &m, head_only) < 0) {
         store_get_close(r);
         return -1;
@@ -830,11 +871,39 @@ static int handle_mpu_initiate(conn_t *c, s3_str_t bucket, s3_str_t key) {
         memcpy(ct_buf, ct_hdr->p, n);
     }
 
+    /* x-amz-checksum-algorithm / -type: COMPOSITE is the default except
+     * for CRC64NVME, which only exists as a full-object checksum. */
+    uint8_t algo = 0, type = 0;
+    const s3_str_t *ah = hdr_get(c, "x-amz-checksum-algorithm");
+    const s3_str_t *th = hdr_get(c, "x-amz-checksum-type");
+    if (ah) {
+        algo = (uint8_t)cksum_algo_from_name(*ah);
+        if (!algo)
+            return rsp_build_s3_error(c, S3_ERR_INVALID_CHECKSUM, c->req.path, NULL);
+        type = algo == S3_CKSUM_CRC64NVME ? S3_CKSUM_TYPE_FULL_OBJECT
+                                          : S3_CKSUM_TYPE_COMPOSITE;
+    }
+    if (th) {
+        if (!algo)
+            return rsp_build_s3_error(c, S3_ERR_INVALID_CHECKSUM, c->req.path, NULL);
+        if (ieq_lit(*th, "FULL_OBJECT")) type = S3_CKSUM_TYPE_FULL_OBJECT;
+        else if (ieq_lit(*th, "COMPOSITE")) type = S3_CKSUM_TYPE_COMPOSITE;
+        else return rsp_build_s3_error(c, S3_ERR_INVALID_CHECKSUM, c->req.path, NULL);
+        if (type == S3_CKSUM_TYPE_COMPOSITE && algo == S3_CKSUM_CRC64NVME)
+            return rsp_build_s3_error(c, S3_ERR_INVALID_CHECKSUM, c->req.path, NULL);
+    }
+
     char upload_id[33];
-    s3_err_t e = store_mpu_create(c->store, bucket, key,
-                                   ct_hdr ? ct_buf : NULL, upload_id);
+    s3_err_t e = store_mpu_create_opts(c->store, bucket, key,
+                                       ct_hdr ? ct_buf : NULL, algo, type,
+                                       upload_id);
     if (e != S3_OK) {
         return rsp_build_s3_error(c, e, c->req.path, NULL);
+    }
+    if (algo) {
+        conn_add_header(c, "x-amz-checksum-algorithm", cksum_upper_name(algo));
+        conn_add_header(c, "x-amz-checksum-type",
+                        type == S3_CKSUM_TYPE_COMPOSITE ? "COMPOSITE" : "FULL_OBJECT");
     }
     return rsp_build_initiate_mpu(c, bucket, key, upload_id);
 }
@@ -970,6 +1039,22 @@ static long parse_one_part(const char *body, size_t n, size_t start,
     out->part_number = part_number;
     memcpy(out->etag_hex, body + et_v0, 32);
     out->etag_hex[32] = '\0';
+    out->cksum_n = 0;
+    for (int algo = 1; algo < S3_CKSUM_MAX; algo++) {
+        char open_t[40], close_t[40];
+        int on = snprintf(open_t, sizeof(open_t), "<%s>", cksum_xml_name(algo));
+        int cn = snprintf(close_t, sizeof(close_t), "</%s>", cksum_xml_name(algo));
+        const char *cp = memmem(body + inner_start, inner_end - inner_start,
+                                open_t, (size_t)on);
+        if (!cp) continue;
+        size_t v0 = (size_t)(cp - body) + (size_t)on;
+        const char *cq = memmem(body + v0, inner_end - v0, close_t, (size_t)cn);
+        if (!cq || out->cksum_n) return -2;
+        int dn = base64_decode(body + v0, (size_t)(cq - body) - v0,
+                               out->cksum, sizeof(out->cksum));
+        if (dn != (int)cksum_digest_len(algo)) return -2;
+        out->cksum_n = (uint8_t)dn;
+    }
     return (long)((size_t)(q - body) + sizeof(close_tag) - 1);
 }
 
@@ -983,16 +1068,21 @@ typedef struct {
     char            upload_id[33];
     s3_part_ref_t  *parts;
     size_t          n_parts;
+    uint8_t         full[32];     /* x-amz-checksum-<algo> on Complete */
+    size_t          full_n;       /* 0 = none */
     s3_err_t        err;
     char            etag[40];
+    s3_obj_meta_t   meta;
 } mpu_complete_job_t;
 
 static void mpu_complete_run(iojob_t *j) {
     mpu_complete_job_t *mj = (mpu_complete_job_t *)j;
     s3_str_t bucket = { mj->names, mj->bucket_n };
     s3_str_t key    = { mj->names + mj->bucket_n, mj->key_n };
-    mj->err = store_mpu_complete(mj->store, bucket, key, mj->upload_id,
-                                 mj->parts, mj->n_parts, mj->etag, NULL);
+    mj->err = store_mpu_complete2(mj->store, bucket, key, mj->upload_id,
+                                  mj->parts, mj->n_parts,
+                                  mj->full_n ? mj->full : NULL, mj->full_n,
+                                  mj->etag, &mj->meta);
 }
 
 static void mpu_complete_done(iojob_t *j) {
@@ -1003,7 +1093,9 @@ static void mpu_complete_done(iojob_t *j) {
          * until its response has been written. */
         job_respond(c, mj->err != S3_OK
             ? rsp_build_s3_error(c, mj->err, c->req.path, NULL)
-            : rsp_build_complete_mpu(c, c->mpu_bucket, c->mpu_key, mj->etag));
+            : (add_checksum_headers(c, &mj->meta),
+               rsp_build_complete_mpu2(c, c->mpu_bucket, c->mpu_key, mj->etag,
+                                       &mj->meta)));
     }
     free(mj->parts);
     free(mj->names);
@@ -1070,6 +1162,19 @@ static int handle_mpu_complete_finish(conn_t *c, s3_str_t bucket, s3_str_t key,
     snprintf(mj->upload_id, sizeof(mj->upload_id), "%s", upload_id);
     mj->parts    = parts;
     mj->n_parts  = parts_n;
+    /* FULL_OBJECT uploads: the whole-object checksum comes as a header on
+     * Complete (conn.c does not treat it as a body checksum here). */
+    for (size_t i = 0; i < c->req.n_headers; i++) {
+        int a = cksum_algo_from_header(c->req.headers[i].k);
+        if (!a) continue;
+        const s3_str_t *v = &c->req.headers[i].v;
+        int dn = base64_decode(v->p, v->n, mj->full, sizeof(mj->full));
+        if (dn != (int)cksum_digest_len(a) || mj->full_n) {
+            free(mj); free(names); free(parts);
+            return rsp_build_s3_error(c, S3_ERR_INVALID_CHECKSUM, c->req.path, NULL);
+        }
+        mj->full_n = (size_t)dn;
+    }
     return job_submit(c, &mj->base);
 }
 

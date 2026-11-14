@@ -227,6 +227,8 @@ s3_err_t store_delete(s3_store_t *s, s3_str_t bucket, s3_str_t key);
 typedef struct {
     int      part_number;         /* 1..10000 */
     char     etag_hex[33];        /* 32 hex chars + NUL — MD5 of the part body */
+    uint8_t  cksum_n;             /* client-listed part checksum length, 0 = none */
+    uint8_t  cksum[32];           /* raw digest from <ChecksumXXX> */
 } s3_part_ref_t;
 
 /* Generate a fresh upload_id and stage it. Writes the upload_id (NUL-
@@ -235,6 +237,17 @@ typedef struct {
 s3_err_t store_mpu_create(s3_store_t *s, s3_str_t bucket, s3_str_t key,
                           const char *content_type,
                           char upload_id_out[S3_MULTIPART_UPLOAD_ID_LEN + 1]);
+
+/* Like store_mpu_create, recording the upload's checksum algorithm and
+ * type (S3_CKSUM_TYPE_*) from x-amz-checksum-algorithm / -type. With an
+ * algorithm set, every part must carry a verified checksum of that
+ * algorithm (part commit refuses otherwise), and complete stores the
+ * object's checksum: COMPOSITE = algo(concat(part digests)) "-N", or
+ * FULL_OBJECT = algo over the assembled bytes. */
+s3_err_t store_mpu_create_opts(s3_store_t *s, s3_str_t bucket, s3_str_t key,
+                               const char *content_type,
+                               uint8_t cksum_algo, uint8_t cksum_type,
+                               char upload_id_out[S3_MULTIPART_UPLOAD_ID_LEN + 1]);
 
 /* Streaming part upload — same shape as the single-PUT writer. */
 s3_err_t store_mpu_part_begin(s3_store_t *s, s3_str_t bucket, s3_str_t key,
@@ -253,6 +266,22 @@ s3_err_t store_mpu_complete(s3_store_t *s, s3_str_t bucket, s3_str_t key,
                             const char *upload_id,
                             const s3_part_ref_t *parts, size_t n_parts,
                             char etag_out[40], s3_obj_meta_t *meta_out);
+
+/* store_mpu_complete with checksum handling. Parts listing a checksum
+ * must match the stored part checksum (else S3_ERR_INVALID_PART). If
+ * full_expect is non-NULL (an x-amz-checksum-<algo> header on Complete,
+ * FULL_OBJECT uploads), the assembled object must match it (else
+ * S3_ERR_CHECKSUM_MISMATCH). */
+s3_err_t store_mpu_complete2(s3_store_t *s, s3_str_t bucket, s3_str_t key,
+                             const char *upload_id,
+                             const s3_part_ref_t *parts, size_t n_parts,
+                             const uint8_t *full_expect, size_t full_n,
+                             char etag_out[40], s3_obj_meta_t *meta_out);
+
+/* The checksum algorithm/type an upload was created with (0 = none). */
+s3_err_t store_mpu_checksum_info(s3_store_t *s, s3_str_t bucket,
+                                 const char *upload_id,
+                                 uint8_t *algo, uint8_t *type);
 
 /* Abort: remove the staging dir and all part files. */
 s3_err_t store_mpu_abort(s3_store_t *s, s3_str_t bucket, s3_str_t key,

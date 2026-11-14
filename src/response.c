@@ -1,6 +1,7 @@
 /* src/response.c — HTTP response building helpers */
 
 #include "response.h"
+#include "checksum.h"
 #include "log.h"
 #include "xml_parser.h"
 
@@ -109,6 +110,10 @@ static const err_entry_t ERR_TABLE[] = {
     { S3_ERR_BAD_DIGEST,                 400, "XAmzContentSHA256Mismatch","The provided x-amz-content-sha256 header does not match the body." },
     { S3_ERR_INVALID_PART,               400, "InvalidPart",              "One or more of the specified parts could not be found." },
     { S3_ERR_MALFORMED_XML,              400, "MalformedXML",             "The XML you provided was not well-formed."         },
+    { S3_ERR_CHECKSUM_MISMATCH,          400, "BadDigest",                "The checksum you specified did not match the calculated checksum." },
+    { S3_ERR_INVALID_CHECKSUM,           400, "InvalidRequest",           "The checksum value or algorithm you specified is invalid." },
+    { S3_ERR_AUTH_QUERY_PARAMS,          400, "AuthorizationQueryParametersError", "The presigned URL parameters are invalid or out of range." },
+    { S3_ERR_PRESIGN_EXPIRED,            403, "AccessDenied",             "Request has expired" },
     { S3_ERR_INSUFFICIENT_STORAGE,       507, "QuotaExceeded",            "There is insufficient storage available to complete the request." },
 };
 
@@ -482,6 +487,18 @@ int rsp_build_initiate_mpu(conn_t *c, s3_str_t bucket, s3_str_t key,
 
 int rsp_build_complete_mpu(conn_t *c, s3_str_t bucket, s3_str_t key,
                            const char *etag) {
+    return rsp_build_complete_mpu2(c, bucket, key, etag, NULL);
+}
+
+void rsp_format_checksum(const s3_obj_meta_t *m, char out[64]) {
+    size_t dn = cksum_digest_len(m->cksum_algo);
+    size_t n = base64_encode(m->cksum, dn, out);
+    if (m->cksum_type == S3_CKSUM_TYPE_COMPOSITE)
+        snprintf(out + n, 64 - n, "-%u", (unsigned)m->cksum_parts);
+}
+
+int rsp_build_complete_mpu2(conn_t *c, s3_str_t bucket, s3_str_t key,
+                            const char *etag, const s3_obj_meta_t *m) {
     XMLNode *root = create_node("CompleteMultipartUploadResult");
     if (!root) return -1;
     if (add_attr(root, "xmlns", "http://s3.amazonaws.com/doc/2006-03-01/") < 0) {
@@ -495,6 +512,14 @@ int rsp_build_complete_mpu(conn_t *c, s3_str_t bucket, s3_str_t key,
     char etag_q[64];
     snprintf(etag_q, sizeof(etag_q), "\"%s\"", etag);
     xml_text_child(root, "ETag", etag_q);
+    if (m && m->cksum_algo) {
+        char ck[64];
+        rsp_format_checksum(m, ck);
+        xml_text_child(root, cksum_xml_name(m->cksum_algo), ck);
+        xml_text_child(root, "ChecksumType",
+                       m->cksum_type == S3_CKSUM_TYPE_COMPOSITE ? "COMPOSITE"
+                                                                : "FULL_OBJECT");
+    }
 
     size_t blen = 0;
     char *body = xml_render_with_decl(root, &blen);

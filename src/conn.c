@@ -25,6 +25,7 @@
  */
 
 #include "conn.h"
+#include "action.h"
 #include "iopool.h"
 #include "log.h"
 #include "metrics.h"
@@ -102,6 +103,8 @@ void conn_destroy(conn_t *c) {
     if (c->get_reader) store_get_close(c->get_reader);
     if (c->body_hash_ctx) sigv4_body_hash_free(c->body_hash_ctx);
     if (c->chunk_decoder) sigv4_chunk_free(c->chunk_decoder);
+    cksum_free(&c->cksum);
+    cksum_free(&c->md5);
     free(c->ext_body);
     free(c->req_body_buf);
     free(c);
@@ -215,74 +218,161 @@ static void request_reset(conn_t *c) {
         c->chunk_decoder = NULL;
     }
     c->get_head_only = 0;
+    c->sig_verified = 0;
+    cksum_free(&c->cksum);
+    cksum_free(&c->md5);
+    c->cksum_algo = 0;
+    c->cksum_from_trailer = 0;
+    c->xhdr_len = 0;
+    c->xhdr_done = 0;
 }
 
 /* ------------------------------------------------------------------------- */
-/* Query parsing                                                             */
+/* Extra response headers                                                    */
 /* ------------------------------------------------------------------------- */
 
-static int hexval(char ch) {
-    if (ch >= '0' && ch <= '9') return ch - '0';
-    if (ch >= 'a' && ch <= 'f') return ch - 'a' + 10;
-    if (ch >= 'A' && ch <= 'F') return ch - 'A' + 10;
-    return -1;
-}
-
-/* Percent-decode src[0..n) into dst; returns bytes written. */
-static size_t qdecode(const char *src, size_t n, char *dst) {
-    size_t w = 0;
-    for (size_t r = 0; r < n; r++) {
-        int hi, lo;
-        if (src[r] == '%' && r + 2 < n
-            && (hi = hexval(src[r+1])) >= 0 && (lo = hexval(src[r+2])) >= 0) {
-            dst[w++] = (char)((hi << 4) | lo);
-            r += 2;
-        } else {
-            dst[w++] = src[r];
-        }
-    }
-    return w;
-}
-
-int conn_parse_query(conn_t *c) {
-    c->req.n_qp = 0;
-    s3_str_t q = c->req.query;
-    if (q.n == 0) return 0;
-    if (q.n > sizeof(c->qbuf)) return -1;
-    size_t used = 0, i = 0;
-    while (i < q.n) {
-        size_t s = i;
-        while (i < q.n && q.p[i] != '&') i++;
-        size_t e = i;
-        if (i < q.n) i++;
-        if (e == s) continue;
-        if (c->req.n_qp >= CONN_MAX_QPARAMS) return -1;
-        size_t eq = s;
-        while (eq < e && q.p[eq] != '=') eq++;
-        conn_qparam_t *p = &c->req.qp[c->req.n_qp++];
-        size_t kn = qdecode(q.p + s, eq - s, c->qbuf + used);
-        p->k = (s3_str_t){ c->qbuf + used, kn };
-        used += kn;
-        p->has_eq = eq < e;
-        size_t vn = p->has_eq ? qdecode(q.p + eq + 1, e - eq - 1,
-                                         c->qbuf + used) : 0;
-        p->v = (s3_str_t){ c->qbuf + used, vn };
-        used += vn;
-    }
+int conn_add_header(conn_t *c, const char *name, const char *value) {
+    size_t nn = strlen(name), vn = strlen(value);
+    if (c->xhdr_len + nn + vn + 4 > sizeof(c->xhdr)) return -1;
+    /* Header injection guard: values come from stored objects/configs. */
+    if (strpbrk(value, "\r\n") || strpbrk(name, "\r\n: ")) return -1;
+    memcpy(c->xhdr + c->xhdr_len, name, nn);
+    c->xhdr_len += nn;
+    c->xhdr[c->xhdr_len++] = ':';
+    c->xhdr[c->xhdr_len++] = ' ';
+    memcpy(c->xhdr + c->xhdr_len, value, vn);
+    c->xhdr_len += vn;
+    c->xhdr[c->xhdr_len++] = '\r';
+    c->xhdr[c->xhdr_len++] = '\n';
     return 0;
 }
 
-const conn_qparam_t *conn_query_get(const conn_t *c, const char *name) {
-    for (size_t i = 0; i < c->req.n_qp; i++)
-        if (s3_str_eq_lit(c->req.qp[i].k, name)) return &c->req.qp[i];
+void conn_clear_headers(conn_t *c) { c->xhdr_len = 0; }
+
+/* Splice xhdr into the head in wbuf, before the blank line. If an inline
+ * body would no longer fit, it moves to ext_body. */
+static int apply_extra_headers(conn_t *c) {
+    c->xhdr_done = 1;
+    if (c->xhdr_len == 0 || c->wlen < 4) return 0;
+    char *end = memmem(c->wbuf, c->wlen, "\r\n\r\n", 4);
+    if (!end) return 0;
+    size_t at = (size_t)(end - c->wbuf) + 2;     /* after the last header CRLF */
+    size_t tail = c->wlen - at;                  /* "\r\n" + inline body */
+    if (c->wlen + c->xhdr_len > sizeof(c->wbuf)) {
+        size_t body_n = tail - 2;
+        if (c->ext_body || at + 2 + c->xhdr_len > sizeof(c->wbuf)) return -1;
+        char *b = malloc(body_n ? body_n : 1);
+        if (!b) return -1;
+        memcpy(b, c->wbuf + at + 2, body_n);
+        c->ext_body = b;
+        c->ext_body_len = body_n;
+        c->ext_body_pos = 0;
+        c->wlen = at + 2;
+        tail = 2;
+    }
+    memmove(c->wbuf + at + c->xhdr_len, c->wbuf + at, tail);
+    memcpy(c->wbuf + at, c->xhdr, c->xhdr_len);
+    c->wlen += c->xhdr_len;
+    return 0;
+}
+
+/* ------------------------------------------------------------------------- */
+/* Additional checksums (x-amz-checksum-*, Content-MD5)                      */
+/* ------------------------------------------------------------------------- */
+
+static const s3_str_t *find_hdr(const conn_t *c, const char *lc) {
+    for (size_t i = 0; i < c->req.n_headers; i++)
+        if (s3_str_eq_lit(c->req.headers[i].k, lc)) return &c->req.headers[i].v;
     return NULL;
 }
 
-int conn_query_count(const conn_t *c, const char *name) {
-    int n = 0;
-    for (size_t i = 0; i < c->req.n_qp; i++)
-        if (s3_str_eq_lit(c->req.qp[i].k, name)) n++;
-    return n;
+/* Decide what to verify from the request headers. Returns S3_OK or the
+ * error to answer with. */
+static s3_err_t checksum_setup(conn_t *c) {
+    int algo = 0;
+    /* On CompleteMultipartUpload the x-amz-checksum-* header is the whole
+     * object's checksum, not the XML body's: route.c handles it. */
+    int hdr_is_body = c->req.act != ACT_MPU_COMPLETE;
+    for (size_t i = 0; hdr_is_body && i < c->req.n_headers; i++) {
+        int a = cksum_algo_from_header(c->req.headers[i].k);
+        if (!a) continue;
+        if (algo) return S3_ERR_INVALID_CHECKSUM;     /* more than one */
+        algo = a;
+        const s3_str_t *v = &c->req.headers[i].v;
+        size_t want = cksum_digest_len(a);
+        if (base64_decode(v->p, v->n, c->cksum_expect, sizeof(c->cksum_expect))
+            != (int)want)
+            return S3_ERR_INVALID_CHECKSUM;
+    }
+    const s3_str_t *tr = find_hdr(c, "x-amz-trailer");
+    if (tr) {
+        /* Only checksum trailers are meaningful; the decoder enforces
+         * that nothing unannounced arrives. */
+        size_t i = 0;
+        while (i < tr->n) {
+            while (i < tr->n && (tr->p[i] == ' ' || tr->p[i] == ',')) i++;
+            size_t st = i;
+            while (i < tr->n && tr->p[i] != ',') i++;
+            size_t e = i;
+            while (e > st && tr->p[e-1] == ' ') e--;
+            if (e == st) continue;
+            int a = cksum_algo_from_header((s3_str_t){ tr->p + st, e - st });
+            if (!a) return S3_ERR_INVALID_CHECKSUM;
+            if (algo) return S3_ERR_INVALID_CHECKSUM;
+            algo = a;
+            c->cksum_from_trailer = 1;
+        }
+        sigv4_stream_mode_t m = sigv4_stream_mode(c);
+        if (c->cksum_from_trailer && m != SIGV4_STREAM_SIGNED_TRAILER
+            && m != SIGV4_STREAM_UNSIGNED_TRAILER)
+            return S3_ERR_INVALID_CHECKSUM;
+    }
+    if (algo) {
+        if (cksum_begin(&c->cksum, algo) < 0) return S3_ERR_INTERNAL;
+        c->cksum_algo = algo;
+    }
+    const s3_str_t *md5 = find_hdr(c, "content-md5");
+    if (md5) {
+        if (base64_decode(md5->p, md5->n, c->md5_expect, sizeof(c->md5_expect)) != 16)
+            return S3_ERR_INVALID_CHECKSUM;
+        if (cksum_begin(&c->md5, CKSUM_MD5) < 0) return S3_ERR_INTERNAL;
+    }
+    return S3_OK;
+}
+
+/* Abort whatever writer the request has open (single PUT or MPU part). */
+static void abort_writer(conn_t *c) {
+    if (!c->put_writer) return;
+    if (c->mpu_is_part_upload) store_mpu_part_abort(c->put_writer);
+    else                       store_put_abort(c->put_writer);
+    c->put_writer = NULL;
+}
+
+/* At end of body: compare checksums. On success, hands the additional
+ * checksum to the open writer so it is stored with the object. */
+static s3_err_t checksum_finish(conn_t *c) {
+    if (c->md5.algo) {
+        uint8_t got[CKSUM_MAX_DIGEST]; size_t n;
+        if (cksum_final(&c->md5, got, &n) < 0) return S3_ERR_INTERNAL;
+        if (n != 16 || memcmp(got, c->md5_expect, 16) != 0)
+            return S3_ERR_CHECKSUM_MISMATCH;
+    }
+    if (!c->cksum_algo) return S3_OK;
+    uint8_t got[CKSUM_MAX_DIGEST]; size_t n;
+    if (cksum_final(&c->cksum, got, &n) < 0) return S3_ERR_INTERNAL;
+    if (memcmp(got, c->cksum_expect, n) != 0) return S3_ERR_CHECKSUM_MISMATCH;
+    if (c->put_writer
+        && store_put_set_checksum(c->put_writer, (uint8_t)c->cksum_algo,
+                                  S3_CKSUM_TYPE_FULL_OBJECT, 0, got, n) != S3_OK)
+        return S3_ERR_INTERNAL;
+    return S3_OK;
+}
+
+/* Decoded body bytes on their way to the router. */
+static int body_deliver(conn_t *c, const char *data, size_t len) {
+    if (c->cksum.algo) cksum_update(&c->cksum, data, len);
+    if (c->md5.algo)   cksum_update(&c->md5, data, len);
+    return route_dispatch_body(c, data, len);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -328,7 +418,7 @@ static void metrics_flush(conn_t *c) {
  * to the route layer (which streams them into the PUT writer). */
 static int chunk_data_to_route(void *user, const char *data, size_t len) {
     conn_t *c = user;
-    return route_dispatch_body(c, data, len);
+    return body_deliver(c, data, len);
 }
 
 static int cb_on_url(llhttp_t *p, const char *at, size_t len) {
@@ -453,7 +543,7 @@ static int cb_on_headers_complete(llhttp_t *p) {
                 break;
             }
         }
-        if (auth_h || c->auth_required) {
+        if (auth_h || sigv4_has_presign(c) || c->auth_required) {
             s3_err_t e = sigv4_verify_id(c->auth, c, &c->id);
             if (e != S3_OK) {
                 LOG_D("sigv4 verify failed (err=%d) on %s",
@@ -461,6 +551,7 @@ static int cb_on_headers_complete(llhttp_t *p) {
                 if (route_build_error(c, e) < 0) return -1;
                 return 0;
             }
+            c->sig_verified = 1;
             /* Verified. If the client declared a real body hash (not
              * UNSIGNED-PAYLOAD and not the streaming literal), set up
              * streaming verification so we catch the case where the
@@ -472,6 +563,10 @@ static int cb_on_headers_complete(llhttp_t *p) {
                     break;
                 }
             }
+            /* A presigned URL may pin the payload in its query instead. */
+            const conn_qparam_t *qbh = c->id.presigned
+                ? conn_query_get(c, "X-Amz-Content-Sha256") : NULL;
+            if (qbh) bh = &qbh->v;
             if (bh && bh->n == 64
                 && !s3_str_eq_lit(*bh, "UNSIGNED-PAYLOAD")) {
                 c->body_hash_ctx = sigv4_body_hash_begin();
@@ -508,29 +603,43 @@ static int cb_on_headers_complete(llhttp_t *p) {
         return -1;
     }
 
-    /* If this is a chunked-SigV4 request, set up the chunk decoder
-     * AFTER route_dispatch_headers has set up a writer (if any).
-     * The decoder's on_data callback forwards verified data bytes to
-     * route_dispatch_body, which requires the writer to exist. */
-    if (c->auth && sigv4_is_chunked(c)) {
-        /* Find x-amz-decoded-content-length for end-of-stream check. */
+    /* Nothing more to set up if the router already answered (error,
+     * GET, ...): remaining body bytes just drain. */
+    if (c->wlen > 0 || c->ext_body || c->state != CST_READ_BODY) return 0;
+
+    /* Additional checksums (x-amz-checksum-* header or trailer,
+     * Content-MD5) over the decoded body. */
+    s3_err_t ce = checksum_setup(c);
+    if (ce != S3_OK) {
+        abort_writer(c);
+        c->mpu_complete_pending = c->delete_pending = c->copy_pending = 0;
+        if (route_build_error(c, ce) < 0) return -1;
+        return 0;
+    }
+
+    /* aws-chunked bodies (signed, signed-with-trailer, unsigned-with-
+     * trailer): set up the decoder AFTER route_dispatch_headers has
+     * opened a writer (if any), since its on_data callback forwards
+     * decoded bytes there. Signatures are checked whenever the request's
+     * seed signature was verified; in open mode the framing is still
+     * decoded so chunk headers never land in the object. */
+    sigv4_stream_mode_t mode = sigv4_stream_mode(c);
+    if (mode != SIGV4_STREAM_NONE) {
         uint64_t expected = 0;
-        for (size_t i = 0; i < c->req.n_headers; i++) {
-            if (s3_str_eq_lit(c->req.headers[i].k, "x-amz-decoded-content-length")) {
-                const s3_str_t *v = &c->req.headers[i].v;
-                /* Bounded parse — value should be plain decimal. */
-                for (size_t j = 0; j < v->n; j++) {
-                    if (v->p[j] < '0' || v->p[j] > '9') { expected = 0; break; }
-                    expected = expected * 10 + (uint64_t)(v->p[j] - '0');
-                }
-                break;
+        const s3_str_t *v = find_hdr(c, "x-amz-decoded-content-length");
+        if (v) {
+            for (size_t j = 0; j < v->n; j++) {
+                if (v->p[j] < '0' || v->p[j] > '9' || j >= 19) { expected = 0; break; }
+                expected = expected * 10 + (uint64_t)(v->p[j] - '0');
             }
         }
-        c->chunk_decoder = sigv4_chunk_begin(c->auth, c, expected,
-                                             chunk_data_to_route, c);
+        int verify = c->sig_verified && mode != SIGV4_STREAM_UNSIGNED_TRAILER;
+        c->chunk_decoder = sigv4_chunk_begin_mode(c->auth, c, mode, verify,
+                                                  expected,
+                                                  chunk_data_to_route, c);
         if (!c->chunk_decoder) {
-            /* OOM or some other failure setting up the decoder. */
-            if (route_build_error(c, S3_ERR_INTERNAL) < 0) return -1;
+            abort_writer(c);
+            if (route_build_error(c, S3_ERR_INVALID_REQUEST) < 0) return -1;
             return 0;
         }
     }
@@ -582,13 +691,13 @@ static int cb_on_body(llhttp_t *p, const char *at, size_t len) {
         if (sigv4_chunk_feed(c->chunk_decoder, at, len) < 0) {
             LOG_D("chunk feed failed on %s", c->peer);
             /* Abort any in-flight PUT so nothing reaches the store. */
-            if (c->put_writer) {
-                store_put_abort(c->put_writer);
-                c->put_writer = NULL;
-            }
+            abort_writer(c);
             sigv4_chunk_free(c->chunk_decoder);
             c->chunk_decoder = NULL;
-            if (route_build_error(c, S3_ERR_SIGNATURE_DOES_NOT_MATCH) < 0) {
+            c->mpu_complete_pending = c->delete_pending = c->copy_pending = 0;
+            s3_err_t fe = c->sig_verified ? S3_ERR_SIGNATURE_DOES_NOT_MATCH
+                                          : S3_ERR_INVALID_REQUEST;
+            if (route_build_error(c, fe) < 0) {
                 return -1;
             }
             /* Drain remaining body bytes silently — but llhttp will keep
@@ -605,7 +714,7 @@ static int cb_on_body(llhttp_t *p, const char *at, size_t len) {
         sigv4_body_hash_update(c->body_hash_ctx, at, len);
     }
     /* Stream body bytes into a writer if route established one for PUT. */
-    if (route_dispatch_body(c, at, len) < 0) return -1;
+    if (body_deliver(c, at, len) < 0) return -1;
     return 0;
 }
 
@@ -617,15 +726,27 @@ static int cb_on_message_complete(llhttp_t *p) {
      * chunk arrived and the total decoded length matched. */
     if (c->chunk_decoder) {
         int ok = (sigv4_chunk_finish(c->chunk_decoder) == 0);
+        s3_err_t fe = c->sig_verified ? S3_ERR_SIGNATURE_DOES_NOT_MATCH
+                                      : S3_ERR_INVALID_REQUEST;
+        if (ok && c->cksum_from_trailer) {
+            size_t tn = 0;
+            const char *tv = sigv4_chunk_trailer(c->chunk_decoder,
+                                                 cksum_header_name(c->cksum_algo),
+                                                 &tn);
+            if (!tv || base64_decode(tv, tn, c->cksum_expect,
+                                     sizeof(c->cksum_expect))
+                       != (int)cksum_digest_len(c->cksum_algo)) {
+                ok = 0;
+                fe = S3_ERR_INVALID_CHECKSUM;
+            }
+        }
         sigv4_chunk_free(c->chunk_decoder);
         c->chunk_decoder = NULL;
         if (!ok) {
             LOG_D("chunk finish failed on %s", c->peer);
-            if (c->put_writer) {
-                store_put_abort(c->put_writer);
-                c->put_writer = NULL;
-            }
-            if (route_build_error(c, S3_ERR_SIGNATURE_DOES_NOT_MATCH) < 0) {
+            abort_writer(c);
+            c->mpu_complete_pending = c->delete_pending = c->copy_pending = 0;
+            if (route_build_error(c, fe) < 0) {
                 return -1;
             }
             c->request_dispatched = 1;
@@ -650,6 +771,19 @@ static int cb_on_message_complete(llhttp_t *p) {
                 c->put_writer = NULL;
             }
             if (route_build_error(c, S3_ERR_BAD_DIGEST) < 0) return -1;
+            c->request_dispatched = 1;
+            return HPE_PAUSED;
+        }
+    }
+
+    /* Additional checksums: compare before anything commits. */
+    if ((c->cksum_algo || c->md5.algo) && c->wlen == 0 && !c->ext_body) {
+        s3_err_t ce = checksum_finish(c);
+        if (ce != S3_OK) {
+            LOG_D("checksum mismatch on %s", c->peer);
+            abort_writer(c);
+            c->mpu_complete_pending = c->delete_pending = c->copy_pending = 0;
+            if (route_build_error(c, ce) < 0) return -1;
             c->request_dispatched = 1;
             return HPE_PAUSED;
         }
@@ -810,6 +944,12 @@ int conn_on_readable(conn_t *c) {
 int conn_on_writable(conn_t *c) {
     /* Nothing to send until the job's done() has built the response. */
     if (c->state == CST_WAIT_JOB) return 0;
+
+    if (c->state == CST_WRITE_RESPONSE && c->wpos == 0 && !c->xhdr_done
+        && apply_extra_headers(c) < 0) {
+        LOG_W("extra headers do not fit on fd=%d", c->fd);
+        return -1;
+    }
 
     /* Drain wbuf (the response head, plus inline body for small responses). */
     while (c->state == CST_WRITE_RESPONSE && c->wpos < c->wlen) {
