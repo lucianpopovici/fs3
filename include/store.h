@@ -224,6 +224,8 @@ s3_err_t store_bucket_grant_set(s3_store_t *s, s3_str_t bucket,
 /* "rw" → bits; -1 if invalid. */
 int      store_grant_parse_perms(const char *p, size_t n);
 int      store_bucket_exists(s3_store_t *s, s3_str_t name);
+/* S3 bucket-name rules (3-63 chars, lowercase, digits, '.', '-'). */
+int      store_valid_bucket_name(s3_str_t name);
 
 /* ---- Streaming PUT ----
  *

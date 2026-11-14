@@ -30,7 +30,7 @@ INCLUDES   := -Iinclude -I$(LLHTTP_DIR)/include -I$(XML_DIR)
 # Server objects
 SRV_SRCS := src/main.c src/server.c src/conn.c src/log.c src/store_fs.c \
             src/route.c src/response.c src/sigv4.c src/metrics.c \
-            src/iopool.c src/action.c src/checksum.c src/query.c src/cors.c src/lifecycle.c
+            src/iopool.c src/action.c src/checksum.c src/query.c src/cors.c src/lifecycle.c src/website.c
 SRV_OBJS := $(SRV_SRCS:.c=.o)
 
 LLHTTP_OBJS := $(LLHTTP_DIR)/src/api.o $(LLHTTP_DIR)/src/http.o \
@@ -117,6 +117,8 @@ test: $(TEST_BINS) fs3
 	@./tests/test_e2e_subresources.sh
 	@echo "=== test_e2e_checksum (item 1: trailers + x-amz-checksum-*) ==="
 	@./tests/test_e2e_checksum.sh
+	@echo "=== test_e2e_website (item 6: static websites) ==="
+	@./tests/test_e2e_website.sh
 	@echo "=== test_e2e_lifecycle (item 5: lifecycle) ==="
 	@./tests/test_e2e_lifecycle.sh
 	@echo "=== test_e2e_cors (item 4: CORS) ==="
@@ -126,7 +128,7 @@ test: $(TEST_BINS) fs3
 	@echo "=== test_ui_cgi (DSM tile admin console) ==="
 	@./tests/test_ui_cgi.sh
 
-FUZZ_CFG_OBJS := src/cors.o src/lifecycle.o src/store_fs.o src/checksum.o src/log.o $(XML_OBJS)
+FUZZ_CFG_OBJS := src/cors.o src/lifecycle.o src/website.o src/store_fs.o src/checksum.o src/log.o $(XML_OBJS)
 tests/test_config_fuzz: tests/test_config_fuzz.c tests/fuzz_targets.h $(FUZZ_CFG_OBJS)
 	$(CC) $(CFLAGS) $(INCLUDES) -Itests tests/test_config_fuzz.c $(FUZZ_CFG_OBJS) \
 	    $(LDFLAGS) -o $@

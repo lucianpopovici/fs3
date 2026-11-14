@@ -67,6 +67,16 @@ typedef struct {
     int                    lifecycle_dry_run;
     long                   lifecycle_time_offset_s;
 
+    /* Static website listener (item 6). web_port 0 = off. Requests there
+     * are anonymous GET/HEAD; the bucket comes from Host
+     * (<bucket>.<web_root_domain>, or a Host equal to a bucket name). */
+    const char            *web_addr;          /* default 127.0.0.1 */
+    uint16_t               web_port;
+    const char            *web_root_domain;   /* may be NULL */
+    /* Block-public-access off (S6): website configs (and public bucket
+     * policies) may be stored. Default 0. */
+    int                    allow_public;
+
     /* Optional tick callback, invoked from the event loop at most once
      * per second, between event batches (so never concurrently with a
      * request). main.c uses it to act on signal flags — e.g. the SIGHUP

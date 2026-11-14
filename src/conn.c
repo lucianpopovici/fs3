@@ -541,9 +541,11 @@ static int cb_on_headers_complete(llhttp_t *p) {
      * Origin are added before auth so even auth errors carry them —
      * otherwise browsers hide the S3 error body. */
     conn_add_header(c, "X-Content-Type-Options", "nosniff");
-    if (!is_preflight) route_cors_decorate(c);
+    if (!is_preflight && !c->is_web) route_cors_decorate(c);
 
-    if (c->auth && !is_health && !is_preflight) {
+    /* The website listener is anonymous by design: Authorization is
+     * ignored entirely there (item 6). */
+    if (c->auth && !is_health && !is_preflight && !c->is_web) {
         /* Look up authorization header. If missing and auth not strictly
          * required, fall through. */
         const s3_str_t *auth_h = NULL;

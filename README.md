@@ -149,6 +149,25 @@ What's working end-to-end:
   the practical cap is the directory entry limit, well above any
   realistic in-flight set).
 
+- **Static website hosting** (Garage's model) — `PUT/GET/DELETE
+  /bucket?website` with `IndexDocument/Suffix`, `ErrorDocument/Key` or
+  `RedirectAllRequestsTo` (`RoutingRules` → 501). A website config makes
+  a bucket anonymously readable **only on a dedicated listener**
+  (`--web-port 9080 --web-addr 127.0.0.1 --web-root-domain
+  web.example.lan`); the S3 endpoint's auth model is untouched. The
+  bucket comes from `Host`: `<bucket>.<root-domain>`, or a Host equal to
+  a bucket name (custom domains through the DSM reverse proxy — one proxy
+  entry per site hostname → `localhost:9080`). Only GET/HEAD; directory
+  paths get the index suffix; `dir` without a slash redirects (302) to
+  `dir/` when `dir/<index>` exists, with a normalised single-slash
+  `Location` (no protocol-relative open redirect); misses serve the
+  ErrorDocument with status 404, or a minimal HTML page. Range and
+  sendfile work as on the S3 port. Authorization headers are ignored,
+  subresource/`X-Amz-*` queries are refused, listing is never served, and
+  errors are HTML, never S3 XML. Bucket CORS rules apply there too.
+  **Block public access is on by default**: website configs are refused
+  unless fs3 runs with `--allow-public`.
+
 - **Lifecycle rules** — `PUT/GET/DELETE /bucket?lifecycle`:
   `Filter/Prefix` (also `Filter/And/Prefix` and the legacy `Rule/Prefix`),
   `Expiration/Days|Date`, `AbortIncompleteMultipartUpload/

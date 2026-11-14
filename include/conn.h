@@ -221,6 +221,13 @@ typedef struct conn {
      * with verified data. */
     struct sigv4_chunk_decoder *chunk_decoder;
 
+    /* Accepted on the website listener (item 6): anonymous GET/HEAD only,
+     * Authorization ignored, bucket from Host. */
+    int                is_web;
+    const char        *web_root_domain;   /* server-lifetime string */
+    /* --allow-public: website configs / public policies may be stored. */
+    int                allow_public;
+
     /* The request's signature was verified (header or presigned). */
     int                sig_verified;
 

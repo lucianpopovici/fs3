@@ -65,6 +65,11 @@ static void usage(const char *argv0) {
         "      --lifecycle-rate N     max lifecycle deletions per second (default 100; 0 = no cap)\n"
         "      --lifecycle-dry-run    log what the sweeper would delete, delete nothing\n"
         "      --lifecycle-time-offset S  shift the sweeper's clock by S seconds (testing)\n"
+        "      --web-port <num>       serve static websites (anonymous GET/HEAD) here\n"
+        "      --web-addr <ip>        website listener address (default 127.0.0.1)\n"
+        "      --web-root-domain <d>  websites at <bucket>.<d> (else Host = bucket name)\n"
+        "      --allow-public         allow website configs / public bucket policies\n"
+        "                             (block-public-access is on by default)\n"
         "  -v, --verbose              debug logging\n"
         "  -h, --help                 this help\n",
         argv0);
@@ -230,6 +235,10 @@ enum {
     OPT_LIFECYCLE_RATE,
     OPT_LIFECYCLE_DRY_RUN,
     OPT_LIFECYCLE_TIME_OFFSET,
+    OPT_WEB_ADDR,
+    OPT_WEB_PORT,
+    OPT_WEB_ROOT_DOMAIN,
+    OPT_ALLOW_PUBLIC,
 };
 
 #ifndef FS3_MAIN_TESTING
@@ -263,6 +272,8 @@ int main(int argc, char **argv) {
     int lifecycle_hour = 3, lifecycle_now = 0, lifecycle_rate = 100;
     int lifecycle_dry_run = 0;
     long lifecycle_time_offset = 0;
+    const char *web_addr = "127.0.0.1", *web_root_domain = NULL;
+    int web_port = 0, allow_public = 0;
     sigv4_verifier_t *auth = NULL;
     reload_ctx_t reload_ctx = {0};
 
@@ -290,6 +301,10 @@ int main(int argc, char **argv) {
         { "lifecycle-rate",   required_argument, NULL, OPT_LIFECYCLE_RATE },
         { "lifecycle-dry-run", no_argument,      NULL, OPT_LIFECYCLE_DRY_RUN },
         { "lifecycle-time-offset", required_argument, NULL, OPT_LIFECYCLE_TIME_OFFSET },
+        { "web-addr",         required_argument, NULL, OPT_WEB_ADDR },
+        { "web-port",         required_argument, NULL, OPT_WEB_PORT },
+        { "web-root-domain",  required_argument, NULL, OPT_WEB_ROOT_DOMAIN },
+        { "allow-public",     no_argument,       NULL, OPT_ALLOW_PUBLIC },
         { "verbose",          no_argument,       NULL, 'v' },
         { "help",             no_argument,       NULL, 'h' },
         { 0 },
@@ -450,6 +465,27 @@ int main(int argc, char **argv) {
             case OPT_LIFECYCLE_TIME_OFFSET:
                 lifecycle_time_offset = atol(optarg);
                 break;
+            case OPT_WEB_ADDR: web_addr = optarg; break;
+            case OPT_WEB_PORT:
+                web_port = atoi(optarg);
+                if (web_port < 1 || web_port > 65535) {
+                    fprintf(stderr, "--web-port must be 1..65535\n");
+                    return 2;
+                }
+                break;
+            case OPT_WEB_ROOT_DOMAIN: {
+                /* Lowercase hostname chars only. */
+                for (const char *q = optarg; *q; q++) {
+                    if (!((*q >= 'a' && *q <= 'z') || (*q >= '0' && *q <= '9')
+                          || *q == '.' || *q == '-')) {
+                        fprintf(stderr, "--web-root-domain: invalid host name\n");
+                        return 2;
+                    }
+                }
+                web_root_domain = optarg;
+                break;
+            }
+            case OPT_ALLOW_PUBLIC: allow_public = 1; break;
             default:  usage(argv[0]); return 2;
         }
     }
@@ -508,6 +544,10 @@ int main(int argc, char **argv) {
         .lifecycle_rate = lifecycle_rate,
         .lifecycle_dry_run = lifecycle_dry_run,
         .lifecycle_time_offset_s = lifecycle_time_offset,
+        .web_addr        = web_addr,
+        .web_port        = (uint16_t)web_port,
+        .web_root_domain = web_root_domain,
+        .allow_public    = allow_public,
         .tick_cb        = reload_tick,
         .tick_user      = &reload_ctx,
     };

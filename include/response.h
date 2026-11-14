@@ -62,6 +62,9 @@ int rsp_build_status_with_headers(conn_t *c, int status, const char *reason,
  * If `head_only` is non-zero, no body will follow and Content-Length
  * is still reported as the object size (HEAD semantics). */
 int rsp_build_object_head(conn_t *c, const s3_obj_meta_t *m, int head_only);
+/* Same with an explicit status line (website ErrorDocument → 404). */
+int rsp_build_object_head_status(conn_t *c, const s3_obj_meta_t *m,
+                                 int head_only, int status, const char *reason);
 
 /* Build an S3 XML error response with the given S3 error enum,
  * resource path, and request id. Sets Content-Type: application/xml

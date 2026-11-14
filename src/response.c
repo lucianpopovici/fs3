@@ -179,13 +179,18 @@ int rsp_build_status_with_headers(conn_t *c, int status, const char *reason,
 /* ===================================================================== */
 
 int rsp_build_object_head(conn_t *c, const s3_obj_meta_t *m, int head_only) {
+    return rsp_build_object_head_status(c, m, head_only, 200, "OK");
+}
+
+int rsp_build_object_head_status(conn_t *c, const s3_obj_meta_t *m,
+                                 int head_only, int status, const char *reason) {
     char etag[41]; rsp_format_etag_with_parts(m->etag, m->part_count, etag);
     char lm[32];   rsp_format_rfc1123(m->mtime_ms, lm);
 
     const char *ct = m->content_type[0] ? m->content_type : "application/octet-stream";
 
     int n = snprintf(c->wbuf, CONN_WBUF_SZ,
-        "HTTP/1.1 200 OK\r\n"
+        "HTTP/1.1 %d %s\r\n"
         "Server: fs3/0.2\r\n"
         "Content-Type: %s\r\n"
         "Content-Length: %llu\r\n"
@@ -194,7 +199,7 @@ int rsp_build_object_head(conn_t *c, const s3_obj_meta_t *m, int head_only) {
         "Accept-Ranges: bytes\r\n"
         "Connection: %s\r\n"
         "\r\n",
-        ct,
+        status, reason, ct,
         (unsigned long long)m->size,
         etag,
         lm,

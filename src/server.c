@@ -36,6 +36,7 @@
 struct server {
     server_cfg_t  cfg;
     int           listen_fd;
+    int           web_fd;       /* website listener, -1 if off */
     int           admin_fd;     /* -1 unless cfg.metrics_port > 0 */
     int           epoll_fd;
     fs3_metrics_t metrics;      /* plain counters; single-threaded loop */
@@ -215,6 +216,7 @@ server_t *server_create(const server_cfg_t *cfg) {
     if (!s) return NULL;
     s->cfg = *cfg;
     s->listen_fd = -1;
+    s->web_fd = -1;
     s->admin_fd = -1;
     s->epoll_fd = -1;
 
@@ -296,6 +298,21 @@ server_t *server_create(const server_cfg_t *cfg) {
         }
     }
 
+    /* Website listener (item 6). */
+    if (cfg->web_port > 0) {
+        s->web_fd = listen_socket(cfg->web_addr ? cfg->web_addr : "127.0.0.1",
+                                  cfg->web_port, cfg->backlog);
+        if (s->web_fd < 0) goto fail;
+        struct epoll_event wev = { .events = EPOLLIN, .data.ptr = &s->web_fd };
+        if (epoll_ctl(s->epoll_fd, EPOLL_CTL_ADD, s->web_fd, &wev) < 0) {
+            LOG_E("epoll_ctl ADD web: %s", strerror(errno));
+            goto fail;
+        }
+        LOG_I("website listener on %s:%u (root domain %s)",
+              cfg->web_addr ? cfg->web_addr : "127.0.0.1", cfg->web_port,
+              cfg->web_root_domain ? cfg->web_root_domain : "-");
+    }
+
     /* Admin/metrics listener — localhost only, by design. */
     if (cfg->metrics_port > 0) {
         s->admin_fd = listen_socket("127.0.0.1", cfg->metrics_port, 16);
@@ -346,6 +363,7 @@ void server_destroy(server_t *s) {
      * gets committed) before the store they write into goes away. */
     iopool_destroy(s->pool);
     if (s->listen_fd >= 0) close(s->listen_fd);
+    if (s->web_fd >= 0) close(s->web_fd);
     if (s->admin_fd  >= 0) close(s->admin_fd);
     if (s->epoll_fd  >= 0) close(s->epoll_fd);
     if (s->store) store_close(s->store);
@@ -396,11 +414,11 @@ static void close_conn(server_t *s, conn_t *c) {
     s->n_conns--;
 }
 
-static void accept_new(server_t *s) {
+static void accept_new(server_t *s, int lfd, int is_web) {
     for (;;) {
         struct sockaddr_in sa;
         socklen_t slen = sizeof(sa);
-        int fd = accept4(s->listen_fd, (struct sockaddr *)&sa, &slen,
+        int fd = accept4(lfd, (struct sockaddr *)&sa, &slen,
                          SOCK_NONBLOCK | SOCK_CLOEXEC);
         if (fd < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) return;
@@ -432,6 +450,9 @@ static void accept_new(server_t *s) {
             continue;
         }
         c->last_activity = time(NULL);
+        c->is_web = is_web;
+        c->web_root_domain = s->cfg.web_root_domain;
+        c->allow_public = s->cfg.allow_public;
 
         struct epoll_event ev = {
             .events = EPOLLIN | EPOLLRDHUP,
@@ -553,7 +574,12 @@ int server_run(server_t *s) {
 
             /* Listening socket */
             if (e->data.ptr == NULL) {
-                if (e->events & EPOLLIN) accept_new(s);
+                if (e->events & EPOLLIN) accept_new(s, s->listen_fd, 0);
+                continue;
+            }
+            /* Website listener (marker: &s->web_fd). */
+            if (e->data.ptr == (void *)&s->web_fd) {
+                if (e->events & EPOLLIN) accept_new(s, s->web_fd, 1);
                 continue;
             }
 

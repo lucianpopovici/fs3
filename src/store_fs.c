@@ -3085,3 +3085,5 @@ s3_err_t store_expire_if_unchanged(s3_store_t *s, s3_str_t bucket,
     if (e == S3_OK) fsync_dir(dir);
     return e;
 }
+
+int store_valid_bucket_name(s3_str_t name) { return valid_bucket_name(name); }

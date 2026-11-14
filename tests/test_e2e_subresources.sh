@@ -59,7 +59,7 @@ body_is_original "POST ?restore"
 
 # Bucket level: DELETE ?cors must not delete the bucket; PUT ?versioning
 # must not try to create it.
-for sub in lifecycle website policy tagging encryption object-lock \
+for sub in policy tagging encryption object-lock \
            replication publicAccessBlock; do
     check_eq "bucket DELETE ?$sub → 501" "$(code -X DELETE "$URL/subb?$sub")" "501"
     check_eq "bucket PUT ?$sub → 501" \

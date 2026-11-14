@@ -19,6 +19,7 @@
 #include "checksum.h"
 #include "cors.h"
 #include "lifecycle.h"
+#include "website.h"
 #include "conn.h"
 #include "iopool.h"
 #include "log.h"
@@ -432,6 +433,8 @@ static const cfg_kind_t CFG_KINDS[] = {
       "cors.xml", S3_ERR_NO_SUCH_CORS, "application/xml" },
     { ACT_GET_BUCKET_LIFECYCLE, ACT_PUT_BUCKET_LIFECYCLE, ACT_DELETE_BUCKET_LIFECYCLE,
       "lifecycle.xml", S3_ERR_NO_SUCH_LIFECYCLE, "application/xml" },
+    { ACT_GET_BUCKET_WEBSITE, ACT_PUT_BUCKET_WEBSITE, ACT_DELETE_BUCKET_WEBSITE,
+      "website.xml", S3_ERR_NO_SUCH_WEBSITE, "application/xml" },
 };
 
 static const cfg_kind_t *cfg_kind_for(s3_action_t act) {
@@ -465,6 +468,17 @@ static s3_err_t cfg_validate(conn_t *c, s3_action_t act, const char *body,
         LOG_W("lifecycle configuration installed on " S3_STR_FMT
               "%s: matching objects will be deleted by the sweeper",
               S3_STR_ARG(c->cfg_bucket), imm ? " (immediate expiry confirmed)" : "");
+        return S3_OK;
+    }
+    case ACT_PUT_BUCKET_WEBSITE: {
+        /* S6: block-public-access is on unless --allow-public: a website
+         * config makes the bucket anonymously readable (on the website
+         * listener). */
+        if (!c->allow_public) return S3_ERR_ACCESS_DENIED;
+        s3_err_t e;
+        web_config_t *w = web_parse(body, n, &e);
+        if (!w) return e;
+        web_free(w);
         return S3_OK;
     }
     case ACT_PUT_BUCKET_CORS: {
@@ -573,12 +587,18 @@ static int path_bucket(const conn_t *c, char out[64], s3_str_t *b) {
     return n > 0;
 }
 
+static void cors_decorate_bucket(conn_t *c, s3_str_t bucket);
+
 void route_cors_decorate(conn_t *c) {
-    const s3_str_t *origin = hdr_get(c, "origin");
-    if (!origin || origin->n == 0) return;
     char bb[64];
     s3_str_t bucket;
     if (!path_bucket(c, bb, &bucket)) return;
+    cors_decorate_bucket(c, bucket);
+}
+
+static void cors_decorate_bucket(conn_t *c, s3_str_t bucket) {
+    const s3_str_t *origin = hdr_get(c, "origin");
+    if (!origin || origin->n == 0) return;
     store_cfg_ref_t *r = cors_ref(c, bucket);
     if (!r) return;
     const cors_rule_t *rule = cors_match(store_cfg_obj(r), *origin,
@@ -936,7 +956,7 @@ static int handle_object_get(conn_t *c, s3_str_t bucket, s3_str_t key,
     }
     /* S7: an uploaded HTML object opened via a presigned or anonymous URL
      * must not run as an active page on this origin. */
-    if (!c->id.user[0] || c->id.presigned)
+    if (!c->is_web && (!c->id.user[0] || c->id.presigned))
         conn_add_header(c, "Content-Security-Policy", "sandbox");
 
     /* Parse optional Range header. */
@@ -1445,6 +1465,175 @@ static int handle_mpu_abort(conn_t *c, s3_str_t bucket, s3_str_t key,
 /* Top-level dispatch                                                     */
 /* ===================================================================== */
 
+static int is_known_subresource(s3_str_t k);
+
+/* ===================================================================== */
+/* Static website listener (item 6)                                       */
+/* ===================================================================== */
+/*
+ * Garage's model: a website config enables anonymous GET/HEAD *only on a
+ * dedicated listener*, so the S3 endpoint's auth model is untouched.
+ * Authorization headers are ignored entirely (no confused deputy), no
+ * subresources or listing, and errors are HTML, never S3 XML.
+ */
+
+static int web_html(conn_t *c, int status, const char *reason, const char *msg) {
+    char *b = malloc(512);
+    if (!b) return -1;
+    int n = snprintf(b, 512,
+        "<!DOCTYPE html>\n<html><head><title>%d %s</title></head>"
+        "<body><h1>%d %s</h1><p>%s</p></body></html>\n",
+        status, reason, status, reason, msg);
+    return rsp_build_raw(c, status, reason, "text/html; charset=utf-8", b,
+                         (size_t)n);
+}
+
+/* Bucket from Host: "<bucket>.<root-domain>" or, for custom domains
+ * behind the DSM proxy, a Host equal to a bucket name. Port stripped;
+ * the result must pass the S3 bucket-name rules (S5). */
+static int web_bucket_from_host(conn_t *c, char out[64], s3_str_t *b) {
+    const s3_str_t *h = hdr_get(c, "host");
+    if (!h || h->n == 0 || h->n > 300) return 0;
+    char host[301];
+    size_t hn = 0;
+    for (size_t i = 0; i < h->n && h->p[i] != ':'; i++) {
+        char ch = h->p[i];
+        host[hn++] = (ch >= 'A' && ch <= 'Z') ? (char)(ch + 32) : ch;
+    }
+    host[hn] = '\0';
+    if (hn && host[hn - 1] == '.') host[--hn] = '\0';
+    const char *root = c->web_root_domain;
+    size_t rn = root ? strlen(root) : 0;
+    size_t bn = hn;
+    if (rn && hn > rn + 1 && host[hn - rn - 1] == '.'
+        && strcmp(host + hn - rn, root) == 0)
+        bn = hn - rn - 1;
+    if (bn == 0 || bn > 63) return 0;
+    memcpy(out, host, bn);
+    out[bn] = '\0';
+    *b = (s3_str_t){ out, bn };
+    return store_valid_bucket_name(*b);
+}
+
+/* Location for a directory redirect: one leading '/', no empty segments
+ * (so "//evil.example" can never become a protocol-relative URL — S7),
+ * percent-encoded except unreserved and '/'. */
+static void web_dir_location(s3_str_t key, char *out, size_t cap) {
+    static const char H[] = "0123456789ABCDEF";
+    size_t o = 0;
+    out[o++] = '/';
+    for (size_t i = 0; i < key.n && o + 4 < cap; i++) {
+        unsigned char ch = (unsigned char)key.p[i];
+        if (ch == '/') {
+            if (out[o - 1] != '/') out[o++] = '/';
+        } else if ((ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z')
+                   || (ch >= '0' && ch <= '9') || ch == '-' || ch == '_'
+                   || ch == '.' || ch == '~') {
+            out[o++] = (char)ch;
+        } else {
+            out[o++] = '%'; out[o++] = H[ch >> 4]; out[o++] = H[ch & 15];
+        }
+    }
+    if (out[o - 1] != '/' && o + 1 < cap) out[o++] = '/';
+    out[o] = '\0';
+}
+
+static int web_store_key_exists(conn_t *c, s3_str_t bucket, s3_str_t key) {
+    s3_obj_meta_t m;
+    return store_head(c->store, bucket, key, &m) == S3_OK
+        && !(m.flags & S3_OBJF_DELETE_MARKER);
+}
+
+static int web_dispatch(conn_t *c) {
+    int head = method_is(c, "HEAD");
+    if (!method_is(c, "GET") && !head) {
+        conn_add_header(c, "Allow", "GET, HEAD");
+        return web_html(c, 405, "Method Not Allowed", "Only GET and HEAD.");
+    }
+    for (size_t i = 0; i < c->req.n_qp; i++) {
+        s3_str_t k = c->req.qp[i].k;
+        if (is_known_subresource(k)
+            || (k.n >= 6 && (memcmp(k.p, "X-Amz-", 6) == 0 || memcmp(k.p, "x-amz-", 6) == 0)))
+            return web_html(c, 400, "Bad Request", "Unsupported query parameter.");
+    }
+    char bb[64];
+    s3_str_t bucket;
+    if (!web_bucket_from_host(c, bb, &bucket))
+        return web_html(c, 404, "Not Found", "No such website.");
+    store_cfg_ref_t *ref = store_sidecar_get_ttl(c->store, bucket, "website.xml",
+                                                 WEB_MAX_BYTES, web_parse_cb,
+                                                 web_free_cb, 1000);
+    if (!ref) return web_html(c, 404, "Not Found", "No such website.");
+    const web_config_t *w = store_cfg_obj(ref);
+    cors_decorate_bucket(c, bucket);
+
+    int rc;
+    if (w->redirect_host) {
+        char loc[2048];
+        snprintf(loc, sizeof(loc), "%s://%s%.*s",
+                 w->redirect_proto ? w->redirect_proto : "http", w->redirect_host,
+                 (int)(c->req.path.n < 1500 ? c->req.path.n : 1500), c->req.path.p);
+        conn_add_header(c, "Location", loc);
+        rc = web_html(c, 301, "Moved Permanently", "Moved.");
+        goto out;
+    }
+
+    /* Key from the decoded path (leading '/' dropped). */
+    char *kb = scratch_alloc(c, c->req.path.n + strlen(w->index_suffix) + 2);
+    if (!kb) { rc = web_html(c, 414, "URI Too Long", "Path too long."); goto out; }
+    memcpy(kb, c->req.path.p, c->req.path.n);
+    size_t kn = pct_decode(kb, c->req.path.n);
+    char *key = kb;
+    while (kn && *key == '/') { key++; kn--; }
+    if (kn == 0 || key[kn - 1] == '/') {
+        size_t sn = strlen(w->index_suffix);
+        memcpy(key + kn, w->index_suffix, sn);
+        kn += sn;
+    }
+    s3_str_t k = { key, kn };
+    if (web_store_key_exists(c, bucket, k)) {
+        rc = handle_object_get(c, bucket, k, head);
+        goto out;
+    }
+    /* "dir" missing but "dir/<index>" present → 302 to "dir/". */
+    if (kn && key[kn - 1] != '/') {
+        size_t sn = strlen(w->index_suffix);
+        char *alt = scratch_alloc(c, kn + sn + 2);
+        if (alt) {
+            memcpy(alt, key, kn);
+            alt[kn] = '/';
+            memcpy(alt + kn + 1, w->index_suffix, sn);
+            if (web_store_key_exists(c, bucket, (s3_str_t){ alt, kn + 1 + sn })) {
+                char loc[2048];
+                web_dir_location(k, loc, sizeof(loc));
+                conn_add_header(c, "Location", loc);
+                rc = web_html(c, 302, "Found", "Moved.");
+                goto out;
+            }
+        }
+    }
+    if (w->error_key) {
+        s3_str_t ek = { w->error_key, strlen(w->error_key) };
+        s3_reader_t *r;
+        s3_obj_meta_t m;
+        if (store_get_open(c->store, bucket, ek, &r, &m) == S3_OK) {
+            if (rsp_build_object_head_status(c, &m, head, 404, "Not Found") < 0) {
+                store_get_close(r);
+                rc = -1;
+                goto out;
+            }
+            if (head) store_get_close(r);
+            else c->get_reader = r;
+            rc = 0;
+            goto out;
+        }
+    }
+    rc = web_html(c, 404, "Not Found", "The requested page does not exist.");
+out:
+    store_sidecar_put(c->store, ref);
+    return rc;
+}
+
 /* ---- Request classification (S0 + F2) -------------------------------
  *
  * Every request is mapped to exactly one S3 operation from its method,
@@ -1513,7 +1702,7 @@ static s3_action_t classify_service(const conn_t *c, s3_err_t *err) {
 static s3_action_t classify_bucket(const conn_t *c, s3_err_t *err) {
     static const char *const handled[] = {
         "acl", "location", "versioning", "uploads", "delete", "cors",
-        "lifecycle", NULL
+        "lifecycle", "website", NULL
     };
     int unhandled;
     const char *sub = pick_subresource(c, handled, &unhandled);
@@ -1547,6 +1736,10 @@ static s3_action_t classify_bucket(const conn_t *c, s3_err_t *err) {
         if (get) return ACT_GET_BUCKET_LIFECYCLE;
         if (put) return ACT_PUT_BUCKET_LIFECYCLE;
         if (del) return ACT_DELETE_BUCKET_LIFECYCLE;
+    } else if (!strcmp(sub, "website")) {
+        if (get) return ACT_GET_BUCKET_WEBSITE;
+        if (put) return ACT_PUT_BUCKET_WEBSITE;
+        if (del) return ACT_DELETE_BUCKET_WEBSITE;
     }
     *err = S3_ERR_METHOD_NOT_ALLOWED;
     return ACT_NONE;
@@ -1643,6 +1836,7 @@ static int parse_upload_id(const conn_t *c, char out[33]) {
 
 int route_dispatch_headers(conn_t *c) {
     scratch_reset(c);
+    if (c->is_web) return web_dispatch(c);
 
     /* Health check — handled on the raw path before any bucket/key routing. */
     if (c->req.path.n == 8 && memcmp(c->req.path.p, "/_health", 8) == 0) {
