@@ -34,6 +34,21 @@ typedef enum {
     S3_ERR_MALFORMED_XML,               /* XML body could not be parsed */
     S3_ERR_INSUFFICIENT_STORAGE,        /* volume full (ENOSPC/EDQUOT) or free
                                            space below --min-free-bytes */
+    S3_ERR_CHECKSUM_MISMATCH,           /* x-amz-checksum-* / Content-MD5 mismatch */
+    S3_ERR_INVALID_CHECKSUM,            /* malformed checksum header/trailer */
+    S3_ERR_AUTH_QUERY_PARAMS,           /* bad presigned-URL parameters */
+    S3_ERR_PRESIGN_EXPIRED,             /* presigned URL past X-Amz-Expires */
+    S3_ERR_CORS_FORBIDDEN,              /* preflight did not match a rule */
+    S3_ERR_NO_SUCH_CORS,                /* GET ?cors with none set */
+    S3_ERR_NO_SUCH_LIFECYCLE,
+    S3_ERR_NO_SUCH_WEBSITE,
+    S3_ERR_NO_SUCH_POLICY,
+    S3_ERR_NO_SUCH_OBJECT_LOCK,
+    S3_ERR_MALFORMED_POLICY,
+    S3_ERR_NO_SUCH_VERSION,
+    S3_ERR_POLICY_DENIED,               /* explicit Deny in a bucket policy */
+    S3_ERR_LOCKED,
+    S3_ERR_SLOW_DOWN,                   /* auth-failure throttling */                      /* object lock retention / legal hold */
     S3_ERR_MAX
 } s3_err_t;
 
@@ -57,6 +72,23 @@ static inline int s3_str_eq_lit(s3_str_t a, const char *lit) {
     size_t n = 0;
     while (lit[n]) n++;
     return a.n == n && memcmp(a.p, lit, n) == 0;
+}
+
+/* Strict identity / access-key charset for every *write* path that puts a
+ * name into a line-based file (grants sidecar, credentials file via the
+ * admin API): [A-Za-z0-9._@-], 1..128. Rejects ':', CR, LF, NUL, spaces
+ * — anything that could split or forge a line (security review S3). */
+static inline int s3_valid_ident_strict(const char *u) {
+    size_t n = 0;
+    for (; u[n]; n++) {
+        char ch = u[n];
+        if (!((ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z')
+              || (ch >= '0' && ch <= '9') || ch == '.' || ch == '_'
+              || ch == '@' || ch == '-'))
+            return 0;
+        if (n >= 128) return 0;
+    }
+    return n > 0;
 }
 
 #endif /* FS3_S3_H */

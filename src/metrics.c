@@ -4,6 +4,7 @@
  * on purpose. */
 
 #include "metrics.h"
+#include "response.h"
 #include "store.h"
 
 #include <stdio.h>
@@ -44,6 +45,10 @@ void metrics_record(fs3_metrics_t *m, s3_str_t method, int status,
     }
 }
 
+void metrics_error(fs3_metrics_t *m, s3_err_t e) {
+    if (m && e > S3_OK && e < S3_ERR_MAX) m->errors[e]++;
+}
+
 int metrics_render(const fs3_metrics_t *m, struct s3_store *store,
                    char *buf, size_t cap) {
     size_t off = 0;
@@ -82,6 +87,27 @@ int metrics_render(const fs3_metrics_t *m, struct s3_store *store,
          "fs3_request_duration_seconds_count %llu\n",
          m->duration_seconds_sum,
          (unsigned long long)m->duration_seconds_count);
+
+    EMIT("# HELP fs3_errors_total S3 error responses, by error.\n"
+         "# TYPE fs3_errors_total counter\n");
+    for (int e = 1; e < S3_ERR_MAX; e++) {
+        if (!m->errors[e]) continue;
+        EMIT("fs3_errors_total{error=\"%s\",status=\"%d\"} %llu\n",
+             s3_err_name((s3_err_t)e), rsp_status_for_err((s3_err_t)e),
+             (unsigned long long)m->errors[e]);
+    }
+    EMIT("# HELP fs3_lifecycle_expired_total Objects deleted by lifecycle rules.\n"
+         "# TYPE fs3_lifecycle_expired_total counter\n"
+         "fs3_lifecycle_expired_total %llu\n"
+         "# HELP fs3_lifecycle_aborted_mpu_total Multipart uploads aborted by lifecycle rules.\n"
+         "# TYPE fs3_lifecycle_aborted_mpu_total counter\n"
+         "fs3_lifecycle_aborted_mpu_total %llu\n"
+         "# HELP fs3_lifecycle_runs_total Completed lifecycle sweeps.\n"
+         "# TYPE fs3_lifecycle_runs_total counter\n"
+         "fs3_lifecycle_runs_total %llu\n",
+         (unsigned long long)__atomic_load_n(&m->lifecycle_expired_total, __ATOMIC_RELAXED),
+         (unsigned long long)__atomic_load_n(&m->lifecycle_aborted_mpu_total, __ATOMIC_RELAXED),
+         (unsigned long long)__atomic_load_n(&m->lifecycle_runs_total, __ATOMIC_RELAXED));
 
     s3_admin_stats_t st;
     store_admin_stats((s3_store_t *)store, &st);

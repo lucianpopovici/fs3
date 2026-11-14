@@ -10,6 +10,11 @@
  */
 
 #include "server.h"
+#include "action.h"
+#include "lifecycle.h"
+#include "admin.h"
+#include "objlock.h"
+#include "tls.h"
 #include "conn.h"
 #include "iopool.h"
 #include "log.h"
@@ -24,8 +29,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/epoll.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/un.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -34,7 +42,12 @@
 struct server {
     server_cfg_t  cfg;
     int           listen_fd;
+    int           web_fd;       /* website listener, -1 if off */
+    int           tls_fd;       /* native TLS listener, -1 if off */
+    tls_ctx_t    *tls;
     int           admin_fd;     /* -1 unless cfg.metrics_port > 0 */
+    int           admin_uds_fd; /* -1 unless cfg.admin_socket */
+    admin_ctx_t  *admin;
     int           epoll_fd;
     fs3_metrics_t metrics;      /* plain counters; single-threaded loop */
     volatile int  stop;
@@ -46,6 +59,11 @@ struct server {
      * timeout — once every gc_interval_ms of wall clock, sweep the MPU
      * staging area and reap any upload older than gc_max_age_ms. */
     time_t        gc_last_run;       /* monotonic seconds */
+    int           lc_running;        /* a sweep job is in flight */
+    int           lc_last_yday;      /* day of year of the last scheduled run */
+    int           lc_pending_now;    /* run at the first tick (--lifecycle-now) */
+    time_t        clock_wall_last;   /* clock-jump detection (item 10.6) */
+    time_t        clock_mono_last;
     int           gc_interval_s;     /* sweep cadence */
     uint64_t      gc_max_age_ms;     /* TTL */
     /* Idle-connection sweep (cfg.idle_timeout_s > 0). Runs at most once
@@ -152,60 +170,117 @@ static int admin_render_buckets(struct s3_store *store,
     return rc < 0 ? -1 : (int)off;
 }
 
-static void admin_handle(server_t *s) {
+/* Read one admin request: headers, then Content-Length body (≤ 16 KiB).
+ * Sockets have short timeouts; this is a localhost control channel. */
+static ssize_t admin_read_request(int fd, char *req, size_t cap) {
+    size_t n = 0;
     for (;;) {
-        int fd = accept4(s->admin_fd, NULL, NULL, SOCK_CLOEXEC);
+        if (n + 1 >= cap) return -1;
+        ssize_t r = read(fd, req + n, cap - 1 - n);
+        if (r <= 0) return n ? (ssize_t)n : -1;
+        n += (size_t)r;
+        req[n] = '\0';
+        char *end = strstr(req, "\r\n\r\n");
+        if (!end) continue;
+        size_t clen = 0;
+        for (char *h = req; h && h < end; h = strstr(h, "\r\n")) {
+            if (*h == '\r') h += 2;
+            if (strncasecmp(h, "content-length:", 15) == 0) {
+                clen = strtoul(h + 15, NULL, 10);
+                break;
+            }
+        }
+        if (clen > 16 * 1024) return -1;
+        if (n >= (size_t)(end + 4 - req) + clen) return (ssize_t)n;
+    }
+}
+
+static void admin_serve_fd(server_t *s, int fd, int via_uds) {
+    struct timeval tv = { .tv_usec = 200 * 1000 };
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+    static char req[20 * 1024];
+    ssize_t r = admin_read_request(fd, req, sizeof(req));
+    if (r <= 0) return;
+
+    if (strncmp(req, "GET /v1/", 8) == 0 || strncmp(req, "POST /v1/", 9) == 0
+        || strncmp(req, "PUT /v1/", 8) == 0 || strncmp(req, "DELETE /v1/", 11) == 0) {
+        size_t rn = 0;
+        char *resp = s->admin ? admin_handle_v1(s->admin, req, (size_t)r, via_uds, &rn) : NULL;
+        if (resp) {
+            (void)!write(fd, resp, rn);
+            free(resp);
+        }
+        return;
+    }
+    if (via_uds) {
+        admin_respond(fd, "404 Not Found", "text/plain", "not found\n", 10);
+        return;
+    }
+    if (strncmp(req, "GET /healthz", 12) == 0
+        || strncmp(req, "HEAD /healthz", 13) == 0) {
+        admin_respond(fd, "200 OK", "text/plain", "ok\n", 3);
+    } else if (strncmp(req, "GET /buckets", 12) == 0) {
+        static char body[64 * 1024];
+        int blen = admin_render_buckets(s->store, body, sizeof(body));
+        if (blen < 0) {
+            admin_respond(fd, "500 Internal Server Error",
+                          "text/plain", "render overflow\n", 16);
+        } else {
+            admin_respond(fd, "200 OK", "text/plain", body, (size_t)blen);
+        }
+    } else if (strncmp(req, "GET /metrics", 12) == 0) {
+        static char body[64 * 1024];
+        int blen = metrics_render(&s->metrics, s->store, body, sizeof(body));
+        if (blen < 0) {
+            admin_respond(fd, "500 Internal Server Error",
+                          "text/plain", "render overflow\n", 16);
+        } else {
+            admin_respond(fd, "200 OK", "text/plain; version=0.0.4",
+                          body, (size_t)blen);
+        }
+    } else {
+        admin_respond(fd, "404 Not Found", "text/plain", "not found\n", 10);
+    }
+}
+
+static void admin_handle(server_t *s, int lfd, int via_uds) {
+    for (;;) {
+        int fd = accept4(lfd, NULL, NULL, SOCK_CLOEXEC);
         if (fd < 0) {
             if (errno == EINTR) continue;
             return;  /* EAGAIN — drained */
         }
-        struct timeval tv = { .tv_usec = 200 * 1000 };
-        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-
-        char req[2048];
-        ssize_t r = read(fd, req, sizeof(req) - 1);
-        if (r <= 0) { close(fd); continue; }
-        req[r] = '\0';
-
-        if (strncmp(req, "GET /healthz", 12) == 0
-            || strncmp(req, "HEAD /healthz", 13) == 0) {
-            admin_respond(fd, "200 OK", "text/plain", "ok\n", 3);
-        } else if (strncmp(req, "GET /buckets", 12) == 0) {
-            static char body[64 * 1024];
-            int blen = admin_render_buckets(s->store, body, sizeof(body));
-            if (blen < 0) {
-                admin_respond(fd, "500 Internal Server Error",
-                              "text/plain", "render overflow\n", 16);
-            } else {
-                admin_respond(fd, "200 OK", "text/plain",
-                              body, (size_t)blen);
+        if (via_uds) {
+            /* S10: only our own uid (or root) may use the socket, on top
+             * of its 0600 mode. */
+            struct ucred cr;
+            socklen_t cl = sizeof(cr);
+            if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &cr, &cl) < 0
+                || (cr.uid != geteuid() && cr.uid != 0)) {
+                LOG_W("admin socket: refused peer uid");
+                close(fd);
+                continue;
             }
-        } else if (strncmp(req, "GET /metrics", 12) == 0) {
-            static char body[32 * 1024];
-            int blen = metrics_render(&s->metrics, s->store,
-                                      body, sizeof(body));
-            if (blen < 0) {
-                admin_respond(fd, "500 Internal Server Error",
-                              "text/plain", "render overflow\n", 16);
-            } else {
-                admin_respond(fd, "200 OK",
-                              "text/plain; version=0.0.4",
-                              body, (size_t)blen);
-            }
-        } else {
-            admin_respond(fd, "404 Not Found", "text/plain",
-                          "not found\n", 10);
         }
+        admin_serve_fd(s, fd, via_uds);
         close(fd);
     }
 }
 
 server_t *server_create(const server_cfg_t *cfg) {
+    if (action_selfcheck() != 0) {
+        LOG_E("action table incomplete: refusing to start (default deny)");
+        return NULL;
+    }
     server_t *s = calloc(1, sizeof(*s));
     if (!s) return NULL;
     s->cfg = *cfg;
     s->listen_fd = -1;
+    s->web_fd = -1;
+    s->tls_fd = -1;
+    s->admin_uds_fd = -1;
     s->admin_fd = -1;
     s->epoll_fd = -1;
 
@@ -287,6 +362,77 @@ server_t *server_create(const server_cfg_t *cfg) {
         }
     }
 
+    /* Native TLS listener (item 7). */
+    if (cfg->tls_port > 0) {
+        if (!tls_available()) {
+            LOG_E("--tls-port: this binary was built without TLS (make TLS=1)");
+            goto fail;
+        }
+        s->tls = tls_ctx_new(cfg->tls_cert, cfg->tls_key);
+        if (!s->tls) goto fail;
+        s->tls_fd = listen_socket(cfg->tls_addr ? cfg->tls_addr : cfg->bind_addr,
+                                  cfg->tls_port, cfg->backlog);
+        if (s->tls_fd < 0) goto fail;
+        struct epoll_event tev = { .events = EPOLLIN, .data.ptr = &s->tls_fd };
+        if (epoll_ctl(s->epoll_fd, EPOLL_CTL_ADD, s->tls_fd, &tev) < 0) goto fail;
+        LOG_I("TLS listener on %s:%u", cfg->tls_addr ? cfg->tls_addr : cfg->bind_addr,
+              cfg->tls_port);
+    }
+
+    /* Admin API (item 11). */
+    {
+        admin_cfg_t ac = {
+            .store = s->store, .token = cfg->admin_token,
+            .cred_file = cfg->admin_cred_file,
+            .reload = cfg->admin_reload, .reload_user = cfg->admin_reload_user,
+        };
+        s->admin = admin_create(&ac);
+        if (!s->admin) goto fail;
+    }
+    if (cfg->admin_socket) {
+        struct sockaddr_un su = { .sun_family = AF_UNIX };
+        if (strlen(cfg->admin_socket) >= sizeof(su.sun_path)) {
+            LOG_E("--admin-socket path too long");
+            goto fail;
+        }
+        snprintf(su.sun_path, sizeof(su.sun_path), "%s", cfg->admin_socket);
+        struct stat lst;
+        if (lstat(su.sun_path, &lst) == 0) {
+            if (!S_ISSOCK(lst.st_mode)) {
+                LOG_E("--admin-socket %s exists and is not a socket", su.sun_path);
+                goto fail;
+            }
+            unlink(su.sun_path);
+        }
+        s->admin_uds_fd = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+        mode_t old = umask(0177);          /* socket file created 0600 */
+        int br = s->admin_uds_fd < 0 ? -1
+               : bind(s->admin_uds_fd, (struct sockaddr *)&su, sizeof(su));
+        umask(old);
+        if (br < 0 || chmod(su.sun_path, 0600) < 0 || listen(s->admin_uds_fd, 16) < 0) {
+            LOG_E("admin socket %s: %s", su.sun_path, strerror(errno));
+            goto fail;
+        }
+        struct epoll_event uev = { .events = EPOLLIN, .data.ptr = &s->admin_uds_fd };
+        if (epoll_ctl(s->epoll_fd, EPOLL_CTL_ADD, s->admin_uds_fd, &uev) < 0) goto fail;
+        LOG_I("admin API on unix:%s", su.sun_path);
+    }
+
+    /* Website listener (item 6). */
+    if (cfg->web_port > 0) {
+        s->web_fd = listen_socket(cfg->web_addr ? cfg->web_addr : "127.0.0.1",
+                                  cfg->web_port, cfg->backlog);
+        if (s->web_fd < 0) goto fail;
+        struct epoll_event wev = { .events = EPOLLIN, .data.ptr = &s->web_fd };
+        if (epoll_ctl(s->epoll_fd, EPOLL_CTL_ADD, s->web_fd, &wev) < 0) {
+            LOG_E("epoll_ctl ADD web: %s", strerror(errno));
+            goto fail;
+        }
+        LOG_I("website listener on %s:%u (root domain %s)",
+              cfg->web_addr ? cfg->web_addr : "127.0.0.1", cfg->web_port,
+              cfg->web_root_domain ? cfg->web_root_domain : "-");
+    }
+
     /* Admin/metrics listener — localhost only, by design. */
     if (cfg->metrics_port > 0) {
         s->admin_fd = listen_socket("127.0.0.1", cfg->metrics_port, 16);
@@ -310,6 +456,13 @@ server_t *server_create(const server_cfg_t *cfg) {
                        ? cfg->gc_max_age_ms
                        : (24ULL * 3600 * 1000);
     s->gc_last_run = time(NULL);
+    s->lc_last_yday = -1;
+    s->lc_pending_now = cfg->lifecycle_now;
+    /* Bucket lifecycle abort rules override the global MPU TTL. */
+    store_set_mpu_gc_filter(s->store, lc_mpu_gc_filter, s->store);
+    /* Object lock is enforced in the store: no path deletes a locked
+     * version (item 10). */
+    store_set_version_guard(s->store, olock_guard, s->store);
     return s;
 
 fail:
@@ -333,6 +486,14 @@ void server_destroy(server_t *s) {
      * gets committed) before the store they write into goes away. */
     iopool_destroy(s->pool);
     if (s->listen_fd >= 0) close(s->listen_fd);
+    if (s->web_fd >= 0) close(s->web_fd);
+    if (s->tls_fd >= 0) close(s->tls_fd);
+    tls_ctx_free(s->tls);
+    if (s->admin_uds_fd >= 0) {
+        close(s->admin_uds_fd);
+        if (s->cfg.admin_socket) unlink(s->cfg.admin_socket);
+    }
+    admin_destroy(s->admin);
     if (s->admin_fd  >= 0) close(s->admin_fd);
     if (s->epoll_fd  >= 0) close(s->epoll_fd);
     if (s->store) store_close(s->store);
@@ -383,11 +544,41 @@ static void close_conn(server_t *s, conn_t *c) {
     s->n_conns--;
 }
 
-static void accept_new(server_t *s) {
+/* Handshake-flood bounds (S8): at most this many TLS handshakes in
+ * flight, and this many TLS connections per client address. */
+#define TLS_MAX_HANDSHAKES 64
+
+static int tls_admission(server_t *s, const struct sockaddr_in *sa) {
+    int hs = 0, same = 0;
+    char ip[64];
+    inet_ntop(AF_INET, &sa->sin_addr, ip, sizeof(ip));
+    size_t ipn = strlen(ip);
+    for (conn_t *c = s->conns_head; c; c = c->list_next) {
+        if (!c->conn_tls) continue;
+        if (c->tls_handshaking) hs++;
+        if (!strncmp(c->peer, ip, ipn) && c->peer[ipn] == ':') same++;
+    }
+    int per_ip = s->cfg.tls_max_per_ip > 0 ? s->cfg.tls_max_per_ip : 32;
+    return hs < TLS_MAX_HANDSHAKES && same < per_ip;
+}
+
+void server_tls_reload(server_t *s) {
+    if (!s || !s->tls || !s->cfg.tls_cert) return;
+    tls_ctx_t *n = tls_ctx_new(s->cfg.tls_cert, s->cfg.tls_key);
+    if (!n) {
+        LOG_E("TLS reload failed; keeping the current certificate");
+        return;
+    }
+    tls_ctx_free(s->tls);
+    s->tls = n;
+    LOG_I("TLS certificate reloaded");
+}
+
+static void accept_new(server_t *s, int lfd, int is_web) {
     for (;;) {
         struct sockaddr_in sa;
         socklen_t slen = sizeof(sa);
-        int fd = accept4(s->listen_fd, (struct sockaddr *)&sa, &slen,
+        int fd = accept4(lfd, (struct sockaddr *)&sa, &slen,
                          SOCK_NONBLOCK | SOCK_CLOEXEC);
         if (fd < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) return;
@@ -398,6 +589,12 @@ static void accept_new(server_t *s) {
 
         if (s->n_conns >= s->cfg.max_conns) {
             LOG_W("conn cap reached (%d), rejecting", s->cfg.max_conns);
+            close(fd);
+            continue;
+        }
+        int is_tls = lfd == s->tls_fd;
+        if (is_tls && !tls_admission(s, &sa)) {
+            LOG_W("TLS handshake/per-IP cap reached, rejecting");
             close(fd);
             continue;
         }
@@ -419,6 +616,21 @@ static void accept_new(server_t *s) {
             continue;
         }
         c->last_activity = time(NULL);
+        c->is_web = is_web;
+        c->web_root_domain = s->cfg.web_root_domain;
+        c->allow_public = s->cfg.allow_public;
+        c->allow_public_write = s->cfg.allow_public_write;
+        c->trusted_proxies = s->cfg.trusted_proxies;
+        c->require_tls = s->cfg.require_tls;
+        c->require_signed_payload = s->cfg.require_signed_payload;
+        if (is_tls && tls_conn_attach(c, s->tls) < 0) {
+            LOG_E("TLS attach failed");
+            close(fd);
+            conn_destroy(c);
+            continue;
+        }
+        c->max_retention_ms = (uint64_t)(s->cfg.max_retention_days > 0
+                                         ? s->cfg.max_retention_days : 3650) * 86400000ULL;
 
         struct epoll_event ev = {
             .events = EPOLLIN | EPOLLRDHUP,
@@ -435,6 +647,69 @@ static void accept_new(server_t *s) {
         s->n_conns++;
         LOG_D("accepted fd=%d peer=%s n_conns=%d", fd, peer, s->n_conns);
     }
+}
+
+/* ---- Lifecycle sweep job (item 5) ------------------------------------- */
+
+typedef struct {
+    iojob_t     base;
+    server_t   *srv;
+    lc_opts_t   opts;
+    lc_stats_t  stats;
+} lc_job_t;
+
+static void lc_job_run(iojob_t *j) {
+    lc_job_t *lj = (lc_job_t *)j;
+    lc_sweep(lj->srv->store, &lj->opts, &lj->stats);
+}
+
+static void lc_job_done(iojob_t *j) {
+    lc_job_t *lj = (lc_job_t *)j;
+    lj->srv->lc_running = 0;
+    __atomic_fetch_add(&lj->srv->metrics.lifecycle_runs_total, 1, __ATOMIC_RELAXED);
+    LOG_I("lifecycle: %llu bucket(s) with rules, %llu object(s) scanned, "
+          "%llu expired, %llu upload(s) aborted, %llu skipped (changed)%s",
+          (unsigned long long)lj->stats.buckets,
+          (unsigned long long)lj->stats.scanned,
+          (unsigned long long)lj->stats.expired,
+          (unsigned long long)lj->stats.aborted,
+          (unsigned long long)lj->stats.skipped_changed,
+          lj->opts.dry_run ? " [dry run]" : "");
+    free(lj);
+}
+
+static void lc_maybe_start(server_t *s, time_t now) {
+    if (s->lc_running) return;
+    int due = s->lc_pending_now;
+    if (!due && s->cfg.lifecycle_hour >= 0) {
+        struct tm lt;
+        localtime_r(&now, &lt);
+        due = lt.tm_hour == s->cfg.lifecycle_hour && lt.tm_yday != s->lc_last_yday;
+        if (due) s->lc_last_yday = lt.tm_yday;
+    }
+    if (!due) return;
+    s->lc_pending_now = 0;
+    lc_job_t *lj = calloc(1, sizeof(*lj));
+    if (!lj) return;
+    lj->base.run  = lc_job_run;
+    lj->base.done = lc_job_done;
+    lj->srv = s;
+    lj->opts.now_ms = ((int64_t)now + s->cfg.lifecycle_time_offset_s) * 1000;
+    lj->opts.rate_per_s = s->cfg.lifecycle_rate;
+    lj->opts.dry_run = s->cfg.lifecycle_dry_run;
+    lj->opts.expired_total = &s->metrics.lifecycle_expired_total;
+    lj->opts.aborted_total = &s->metrics.lifecycle_aborted_mpu_total;
+    s->lc_running = 1;
+    /* Never walk buckets on the event loop: without a pool (io_threads 0)
+     * the sweep is skipped. */
+    if (!s->pool) {
+        LOG_W("lifecycle: --io-threads 0, sweep skipped (would block the loop)");
+        s->lc_running = 0;
+        free(lj);
+        return;
+    }
+    LOG_I("lifecycle: sweep started");
+    iopool_submit(s->pool, &lj->base);
 }
 
 int server_run(server_t *s) {
@@ -469,19 +744,49 @@ int server_run(server_t *s) {
             s->gc_last_run = now;
         }
 
+        lc_maybe_start(s, now);
+
+        /* Retention trusts the wall clock: warn if it jumps backwards by
+         * more than an hour relative to the monotonic clock. */
+        {
+            struct timespec mt;
+            clock_gettime(CLOCK_MONOTONIC, &mt);
+            if (s->clock_mono_last) {
+                long expect = (long)(s->clock_wall_last + (mt.tv_sec - s->clock_mono_last));
+                if ((long)now < expect - 3600)
+                    LOG_W("wall clock jumped backwards by %ld s: object lock retention "
+                          "and lifecycle rely on it", expect - (long)now);
+            }
+            s->clock_wall_last = now;
+            s->clock_mono_last = mt.tv_sec;
+        }
+
         int jobs_ready = 0;
         for (int i = 0; i < n; i++) {
             struct epoll_event *e = &events[i];
 
             /* Listening socket */
             if (e->data.ptr == NULL) {
-                if (e->events & EPOLLIN) accept_new(s);
+                if (e->events & EPOLLIN) accept_new(s, s->listen_fd, 0);
+                continue;
+            }
+            if (e->data.ptr == (void *)&s->tls_fd) {
+                if (e->events & EPOLLIN) accept_new(s, s->tls_fd, 0);
+                continue;
+            }
+            /* Website listener (marker: &s->web_fd). */
+            if (e->data.ptr == (void *)&s->web_fd) {
+                if (e->events & EPOLLIN) accept_new(s, s->web_fd, 1);
                 continue;
             }
 
             /* Admin/metrics listener (marker: the server pointer). */
             if (e->data.ptr == (void *)s) {
-                if (e->events & EPOLLIN) admin_handle(s);
+                if (e->events & EPOLLIN) admin_handle(s, s->admin_fd, 0);
+                continue;
+            }
+            if (e->data.ptr == (void *)&s->admin_uds_fd) {
+                if (e->events & EPOLLIN) admin_handle(s, s->admin_uds_fd, 1);
                 continue;
             }
 

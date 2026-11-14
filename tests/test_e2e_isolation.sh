@@ -310,5 +310,74 @@ else
 fi
 stop_server
 
+# ===================================================================
+# 10. Per-user bucket grants (item 3): buckets/<b>/grants, user:perms
+#     with perms ⊆ rwo. Edited directly here, as the DSM console would;
+#     changes apply without a restart.
+# ===================================================================
+write_creds "$A1" "$A1S"
+start_server --credentials-file "$CRED_FILE" --require-auth --admin root
+check_eq "alice creates shared bucket" \
+    "$(req $A1 $A1S --method PUT --url "$URL/alice-shared")" "STATUS=200"
+check_eq "alice uploads to shared" \
+    "$(req $A1 $A1S --method PUT --url "$URL/alice-shared/doc.txt" --body "shared doc")" \
+    "STATUS=200"
+check_eq "bob: no grant → 403" \
+    "$(req $B $BS --method GET --url "$URL/alice-shared/doc.txt")" "STATUS=403"
+printf 'bob:r\n' > "$DATA/buckets/alice-shared/grants"
+check_eq "bob r: GET → 200" \
+    "$(req $B $BS --method GET --url "$URL/alice-shared/doc.txt")" "STATUS=200"
+check_eq "bob r: list → 200" \
+    "$(req $B $BS --method GET --url "$URL/alice-shared")" "STATUS=200"
+check_eq "bob r: PUT → 403" \
+    "$(req $B $BS --method PUT --url "$URL/alice-shared/x" --body x)" "STATUS=403"
+check_eq "bob r: DELETE → 403" \
+    "$(req $B $BS --method DELETE --url "$URL/alice-shared/doc.txt")" "STATUS=403"
+check_eq "bob r: GET ?acl (config) → 403" \
+    "$(req $B $BS --method GET --url "$URL/alice-shared?acl")" "STATUS=403"
+check_has "bob r: bucket listed in ListAllMyBuckets" \
+    "$(req_body $B $BS --method GET --url "$URL/")" "alice-shared"
+check_lacks "carol (no grant) doesn't see it" \
+    "$(req_body $C $CS --method GET --url "$URL/")" "alice-shared"
+printf 'bob:rw\n%s:o\n' "$C" > "$DATA/buckets/alice-shared/grants.new"
+mv "$DATA/buckets/alice-shared/grants.new" "$DATA/buckets/alice-shared/grants"
+check_eq "bob rw: PUT → 200" \
+    "$(req $B $BS --method PUT --url "$URL/alice-shared/bob.txt" --body b)" "STATUS=200"
+check_eq "bob rw: DELETE bucket still → 403" \
+    "$(req $B $BS --method DELETE --url "$URL/alice-shared")" "STATUS=403"
+check_eq "carol o: GET ?acl → 200" \
+    "$(req $C $CS --method GET --url "$URL/alice-shared?acl")" "STATUS=200"
+check_eq "carol o: GET object (no r) → 403" \
+    "$(req $C $CS --method GET --url "$URL/alice-shared/doc.txt")" "STATUS=403"
+check_eq "bob rw: copy from his own bucket in" \
+    "$(req $B $BS --method PUT --url "$URL/alice-shared/copied" \
+        --header "x-amz-copy-source:/alice-shared/doc.txt")" "STATUS=200"
+check_eq "bob rw: copy alice-shared → alice-bkt (no grant there) → 403" \
+    "$(req $B $BS --method PUT --url "$URL/alice-bkt/stolen" \
+        --header "x-amz-copy-source:/alice-shared/doc.txt")" "STATUS=403"
+# Malformed lines never widen access.
+printf 'bob:rwx\nbob\n:rw\nb ob:rw\n' > "$DATA/buckets/alice-shared/grants"
+check_eq "malformed grant lines ignored → 403" \
+    "$(req $B $BS --method GET --url "$URL/alice-shared/doc.txt")" "STATUS=403"
+# Revocation without restart.
+printf 'bob:r\n' > "$DATA/buckets/alice-shared/grants"
+check_eq "re-granted r" \
+    "$(req $B $BS --method GET --url "$URL/alice-shared/doc.txt")" "STATUS=200"
+rm "$DATA/buckets/alice-shared/grants"
+check_eq "revoked → 403 without restart" \
+    "$(req $B $BS --method GET --url "$URL/alice-shared/doc.txt")" "STATUS=403"
+# Delete and re-create drops grants.
+printf 'bob:rw\n' > "$DATA/buckets/alice-shared/grants"
+for k in doc.txt bob.txt copied; do
+    req $A1 $A1S --method DELETE --url "$URL/alice-shared/$k" >/dev/null
+done
+check_eq "alice deletes shared bucket" \
+    "$(req $A1 $A1S --method DELETE --url "$URL/alice-shared")" "STATUS=204"
+check_eq "alice re-creates it" \
+    "$(req $A1 $A1S --method PUT --url "$URL/alice-shared")" "STATUS=200"
+check_eq "old grant gone after re-create" \
+    "$(req $B $BS --method GET --url "$URL/alice-shared")" "STATUS=403"
+stop_server
+
 printf '\n===== isolation e2e: %d passed, %d failed =====\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

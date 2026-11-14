@@ -3,8 +3,14 @@
 #include "log.h"
 #include "server.h"
 #include "sigv4.h"
+#include "audit.h"
 
+#include <errno.h>
+#include <fcntl.h>
 #include <getopt.h>
+#include <sys/prctl.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -56,9 +62,47 @@ static void usage(const char *argv0) {
         "                             (default 4; 0 = run them on the event loop)\n"
         "      --mpu-gc-interval N    seconds between MPU GC sweeps (default 60)\n"
         "      --mpu-gc-max-age N     seconds before a stale MPU is reaped (default 86400)\n"
+        "", argv0);
+    fprintf(stderr,
+        "      --presign-max-expires N  longest accepted presigned-URL lifetime in\n"
+        "                             seconds (default 86400; at most 604800)\n"
+        "      --no-presign-admin     refuse presigned URLs signed by an --admin user\n"
+        "      --lifecycle-hour H     run the lifecycle sweeper daily at local hour H\n"
+        "                             (default 3; -1 = never)\n"
+        "      --lifecycle-now        also run a sweep right after startup\n"
+        "      --lifecycle-rate N     max lifecycle deletions per second (default 100; 0 = no cap)\n"
+        "      --lifecycle-dry-run    log what the sweeper would delete, delete nothing\n"
+        "      --lifecycle-time-offset S  shift the sweeper's clock by S seconds (testing)\n"
+        "      --web-port <num>       serve static websites (anonymous GET/HEAD) here\n"
+        "      --web-addr <ip>        website listener address (default 127.0.0.1)\n"
+        "      --web-root-domain <d>  websites at <bucket>.<d> (else Host = bucket name)\n"
+        "      --allow-public         allow website configs / public bucket policies\n"
+        "      --allow-public-write   also allow public policies that grant writes\n"
+        "      --trusted-proxy <ip>   honour X-Forwarded-For/-Proto from this proxy\n"
+        "                             (repeatable; e.g. 127.0.0.1 behind DSM)\n"
+        "      --tls-port <num>       native TLS listener (make TLS=1 builds); plain and\n"
+        "                             TLS listeners can run together\n"
+        "      --tls-addr <ip>        TLS bind address (default: --addr)\n"
+        "      --tls-cert <pem>       certificate chain; --tls-key <pem> key (mode 0600)\n"
+        "                             SIGHUP re-reads both (a bad file keeps the old ones)\n"
+        "      --audit-log <file>     append one JSON line per request + admin change\n"
+        "                             (no query strings / signatures); SIGHUP reopens\n"
+        "      --auth-fail-limit N    auth failures per client IP per minute before\n"
+        "                             503 SlowDown backoff (default 20; 0 = off)\n"
+        "      --tls-max-per-ip N     concurrent TLS connections per client IP (default 32);\n"
+        "                             at most 64 handshakes in flight overall\n"
+        "      --require-tls          refuse signed requests over plain HTTP unless\n"
+        "                             from loopback or a trusted proxy saying https\n"
+        "      --require-signed-payload  refuse UNSIGNED-PAYLOAD / unsigned trailer\n"
+        "                             uploads and presigned writes unless over TLS\n"
+        "      --max-retention-days N longest object-lock retention clients may set\n"
+        "                             (default 3650)\n"
+        "      --admin-token-file <f> bearer token for the /v1 admin API on the metrics\n"
+        "                             port; file must be mode 0600 and owned by us\n"
+        "      --admin-socket <path>  serve the /v1 admin API on a unix socket (0600)\n"
+        "                             (block-public-access is on by default)\n"
         "  -v, --verbose              debug logging\n"
-        "  -h, --help                 this help\n",
-        argv0);
+        "  -h, --help                 this help\n");
 }
 
 /* Parse a size string with optional K/M/G suffix. Returns 0 on error. */
@@ -169,35 +213,49 @@ typedef struct {
     int               n_auth_specs;
 } reload_ctx_t;
 
+static int do_reload(void *user);
+
 static void reload_tick(void *user) {
     if (!g_reload) return;
     g_reload = 0;
     reload_ctx_t *r = user;
+    if (r->cred_file) (void)do_reload(user);
+#ifndef FS3_MAIN_TESTING
+    server_tls_reload(g_server);
+    audit_reopen();             /* log rotation */
+#endif
+}
+
+/* Build-then-swap credential reload; also called by the admin API after
+ * it rewrites the credentials file. 0 on success. */
+static int do_reload(void *user) {
+    reload_ctx_t *r = user;
     if (!r->live || !r->cred_file) {
         LOG_W("SIGHUP: credential reload needs --credentials-file; ignored");
-        return;
+        return -1;
     }
     sigv4_verifier_t *scratch = sigv4_create();
     if (!scratch) {
         LOG_E("SIGHUP reload: out of memory; keeping old credentials");
-        return;
+        return -1;
     }
     for (int i = 0; i < r->n_auth_specs; i++) {
         if (parse_and_add_cred(scratch, r->auth_specs[i]) < 0) {
             LOG_E("SIGHUP reload: bad --auth spec; keeping old credentials");
             sigv4_destroy(scratch);
-            return;
+            return -1;
         }
     }
     if (load_credentials_file(scratch, r->cred_file) < 0) {
         LOG_E("SIGHUP reload: cannot load %s; keeping old credentials",
               r->cred_file);
         sigv4_destroy(scratch);
-        return;
+        return -1;
     }
     sigv4_swap_creds(r->live, scratch);
     sigv4_destroy(scratch);  /* now holds (and zeroes) the old list */
     LOG_I("SIGHUP: credentials reloaded from %s", r->cred_file);
+    return 0;
 }
 
 enum {
@@ -214,9 +272,62 @@ enum {
     OPT_IO_THREADS,
     OPT_ADMIN,
     OPT_LEGACY_OWNER,
+    OPT_PRESIGN_MAX_EXPIRES,
+    OPT_NO_PRESIGN_ADMIN,
+    OPT_LIFECYCLE_HOUR,
+    OPT_LIFECYCLE_NOW,
+    OPT_LIFECYCLE_RATE,
+    OPT_LIFECYCLE_DRY_RUN,
+    OPT_LIFECYCLE_TIME_OFFSET,
+    OPT_WEB_ADDR,
+    OPT_WEB_PORT,
+    OPT_WEB_ROOT_DOMAIN,
+    OPT_ALLOW_PUBLIC,
+    OPT_ADMIN_TOKEN_FILE,
+    OPT_ADMIN_SOCKET,
+    OPT_ALLOW_PUBLIC_WRITE,
+    OPT_TRUSTED_PROXY,
+    OPT_MAX_RETENTION_DAYS,
+    OPT_TLS_PORT,
+    OPT_TLS_ADDR,
+    OPT_TLS_CERT,
+    OPT_TLS_KEY,
+    OPT_REQUIRE_TLS,
+    OPT_REQUIRE_SIGNED_PAYLOAD,
+    OPT_TLS_MAX_PER_IP,
+    OPT_AUDIT_LOG,
+    OPT_AUTH_FAIL_LIMIT,
 };
 
 #ifndef FS3_MAIN_TESTING
+/* Read a secret (first line, trimmed) from a file that must be a
+ * regular file, mode 0600 (no group/other bits), owned by our euid —
+ * else refuse to start (S8/S10). */
+static int read_secret_file(const char *path, char *out, size_t cap) {
+    int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    struct stat st;
+    if (fd < 0 || fstat(fd, &st) < 0) {
+        fprintf(stderr, "%s: cannot open: %s\n", path, strerror(errno));
+        if (fd >= 0) close(fd);
+        return -1;
+    }
+    if (!S_ISREG(st.st_mode) || (st.st_mode & 077) || st.st_uid != geteuid()) {
+        fprintf(stderr, "%s: must be a regular file, mode 0600, owned by the "
+                        "service user\n", path);
+        close(fd);
+        return -1;
+    }
+    ssize_t n = read(fd, out, cap - 1);
+    close(fd);
+    if (n <= 0) { fprintf(stderr, "%s: empty\n", path); return -1; }
+    out[n] = '\0';
+    out[strcspn(out, "\r\n")] = '\0';
+    size_t len = strlen(out);
+    while (len && (out[len-1] == ' ' || out[len-1] == '\t')) out[--len] = '\0';
+    if (len < 16) { fprintf(stderr, "%s: secret must be at least 16 characters\n", path); return -1; }
+    return 0;
+}
+
 int main(int argc, char **argv) {
     const char *addr = "127.0.0.1";
     const char *data_root = "/tmp/fs3-data";
@@ -242,6 +353,22 @@ int main(int argc, char **argv) {
     const char *admins[32];
     int n_admins = 0;
     const char *legacy_owner = NULL;
+    long presign_max_expires = 86400;   /* 24 h; AWS allows 7 days */
+    int no_presign_admin = 0;
+    int lifecycle_hour = 3, lifecycle_now = 0, lifecycle_rate = 100;
+    int lifecycle_dry_run = 0;
+    long lifecycle_time_offset = 0;
+    const char *web_addr = "127.0.0.1", *web_root_domain = NULL;
+    int web_port = 0, allow_public = 0;
+    char admin_token[256] = "";
+    const char *admin_socket = NULL;
+    int allow_public_write = 0;
+    int max_retention_days = 3650;
+    const char *audit_log = NULL;
+    int auth_fail_limit = 20;
+    int tls_port = 0, require_tls = 0, require_signed_payload = 0, tls_max_per_ip = 32;
+    const char *tls_addr = NULL, *tls_cert = NULL, *tls_key = NULL;
+    char trusted_proxies[1024] = "";
     sigv4_verifier_t *auth = NULL;
     reload_ctx_t reload_ctx = {0};
 
@@ -262,6 +389,31 @@ int main(int argc, char **argv) {
         { "legacy-owner",     required_argument, NULL, OPT_LEGACY_OWNER },
         { "mpu-gc-interval",  required_argument, NULL, OPT_MPU_GC_INTERVAL },
         { "mpu-gc-max-age",   required_argument, NULL, OPT_MPU_GC_MAX_AGE },
+        { "presign-max-expires", required_argument, NULL, OPT_PRESIGN_MAX_EXPIRES },
+        { "no-presign-admin", no_argument,       NULL, OPT_NO_PRESIGN_ADMIN },
+        { "lifecycle-hour",   required_argument, NULL, OPT_LIFECYCLE_HOUR },
+        { "lifecycle-now",    no_argument,       NULL, OPT_LIFECYCLE_NOW },
+        { "lifecycle-rate",   required_argument, NULL, OPT_LIFECYCLE_RATE },
+        { "lifecycle-dry-run", no_argument,      NULL, OPT_LIFECYCLE_DRY_RUN },
+        { "lifecycle-time-offset", required_argument, NULL, OPT_LIFECYCLE_TIME_OFFSET },
+        { "web-addr",         required_argument, NULL, OPT_WEB_ADDR },
+        { "web-port",         required_argument, NULL, OPT_WEB_PORT },
+        { "web-root-domain",  required_argument, NULL, OPT_WEB_ROOT_DOMAIN },
+        { "allow-public",     no_argument,       NULL, OPT_ALLOW_PUBLIC },
+        { "admin-token-file", required_argument, NULL, OPT_ADMIN_TOKEN_FILE },
+        { "admin-socket",     required_argument, NULL, OPT_ADMIN_SOCKET },
+        { "allow-public-write", no_argument,     NULL, OPT_ALLOW_PUBLIC_WRITE },
+        { "trusted-proxy",    required_argument, NULL, OPT_TRUSTED_PROXY },
+        { "max-retention-days", required_argument, NULL, OPT_MAX_RETENTION_DAYS },
+        { "tls-port",         required_argument, NULL, OPT_TLS_PORT },
+        { "tls-addr",         required_argument, NULL, OPT_TLS_ADDR },
+        { "tls-cert",         required_argument, NULL, OPT_TLS_CERT },
+        { "tls-key",          required_argument, NULL, OPT_TLS_KEY },
+        { "require-tls",      no_argument,       NULL, OPT_REQUIRE_TLS },
+        { "tls-max-per-ip",   required_argument, NULL, OPT_TLS_MAX_PER_IP },
+        { "audit-log",        required_argument, NULL, OPT_AUDIT_LOG },
+        { "auth-fail-limit",  required_argument, NULL, OPT_AUTH_FAIL_LIMIT },
+        { "require-signed-payload", no_argument, NULL, OPT_REQUIRE_SIGNED_PAYLOAD },
         { "verbose",          no_argument,       NULL, 'v' },
         { "help",             no_argument,       NULL, 'h' },
         { 0 },
@@ -393,7 +545,126 @@ int main(int argc, char **argv) {
                     return 2;
                 }
                 break;
+            case OPT_PRESIGN_MAX_EXPIRES:
+                presign_max_expires = atol(optarg);
+                if (presign_max_expires < 1 || presign_max_expires > 604800) {
+                    fprintf(stderr, "--presign-max-expires must be 1..604800\n");
+                    return 2;
+                }
+                break;
+            case OPT_NO_PRESIGN_ADMIN:
+                no_presign_admin = 1;
+                break;
+            case OPT_LIFECYCLE_HOUR:
+                lifecycle_hour = atoi(optarg);
+                if (lifecycle_hour < -1 || lifecycle_hour > 23) {
+                    fprintf(stderr, "--lifecycle-hour must be 0..23 (-1 = off)\n");
+                    return 2;
+                }
+                break;
+            case OPT_LIFECYCLE_NOW:     lifecycle_now = 1; break;
+            case OPT_LIFECYCLE_DRY_RUN: lifecycle_dry_run = 1; break;
+            case OPT_LIFECYCLE_RATE:
+                lifecycle_rate = atoi(optarg);
+                if (lifecycle_rate < 0) {
+                    fprintf(stderr, "--lifecycle-rate must be >= 0\n");
+                    return 2;
+                }
+                break;
+            case OPT_LIFECYCLE_TIME_OFFSET:
+                lifecycle_time_offset = atol(optarg);
+                break;
+            case OPT_WEB_ADDR: web_addr = optarg; break;
+            case OPT_WEB_PORT:
+                web_port = atoi(optarg);
+                if (web_port < 1 || web_port > 65535) {
+                    fprintf(stderr, "--web-port must be 1..65535\n");
+                    return 2;
+                }
+                break;
+            case OPT_WEB_ROOT_DOMAIN: {
+                /* Lowercase hostname chars only. */
+                for (const char *q = optarg; *q; q++) {
+                    if (!((*q >= 'a' && *q <= 'z') || (*q >= '0' && *q <= '9')
+                          || *q == '.' || *q == '-')) {
+                        fprintf(stderr, "--web-root-domain: invalid host name\n");
+                        return 2;
+                    }
+                }
+                web_root_domain = optarg;
+                break;
+            }
+            case OPT_ALLOW_PUBLIC: allow_public = 1; break;
+            case OPT_ADMIN_SOCKET: admin_socket = optarg; break;
+            case OPT_TLS_PORT:
+                tls_port = atoi(optarg);
+                if (tls_port < 1 || tls_port > 65535) {
+                    fprintf(stderr, "--tls-port must be 1..65535\n");
+                    return 2;
+                }
+                break;
+            case OPT_TLS_ADDR: tls_addr = optarg; break;
+            case OPT_AUDIT_LOG: audit_log = optarg; break;
+            case OPT_AUTH_FAIL_LIMIT:
+                auth_fail_limit = atoi(optarg);
+                if (auth_fail_limit < 0) { fprintf(stderr, "--auth-fail-limit must be >= 0\n"); return 2; }
+                break;
+            case OPT_TLS_CERT: tls_cert = optarg; break;
+            case OPT_TLS_KEY:  tls_key = optarg; break;
+            case OPT_REQUIRE_TLS: require_tls = 1; break;
+            case OPT_TLS_MAX_PER_IP:
+                tls_max_per_ip = atoi(optarg);
+                if (tls_max_per_ip < 1) { fprintf(stderr, "--tls-max-per-ip must be >= 1\n"); return 2; }
+                break;
+            case OPT_REQUIRE_SIGNED_PAYLOAD: require_signed_payload = 1; break;
+            case OPT_MAX_RETENTION_DAYS:
+                max_retention_days = atoi(optarg);
+                if (max_retention_days < 1 || max_retention_days > 36500) {
+                    fprintf(stderr, "--max-retention-days must be 1..36500\n");
+                    return 2;
+                }
+                break;
+            case OPT_ALLOW_PUBLIC_WRITE: allow_public_write = 1; allow_public = 1; break;
+            case OPT_TRUSTED_PROXY: {
+                size_t cur = strlen(trusted_proxies);
+                if (strlen(optarg) > 60 || strchr(optarg, ',')
+                    || cur + strlen(optarg) + 2 >= sizeof(trusted_proxies)) {
+                    fprintf(stderr, "--trusted-proxy: one IP per flag\n");
+                    return 2;
+                }
+                snprintf(trusted_proxies + cur, sizeof(trusted_proxies) - cur, "%s%s",
+                         cur ? "," : "", optarg);
+                break;
+            }
+            case OPT_ADMIN_TOKEN_FILE:
+                if (read_secret_file(optarg, admin_token, sizeof(admin_token)) < 0) {
+                    sigv4_destroy(auth);
+                    return 2;
+                }
+                break;
             default:  usage(argv[0]); return 2;
+        }
+    }
+    if (auth) sigv4_set_presign_policy(auth, presign_max_expires, no_presign_admin);
+    throttle_set_limit(auth_fail_limit);
+    if (audit_log && audit_open(audit_log) < 0) {
+        fprintf(stderr, "--audit-log %s: cannot open: %s\n", audit_log, strerror(errno));
+        sigv4_destroy(auth);
+        return 2;
+    }
+    if (tls_port) {
+        if (!tls_cert || !tls_key) {
+            fprintf(stderr, "--tls-port needs --tls-cert and --tls-key\n");
+            return 2;
+        }
+        /* S8: the private key must be 0600 and ours. */
+        struct stat kst;
+        if (stat(tls_key, &kst) < 0 || !S_ISREG(kst.st_mode) || (kst.st_mode & 077)
+            || kst.st_uid != geteuid()) {
+            fprintf(stderr, "%s: TLS key must be a regular file, mode 0600, owned by "
+                            "the service user\n", tls_key);
+            sigv4_destroy(auth);
+            return 2;
         }
     }
 
@@ -414,6 +685,11 @@ int main(int argc, char **argv) {
     }
 
     log_init(verbose ? LOG_DEBUG : LOG_INFO);
+
+    /* Process hardening: no privilege gain through exec'd setuid helpers,
+     * no core dumps carrying secrets. */
+    prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+    prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
 
     /* Ignore SIGPIPE; we handle EPIPE on write() instead. */
     signal(SIGPIPE, SIG_IGN);
@@ -445,6 +721,30 @@ int main(int argc, char **argv) {
         .metrics_port   = (uint16_t)metrics_port,
         .io_threads     = io_threads,
         .legacy_owner   = legacy_owner,
+        .lifecycle_hour = lifecycle_hour,
+        .lifecycle_now  = lifecycle_now,
+        .lifecycle_rate = lifecycle_rate,
+        .lifecycle_dry_run = lifecycle_dry_run,
+        .lifecycle_time_offset_s = lifecycle_time_offset,
+        .web_addr        = web_addr,
+        .web_port        = (uint16_t)web_port,
+        .web_root_domain = web_root_domain,
+        .allow_public    = allow_public,
+        .allow_public_write = allow_public_write,
+        .max_retention_days = max_retention_days,
+        .tls_port        = (uint16_t)tls_port,
+        .tls_addr        = tls_addr,
+        .tls_cert        = tls_cert,
+        .tls_key         = tls_key,
+        .require_tls     = require_tls,
+        .tls_max_per_ip  = tls_max_per_ip,
+        .require_signed_payload = require_signed_payload,
+        .trusted_proxies = trusted_proxies[0] ? trusted_proxies : NULL,
+        .admin_token     = admin_token[0] ? admin_token : NULL,
+        .admin_socket    = admin_socket,
+        .admin_cred_file = reload_ctx.cred_file,
+        .admin_reload    = do_reload,
+        .admin_reload_user = &reload_ctx,
         .tick_cb        = reload_tick,
         .tick_user      = &reload_ctx,
     };

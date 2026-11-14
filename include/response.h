@@ -62,6 +62,9 @@ int rsp_build_status_with_headers(conn_t *c, int status, const char *reason,
  * If `head_only` is non-zero, no body will follow and Content-Length
  * is still reported as the object size (HEAD semantics). */
 int rsp_build_object_head(conn_t *c, const s3_obj_meta_t *m, int head_only);
+/* Same with an explicit status line (website ErrorDocument → 404). */
+int rsp_build_object_head_status(conn_t *c, const s3_obj_meta_t *m,
+                                 int head_only, int status, const char *reason);
 
 /* Build an S3 XML error response with the given S3 error enum,
  * resource path, and request id. Sets Content-Type: application/xml
@@ -81,8 +84,18 @@ int rsp_build_initiate_mpu(conn_t *c, s3_str_t bucket, s3_str_t key,
 /* Build a CompleteMultipartUploadResult XML body, 200 OK.
  * etag is the multipart-style ETag returned by store_mpu_complete
  * (e.g. "abc...-3"); we wrap it in quotes per S3 convention. */
+/* Arbitrary body (takes ownership of `body`, a malloc'd buffer). */
+int rsp_build_raw(conn_t *c, int status, const char *reason,
+                  const char *content_type, char *body, size_t blen);
+
 int rsp_build_complete_mpu(conn_t *c, s3_str_t bucket, s3_str_t key,
                            const char *etag);
+/* With the object's checksum element (m may be NULL). */
+int rsp_build_complete_mpu2(conn_t *c, s3_str_t bucket, s3_str_t key,
+                            const char *etag, const s3_obj_meta_t *m);
+/* base64 checksum value as sent in x-amz-checksum-*: "<b64>" or, for
+ * composite multipart checksums, "<b64>-<parts>". */
+void rsp_format_checksum(const s3_obj_meta_t *m, char out[64]);
 
 /* Build a ListAllMyBucketsResult XML body, 200 OK. */
 int rsp_build_list_all_my_buckets(conn_t *c,
@@ -131,9 +144,18 @@ int rsp_build_bucket_location(conn_t *c);
 
 /* Build a GetBucketVersioning XML response (versioning never enabled). */
 int rsp_build_bucket_versioning(conn_t *c);
+int rsp_build_bucket_versioning_state(conn_t *c, int state);
+int rsp_build_list_versions(conn_t *c, s3_str_t bucket,
+                            const s3_version_list_opts_t *o,
+                            const s3_version_info_t *v, size_t n,
+                            int truncated, const char *next_key,
+                            const char *next_vid);
 
 /* Map an s3_err_t to an HTTP status code. */
 int rsp_status_for_err(s3_err_t err);
+
+/* Stable per-enum label (metrics). */
+const char *s3_err_name(s3_err_t e);
 
 /* Map an s3_err_t to an S3 error code string (e.g. "NoSuchBucket"). */
 const char *rsp_code_for_err(s3_err_t err);

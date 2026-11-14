@@ -20,6 +20,8 @@
 #include "llhttp.h"
 #include "s3.h"
 #include "sigv4.h"
+#include "checksum.h"
+#include "store.h"
 
 #define CONN_RBUF_SZ          (16 * 1024)
 #define CONN_WBUF_SZ          (16 * 1024)
@@ -31,6 +33,7 @@
  * re-fire EPOLLIN on the next wait; the cap just stops one fast uploader
  * from starving every other connection. */
 #define CONN_READ_BUDGET      (256 * 1024)
+#define CONN_XHDR_SZ          2048          /* extra response headers */
 
 typedef enum {
     CST_READ_HEADERS,    /* feeding bytes to llhttp; headers not yet complete */
@@ -48,6 +51,16 @@ typedef struct {
     s3_str_t k, v;
 } conn_header_t;
 
+/* One decoded query parameter. `has_eq` distinguishes "?acl" from
+ * "?acl=". Both spans point into conn_t.qbuf. */
+typedef struct {
+    s3_str_t k, v;
+    int      has_eq;
+} conn_qparam_t;
+
+#define CONN_MAX_QPARAMS      48
+#define CONN_QBUF_SZ          (8 * 1024)
+
 typedef struct {
     s3_str_t       method;        /* "GET", "PUT", "POST", "DELETE", "HEAD" — static literal */
     s3_str_t       target;        /* raw request-target, points into hdr_scratch */
@@ -62,6 +75,12 @@ typedef struct {
     uint64_t       content_length_hint; /* parser->content_length at headers_complete */
 
     uint64_t       body_consumed; /* bytes seen via on_body so far */
+
+    /* Query string, split on '&' and percent-decoded once at
+     * headers-complete (conn_parse_query). */
+    conn_qparam_t  qp[CONN_MAX_QPARAMS];
+    size_t         n_qp;
+    int            act;           /* s3_action_t, set by the router */
 } conn_req_t;
 
 /* Header-accumulation state machine. Tracks whether the most recent
@@ -174,6 +193,9 @@ typedef struct conn {
     conn_req_t         req;
     int                request_dispatched;  /* response has been built */
 
+    /* Decoded query bytes (req.qp spans point here). */
+    char               qbuf[CONN_QBUF_SZ];
+
     /* Per-request bump arena, used by route.c for decoded path/query
      * spans. Reset at the start of each request. */
     char               req_scratch[CONN_REQ_SCRATCH_SZ];
@@ -200,6 +222,57 @@ typedef struct conn {
      * with verified data. */
     struct sigv4_chunk_decoder *chunk_decoder;
 
+    /* Accepted on the website listener (item 6): anonymous GET/HEAD only,
+     * Authorization ignored, bucket from Host. */
+    int                is_web;
+    const char        *web_root_domain;   /* server-lifetime string */
+    /* --allow-public: website configs / public policies may be stored.
+     * --allow-public-write: public policies may also grant writes. */
+    int                allow_public;
+    int                allow_public_write;
+    /* Trust signals (items 7.6 / 9): client address and whether the
+     * request arrived over TLS. Behind a proxy listed in
+     * trusted_proxies, X-Forwarded-For / X-Forwarded-Proto are honoured;
+     * from anyone else they are ignored. */
+    const char        *trusted_proxies;   /* comma-separated IPs, server-lifetime */
+    int                conn_tls;          /* this connection is TLS (native) */
+    /* Native TLS state (FS3_TLS builds; unused otherwise). */
+    void              *ssl;               /* SSL* */
+    int                tls_handshaking;
+    int                tls_want_write;    /* last TLS op needs EPOLLOUT */
+    char              *tls_buf;           /* body bounce buffer (no kTLS) */
+    size_t             tls_buf_len, tls_buf_pos;
+    /* --require-tls: SigV4 on a plain listener only from loopback. */
+    int                require_tls;
+    /* --require-signed-payload (S2): refuse unsigned payloads unless the
+     * request is over TLS / from a trusted proxy that says https. */
+    int                require_signed_payload;
+    char               client_ip[64];
+    int                secure;
+
+    /* The request's signature was verified (header or presigned). */
+    int                sig_verified;
+
+    /* Additional-checksum verification (item 1). cksum runs over the
+     * decoded body bytes delivered to the router; the expected value
+     * comes from an x-amz-checksum-<algo> header or, for aws-chunked
+     * trailers, from the decoder at end of body. md5 does the same for
+     * Content-MD5. Inactive when .algo == 0. */
+    cksum_ctx_t        cksum;
+    int                cksum_algo;
+    int                cksum_from_trailer;
+    uint8_t            cksum_expect[CKSUM_MAX_DIGEST];
+    cksum_ctx_t        md5;
+    uint8_t            md5_expect[16];
+
+    /* Extra response headers ("Name: value\r\n"...), spliced into
+     * whatever response head is built for this request when it starts
+     * going out (conn_on_writable). Used for checksum echoes, CORS,
+     * version ids, ... so the many head builders need no new params. */
+    char               xhdr[CONN_XHDR_SZ];
+    size_t             xhdr_len;
+    int                xhdr_done;
+
     /* Multipart upload context.
      *  mpu_is_part_upload — when true, c->put_writer was created via
      *      store_mpu_part_begin and route_dispatch_complete should call
@@ -222,6 +295,19 @@ typedef struct conn {
     int                copy_pending;
     s3_str_t           copy_bucket;
     s3_str_t           copy_key;
+
+    /* Bucket config PUT (?cors, ?lifecycle, ?website, ?policy, ...):
+     * body buffered into req_body_buf, handled at message-complete.
+     * cfg_act is the s3_action_t (0 = none). */
+    int                cfg_act;
+    s3_str_t           cfg_bucket;      /* points into req_scratch */
+    s3_str_t           cfg_key;         /* object subresources (?retention) */
+
+    /* Object Lock (item 10): lock headers on a PUT, applied to the new
+     * version when the commit finishes. */
+    int                lock_pending;
+    s3_lock_t          lock_new;
+    uint64_t           max_retention_ms;   /* server-lifetime setting */
 
     /* Bulk-delete context (POST /<bucket>?delete) */
     int                delete_pending;
@@ -252,5 +338,28 @@ int     conn_wants_write(const conn_t *c);
  * bytes, or unread socket data left behind by a read that yielded at
  * CONN_READ_BUDGET. */
 int     conn_hup_can_close(const conn_t *c);
+
+/* Split and percent-decode c->req.query into c->req.qp. '+' stays '+'.
+ * Returns 0, or -1 if the query has too many parameters or is too long. */
+int     conn_parse_query(conn_t *c);
+/* First parameter named `name` (exact, case-sensitive), or NULL. */
+const conn_qparam_t *conn_query_get(const conn_t *c, const char *name);
+/* Number of parameters named `name`. */
+int     conn_query_count(const conn_t *c, const char *name);
+
+/* Body bytes to the socket: sendfile, or the TLS path. */
+struct s3_reader;
+ssize_t conn_io_send_body(conn_t *c, struct s3_reader *r, size_t max);
+
+/* Fill c->client_ip / c->secure from the peer and, for a trusted proxy,
+ * X-Forwarded-For (rightmost entry) / X-Forwarded-Proto. */
+void    conn_resolve_client(conn_t *c);
+
+/* Queue an extra response header for the current request. Returns 0, or
+ * -1 if the extra-header buffer is full (the header is dropped). */
+int     conn_add_header(conn_t *c, const char *name, const char *value);
+/* Drop queued extra headers (e.g. when a success response turns into an
+ * error after they were added). */
+void    conn_clear_headers(conn_t *c);
 
 #endif

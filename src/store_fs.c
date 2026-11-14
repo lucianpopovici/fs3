@@ -36,9 +36,11 @@
 #endif
 
 #include "store.h"
+#include "checksum.h"
 #include "log.h"
 
 #include <dirent.h>
+#include <ftw.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
@@ -65,7 +67,8 @@
 
 #define OBJ_MAGIC    "YS3OBJ\0"
 #define OBJ_MAGIC_LEN 8         /* "YS3OBJ\0\0" — 6 chars + 2 NUL */
-#define OBJ_SCHEMA   2u         /* v2 added part_count */
+#define OBJ_SCHEMA_V2 2u        /* v2 added part_count */
+#define OBJ_SCHEMA   3u         /* v3 added obj_ext_v3_t (checksum, version id, flags) */
 
 typedef struct __attribute__((packed)) {
     char     magic[OBJ_MAGIC_LEN];   /* "YS3OBJ\0\0" */
@@ -82,6 +85,26 @@ typedef struct __attribute__((packed)) {
 
 _Static_assert(sizeof(obj_header_t) == 60, "obj_header_t layout");
 
+/* Schema 3: an extension block between the fixed header and the
+ * content-type/key bytes. v2 files have no extension (read as zeroes).
+ * header_size always covers everything before the data, so the data
+ * offset stays header-driven. One-way migration: a pre-v3 binary
+ * refuses v3 objects. */
+typedef struct __attribute__((packed)) {
+    uint8_t  version_id[16];   /* all-zero = "null" version */
+    uint32_t flags;            /* S3_OBJF_* */
+    uint8_t  cksum_algo;       /* s3_cksum_algo_t */
+    uint8_t  cksum_type;       /* 0 FULL_OBJECT, 1 COMPOSITE */
+    uint16_t cksum_parts;      /* composite part count */
+    uint8_t  cksum[32];        /* raw digest, left-aligned */
+    uint8_t  reserved[8];
+} obj_ext_v3_t;
+
+_Static_assert(sizeof(obj_ext_v3_t) == 64, "obj_ext_v3_t layout");
+
+/* Upper bound on content-type bytes we write (s3_obj_meta_t holds 127). */
+#define OBJ_MAX_CT_LEN 1024
+
 /* ===================================================================== */
 /* Path computation and small helpers                                    */
 /* ===================================================================== */
@@ -92,6 +115,10 @@ struct s3_store {
     char    *tmp_dir;        /* ROOT/tmp */
     char    *buckets_dir;    /* ROOT/buckets */
     char    *mpu_dir;        /* ROOT/mpu — multipart upload staging */
+    char    *versions_dir;   /* ROOT/versions — noncurrent versions (item 8) */
+    char    *locks_dir;      /* ROOT/locks — object lock sidecars (item 10) */
+    store_version_guard_fn vguard;   /* object-lock veto (item 10) */
+    void    *vguard_user;
     uint64_t min_free_bytes; /* 0 = no quota check */
     /* Namespace lock. Commits run on iopool worker threads while the
      * event loop keeps serving other requests, so the short steps that
@@ -99,6 +126,22 @@ struct s3_store {
      * mkdir_p + rename, and rm_rf of bucket/upload dirs — are serialized
      * here. Never held across data writes or fsync of object bytes. */
     pthread_mutex_t ns_mu;
+
+    /* Striped per-object locks (security review S4), indexed by the
+     * first byte of the object's path hash. Held across every multi-step
+     * mutation of one key — PUT/MPU publish, delete, lifecycle expiry
+     * (re-check + unlink), versioning's link-aside + rename — so racing
+     * sequences on the same key serialize. Order: key lock before ns_mu;
+     * never two key locks at once. */
+    pthread_mutex_t key_mu[256];
+
+    int  (*mpu_gc_filter)(void *user, s3_str_t bucket, s3_str_t key);
+    void  *mpu_gc_filter_user;
+
+    /* Parsed bucket-config cache (store_sidecar_get). */
+    pthread_mutex_t cfg_mu;
+    struct store_cfg_ref *cfg_head;
+    size_t           cfg_count;
 };
 
 static char *xstrdup_join(const char *a, const char *b) {
@@ -192,6 +235,15 @@ static void hash_bucket_key(s3_str_t bucket, s3_str_t key, char out[65]) {
         out[i*2 + 1] = hex[raw[i] & 0xF];
     }
     out[64] = '\0';
+}
+
+static int hexnib(char ch) {
+    return ch >= 'a' ? ch - 'a' + 10 : ch - '0';
+}
+
+/* The stripe lock guarding object `hex` (S4). */
+static pthread_mutex_t *key_lock(s3_store_t *s, const char hex[65]) {
+    return &s->key_mu[(hexnib(hex[0]) << 4) | hexnib(hex[1])];
 }
 
 /* Build object directory path: ROOT/data/<bucket>/<xx>/<yy>
@@ -314,19 +366,74 @@ static void recover_tmp_dir(const s3_store_t *s) {
     }
 }
 
+static void cfg_cache_clear(s3_store_t *s);
+static void recover_version_links(const s3_store_t *s);
+
+/* Startup: half-written object-lock sidecars (locks/.../<vid>.tmp.XXXXXX). */
+static int lock_tmp_cb(const char *path, const struct stat *st, int type,
+                       struct FTW *ftw) {
+    (void)st; (void)ftw;
+    const char *base = strrchr(path, '/');
+    if (type == FTW_F && strstr(base ? base : path, ".tmp.")) unlink(path);
+    return 0;
+}
+static void recover_lock_tmp(const s3_store_t *s) {
+    nftw(s->locks_dir, lock_tmp_cb, 16, FTW_PHYS);
+}
+static int bucket_versioning(s3_store_t *s, s3_str_t bucket);
+static int random_vid(uint8_t vid[16]);
+static s3_err_t link_aside_locked(s3_store_t *s, s3_str_t bucket,
+                                  const char hex[65], const char *path,
+                                  int versioning);
+static s3_err_t delete_locked(s3_store_t *s, s3_str_t bucket, s3_str_t key,
+                              const char hex[65], const uint8_t *vid,
+                              uint64_t expect_mtime, store_delete_result_t *res);
+
+/* Startup: remove half-written sidecars (buckets/<b>/<name>.tmp.XXXXXX
+ * and meta.tmp) left by a crash between write and rename. */
+static void recover_sidecar_tmp(const s3_store_t *s) {
+    DIR *d = opendir(s->buckets_dir);
+    if (!d) return;
+    struct dirent *e;
+    int n = 0;
+    while ((e = readdir(d)) != NULL) {
+        if (e->d_name[0] == '.') continue;
+        char bdir[4200];
+        snprintf(bdir, sizeof(bdir), "%s/%s", s->buckets_dir, e->d_name);
+        DIR *b = opendir(bdir);
+        if (!b) continue;
+        struct dirent *f;
+        while ((f = readdir(b)) != NULL) {
+            if (strstr(f->d_name, ".tmp.") || strcmp(f->d_name, "meta.tmp") == 0) {
+                char p[4500];
+                snprintf(p, sizeof(p), "%s/%s", bdir, f->d_name);
+                if (unlink(p) == 0) n++;
+            }
+        }
+        closedir(b);
+    }
+    closedir(d);
+    if (n) LOG_I("recovery: removed %d orphaned bucket sidecar temp file(s)", n);
+}
+
 s3_err_t store_open(s3_store_t **out, const char *root) {
     if (!out || !root) return S3_ERR_INVALID_ARGUMENT;
 
     s3_store_t *s = calloc(1, sizeof(*s));
     if (!s) return S3_ERR_INTERNAL;
     pthread_mutex_init(&s->ns_mu, NULL);
+    pthread_mutex_init(&s->cfg_mu, NULL);
+    for (int i = 0; i < 256; i++) pthread_mutex_init(&s->key_mu[i], NULL);
 
     s->root        = strdup(root);
     s->data_dir    = xstrdup_join(root, "data");
     s->tmp_dir     = xstrdup_join(root, "tmp");
     s->buckets_dir = xstrdup_join(root, "buckets");
     s->mpu_dir     = xstrdup_join(root, "mpu");
-    if (!s->root || !s->data_dir || !s->tmp_dir || !s->buckets_dir || !s->mpu_dir) {
+    s->versions_dir = xstrdup_join(root, "versions");
+    s->locks_dir   = xstrdup_join(root, "locks");
+    if (!s->root || !s->data_dir || !s->tmp_dir || !s->buckets_dir || !s->mpu_dir
+        || !s->versions_dir || !s->locks_dir) {
         store_close(s);
         return S3_ERR_INTERNAL;
     }
@@ -335,13 +442,18 @@ s3_err_t store_open(s3_store_t **out, const char *root) {
         || mkdir_p(s->data_dir, 0700) < 0
         || mkdir_p(s->tmp_dir, 0700) < 0
         || mkdir_p(s->buckets_dir, 0700) < 0
-        || mkdir_p(s->mpu_dir, 0700) < 0) {
+        || mkdir_p(s->mpu_dir, 0700) < 0
+        || mkdir_p(s->versions_dir, 0700) < 0
+        || mkdir_p(s->locks_dir, 0700) < 0) {
         LOG_E("store_open: mkdir failed under %s: %s", root, strerror(errno));
         store_close(s);
         return S3_ERR_INTERNAL;
     }
 
     recover_tmp_dir(s);
+    recover_sidecar_tmp(s);
+    recover_version_links(s);
+    recover_lock_tmp(s);
 
     *out = s;
     return S3_OK;
@@ -354,7 +466,12 @@ void store_close(s3_store_t *s) {
     free(s->tmp_dir);
     free(s->buckets_dir);
     free(s->mpu_dir);
+    free(s->versions_dir);
+    free(s->locks_dir);
     pthread_mutex_destroy(&s->ns_mu);
+    cfg_cache_clear(s);
+    pthread_mutex_destroy(&s->cfg_mu);
+    for (int i = 0; i < 256; i++) pthread_mutex_destroy(&s->key_mu[i]);
     free(s);
 }
 
@@ -435,16 +552,20 @@ static s3_err_t quota_check(const s3_store_t *s) {
 static int random_hex_id(char *out, size_t out_n);
 
 /* Write `owner`/`id` as dir/meta, atomically (tmp + fsync + rename). */
-static s3_err_t write_bucket_meta(const char *dir, const char *id,
-                                  const char *owner) {
+static s3_err_t write_bucket_meta_full(const char *dir,
+                                       const s3_bucket_meta_t *m) {
     char tmp[4200], final[4200];
     snprintf(tmp, sizeof(tmp), "%s/meta.tmp", dir);
     snprintf(final, sizeof(final), "%s/meta", dir);
     int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
     if (fd < 0) return map_io_err(errno);
-    char buf[256];
-    int n = snprintf(buf, sizeof(buf), "id=%s\nowner=%s\n", id,
-                     owner ? owner : "");
+    char buf[512];
+    int n = snprintf(buf, sizeof(buf), "id=%s\nowner=%s\n", m->id, m->owner);
+    if (m->versioning && n > 0 && (size_t)n < sizeof(buf))
+        n += snprintf(buf + n, sizeof(buf) - (size_t)n, "versioning=%s\n",
+                      m->versioning == S3_VERSIONING_ENABLED ? "Enabled" : "Suspended");
+    if (m->object_lock && n > 0 && (size_t)n < sizeof(buf))
+        n += snprintf(buf + n, sizeof(buf) - (size_t)n, "object_lock=1\n");
     if (n < 0 || (size_t)n >= sizeof(buf)
         || xwrite(fd, buf, (size_t)n) != n || xfsync(fd) < 0) {
         s3_err_t e = (n < 0 || (size_t)n >= sizeof(buf))
@@ -476,8 +597,16 @@ static void read_bucket_meta(const char *bucket_dir, s3_bucket_meta_t *out) {
             snprintf(out->id, sizeof(out->id), "%.32s", line + 3);
         else if (strncmp(line, "owner=", 6) == 0)
             snprintf(out->owner, sizeof(out->owner), "%.128s", line + 6);
+        else if (strcmp(line, "versioning=Enabled") == 0)
+            out->versioning = S3_VERSIONING_ENABLED;
+        else if (strcmp(line, "versioning=Suspended") == 0)
+            out->versioning = S3_VERSIONING_SUSPENDED;
+        else if (strcmp(line, "object_lock=1") == 0)
+            out->object_lock = 1;
     }
     fclose(fp);
+    /* Lock implies versioning, whatever the file says (fail safe). */
+    if (out->object_lock) out->versioning = S3_VERSIONING_ENABLED;
 }
 
 s3_err_t store_bucket_create(s3_store_t *s, s3_str_t name) {
@@ -487,8 +616,55 @@ s3_err_t store_bucket_create(s3_store_t *s, s3_str_t name) {
 /* The bucket dir and its meta are assembled under tmp/ and renamed into
  * buckets/ in one step, so a bucket never exists without its owner
  * (a crash leaves only a tmp/ dir, swept at startup). */
+static s3_err_t bucket_create(s3_store_t *s, s3_str_t name,
+                              const char *owner, int locked);
+
 s3_err_t store_bucket_create_owned(s3_store_t *s, s3_str_t name,
                                    const char *owner) {
+    return bucket_create(s, name, owner, 0);
+}
+
+s3_err_t store_bucket_create_locked(s3_store_t *s, s3_str_t name,
+                                    const char *owner) {
+    return bucket_create(s, name, owner, 1);
+}
+
+s3_err_t store_bucket_set_versioning(s3_store_t *s, s3_str_t name, int state) {
+    if (!s || state < 0 || state > 2) return S3_ERR_INVALID_ARGUMENT;
+    char bp[4096];
+    if (bucket_path(s, name, bp, sizeof(bp)) < 0) return S3_ERR_INTERNAL;
+    pthread_mutex_lock(&s->ns_mu);
+    s3_err_t e = S3_ERR_NO_SUCH_BUCKET;
+    if (store_bucket_exists(s, name)) {
+        s3_bucket_meta_t m;
+        read_bucket_meta(bp, &m);
+        if ((m.versioning && state == S3_VERSIONING_UNSET)
+            || (m.object_lock && state != S3_VERSIONING_ENABLED)) {
+            e = S3_ERR_INVALID_REQUEST;
+        } else {
+            if (!m.id[0]) random_hex_id(m.id, sizeof(m.id));
+            m.versioning = state;
+            e = write_bucket_meta_full(bp, &m);
+        }
+    }
+    pthread_mutex_unlock(&s->ns_mu);
+    return e;
+}
+
+const char *store_bucket_versioning(s3_store_t *s, s3_str_t name) {
+    s3_bucket_meta_t m;
+    if (store_bucket_meta(s, name, &m) != S3_OK) return "";
+    return m.versioning == S3_VERSIONING_ENABLED ? "Enabled"
+         : m.versioning == S3_VERSIONING_SUSPENDED ? "Suspended" : "Unset";
+}
+
+int store_bucket_object_lock(s3_store_t *s, s3_str_t name) {
+    s3_bucket_meta_t m;
+    return store_bucket_meta(s, name, &m) == S3_OK && m.object_lock;
+}
+
+static s3_err_t bucket_create(s3_store_t *s, s3_str_t name,
+                              const char *owner, int locked) {
     if (!s) return S3_ERR_INVALID_ARGUMENT;
     if (!valid_bucket_name(name)) return S3_ERR_INVALID_BUCKET_NAME;
 
@@ -499,7 +675,12 @@ s3_err_t store_bucket_create_owned(s3_store_t *s, s3_str_t name,
     snprintf(stage, sizeof(stage), "%s/bucket.XXXXXX", s->tmp_dir);
     if (random_hex_id(id, sizeof(id)) < 0) return S3_ERR_INTERNAL;
     if (!mkdtemp(stage)) return map_io_err(errno);
-    s3_err_t e = write_bucket_meta(stage, id, owner);
+    s3_bucket_meta_t nm;
+    memset(&nm, 0, sizeof(nm));
+    snprintf(nm.id, sizeof(nm.id), "%s", id);
+    snprintf(nm.owner, sizeof(nm.owner), "%s", owner ? owner : "");
+    if (locked) { nm.object_lock = 1; nm.versioning = S3_VERSIONING_ENABLED; }
+    s3_err_t e = write_bucket_meta_full(stage, &nm);
     if (e != S3_OK) { rm_rf(stage); return e; }
 
     /* ns_mu: the exists check and the rename are one step. rename() would
@@ -548,10 +729,12 @@ s3_err_t store_bucket_set_owner(s3_store_t *s, s3_str_t name,
         /* A pre-isolation bucket gets its id now; any upload still
          * streaming into it (captured id "") will then fail its commit
          * rather than land in a bucket that changed hands. */
-        if (!m.id[0] && random_hex_id(m.id, sizeof(m.id)) < 0)
+        if (!m.id[0] && random_hex_id(m.id, sizeof(m.id)) < 0) {
             e = S3_ERR_INTERNAL;
-        else
-            e = write_bucket_meta(bp, m.id, owner);
+        } else {
+            snprintf(m.owner, sizeof(m.owner), "%s", owner);
+            e = write_bucket_meta_full(bp, &m);
+        }
     }
     pthread_mutex_unlock(&s->ns_mu);
     return e;
@@ -633,6 +816,13 @@ static s3_err_t bucket_delete_locked(s3_store_t *s, s3_str_t name) {
     char dp[4096];
     snprintf(dp, sizeof(dp), "%s/" S3_STR_FMT, s->data_dir, S3_STR_ARG(name));
     if (dir_has_files(dp)) return S3_ERR_BUCKET_NOT_EMPTY;
+    /* Versioning: noncurrent versions and delete markers count too. */
+    char vp[4096];
+    snprintf(vp, sizeof(vp), "%s/" S3_STR_FMT, s->versions_dir, S3_STR_ARG(name));
+    if (dir_has_files(vp)) return S3_ERR_BUCKET_NOT_EMPTY;
+    rm_rf(vp);
+    snprintf(vp, sizeof(vp), "%s/" S3_STR_FMT, s->locks_dir, S3_STR_ARG(name));
+    rm_rf(vp);
 
     /* Drop any in-flight multipart uploads first. Left behind, they could
      * be completed into a later bucket of the same name. */
@@ -648,16 +838,20 @@ static s3_err_t bucket_delete_locked(s3_store_t *s, s3_str_t name) {
 
     char bp[4096];
     if (bucket_path(s, name, bp, sizeof(bp)) < 0) return S3_ERR_INTERNAL;
-    char meta_p[4200];
-    snprintf(meta_p, sizeof(meta_p), "%s/meta", bp);
-    if (unlink(meta_p) < 0 && errno != ENOENT) {
-        LOG_W("bucket_delete unlink %s: %s", meta_p, strerror(errno));
+    /* The marker dir holds meta plus config sidecars (grants, cors.xml,
+     * ...). Move it out of buckets/ in one rename, so the bucket vanishes
+     * atomically (never ownerless-but-present after a crash), then remove
+     * it; a crash in between leaves only a tmp/bucket.* dir, swept at
+     * startup. */
+    char gone[4096];
+    snprintf(gone, sizeof(gone), "%s/bucket.XXXXXX", s->tmp_dir);
+    if (!mkdtemp(gone) || rename(bp, gone) < 0) {
+        LOG_W("bucket_delete move %s: %s", bp, strerror(errno));
+        rmdir(gone);
         return S3_ERR_INTERNAL;
     }
-    if (rmdir(bp) < 0) {
-        LOG_W("bucket_delete rmdir %s: %s", bp, strerror(errno));
-        return S3_ERR_INTERNAL;
-    }
+    fsync_dir(s->buckets_dir);
+    rm_rf(gone);
     return S3_OK;
 }
 
@@ -672,6 +866,385 @@ s3_err_t store_bucket_delete(s3_store_t *s, s3_str_t name) {
 }
 
 /* ===================================================================== */
+/* Bucket config sidecars + parsed-config cache                           */
+/* ===================================================================== */
+
+struct store_cfg_ref {
+    char      key[33 + 1 + 64 + 1 + 32];  /* "<id or :name or ?name>/<sidecar>" */
+    char      bname[64];      /* bucket name, for TTL lookups */
+    char      sname[32];      /* sidecar name */
+    uint64_t  checked_ms;     /* last validation (monotonic) */
+    dev_t     dev;
+    ino_t     ino;
+    int64_t   mtime_ns;
+    off_t     size;
+    void     *obj;
+    store_cfg_free_fn release;
+    int       refs;           /* holders, plus 1 while cached */
+    int       cached;
+    struct store_cfg_ref *next;
+};
+
+static int sidecar_path(s3_store_t *s, s3_str_t bucket, const char *name,
+                        char *out, size_t cap) {
+    if (!valid_bucket_name(bucket)) return -1;
+    int n = snprintf(out, cap, "%s/" S3_STR_FMT "/%s", s->buckets_dir,
+                     S3_STR_ARG(bucket), name);
+    return (n > 0 && (size_t)n < cap) ? 0 : -1;
+}
+
+s3_err_t store_bucket_sidecar_write(s3_store_t *s, s3_str_t bucket,
+                                    const char *name,
+                                    const void *data, size_t n) {
+    char final[4200], tmp[4300], dir[4200];
+    if (!s || sidecar_path(s, bucket, name, final, sizeof(final)) < 0)
+        return S3_ERR_INVALID_ARGUMENT;
+    if (!store_bucket_exists(s, bucket)) return S3_ERR_NO_SUCH_BUCKET;
+    snprintf(dir, sizeof(dir), "%s/" S3_STR_FMT, s->buckets_dir, S3_STR_ARG(bucket));
+    snprintf(tmp, sizeof(tmp), "%s.tmp.XXXXXX", final);
+    int fd = mkstemp(tmp);
+    if (fd < 0) return map_io_err(errno);
+    if ((n && xwrite(fd, data, n) != (ssize_t)n) || xfsync(fd) < 0) {
+        s3_err_t e = map_io_err(errno);
+        close(fd); unlink(tmp);
+        return e;
+    }
+    close(fd);
+    pthread_mutex_lock(&s->ns_mu);
+    int rc = store_bucket_exists(s, bucket) ? rename(tmp, final) : -1;
+    int err = errno;
+    pthread_mutex_unlock(&s->ns_mu);
+    if (rc < 0) {
+        unlink(tmp);
+        return store_bucket_exists(s, bucket) ? map_io_err(err)
+                                              : S3_ERR_NO_SUCH_BUCKET;
+    }
+    fsync_dir(dir);
+    return S3_OK;
+}
+
+s3_err_t store_bucket_sidecar_read(s3_store_t *s, s3_str_t bucket,
+                                   const char *name, size_t max,
+                                   char **out, size_t *n_out) {
+    char path[4200];
+    if (!s || sidecar_path(s, bucket, name, path, sizeof(path)) < 0)
+        return S3_ERR_INVALID_ARGUMENT;
+    if (!store_bucket_exists(s, bucket)) return S3_ERR_NO_SUCH_BUCKET;
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return errno == ENOENT ? S3_ERR_NO_SUCH_KEY : S3_ERR_INTERNAL;
+    struct stat st;
+    if (fstat(fd, &st) < 0 || !S_ISREG(st.st_mode)) { close(fd); return S3_ERR_INTERNAL; }
+    if ((uint64_t)st.st_size > max) { close(fd); return S3_ERR_ENTITY_TOO_LARGE; }
+    char *b = malloc((size_t)st.st_size + 1);
+    if (!b) { close(fd); return S3_ERR_INTERNAL; }
+    ssize_t got = pread(fd, b, (size_t)st.st_size, 0);
+    close(fd);
+    if (got != st.st_size) { free(b); return S3_ERR_INTERNAL; }
+    b[got] = '\0';
+    *out = b;
+    *n_out = (size_t)got;
+    return S3_OK;
+}
+
+s3_err_t store_bucket_sidecar_delete(s3_store_t *s, s3_str_t bucket,
+                                     const char *name) {
+    char path[4200], dir[4200];
+    if (!s || sidecar_path(s, bucket, name, path, sizeof(path)) < 0)
+        return S3_ERR_INVALID_ARGUMENT;
+    if (!store_bucket_exists(s, bucket)) return S3_ERR_NO_SUCH_BUCKET;
+    if (unlink(path) < 0 && errno != ENOENT) return map_io_err(errno);
+    snprintf(dir, sizeof(dir), "%s/" S3_STR_FMT, s->buckets_dir, S3_STR_ARG(bucket));
+    fsync_dir(dir);
+    return S3_OK;
+}
+
+static void cfg_unref_locked(struct store_cfg_ref *r) {
+    if (--r->refs == 0) {
+        if (r->obj) r->release(r->obj);
+        free(r);
+    }
+}
+
+void *store_cfg_obj(const store_cfg_ref_t *r) { return r ? r->obj : NULL; }
+
+static void cfg_cache_clear(s3_store_t *s) {
+    while (s->cfg_head) {
+        struct store_cfg_ref *n = s->cfg_head->next;
+        s->cfg_head->cached = 0;
+        cfg_unref_locked(s->cfg_head);
+        s->cfg_head = n;
+    }
+    s->cfg_count = 0;
+}
+
+void store_sidecar_put(s3_store_t *s, store_cfg_ref_t *r) {
+    if (!s || !r) return;
+    pthread_mutex_lock(&s->cfg_mu);
+    cfg_unref_locked(r);
+    pthread_mutex_unlock(&s->cfg_mu);
+}
+
+/* Drop a cache entry (caller holds cfg_mu). */
+static void cfg_evict_locked(s3_store_t *s, struct store_cfg_ref **pp) {
+    struct store_cfg_ref *r = *pp;
+    *pp = r->next;
+    r->cached = 0;
+    s->cfg_count--;
+    cfg_unref_locked(r);
+}
+
+static uint64_t mono_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
+}
+
+/* Insert r at the head, first evicting entries for the same bucket name +
+ * sidecar (stale positives, negatives) and bounding the cache. */
+static void cfg_insert_locked(s3_store_t *s, struct store_cfg_ref *r) {
+    struct store_cfg_ref **q = &s->cfg_head;
+    while (*q) {
+        if (strcmp((*q)->bname, r->bname) == 0 && strcmp((*q)->sname, r->sname) == 0)
+            cfg_evict_locked(s, q);
+        else
+            q = &(*q)->next;
+    }
+    if (s->cfg_count >= 1024) {
+        q = &s->cfg_head;
+        size_t i = 0;
+        while (*q && i < 512) { q = &(*q)->next; i++; }
+        while (*q) cfg_evict_locked(s, q);
+    }
+    r->next = s->cfg_head;
+    s->cfg_head = r;
+    s->cfg_count++;
+}
+
+store_cfg_ref_t *store_sidecar_get(s3_store_t *s, s3_str_t bucket,
+                                   const char *name, size_t max,
+                                   store_cfg_parse_fn parse,
+                                   store_cfg_free_fn release) {
+    return store_sidecar_get_ttl(s, bucket, name, max, parse, release, 0);
+}
+
+store_cfg_ref_t *store_sidecar_get_ttl(s3_store_t *s, s3_str_t bucket,
+                                       const char *name, size_t max,
+                                       store_cfg_parse_fn parse,
+                                       store_cfg_free_fn release,
+                                       unsigned ttl_ms) {
+    char path[4200];
+    if (!s || bucket.n >= 64 || strlen(name) >= 32
+        || sidecar_path(s, bucket, name, path, sizeof(path)) < 0) return NULL;
+    char bname[64];
+    memcpy(bname, bucket.p, bucket.n);
+    bname[bucket.n] = '\0';
+    uint64_t now = mono_ms();
+
+    if (ttl_ms) {
+        /* Recently validated (positive or negative): no disk access. */
+        pthread_mutex_lock(&s->cfg_mu);
+        for (struct store_cfg_ref *r = s->cfg_head; r; r = r->next) {
+            if (strcmp(r->bname, bname) || strcmp(r->sname, name)) continue;
+            if (now - r->checked_ms >= ttl_ms) break;
+            if (!r->obj) { pthread_mutex_unlock(&s->cfg_mu); return NULL; }
+            r->refs++;
+            pthread_mutex_unlock(&s->cfg_mu);
+            return r;
+        }
+        pthread_mutex_unlock(&s->cfg_mu);
+    }
+
+    s3_bucket_meta_t bm;
+    int have_bucket = store_bucket_meta(s, bucket, &bm) == S3_OK;
+    char key[sizeof(((struct store_cfg_ref *)0)->key)];
+    if (!have_bucket)
+        snprintf(key, sizeof(key), "?%s/%s", bname, name);
+    else if (bm.id[0])
+        snprintf(key, sizeof(key), "%s/%s", bm.id, name);
+    else
+        snprintf(key, sizeof(key), ":%s/%s", bname, name);
+
+    struct stat st;
+    int have = have_bucket && stat(path, &st) == 0 && S_ISREG(st.st_mode);
+    int64_t mns = have ? (int64_t)st.st_mtim.tv_sec * 1000000000LL + st.st_mtim.tv_nsec : 0;
+
+    pthread_mutex_lock(&s->cfg_mu);
+    for (struct store_cfg_ref *r = s->cfg_head; r; r = r->next) {
+        if (strcmp(r->key, key) != 0) continue;
+        if (have && r->obj && r->dev == st.st_dev && r->ino == st.st_ino
+            && r->mtime_ns == mns && r->size == st.st_size) {
+            r->refs++;
+            r->checked_ms = now;
+            pthread_mutex_unlock(&s->cfg_mu);
+            return r;
+        }
+        break;
+    }
+    if (!have) {
+        /* Remember the absence only when asked to (TTL lookups). */
+        if (ttl_ms) {
+            struct store_cfg_ref *neg = calloc(1, sizeof(*neg));
+            if (neg) {
+                snprintf(neg->key, sizeof(neg->key), "%s", key);
+                snprintf(neg->bname, sizeof(neg->bname), "%s", bname);
+                snprintf(neg->sname, sizeof(neg->sname), "%s", name);
+                neg->release = release;
+                neg->refs = 1;
+                neg->cached = 1;
+                neg->checked_ms = now;
+                cfg_insert_locked(s, neg);
+            }
+        }
+        pthread_mutex_unlock(&s->cfg_mu);
+        return NULL;
+    }
+    pthread_mutex_unlock(&s->cfg_mu);
+
+    /* Parse outside the lock. */
+    char *data = NULL;
+    size_t n = 0;
+    if (store_bucket_sidecar_read(s, bucket, name, max, &data, &n) != S3_OK)
+        return NULL;
+    void *obj = parse(data, n);
+    free(data);
+    struct store_cfg_ref *r = calloc(1, sizeof(*r));
+    if (!r) { if (obj) release(obj); return NULL; }
+    snprintf(r->key, sizeof(r->key), "%s", key);
+    snprintf(r->bname, sizeof(r->bname), "%s", bname);
+    snprintf(r->sname, sizeof(r->sname), "%s", name);
+    r->dev = st.st_dev; r->ino = st.st_ino; r->mtime_ns = mns; r->size = st.st_size;
+    r->obj = obj;
+    r->release = release;
+    r->refs = obj ? 2 : 1;     /* cache (+ caller) */
+    r->cached = 1;
+    r->checked_ms = now;
+    pthread_mutex_lock(&s->cfg_mu);
+    cfg_insert_locked(s, r);
+    pthread_mutex_unlock(&s->cfg_mu);
+    return obj ? r : NULL;
+}
+
+/* ---- Grants ---------------------------------------------------------- */
+
+#define GRANTS_MAX_BYTES (64 * 1024)
+
+typedef struct { size_t n; s3_grant_t *g; } grant_list_t;
+
+int store_grant_parse_perms(const char *p, size_t n) {
+    int bits = 0;
+    for (size_t i = 0; i < n; i++) {
+        int b = p[i] == 'r' ? S3_GRANT_R : p[i] == 'w' ? S3_GRANT_W
+              : p[i] == 'o' ? S3_GRANT_O : -1;
+        if (b < 0 || (bits & b)) return -1;
+        bits |= b;
+    }
+    return bits;
+}
+
+static void grants_free(void *o) {
+    grant_list_t *l = o;
+    if (l) { free(l->g); free(l); }
+}
+
+/* Lines "user:perms". Malformed lines are skipped (logged once per parse):
+ * a bad line must never be read as a broader grant. */
+static void *grants_parse(const char *d, size_t n) {
+    grant_list_t *l = calloc(1, sizeof(*l));
+    if (!l) return NULL;
+    size_t cap = 0, i = 0;
+    while (i < n) {
+        size_t st = i;
+        while (i < n && d[i] != '\n') i++;
+        size_t e = i;
+        if (i < n) i++;
+        if (e == st || d[st] == '#') continue;
+        const char *colon = memchr(d + st, ':', e - st);
+        if (!colon) continue;
+        size_t un = (size_t)(colon - (d + st));
+        char user[129];
+        if (un == 0 || un > 128) continue;
+        memcpy(user, d + st, un);
+        user[un] = '\0';
+        int perms = store_grant_parse_perms(colon + 1, e - (size_t)(colon - d) - 1);
+        if (!s3_valid_ident_strict(user) || perms <= 0) {
+            LOG_W("grants: ignoring malformed line");
+            continue;
+        }
+        if (l->n == cap) {
+            size_t nc = cap ? cap * 2 : 8;
+            s3_grant_t *ng = realloc(l->g, nc * sizeof(*ng));
+            if (!ng) { grants_free(l); return NULL; }
+            l->g = ng; cap = nc;
+        }
+        snprintf(l->g[l->n].user, sizeof(l->g[l->n].user), "%s", user);
+        l->g[l->n].perms = perms;
+        l->n++;
+    }
+    return l;
+}
+
+int store_bucket_grant_perms(s3_store_t *s, s3_str_t bucket, const char *user) {
+    store_cfg_ref_t *r = store_sidecar_get(s, bucket, "grants", GRANTS_MAX_BYTES,
+                                           grants_parse, grants_free);
+    if (!r) return 0;
+    const grant_list_t *l = store_cfg_obj(r);
+    int perms = 0;
+    for (size_t i = 0; i < l->n; i++)
+        if (strcmp(l->g[i].user, user) == 0) perms |= l->g[i].perms;
+    store_sidecar_put(s, r);
+    return perms;
+}
+
+s3_err_t store_bucket_grants_get(s3_store_t *s, s3_str_t bucket,
+                                 s3_grant_t **out, size_t *n_out) {
+    *out = NULL;
+    *n_out = 0;
+    if (!store_bucket_exists(s, bucket)) return S3_ERR_NO_SUCH_BUCKET;
+    store_cfg_ref_t *r = store_sidecar_get(s, bucket, "grants", GRANTS_MAX_BYTES,
+                                           grants_parse, grants_free);
+    if (!r) return S3_OK;
+    const grant_list_t *l = store_cfg_obj(r);
+    if (l->n) {
+        *out = malloc(l->n * sizeof(**out));
+        if (!*out) { store_sidecar_put(s, r); return S3_ERR_INTERNAL; }
+        memcpy(*out, l->g, l->n * sizeof(**out));
+        *n_out = l->n;
+    }
+    store_sidecar_put(s, r);
+    return S3_OK;
+}
+
+s3_err_t store_bucket_grant_set(s3_store_t *s, s3_str_t bucket,
+                                const char *user, int perms) {
+    if (!user || !s3_valid_ident_strict(user) || perms < 0 || perms > 7)
+        return S3_ERR_INVALID_ARGUMENT;
+    s3_grant_t *g = NULL;
+    size_t n = 0;
+    s3_err_t e = store_bucket_grants_get(s, bucket, &g, &n);
+    if (e != S3_OK) return e;
+    size_t cap = (n + 1) * (128 + 8) + 1;
+    char *buf = malloc(cap);
+    if (!buf) { free(g); return S3_ERR_INTERNAL; }
+    size_t o = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (strcmp(g[i].user, user) == 0) continue;
+        o += (size_t)snprintf(buf + o, cap - o, "%s:%s%s%s\n", g[i].user,
+                              g[i].perms & S3_GRANT_R ? "r" : "",
+                              g[i].perms & S3_GRANT_W ? "w" : "",
+                              g[i].perms & S3_GRANT_O ? "o" : "");
+    }
+    if (perms)
+        o += (size_t)snprintf(buf + o, cap - o, "%s:%s%s%s\n", user,
+                              perms & S3_GRANT_R ? "r" : "",
+                              perms & S3_GRANT_W ? "w" : "",
+                              perms & S3_GRANT_O ? "o" : "");
+    free(g);
+    e = store_bucket_sidecar_write(s, bucket, "grants", buf, o);
+    free(buf);
+    return e;
+}
+
+/* ===================================================================== */
 /* Streaming PUT                                                          */
 /* ===================================================================== */
 
@@ -682,6 +1255,7 @@ struct s3_writer {
     uint64_t    data_written;        /* bytes written to data region so far */
     EVP_MD_CTX *md5_ctx;             /* running MD5 */
     obj_header_t hdr;                /* accumulated header (filled in begin) */
+    obj_ext_v3_t ext;                /* schema-3 extension (checksum, ...) */
     char       *bucket_dup;
     char       *key_dup;             /* NOT NUL-terminated; key_len in hdr.key_len */
     char       *content_type_dup;    /* NUL-terminated */
@@ -694,6 +1268,7 @@ struct s3_writer {
      * The content_type/key fields above are NOT used in this mode. */
     int         is_part;
     char        final_path[4096];    /* destination for atomic rename */
+    uint8_t     mpu_algo;            /* part: upload's required checksum algo */
 
     /* Bucket id at put_begin. Commit publishes only if the bucket still
      * has this id: deleted-and-recreated (maybe by another user) is a
@@ -714,7 +1289,29 @@ static void writer_free(s3_writer_t *w) {
 
 s3_err_t store_put_begin(s3_store_t *s, s3_str_t bucket, s3_str_t key,
                          const char *content_type, s3_writer_t **out) {
-    if (!s || !out) return S3_ERR_INVALID_ARGUMENT;
+    store_put_opts_t o = { .content_type = content_type };
+    return store_put_begin_opts(s, bucket, key, &o, out);
+}
+
+s3_err_t store_put_set_checksum(s3_writer_t *w, uint8_t algo, uint8_t type,
+                                uint16_t parts, const uint8_t *digest,
+                                size_t n) {
+    if (!w || w->finalized || algo >= S3_CKSUM_MAX || n > sizeof(w->ext.cksum)
+        || type > S3_CKSUM_TYPE_COMPOSITE)
+        return S3_ERR_INVALID_ARGUMENT;
+    memset(w->ext.cksum, 0, sizeof(w->ext.cksum));
+    w->ext.cksum_algo  = algo;
+    w->ext.cksum_type  = type;
+    w->ext.cksum_parts = parts;
+    if (n) memcpy(w->ext.cksum, digest, n);
+    return S3_OK;
+}
+
+s3_err_t store_put_begin_opts(s3_store_t *s, s3_str_t bucket, s3_str_t key,
+                              const store_put_opts_t *opts,
+                              s3_writer_t **out) {
+    if (!s || !out || !opts) return S3_ERR_INVALID_ARGUMENT;
+    const char *content_type = opts->content_type;
     if (!valid_bucket_name(bucket)) return S3_ERR_INVALID_BUCKET_NAME;
     if (!valid_key(key))            return S3_ERR_INVALID_ARGUMENT;
     if (!store_bucket_exists(s, bucket)) return S3_ERR_NO_SUCH_BUCKET;
@@ -763,7 +1360,14 @@ s3_err_t store_put_begin(s3_store_t *s, s3_str_t bucket, s3_str_t key,
     if (ct_n > UINT16_MAX)  { writer_free(w); return S3_ERR_INVALID_ARGUMENT; }
     memcpy(w->hdr.magic, OBJ_MAGIC, OBJ_MAGIC_LEN);
     w->hdr.schema      = OBJ_SCHEMA;
-    w->hdr.header_size = (uint32_t)(sizeof(obj_header_t) + ct_n + key.n);
+    w->hdr.header_size = (uint32_t)(sizeof(obj_header_t) + sizeof(obj_ext_v3_t)
+                                    + ct_n + key.n);
+    if (opts->have_cksum
+        && store_put_set_checksum(w, opts->cksum_algo, opts->cksum_type,
+                                  opts->cksum_parts, opts->cksum,
+                                  sizeof(opts->cksum)) != S3_OK) {
+        writer_free(w); return S3_ERR_INVALID_ARGUMENT;
+    }
     w->hdr.ct_len      = (uint16_t)ct_n;
     w->hdr.key_len     = (uint16_t)key.n;
     /* data_size, mtime_ms, etag filled at commit */
@@ -781,6 +1385,7 @@ s3_err_t store_put_begin(s3_store_t *s, s3_str_t bucket, s3_str_t key,
      * variable-length content_type and key bytes. We'll pwrite the final
      * header back at offset 0 in commit. */
     if (xwrite(w->fd, &w->hdr, sizeof(w->hdr)) != (ssize_t)sizeof(w->hdr)
+        || xwrite(w->fd, &w->ext, sizeof(w->ext)) != (ssize_t)sizeof(w->ext)
         || (ct_n  && xwrite(w->fd, w->content_type_dup, ct_n) != (ssize_t)ct_n)
         || (key.n && xwrite(w->fd, w->key_dup, key.n)         != (ssize_t)key.n)) {
         LOG_E("write header: %s", strerror(errno));
@@ -825,8 +1430,22 @@ s3_err_t store_put_commit(s3_writer_t *w, s3_obj_meta_t *meta_out) {
     w->hdr.mtime_ms = (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)(ts.tv_nsec / 1000000);
     w->hdr.data_size = w->data_written;
 
+    /* Versioning: an Enabled bucket gives every new object a fresh
+     * version id; Suspended/Unset write the null version. */
+    int versioning = 0;
+    {
+        s3_str_t bk = { w->bucket_dup, strlen(w->bucket_dup) };
+        versioning = bucket_versioning(w->store, bk);
+        memset(w->ext.version_id, 0, 16);
+        if (versioning == S3_VERSIONING_ENABLED && random_vid(w->ext.version_id) < 0) {
+            writer_free(w); return S3_ERR_INTERNAL;
+        }
+    }
+
     /* Pwrite the finalized header back at offset 0. */
-    if (pwrite(w->fd, &w->hdr, sizeof(w->hdr), 0) != (ssize_t)sizeof(w->hdr)) {
+    if (pwrite(w->fd, &w->hdr, sizeof(w->hdr), 0) != (ssize_t)sizeof(w->hdr)
+        || pwrite(w->fd, &w->ext, sizeof(w->ext), sizeof(w->hdr))
+           != (ssize_t)sizeof(w->ext)) {
         LOG_E("pwrite header: %s", strerror(errno));
         s3_err_t e = map_io_err(errno);
         writer_free(w); return e;
@@ -858,18 +1477,33 @@ s3_err_t store_put_commit(s3_writer_t *w, s3_obj_meta_t *meta_out) {
      * another user. Without this re-check under ns_mu, mkdir_p would
      * resurrect data/<bucket>/, or the object would land in a bucket
      * the uploader doesn't own. */
+    pthread_mutex_t *km = key_lock(w->store, hex);
+    pthread_mutex_lock(km);
     pthread_mutex_lock(&w->store->ns_mu);
     s3_bucket_meta_t bm;
     if (store_bucket_meta(w->store, bucket, &bm) != S3_OK
         || strcmp(bm.id, w->bucket_id) != 0) {
         pthread_mutex_unlock(&w->store->ns_mu);
+    pthread_mutex_unlock(km);
         writer_free(w); return S3_ERR_NO_SUCH_BUCKET;
     }
     if (mkdir_p(dir, 0700) < 0) {
         LOG_E("mkdir_p %s: %s", dir, strerror(errno));
         s3_err_t e = map_io_err(errno);
         pthread_mutex_unlock(&w->store->ns_mu);
+    pthread_mutex_unlock(km);
         writer_free(w); return e;
+    }
+
+    /* Versioned bucket: move the current version aside first (hard link,
+     * crash-safe; see store.h). */
+    {
+        s3_err_t le = link_aside_locked(w->store, bucket, hex, path, versioning);
+        if (le != S3_OK) {
+            pthread_mutex_unlock(&w->store->ns_mu);
+            pthread_mutex_unlock(km);
+            writer_free(w); return le;
+        }
     }
 
     /* Atomic rename. Can also fail with ENOSPC (new dirent allocation). */
@@ -877,9 +1511,11 @@ s3_err_t store_put_commit(s3_writer_t *w, s3_obj_meta_t *meta_out) {
         LOG_E("rename %s -> %s: %s", w->tmp_path, path, strerror(errno));
         s3_err_t e = map_io_err(errno);
         pthread_mutex_unlock(&w->store->ns_mu);
+    pthread_mutex_unlock(km);
         writer_free(w); return e;
     }
     pthread_mutex_unlock(&w->store->ns_mu);
+    pthread_mutex_unlock(km);
     /* tmp_path is gone; clear so writer_free doesn't unlink the live file. */
     w->tmp_path[0] = '\0';
 
@@ -898,6 +1534,12 @@ s3_err_t store_put_commit(s3_writer_t *w, s3_obj_meta_t *meta_out) {
         if (ctn >= sizeof(meta_out->content_type)) ctn = sizeof(meta_out->content_type) - 1;
         memcpy(meta_out->content_type, w->content_type_dup, ctn);
         meta_out->content_type[ctn] = '\0';
+        memcpy(meta_out->version_id, w->ext.version_id, 16);
+        meta_out->flags       = w->ext.flags;
+        meta_out->cksum_algo  = w->ext.cksum_algo;
+        meta_out->cksum_type  = w->ext.cksum_type;
+        meta_out->cksum_parts = w->ext.cksum_parts;
+        memcpy(meta_out->cksum, w->ext.cksum, 32);
     }
 
     writer_free(w);
@@ -921,66 +1563,87 @@ struct s3_reader {
     uint64_t pos;            /* bytes already returned to caller */
 };
 
-/* Read header from fd at offset 0; verify magic/schema; populate meta. */
+/* Read and validate an object file's header. The share holding the data
+ * root may be writable by other DSM users, so every length is treated as
+ * untrusted: header_size must equal exactly fixed + ext + ct + key, fit
+ * inside the file, and the data region must match the file size.
+ * Fills h, x (zeroes for schema 2) and *ct_off (offset of content-type
+ * bytes; the key follows them). */
+static s3_err_t obj_read_hdr(int fd, obj_header_t *h, obj_ext_v3_t *x,
+                             uint32_t *ct_off) {
+    ssize_t r = pread(fd, h, sizeof(*h), 0);
+    if (r != (ssize_t)sizeof(*h)) return S3_ERR_INTERNAL;
+    if (memcmp(h->magic, OBJ_MAGIC, OBJ_MAGIC_LEN) != 0) return S3_ERR_INTERNAL;
+    uint32_t fixed;
+    memset(x, 0, sizeof(*x));
+    if (h->schema == OBJ_SCHEMA_V2) {
+        fixed = (uint32_t)sizeof(*h);
+    } else if (h->schema == OBJ_SCHEMA) {
+        fixed = (uint32_t)(sizeof(*h) + sizeof(*x));
+        if (pread(fd, x, sizeof(*x), sizeof(*h)) != (ssize_t)sizeof(*x))
+            return S3_ERR_INTERNAL;
+        if (x->cksum_algo >= S3_CKSUM_MAX
+            || x->cksum_type > S3_CKSUM_TYPE_COMPOSITE
+            || (x->cksum_type == S3_CKSUM_TYPE_COMPOSITE
+                && (x->cksum_parts == 0 || x->cksum_parts > 10000)))
+            return S3_ERR_INTERNAL;
+    } else {
+        return S3_ERR_INTERNAL;
+    }
+    if (h->ct_len > OBJ_MAX_CT_LEN || h->key_len == 0 || h->key_len > 1024)
+        return S3_ERR_INTERNAL;
+    if ((uint64_t)h->header_size != (uint64_t)fixed + h->ct_len + h->key_len)
+        return S3_ERR_INTERNAL;
+    if (h->part_count > 10000) return S3_ERR_INTERNAL;
+    struct stat st;
+    if (fstat(fd, &st) < 0 || st.st_size < 0
+        || (uint64_t)st.st_size < h->header_size
+        || (uint64_t)st.st_size - h->header_size != h->data_size)
+        return S3_ERR_INTERNAL;
+    *ct_off = fixed;
+    return S3_OK;
+}
+
+/* Fill meta from a validated header (content-type read from fd). */
+static s3_err_t obj_fill_meta(int fd, const obj_header_t *h,
+                              const obj_ext_v3_t *x, uint32_t ct_off,
+                              s3_obj_meta_t *m) {
+    memset(m, 0, sizeof(*m));
+    m->size       = h->data_size;
+    m->mtime_ms   = h->mtime_ms;
+    m->part_count = h->part_count;
+    memcpy(m->etag, h->etag, 16);
+    memcpy(m->version_id, x->version_id, 16);
+    m->flags       = x->flags;
+    m->cksum_algo  = x->cksum_algo;
+    m->cksum_type  = x->cksum_type;
+    m->cksum_parts = x->cksum_parts;
+    memcpy(m->cksum, x->cksum, 32);
+    if (h->ct_len > 0) {
+        size_t ctn = h->ct_len;
+        if (ctn >= sizeof(m->content_type)) ctn = sizeof(m->content_type) - 1;
+        if (pread(fd, m->content_type, ctn, ct_off) != (ssize_t)ctn)
+            return S3_ERR_INTERNAL;
+        m->content_type[ctn] = '\0';
+    }
+    return S3_OK;
+}
+
+/* Read header from fd at offset 0; verify; populate meta. */
 static s3_err_t read_header(int fd, obj_header_t *hdr_out, s3_obj_meta_t *meta_out) {
     obj_header_t h;
-    ssize_t r = pread(fd, &h, sizeof(h), 0);
-    if (r != (ssize_t)sizeof(h)) return S3_ERR_INTERNAL;
-    if (memcmp(h.magic, OBJ_MAGIC, OBJ_MAGIC_LEN) != 0) return S3_ERR_INTERNAL;
-    if (h.schema != OBJ_SCHEMA) return S3_ERR_INTERNAL;
-
+    obj_ext_v3_t x;
+    uint32_t ct_off;
+    s3_err_t e = obj_read_hdr(fd, &h, &x, &ct_off);
+    if (e != S3_OK) return e;
     if (hdr_out) *hdr_out = h;
-
-    if (meta_out) {
-        memset(meta_out, 0, sizeof(*meta_out));
-        meta_out->size     = h.data_size;
-        meta_out->mtime_ms = h.mtime_ms;
-        meta_out->part_count = h.part_count;
-        memcpy(meta_out->etag, h.etag, 16);
-
-        if (h.ct_len > 0) {
-            size_t ctn = h.ct_len;
-            if (ctn >= sizeof(meta_out->content_type)) {
-                ctn = sizeof(meta_out->content_type) - 1;
-            }
-            ssize_t cr = pread(fd, meta_out->content_type, ctn, sizeof(h));
-            if (cr != (ssize_t)ctn) return S3_ERR_INTERNAL;
-            meta_out->content_type[ctn] = '\0';
-        }
-    }
+    if (meta_out) return obj_fill_meta(fd, &h, &x, ct_off, meta_out);
     return S3_OK;
 }
 
 s3_err_t store_get_open(s3_store_t *s, s3_str_t bucket, s3_str_t key,
                         s3_reader_t **out, s3_obj_meta_t *meta_out) {
-    if (!s || !out) return S3_ERR_INVALID_ARGUMENT;
-    if (!valid_bucket_name(bucket)) return S3_ERR_INVALID_BUCKET_NAME;
-    if (!valid_key(key))            return S3_ERR_INVALID_ARGUMENT;
-    if (!store_bucket_exists(s, bucket)) return S3_ERR_NO_SUCH_BUCKET;
-
-    char hex[65];
-    hash_bucket_key(bucket, key, hex);
-    char path[4096];
-    if (obj_path(s, bucket, hex, path, sizeof(path)) < 0) return S3_ERR_INTERNAL;
-
-    int fd = open(path, O_RDONLY | O_CLOEXEC);
-    if (fd < 0) {
-        if (errno == ENOENT) return S3_ERR_NO_SUCH_KEY;
-        return S3_ERR_INTERNAL;
-    }
-
-    obj_header_t h;
-    s3_err_t e = read_header(fd, &h, meta_out);
-    if (e != S3_OK) { close(fd); return e; }
-
-    s3_reader_t *r = calloc(1, sizeof(*r));
-    if (!r) { close(fd); return S3_ERR_INTERNAL; }
-    r->fd        = fd;
-    r->data_off  = h.header_size;
-    r->data_size = h.data_size;
-    r->pos       = 0;
-    *out = r;
-    return S3_OK;
+    return store_get_open_version(s, bucket, key, NULL, out, meta_out);
 }
 
 ssize_t store_get_read(s3_reader_t *r, void *buf, size_t n) {
@@ -1030,30 +1693,7 @@ s3_err_t store_head(s3_store_t *s, s3_str_t bucket, s3_str_t key,
 }
 
 s3_err_t store_delete(s3_store_t *s, s3_str_t bucket, s3_str_t key) {
-    if (!s) return S3_ERR_INVALID_ARGUMENT;
-    if (!valid_bucket_name(bucket)) return S3_ERR_INVALID_BUCKET_NAME;
-    if (!valid_key(key))            return S3_ERR_INVALID_ARGUMENT;
-    if (!store_bucket_exists(s, bucket)) return S3_ERR_NO_SUCH_BUCKET;
-
-    char hex[65];
-    hash_bucket_key(bucket, key, hex);
-    char path[4096];
-    if (obj_path(s, bucket, hex, path, sizeof(path)) < 0) return S3_ERR_INTERNAL;
-    if (unlink(path) < 0) {
-        if (errno == ENOENT) {
-            /* S3 DELETE is idempotent: deleting a missing key is success. */
-            return S3_OK;
-        }
-        LOG_W("unlink %s: %s", path, strerror(errno));
-        return S3_ERR_INTERNAL;
-    }
-    /* fsync the leaf dir for durability. */
-    char *slash = strrchr(path, '/');
-    if (slash) {
-        *slash = '\0';
-        (void)fsync_dir(path);
-    }
-    return S3_OK;
+    return store_delete_ex(s, bucket, key, NULL, NULL);
 }
 
 /* ===================================================================== */
@@ -1121,36 +1761,19 @@ static int starts_with(const char *p, size_t n, s3_str_t pref) {
 static int load_entry(const char *path, list_entry_t *out) {
     int fd = open(path, O_RDONLY | O_CLOEXEC);
     if (fd < 0) return -1;
-
     obj_header_t h;
-    ssize_t r = pread(fd, &h, sizeof(h), 0);
-    if (r != (ssize_t)sizeof(h) || memcmp(h.magic, OBJ_MAGIC, OBJ_MAGIC_LEN) != 0) {
-        close(fd); return -1;
-    }
+    obj_ext_v3_t x;
+    uint32_t ct_off;
+    if (obj_read_hdr(fd, &h, &x, &ct_off) != S3_OK) { close(fd); return -1; }
     char *kbuf = malloc((size_t)h.key_len + 1);
     if (!kbuf) { close(fd); return -1; }
-    if (h.key_len > 0) {
-        if (pread(fd, kbuf, h.key_len, sizeof(h) + h.ct_len) != (ssize_t)h.key_len) {
-            free(kbuf); close(fd); return -1;
-        }
+    if (pread(fd, kbuf, h.key_len, (off_t)ct_off + h.ct_len) != (ssize_t)h.key_len
+        || obj_fill_meta(fd, &h, &x, ct_off, &out->meta) != S3_OK) {
+        free(kbuf); close(fd); return -1;
     }
     kbuf[h.key_len] = '\0';
-
     out->key = kbuf;
     out->key_len = h.key_len;
-    memset(&out->meta, 0, sizeof(out->meta));
-    out->meta.size = h.data_size;
-    out->meta.mtime_ms = h.mtime_ms;
-    out->meta.part_count = h.part_count;
-    memcpy(out->meta.etag, h.etag, 16);
-    if (h.ct_len > 0) {
-        size_t ctn = h.ct_len;
-        if (ctn >= sizeof(out->meta.content_type)) ctn = sizeof(out->meta.content_type) - 1;
-        if (pread(fd, out->meta.content_type, ctn, sizeof(h)) != (ssize_t)ctn) {
-            free(kbuf); close(fd); return -1;
-        }
-        out->meta.content_type[ctn] = '\0';
-    }
     close(fd);
     return 0;
 }
@@ -1194,7 +1817,11 @@ static int walk_bucket(const char *bucket_data_dir, list_entry_t **items_out,
                     if (!ni) { closedir(d3); closedir(d2); closedir(d1); goto oom; }
                     items = ni; cap = nc;
                 }
-                if (load_entry(path, &items[n]) == 0) n++;
+                if (load_entry(path, &items[n]) == 0) {
+                    /* A delete marker hides the key from listings. */
+                    if (items[n].meta.flags & S3_OBJF_DELETE_MARKER) free(items[n].key);
+                    else n++;
+                }
             }
             closedir(d3);
         }
@@ -1440,6 +2067,58 @@ void store_buckets_free(s3_bucket_info_t *list, size_t n) {
     free(list);
 }
 
+/* Noncurrent versions (and markers) under versions/<b>/xx/yy/<hex>/. */
+static void count_versions(s3_store_t *s, s3_str_t bucket, s3_bucket_stats_t *st) {
+    char vb[4200];
+    snprintf(vb, sizeof(vb), "%s/" S3_STR_FMT, s->versions_dir, S3_STR_ARG(bucket));
+    DIR *d1 = opendir(vb);
+    if (!d1) return;
+    struct dirent *e1;
+    while ((e1 = readdir(d1)) != NULL) {
+        if (e1->d_name[0] == '.') continue;
+        char p1[4500];
+        snprintf(p1, sizeof(p1), "%s/%s", vb, e1->d_name);
+        DIR *d2 = opendir(p1);
+        if (!d2) continue;
+        struct dirent *e2;
+        while ((e2 = readdir(d2)) != NULL) {
+            if (e2->d_name[0] == '.') continue;
+            char p2[4800];
+            snprintf(p2, sizeof(p2), "%s/%s", p1, e2->d_name);
+            DIR *d3 = opendir(p2);
+            if (!d3) continue;
+            struct dirent *e3;
+            while ((e3 = readdir(d3)) != NULL) {
+                if (e3->d_name[0] == '.') continue;
+                char p3[5100];
+                snprintf(p3, sizeof(p3), "%s/%s", p2, e3->d_name);
+                DIR *d4 = opendir(p3);
+                if (!d4) continue;
+                struct dirent *e4;
+                while ((e4 = readdir(d4)) != NULL) {
+                    if (e4->d_name[0] == '.') continue;
+                    char fp[5400];
+                    snprintf(fp, sizeof(fp), "%s/%s", p3, e4->d_name);
+                    int fd = open(fp, O_RDONLY | O_CLOEXEC);
+                    if (fd < 0) continue;
+                    obj_header_t h;
+                    obj_ext_v3_t x;
+                    uint32_t co;
+                    if (obj_read_hdr(fd, &h, &x, &co) == S3_OK) {
+                        st->versions++;
+                        st->version_bytes += h.data_size;
+                    }
+                    close(fd);
+                }
+                closedir(d4);
+            }
+            closedir(d3);
+        }
+        closedir(d2);
+    }
+    closedir(d1);
+}
+
 /* Read just the header of one object file and accumulate into stats.
  * Unreadable or non-object files are skipped, not errors: the walk is
  * advisory (admin display), and a file mid-rename shouldn't fail it. */
@@ -1447,11 +2126,12 @@ static void stats_count_file(const char *path, s3_bucket_stats_t *st) {
     int fd = open(path, O_RDONLY | O_CLOEXEC);
     if (fd < 0) return;
     obj_header_t h;
-    ssize_t r = pread(fd, &h, sizeof(h), 0);
+    obj_ext_v3_t x;
+    uint32_t ct_off;
+    s3_err_t e = obj_read_hdr(fd, &h, &x, &ct_off);
     close(fd);
-    if (r != (ssize_t)sizeof(h)
-        || memcmp(h.magic, OBJ_MAGIC, OBJ_MAGIC_LEN) != 0)
-        return;
+    if (e != S3_OK) return;
+    if (x.flags & S3_OBJF_DELETE_MARKER) { st->versions++; return; }
     st->objects++;
     st->bytes += h.data_size;
 }
@@ -1498,6 +2178,7 @@ s3_err_t store_bucket_stats(s3_store_t *s, s3_str_t bucket,
         closedir(d2);
     }
     closedir(d1);
+    count_versions(s, bucket, out);
     return S3_OK;
 }
 
@@ -1588,7 +2269,21 @@ static int rm_rf(const char *path) {
 s3_err_t store_mpu_create(s3_store_t *s, s3_str_t bucket, s3_str_t key,
                           const char *content_type,
                           char upload_id_out[S3_MULTIPART_UPLOAD_ID_LEN + 1]) {
+    return store_mpu_create_opts(s, bucket, key, content_type, 0, 0,
+                                 upload_id_out);
+}
+
+s3_err_t store_mpu_create_opts(s3_store_t *s, s3_str_t bucket, s3_str_t key,
+                               const char *content_type,
+                               uint8_t cksum_algo, uint8_t cksum_type,
+                               char upload_id_out[S3_MULTIPART_UPLOAD_ID_LEN + 1]) {
     if (!s || !upload_id_out) return S3_ERR_INVALID_ARGUMENT;
+    if (cksum_algo >= S3_CKSUM_MAX || cksum_type > S3_CKSUM_TYPE_COMPOSITE)
+        return S3_ERR_INVALID_ARGUMENT;
+    /* Content-type and key go into a line-based file: no newlines. */
+    if (memchr(key.p, '\n', key.n)
+        || (content_type && strpbrk(content_type, "\r\n")))
+        return S3_ERR_INVALID_ARGUMENT;
     if (!valid_bucket_name(bucket)) return S3_ERR_INVALID_BUCKET_NAME;
     if (!valid_key(key))            return S3_ERR_INVALID_ARGUMENT;
     if (!store_bucket_exists(s, bucket)) return S3_ERR_NO_SUCH_BUCKET;
@@ -1638,6 +2333,8 @@ s3_err_t store_mpu_create(s3_store_t *s, s3_str_t bucket, s3_str_t key,
         fprintf(fp, "key=" S3_STR_FMT "\n", S3_STR_ARG(key));
         fprintf(fp, "ct=%s\n", content_type ? content_type : "");
         fprintf(fp, "ctime_ms=%" PRIu64 "\n", ctime_ms);
+        if (cksum_algo)
+            fprintf(fp, "cksum=%u\ncktype=%u\n", cksum_algo, cksum_type);
         if (fflush(fp) < 0 || xfsync(fileno(fp)) < 0) {
             s3_err_t e = map_io_err(errno);
             fclose(fp); unlink(meta_tmp); rmdir(dir);
@@ -1663,7 +2360,8 @@ s3_err_t store_mpu_create(s3_store_t *s, s3_str_t bucket, s3_str_t key,
 static s3_err_t mpu_read_meta(const s3_store_t *s, s3_str_t bucket,
                               const char *upload_id,
                               char **out_key, size_t *out_key_n,
-                              char **out_ct) {
+                              char **out_ct, uint8_t *out_algo,
+                              uint8_t *out_type) {
     char dir[4096], meta[4096];
     if (mpu_dir_path(s, bucket, upload_id, dir, sizeof(dir)) < 0)
         return S3_ERR_INTERNAL;
@@ -1679,6 +2377,8 @@ static s3_err_t mpu_read_meta(const s3_store_t *s, s3_str_t bucket,
     if (out_key) *out_key = NULL;
     if (out_ct)  *out_ct  = NULL;
     if (out_key_n) *out_key_n = 0;
+    if (out_algo) *out_algo = 0;
+    if (out_type) *out_type = 0;
     ssize_t r;
     while ((r = getline(&line, &line_cap, fp)) > 0) {
         if (r > 0 && line[r-1] == '\n') { line[r-1] = '\0'; r--; }
@@ -1687,6 +2387,11 @@ static s3_err_t mpu_read_meta(const s3_store_t *s, s3_str_t bucket,
             if (out_key_n) *out_key_n = (size_t)r - 4;
         } else if (strncmp(line, "ct=", 3) == 0 && out_ct) {
             *out_ct = strdup(line + 3);
+        } else if (strncmp(line, "cksum=", 6) == 0 && out_algo) {
+            unsigned long a = strtoul(line + 6, NULL, 10);
+            *out_algo = a < S3_CKSUM_MAX ? (uint8_t)a : 0;
+        } else if (strncmp(line, "cktype=", 7) == 0 && out_type) {
+            *out_type = strtoul(line + 7, NULL, 10) == 1 ? 1 : 0;
         }
     }
     free(line);
@@ -1707,8 +2412,10 @@ s3_err_t store_mpu_part_begin(s3_store_t *s, s3_str_t bucket, s3_str_t key,
     /* Verify the upload exists and the key matches. */
     char *stored_key = NULL;
     size_t stored_key_n = 0;
+    uint8_t mpu_algo = 0;
     s3_err_t err = mpu_read_meta(s, bucket, upload_id,
-                                  &stored_key, &stored_key_n, NULL);
+                                  &stored_key, &stored_key_n, NULL,
+                                  &mpu_algo, NULL);
     if (err != S3_OK) return err;
     if (stored_key_n != key.n
         || memcmp(stored_key, key.p, key.n) != 0) {
@@ -1722,6 +2429,7 @@ s3_err_t store_mpu_part_begin(s3_store_t *s, s3_str_t bucket, s3_str_t key,
     w->store = s;
     w->fd = -1;
     w->is_part = 1;
+    w->mpu_algo = mpu_algo;
 
     /* Final destination: <mpu>/<bucket>/<upload_id>/part-NNNNN */
     if (mpu_part_path(s, bucket, upload_id, part_number,
@@ -1788,18 +2496,51 @@ s3_err_t store_mpu_part_commit(s3_writer_t *w, char etag_hex_out[33]) {
         etag_hex_out[32] = '\0';
     }
 
+    /* An upload created with a checksum algorithm needs every part to
+     * carry a verified checksum of that algorithm. */
+    if (w->mpu_algo && w->ext.cksum_algo != w->mpu_algo) {
+        writer_free(w); return S3_ERR_INVALID_CHECKSUM;
+    }
     if (xfsync(w->fd) < 0) {
         s3_err_t e = map_io_err(errno);
         writer_free(w); return e;
     }
     close(w->fd); w->fd = -1;
+
+    /* Part checksum sidecar part-NNNNN.ck: [algo][digest]. Staged in
+     * tmp/ and renamed in with the part. */
+    char ck_tmp[4096] = "", ck_final[4200] = "";
+    if (w->ext.cksum_algo) {
+        size_t dn = cksum_digest_len(w->ext.cksum_algo);
+        uint8_t rec[1 + 32];
+        rec[0] = w->ext.cksum_algo;
+        memcpy(rec + 1, w->ext.cksum, dn);
+        snprintf(ck_final, sizeof(ck_final), "%s.ck", w->final_path);
+        int cfd = tmp_open(w->store, ck_tmp, sizeof(ck_tmp));
+        if (cfd < 0) { s3_err_t e = map_io_err(errno); writer_free(w); return e; }
+        if (xwrite(cfd, rec, 1 + dn) != (ssize_t)(1 + dn) || xfsync(cfd) < 0) {
+            s3_err_t e = map_io_err(errno);
+            close(cfd); unlink(ck_tmp); writer_free(w); return e;
+        }
+        close(cfd);
+    }
     /* ns_mu: an rm_rf of the upload dir (abort, GC, complete, bucket
      * delete) must not interleave with this rename, or its final rmdir
      * would fail on the newly-arrived part. */
     pthread_mutex_lock(&w->store->ns_mu);
-    int rc = rename(w->tmp_path, w->final_path);
+    int rc = 0;
+    if (ck_tmp[0]) {
+        rc = rename(ck_tmp, ck_final);
+    } else {
+        /* A re-upload without a checksum must not inherit a stale one. */
+        char stale[4200];
+        snprintf(stale, sizeof(stale), "%s.ck", w->final_path);
+        unlink(stale);
+    }
+    if (rc == 0) rc = rename(w->tmp_path, w->final_path);
     int rename_errno = errno;
     pthread_mutex_unlock(&w->store->ns_mu);
+    if (rc < 0 && ck_tmp[0]) unlink(ck_tmp);
     if (rc < 0) {
         /* ENOENT: the upload dir vanished mid-stream (abort, GC, or
          * bucket delete ran while this part was uploading). */
@@ -1856,7 +2597,44 @@ s3_err_t store_mpu_complete(s3_store_t *s, s3_str_t bucket, s3_str_t key,
                             const char *upload_id,
                             const s3_part_ref_t *parts, size_t n_parts,
                             char etag_out[40], s3_obj_meta_t *meta_out) {
+    return store_mpu_complete2(s, bucket, key, upload_id, parts, n_parts,
+                               NULL, 0, etag_out, meta_out);
+}
+
+s3_err_t store_mpu_checksum_info(s3_store_t *s, s3_str_t bucket,
+                                 const char *upload_id,
+                                 uint8_t *algo, uint8_t *type) {
+    if (!s || !upload_id) return S3_ERR_INVALID_ARGUMENT;
+    if (!valid_bucket_name(bucket)) return S3_ERR_INVALID_BUCKET_NAME;
+    return mpu_read_meta(s, bucket, upload_id, NULL, NULL, NULL, algo, type);
+}
+
+/* Read part-NNNNN.ck. Returns digest length, 0 if absent, -1 if corrupt. */
+static int read_part_cksum(const char *part_path, uint8_t algo_want,
+                           uint8_t out[32]) {
+    char ck[4200];
+    snprintf(ck, sizeof(ck), "%s.ck", part_path);
+    int fd = open(ck, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return errno == ENOENT ? 0 : -1;
+    uint8_t rec[1 + 32 + 1];
+    ssize_t n = read(fd, rec, sizeof(rec));
+    close(fd);
+    if (n < 1) return -1;
+    size_t dn = cksum_digest_len(rec[0]);
+    if (!dn || (size_t)n != 1 + dn || rec[0] != algo_want) return -1;
+    memcpy(out, rec + 1, dn);
+    return (int)dn;
+}
+
+s3_err_t store_mpu_complete2(s3_store_t *s, s3_str_t bucket, s3_str_t key,
+                             const char *upload_id,
+                             const s3_part_ref_t *parts, size_t n_parts,
+                             const uint8_t *full_expect, size_t full_n,
+                             char etag_out[40], s3_obj_meta_t *meta_out) {
     if (!s || !upload_id || !parts || n_parts == 0) return S3_ERR_INVALID_ARGUMENT;
+    cksum_ctx_t comp, full;        /* composite / full-object checksum */
+    memset(&comp, 0, sizeof(comp));
+    memset(&full, 0, sizeof(full));
     if (n_parts > 10000) return S3_ERR_INVALID_ARGUMENT;
     if (!valid_bucket_name(bucket)) return S3_ERR_INVALID_BUCKET_NAME;
     if (!valid_key(key))            return S3_ERR_INVALID_ARGUMENT;
@@ -1866,15 +2644,17 @@ s3_err_t store_mpu_complete(s3_store_t *s, s3_str_t bucket, s3_str_t key,
     char *stored_key = NULL;
     size_t stored_key_n = 0;
     char *stored_ct = NULL;
+    uint8_t mpu_algo = 0, mpu_type = 0;
     s3_err_t err = mpu_read_meta(s, bucket, upload_id,
-                                  &stored_key, &stored_key_n, &stored_ct);
+                                  &stored_key, &stored_key_n, &stored_ct,
+                                  &mpu_algo, &mpu_type);
     if (err != S3_OK) {
-        free(stored_key); free(stored_ct);
+        free(stored_key); free(stored_ct); cksum_free(&comp); cksum_free(&full);
         return err;
     }
     if (stored_key_n != key.n
         || memcmp(stored_key, key.p, key.n) != 0) {
-        free(stored_key); free(stored_ct);
+        free(stored_key); free(stored_ct); cksum_free(&comp); cksum_free(&full);
         return S3_ERR_NO_SUCH_UPLOAD;
     }
     free(stored_key);
@@ -1897,7 +2677,7 @@ s3_err_t store_mpu_complete(s3_store_t *s, s3_str_t bucket, s3_str_t key,
     EVP_MD_CTX *etag_md = EVP_MD_CTX_new();
     if (!etag_md || EVP_DigestInit_ex(etag_md, EVP_md5(), NULL) != 1) {
         if (etag_md) EVP_MD_CTX_free(etag_md);
-        free(stored_ct);
+        free(stored_ct); cksum_free(&comp); cksum_free(&full);
         return S3_ERR_INTERNAL;
     }
 
@@ -1908,10 +2688,20 @@ s3_err_t store_mpu_complete(s3_store_t *s, s3_str_t bucket, s3_str_t key,
             || parts[i].part_number < 1
             || parts[i].part_number > 10000) {
             EVP_MD_CTX_free(etag_md);
-            free(stored_ct);
+            free(stored_ct); cksum_free(&comp); cksum_free(&full);
             return S3_ERR_INVALID_ARGUMENT;
         }
         prev_pn = parts[i].part_number;
+    }
+
+    if (mpu_algo) {
+        int a = mpu_type == S3_CKSUM_TYPE_COMPOSITE ? cksum_begin(&comp, mpu_algo)
+                                                    : cksum_begin(&full, mpu_algo);
+        if (a < 0) {
+            EVP_MD_CTX_free(etag_md);
+            free(stored_ct); cksum_free(&comp); cksum_free(&full);
+            return S3_ERR_INTERNAL;
+        }
     }
 
     /* Second pass: stat each part, accumulate sizes + multipart-MD5. */
@@ -1921,16 +2711,29 @@ s3_err_t store_mpu_complete(s3_store_t *s, s3_str_t bucket, s3_str_t key,
         if (mpu_part_path(s, bucket, upload_id, parts[i].part_number,
                           pp, sizeof(pp)) < 0) {
             EVP_MD_CTX_free(etag_md);
-            free(stored_ct);
+            free(stored_ct); cksum_free(&comp); cksum_free(&full);
             return S3_ERR_INTERNAL;
         }
         struct stat st;
         if (stat(pp, &st) < 0) {
             EVP_MD_CTX_free(etag_md);
-            free(stored_ct);
+            free(stored_ct); cksum_free(&comp); cksum_free(&full);
             return S3_ERR_INVALID_PART;
         }
         total_size += (uint64_t)st.st_size;
+
+        if (mpu_algo) {
+            uint8_t pck[32];
+            int pn = read_part_cksum(pp, mpu_algo, pck);
+            if (pn <= 0 || (parts[i].cksum_n
+                            && (parts[i].cksum_n != pn
+                                || memcmp(parts[i].cksum, pck, (size_t)pn)))) {
+                EVP_MD_CTX_free(etag_md);
+                free(stored_ct); cksum_free(&comp); cksum_free(&full);
+                return S3_ERR_INVALID_PART;
+            }
+            if (comp.algo) cksum_update(&comp, pck, (size_t)pn);
+        }
 
         /* Decode the etag hex into 16 raw bytes and feed into multipart-MD5. */
         uint8_t raw[16];
@@ -1945,7 +2748,7 @@ s3_err_t store_mpu_complete(s3_store_t *s, s3_str_t bucket, s3_str_t key,
                    : (lo >= 'A' && lo <= 'F') ? lo - 'A' + 10 : -1;
             if (hv < 0 || lv < 0) {
                 EVP_MD_CTX_free(etag_md);
-                free(stored_ct);
+                free(stored_ct); cksum_free(&comp); cksum_free(&full);
                 return S3_ERR_INVALID_PART;
             }
             raw[j] = (uint8_t)((hv << 4) | lv);
@@ -1976,12 +2779,12 @@ s3_err_t store_mpu_complete(s3_store_t *s, s3_str_t bucket, s3_str_t key,
     hash_bucket_key(bucket, key, hex);
     char target_dir[4096];
     if (obj_dir(s, bucket, hex, target_dir, sizeof(target_dir)) < 0) {
-        free(stored_ct);
+        free(stored_ct); cksum_free(&comp); cksum_free(&full);
         return S3_ERR_INTERNAL;
     }
     char target_path[4096];
     if (obj_path(s, bucket, hex, target_path, sizeof(target_path)) < 0) {
-        free(stored_ct);
+        free(stored_ct); cksum_free(&comp); cksum_free(&full);
         return S3_ERR_INTERNAL;
     }
 
@@ -1991,7 +2794,7 @@ s3_err_t store_mpu_complete(s3_store_t *s, s3_str_t bucket, s3_str_t key,
     int tfd = mkstemp(tmp_path);
     if (tfd < 0) {
         s3_err_t e = map_io_err(errno);
-        free(stored_ct);
+        free(stored_ct); cksum_free(&comp); cksum_free(&full);
         return e;
     }
 
@@ -2001,14 +2804,22 @@ s3_err_t store_mpu_complete(s3_store_t *s, s3_str_t bucket, s3_str_t key,
     hdr.schema = OBJ_SCHEMA;
     size_t ct_n = stored_ct ? strlen(stored_ct) : 0;
     if (ct_n > UINT16_MAX || key.n > UINT16_MAX) {
-        close(tfd); unlink(tmp_path); free(stored_ct);
+        close(tfd); unlink(tmp_path); free(stored_ct); cksum_free(&comp); cksum_free(&full);
         return S3_ERR_INVALID_ARGUMENT;
     }
     hdr.ct_len = (uint16_t)ct_n;
     hdr.key_len = (uint16_t)key.n;
     hdr.part_count = (uint16_t)n_parts;
-    hdr.header_size = (uint32_t)(sizeof(hdr) + ct_n + key.n);
+    hdr.header_size = (uint32_t)(sizeof(hdr) + sizeof(obj_ext_v3_t)
+                                 + ct_n + key.n);
     hdr.data_size = total_size;
+    obj_ext_v3_t ext;
+    memset(&ext, 0, sizeof(ext));
+    int versioning = bucket_versioning(s, bucket);
+    if (versioning == S3_VERSIONING_ENABLED && random_vid(ext.version_id) < 0) {
+        close(tfd); unlink(tmp_path); free(stored_ct); cksum_free(&comp); cksum_free(&full);
+        return S3_ERR_INTERNAL;
+    }
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     uint64_t mtime_ms = (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
@@ -2016,10 +2827,11 @@ s3_err_t store_mpu_complete(s3_store_t *s, s3_str_t bucket, s3_str_t key,
     memcpy(hdr.etag, mp_md5, 16);
 
     if (xwrite(tfd, &hdr, sizeof(hdr)) != (ssize_t)sizeof(hdr)
+        || xwrite(tfd, &ext, sizeof(ext)) != (ssize_t)sizeof(ext)
         || (ct_n && xwrite(tfd, stored_ct, ct_n) != (ssize_t)ct_n)
         || (key.n && xwrite(tfd, key.p, key.n) != (ssize_t)key.n)) {
         s3_err_t e = map_io_err(errno);
-        close(tfd); unlink(tmp_path); free(stored_ct);
+        close(tfd); unlink(tmp_path); free(stored_ct); cksum_free(&comp); cksum_free(&full);
         return e;
     }
 
@@ -2030,7 +2842,7 @@ s3_err_t store_mpu_complete(s3_store_t *s, s3_str_t bucket, s3_str_t key,
                       pp, sizeof(pp));
         int pfd = open(pp, O_RDONLY | O_CLOEXEC);
         if (pfd < 0) {
-            close(tfd); unlink(tmp_path); free(stored_ct);
+            close(tfd); unlink(tmp_path); free(stored_ct); cksum_free(&comp); cksum_free(&full);
             return S3_ERR_INVALID_PART;
         }
         char buf[64 * 1024];
@@ -2039,16 +2851,17 @@ s3_err_t store_mpu_complete(s3_store_t *s, s3_str_t bucket, s3_str_t key,
             if (r == 0) break;
             if (r < 0) {
                 if (errno == EINTR) continue;
-                close(pfd); close(tfd); unlink(tmp_path); free(stored_ct);
+                close(pfd); close(tfd); unlink(tmp_path); free(stored_ct); cksum_free(&comp); cksum_free(&full);
                 return S3_ERR_INTERNAL;
             }
+            if (full.algo) cksum_update(&full, buf, (size_t)r);
             ssize_t off = 0;
             while (off < r) {
                 ssize_t wr = xwrite(tfd, buf + off, (size_t)(r - off));
                 if (wr < 0) {
                     if (errno == EINTR) continue;
                     s3_err_t e = map_io_err(errno);
-                    close(pfd); close(tfd); unlink(tmp_path); free(stored_ct);
+                    close(pfd); close(tfd); unlink(tmp_path); free(stored_ct); cksum_free(&comp); cksum_free(&full);
                     return e;
                 }
                 off += wr;
@@ -2057,9 +2870,35 @@ s3_err_t store_mpu_complete(s3_store_t *s, s3_str_t bucket, s3_str_t key,
         close(pfd);
     }
 
+    /* Object checksum into the v3 extension. */
+    if (mpu_algo) {
+        uint8_t dg[32]; size_t dn = 0;
+        cksum_ctx_t *k = comp.algo ? &comp : &full;
+        if (cksum_final(k, dg, &dn) < 0) {
+            close(tfd); unlink(tmp_path); free(stored_ct); cksum_free(&comp); cksum_free(&full);
+            return S3_ERR_INTERNAL;
+        }
+        if (!comp.algo && full_expect
+            && (full_n != dn || memcmp(full_expect, dg, dn) != 0)) {
+            close(tfd); unlink(tmp_path); free(stored_ct); cksum_free(&comp); cksum_free(&full);
+            return S3_ERR_CHECKSUM_MISMATCH;
+        }
+        ext.cksum_algo = mpu_algo;
+        ext.cksum_type = mpu_type;
+        ext.cksum_parts = mpu_type == S3_CKSUM_TYPE_COMPOSITE ? (uint16_t)n_parts : 0;
+        memcpy(ext.cksum, dg, dn);
+        if (pwrite(tfd, &ext, sizeof(ext), sizeof(hdr)) != (ssize_t)sizeof(ext)) {
+            s3_err_t e = map_io_err(errno);
+            close(tfd); unlink(tmp_path); free(stored_ct); cksum_free(&comp); cksum_free(&full);
+            return e;
+        }
+    }
+    cksum_free(&comp);
+    cksum_free(&full);
+
     if (xfsync(tfd) < 0) {
         s3_err_t e = map_io_err(errno);
-        close(tfd); unlink(tmp_path); free(stored_ct);
+        close(tfd); unlink(tmp_path); free(stored_ct); cksum_free(&comp); cksum_free(&full);
         return e;
     }
     close(tfd);
@@ -2073,16 +2912,20 @@ s3_err_t store_mpu_complete(s3_store_t *s, s3_str_t bucket, s3_str_t key,
     char up_dir[4096], up_meta[4200];
     mpu_dir_path(s, bucket, upload_id, up_dir, sizeof(up_dir));
     snprintf(up_meta, sizeof(up_meta), "%s/meta", up_dir);
+    pthread_mutex_t *km = key_lock(s, hex);
+    pthread_mutex_lock(km);
     pthread_mutex_lock(&s->ns_mu);
     s3_err_t pe = S3_OK;
     if (!store_bucket_exists(s, bucket))          pe = S3_ERR_NO_SUCH_BUCKET;
     else if (access(up_meta, F_OK) < 0)           pe = S3_ERR_NO_SUCH_UPLOAD;
+    else if ((pe = link_aside_locked(s, bucket, hex, target_path, versioning)) != S3_OK) ;
     else if (mkdir_p(target_dir, 0700) < 0
              || rename(tmp_path, target_path) < 0) pe = map_io_err(errno);
     else                                          rm_rf(up_dir);
     pthread_mutex_unlock(&s->ns_mu);
+    pthread_mutex_unlock(km);
     if (pe != S3_OK) {
-        unlink(tmp_path); free(stored_ct);
+        unlink(tmp_path); free(stored_ct); cksum_free(&comp); cksum_free(&full);
         return pe;
     }
     fsync_dir(target_dir);
@@ -2097,12 +2940,17 @@ s3_err_t store_mpu_complete(s3_store_t *s, s3_str_t bucket, s3_str_t key,
         meta_out->mtime_ms = mtime_ms;
         meta_out->part_count = (uint16_t)n_parts;
         memcpy(meta_out->etag, mp_md5, 16);
+        memcpy(meta_out->version_id, ext.version_id, 16);
+        meta_out->cksum_algo  = ext.cksum_algo;
+        meta_out->cksum_type  = ext.cksum_type;
+        meta_out->cksum_parts = ext.cksum_parts;
+        memcpy(meta_out->cksum, ext.cksum, 32);
         if (stored_ct) {
             strncpy(meta_out->content_type, stored_ct,
                     sizeof(meta_out->content_type) - 1);
         }
     }
-    free(stored_ct);
+    free(stored_ct); cksum_free(&comp); cksum_free(&full);
     return S3_OK;
 }
 
@@ -2145,7 +2993,8 @@ s3_err_t store_list_mpu_uploads(s3_store_t *s, s3_str_t bucket,
         char *stored_key = NULL;
         size_t stored_key_n = 0;
         s3_err_t er = mpu_read_meta(s, bucket, e->d_name,
-                                     &stored_key, &stored_key_n, NULL);
+                                     &stored_key, &stored_key_n, NULL,
+                                     NULL, NULL);
         if (er != S3_OK || !stored_key) {
             free(stored_key);
             continue;
@@ -2268,6 +3117,19 @@ int store_mpu_gc(s3_store_t *s, uint64_t now_ms, uint64_t max_age_ms) {
             if (ctime_ms == 0) continue;  /* unknown age — skip conservatively */
             if (now_ms < ctime_ms) continue;
             if (now_ms - ctime_ms < max_age_ms) continue;
+            if (s->mpu_gc_filter) {
+                /* A bucket lifecycle AbortIncompleteMultipartUpload rule
+                 * covering this key overrides the global TTL. */
+                char *k = NULL; size_t kn = 0;
+                s3_str_t bn = { be->d_name, strlen(be->d_name) };
+                if (mpu_read_meta(s, bn, ue->d_name, &k, &kn, NULL, NULL, NULL) == S3_OK
+                    && k) {
+                    int skip = s->mpu_gc_filter(s->mpu_gc_filter_user, bn,
+                                                (s3_str_t){ k, kn });
+                    free(k);
+                    if (skip) continue;
+                }
+            }
 
             LOG_I("mpu_gc: reaping stale upload %s (age=%" PRIu64 "ms)",
                   ue->d_name, now_ms - ctime_ms);
@@ -2279,4 +3141,823 @@ int store_mpu_gc(s3_store_t *s, uint64_t now_ms, uint64_t max_age_ms) {
     }
     closedir(bd);
     return removed;
+}
+
+/* ===================================================================== */
+/* Object walk + lifecycle expiry                                         */
+/* ===================================================================== */
+
+void store_set_mpu_gc_filter(s3_store_t *s,
+                             int (*filter)(void *user, s3_str_t bucket,
+                                           s3_str_t key),
+                             void *user) {
+    if (!s) return;
+    s->mpu_gc_filter = filter;
+    s->mpu_gc_filter_user = user;
+}
+
+s3_err_t store_walk_objects(s3_store_t *s, s3_str_t bucket,
+                            store_walk_cb cb, void *user) {
+    if (!s || !cb) return S3_ERR_INVALID_ARGUMENT;
+    if (!valid_bucket_name(bucket)) return S3_ERR_INVALID_BUCKET_NAME;
+    if (!store_bucket_exists(s, bucket)) return S3_ERR_NO_SUCH_BUCKET;
+    char dp[4096];
+    snprintf(dp, sizeof(dp), "%s/" S3_STR_FMT, s->data_dir, S3_STR_ARG(bucket));
+    DIR *d1 = opendir(dp);
+    if (!d1) return S3_OK;
+    struct dirent *e1;
+    int stop = 0;
+    while (!stop && (e1 = readdir(d1)) != NULL) {
+        if (e1->d_name[0] == '.') continue;
+        char p2[4400];
+        snprintf(p2, sizeof(p2), "%s/%s", dp, e1->d_name);
+        DIR *d2 = opendir(p2);
+        if (!d2) continue;
+        struct dirent *e2;
+        while (!stop && (e2 = readdir(d2)) != NULL) {
+            if (e2->d_name[0] == '.') continue;
+            char p3[4700];
+            snprintf(p3, sizeof(p3), "%s/%s", p2, e2->d_name);
+            DIR *d3 = opendir(p3);
+            if (!d3) continue;
+            struct dirent *e3;
+            while (!stop && (e3 = readdir(d3)) != NULL) {
+                if (e3->d_name[0] == '.') continue;
+                char fp[5000];
+                snprintf(fp, sizeof(fp), "%s/%s", p3, e3->d_name);
+                list_entry_t ent;
+                if (load_entry(fp, &ent) < 0) continue;
+                stop = cb(user, (s3_str_t){ ent.key, ent.key_len }, &ent.meta);
+                free(ent.key);
+            }
+            closedir(d3);
+        }
+        closedir(d2);
+    }
+    closedir(d1);
+    return S3_OK;
+}
+
+s3_err_t store_expire_if_unchanged(s3_store_t *s, s3_str_t bucket,
+                                   s3_str_t key, uint64_t mtime_ms) {
+    if (!s) return S3_ERR_INVALID_ARGUMENT;
+    if (!valid_bucket_name(bucket)) return S3_ERR_INVALID_BUCKET_NAME;
+    if (!valid_key(key)) return S3_ERR_INVALID_ARGUMENT;
+    char hex[65];
+    hash_bucket_key(bucket, key, hex);
+    pthread_mutex_t *km = key_lock(s, hex);
+    pthread_mutex_lock(km);
+    /* Normal delete path: a versioned bucket gets a delete marker. */
+    store_delete_result_t res;
+    memset(&res, 0, sizeof(res));
+    s3_err_t e = delete_locked(s, bucket, key, hex, NULL, mtime_ms, &res);
+    pthread_mutex_unlock(km);
+    return e;
+}
+
+int store_valid_bucket_name(s3_str_t name) { return valid_bucket_name(name); }
+
+/* ===================================================================== */
+/* Versioning (item 8)                                                    */
+/* ===================================================================== */
+
+static __thread int g_guard_bypass;
+
+void store_set_guard_bypass(int bypass) { g_guard_bypass = bypass; }
+
+void store_set_version_guard(s3_store_t *s, store_version_guard_fn fn, void *user) {
+    if (!s) return;
+    s->vguard = fn;
+    s->vguard_user = user;
+}
+
+static int vid_is_null(const uint8_t vid[16]) {
+    for (int i = 0; i < 16; i++) if (vid[i]) return 0;
+    return 1;
+}
+
+static void vid_hex(const uint8_t vid[16], char out[33]) {
+    static const char H[] = "0123456789abcdef";
+    for (int i = 0; i < 16; i++) {
+        out[2*i] = H[vid[i] >> 4];
+        out[2*i + 1] = H[vid[i] & 15];
+    }
+    out[32] = '\0';
+}
+
+void store_vid_format(const uint8_t vid[16], char out[33]) {
+    if (vid_is_null(vid)) snprintf(out, 33, "null");
+    else vid_hex(vid, out);
+}
+
+int store_vid_parse(s3_str_t s, uint8_t vid[16]) {
+    if (s3_str_eq_lit(s, "null")) { memset(vid, 0, 16); return 0; }
+    if (s.n != 32) return -1;
+    for (size_t i = 0; i < 32; i++) {
+        char c = s.p[i];
+        int v = (c >= '0' && c <= '9') ? c - '0' : (c >= 'a' && c <= 'f') ? c - 'a' + 10 : -1;
+        if (v < 0) return -1;
+        if (i % 2 == 0) vid[i / 2] = (uint8_t)(v << 4); else vid[i / 2] |= (uint8_t)v;
+    }
+    return vid_is_null(vid) ? -1 : 0;    /* zeros only via "null" */
+}
+
+static int random_vid(uint8_t vid[16]) {
+    char hx[33];
+    if (random_hex_id(hx, sizeof(hx)) < 0) return -1;
+    s3_str_t h = { hx, 32 };
+    for (size_t i = 0; i < 32; i++) {
+        char c = hx[i];
+        if (c >= 'A' && c <= 'F') hx[i] = (char)(c + 32);
+    }
+    if (store_vid_parse(h, vid) < 0) { memset(vid, 0, 16); vid[15] = 1; }
+    return 0;
+}
+
+static int vdir_path(const s3_store_t *s, s3_str_t bucket, const char hex[65],
+                     char *out, size_t cap) {
+    int n = snprintf(out, cap, "%s/" S3_STR_FMT "/%c%c/%c%c/%s", s->versions_dir,
+                     S3_STR_ARG(bucket), hex[0], hex[1], hex[2], hex[3], hex);
+    return (n > 0 && (size_t)n < cap) ? 0 : -1;
+}
+
+/* "<inv_ts 16 hex>-<vid 32 hex>" */
+static void ventry_name(uint64_t mtime_ms, const uint8_t vid[16], char out[50]) {
+    char vh[33];
+    vid_hex(vid, vh);
+    snprintf(out, 50, "%016" PRIx64 "-%s", UINT64_MAX - mtime_ms, vh);
+}
+
+static int ventry_parse(const char *name, uint8_t vid[16]) {
+    if (strlen(name) != 49 || name[16] != '-') return -1;
+    s3_str_t h = { name + 17, 32 };
+    if (s3_str_eq_lit(h, "00000000000000000000000000000000")) { memset(vid, 0, 16); return 0; }
+    return store_vid_parse(h, vid);
+}
+
+typedef struct { char name[50]; } vname_t;
+
+static int vname_cmp(const void *a, const void *b) {
+    return strcmp(((const vname_t *)a)->name, ((const vname_t *)b)->name);
+}
+
+/* Sorted (newest first) entry names of a version dir. */
+static vname_t *vdir_list(const char *vdir, size_t *n_out) {
+    *n_out = 0;
+    DIR *d = opendir(vdir);
+    if (!d) return NULL;
+    vname_t *v = NULL;
+    size_t n = 0, cap = 0;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        uint8_t vid[16];
+        if (ventry_parse(e->d_name, vid) < 0) continue;
+        if (n == cap) {
+            size_t nc = cap ? cap * 2 : 8;
+            vname_t *nv = realloc(v, nc * sizeof(*nv));
+            if (!nv) break;
+            v = nv; cap = nc;
+        }
+        snprintf(v[n++].name, sizeof(v[0].name), "%s", e->d_name);
+    }
+    closedir(d);
+    if (n) qsort(v, n, sizeof(*v), vname_cmp);
+    *n_out = n;
+    return v;
+}
+
+static int bucket_versioning(s3_store_t *s, s3_str_t bucket) {
+    s3_bucket_meta_t m;
+    if (store_bucket_meta(s, bucket, &m) != S3_OK) return 0;
+    return m.versioning;
+}
+
+/* Header of the file at path (0 ok). */
+static int peek_meta(const char *path, s3_obj_meta_t *m) {
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return -1;
+    s3_err_t e = read_header(fd, NULL, m);
+    close(fd);
+    return e == S3_OK ? 0 : -1;
+}
+
+/* Before replacing the current object of a versioned bucket: move the
+ * current version aside (hard link) unless it is the null version in a
+ * Suspended bucket (overwritten in place). In Suspended mode any older
+ * noncurrent null version is dropped: there is only ever one null
+ * version. Caller holds the key's stripe lock. */
+static s3_err_t link_aside_locked(s3_store_t *s, s3_str_t bucket,
+                                  const char hex[65], const char *path,
+                                  int versioning) {
+    if (versioning == S3_VERSIONING_UNSET) return S3_OK;
+    char vdir[4300];
+    if (vdir_path(s, bucket, hex, vdir, sizeof(vdir)) < 0) return S3_ERR_INTERNAL;
+    if (versioning == S3_VERSIONING_SUSPENDED) {
+        size_t n;
+        vname_t *v = vdir_list(vdir, &n);
+        for (size_t i = 0; i < n; i++) {
+            if (!strcmp(v[i].name + 17, "00000000000000000000000000000000")) {
+                char vp[4400];
+                snprintf(vp, sizeof(vp), "%s/%s", vdir, v[i].name);
+                unlink(vp);
+            }
+        }
+        free(v);
+    }
+    s3_obj_meta_t cur;
+    if (peek_meta(path, &cur) < 0) return S3_OK;          /* no current */
+    if (versioning == S3_VERSIONING_SUSPENDED && vid_is_null(cur.version_id))
+        return S3_OK;
+    if (mkdir_p(vdir, 0700) < 0) return map_io_err(errno);
+    char name[50], vp[4400];
+    ventry_name(cur.mtime_ms, cur.version_id, name);
+    snprintf(vp, sizeof(vp), "%s/%s", vdir, name);
+    if (link(path, vp) < 0 && errno != EEXIST) return map_io_err(errno);
+    fsync_dir(vdir);
+    return S3_OK;
+}
+
+/* Startup: a crash between link-aside and the rename of the new current
+ * leaves a version entry that is the same inode as current. Drop those. */
+static void recover_version_links(const s3_store_t *s) {
+    DIR *b = opendir(s->versions_dir);
+    if (!b) return;
+    int removed = 0;
+    struct dirent *be;
+    while ((be = readdir(b)) != NULL) {
+        if (be->d_name[0] == '.') continue;
+        char p1[4500];
+        snprintf(p1, sizeof(p1), "%s/%s", s->versions_dir, be->d_name);
+        DIR *d1 = opendir(p1);
+        if (!d1) continue;
+        struct dirent *e1;
+        while ((e1 = readdir(d1)) != NULL) {
+            if (e1->d_name[0] == '.') continue;
+            char p2[4800];
+            snprintf(p2, sizeof(p2), "%s/%s", p1, e1->d_name);
+            DIR *d2 = opendir(p2);
+            if (!d2) continue;
+            struct dirent *e2;
+            while ((e2 = readdir(d2)) != NULL) {
+                if (e2->d_name[0] == '.') continue;
+                char p3[5100];
+                snprintf(p3, sizeof(p3), "%s/%s", p2, e2->d_name);
+                DIR *dh = opendir(p3);
+                if (!dh) continue;
+                struct dirent *eh;
+                while ((eh = readdir(dh)) != NULL) {
+                    if (eh->d_name[0] == '.') continue;
+                    char vdir[5400], cur[5400];
+                    snprintf(vdir, sizeof(vdir), "%s/%s", p3, eh->d_name);
+                    snprintf(cur, sizeof(cur), "%s/%s/%s/%s/%s", s->data_dir, be->d_name,
+                             e1->d_name, e2->d_name, eh->d_name);
+                    struct stat cst;
+                    if (stat(cur, &cst) < 0) continue;
+                    DIR *d3 = opendir(vdir);
+                    if (!d3) continue;
+                    struct dirent *e3;
+                    while ((e3 = readdir(d3)) != NULL) {
+                        if (e3->d_name[0] == '.') continue;
+                        char vp[5700];
+                        snprintf(vp, sizeof(vp), "%s/%s", vdir, e3->d_name);
+                        struct stat vst;
+                        if (stat(vp, &vst) == 0 && vst.st_ino == cst.st_ino
+                            && vst.st_dev == cst.st_dev && unlink(vp) == 0)
+                            removed++;
+                    }
+                    closedir(d3);
+                }
+                closedir(dh);
+            }
+            closedir(d2);
+        }
+        closedir(d1);
+    }
+    closedir(b);
+    if (removed) LOG_I("recovery: removed %d duplicate version link(s)", removed);
+}
+
+s3_err_t store_get_open_version(s3_store_t *s, s3_str_t bucket, s3_str_t key,
+                                const uint8_t *vid,
+                                s3_reader_t **out, s3_obj_meta_t *meta_out) {
+    if (!s || !out) return S3_ERR_INVALID_ARGUMENT;
+    if (!valid_bucket_name(bucket)) return S3_ERR_INVALID_BUCKET_NAME;
+    if (!valid_key(key))            return S3_ERR_INVALID_ARGUMENT;
+    if (!store_bucket_exists(s, bucket)) return S3_ERR_NO_SUCH_BUCKET;
+    s3_obj_meta_t mtmp;
+    if (!meta_out) meta_out = &mtmp;
+    memset(meta_out, 0, sizeof(*meta_out));
+
+    char hex[65], path[4096];
+    hash_bucket_key(bucket, key, hex);
+    if (obj_path(s, bucket, hex, path, sizeof(path)) < 0) return S3_ERR_INTERNAL;
+
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    obj_header_t h;
+    if (fd >= 0) {
+        s3_err_t e = read_header(fd, &h, meta_out);
+        if (e != S3_OK) { close(fd); return e; }
+        if (vid && memcmp(meta_out->version_id, vid, 16) != 0) {
+            close(fd);
+            fd = -1;
+        }
+    } else if (errno != ENOENT) {
+        return S3_ERR_INTERNAL;
+    }
+    if (fd < 0 && vid) {
+        /* Look for the version among the noncurrent ones. */
+        char vdir[4300];
+        if (vdir_path(s, bucket, hex, vdir, sizeof(vdir)) < 0) return S3_ERR_INTERNAL;
+        size_t n;
+        vname_t *v = vdir_list(vdir, &n);
+        char want[33];
+        vid_hex(vid, want);
+        for (size_t i = 0; i < n && fd < 0; i++) {
+            if (strcmp(v[i].name + 17, want) != 0) continue;
+            char vp[4400];
+            snprintf(vp, sizeof(vp), "%s/%s", vdir, v[i].name);
+            fd = open(vp, O_RDONLY | O_CLOEXEC);
+        }
+        free(v);
+        if (fd < 0) { memset(meta_out, 0, sizeof(*meta_out)); return S3_ERR_NO_SUCH_VERSION; }
+        s3_err_t e = read_header(fd, &h, meta_out);
+        if (e != S3_OK) { close(fd); return e; }
+    }
+    if (fd < 0) return S3_ERR_NO_SUCH_KEY;
+    if (meta_out->flags & S3_OBJF_DELETE_MARKER) {
+        close(fd);
+        return vid ? S3_ERR_METHOD_NOT_ALLOWED : S3_ERR_NO_SUCH_KEY;
+    }
+
+    s3_reader_t *r = calloc(1, sizeof(*r));
+    if (!r) { close(fd); return S3_ERR_INTERNAL; }
+    r->fd        = fd;
+    r->data_off  = h.header_size;
+    r->data_size = h.data_size;
+    r->pos       = 0;
+    *out = r;
+    return S3_OK;
+}
+
+/* Write a delete marker (zero-length v3 object) into a tmp file. */
+static s3_err_t make_marker_tmp(s3_store_t *s, s3_str_t key, const uint8_t vid[16],
+                                char *tmp_path, size_t cap) {
+    int fd = tmp_open(s, tmp_path, cap);
+    if (fd < 0) return map_io_err(errno);
+    obj_header_t h;
+    obj_ext_v3_t x;
+    memset(&h, 0, sizeof(h));
+    memset(&x, 0, sizeof(x));
+    memcpy(h.magic, OBJ_MAGIC, OBJ_MAGIC_LEN);
+    h.schema = OBJ_SCHEMA;
+    h.header_size = (uint32_t)(sizeof(h) + sizeof(x) + key.n);
+    h.key_len = (uint16_t)key.n;
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    h.mtime_ms = (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
+    static const uint8_t empty_md5[16] = { 0xd4,0x1d,0x8c,0xd9,0x8f,0x00,0xb2,0x04,
+                                           0xe9,0x80,0x09,0x98,0xec,0xf8,0x42,0x7e };
+    memcpy(h.etag, empty_md5, 16);
+    memcpy(x.version_id, vid, 16);
+    x.flags = S3_OBJF_DELETE_MARKER;
+    if (xwrite(fd, &h, sizeof(h)) != (ssize_t)sizeof(h)
+        || xwrite(fd, &x, sizeof(x)) != (ssize_t)sizeof(x)
+        || xwrite(fd, key.p, key.n) != (ssize_t)key.n || xfsync(fd) < 0) {
+        s3_err_t e = map_io_err(errno);
+        close(fd); unlink(tmp_path);
+        return e;
+    }
+    close(fd);
+    return S3_OK;
+}
+
+static s3_err_t guard_check(s3_store_t *s, s3_str_t bucket, s3_str_t key,
+                            const s3_obj_meta_t *m) {
+    int bypass = g_guard_bypass;
+    if (!s->vguard || (m->flags & S3_OBJF_DELETE_MARKER)) return S3_OK;
+    return s->vguard(s->vguard_user, bucket, key, m, bypass);
+}
+
+/* Delete (versioning-aware) with the key lock held. expect_mtime != 0:
+ * lifecycle — only if the current object still has that mtime. */
+static s3_err_t delete_locked(s3_store_t *s, s3_str_t bucket, s3_str_t key,
+                              const char hex[65], const uint8_t *vid,
+                              uint64_t expect_mtime, store_delete_result_t *res) {
+    char path[4096], dir[4096], vdir[4300];
+    if (obj_path(s, bucket, hex, path, sizeof(path)) < 0
+        || obj_dir(s, bucket, hex, dir, sizeof(dir)) < 0
+        || vdir_path(s, bucket, hex, vdir, sizeof(vdir)) < 0)
+        return S3_ERR_INTERNAL;
+    int versioning = bucket_versioning(s, bucket);
+    res->versioned = versioning != S3_VERSIONING_UNSET;
+    s3_obj_meta_t cur;
+    int have_cur = peek_meta(path, &cur) == 0;
+    if (expect_mtime && (!have_cur || cur.mtime_ms != expect_mtime))
+        return have_cur ? S3_ERR_INVALID_REQUEST : S3_ERR_NO_SUCH_KEY;
+
+    if (!vid) {
+        if (versioning == S3_VERSIONING_UNSET) {
+            if (unlink(path) < 0)
+                return errno == ENOENT ? S3_OK : map_io_err(errno);
+            fsync_dir(dir);
+            return S3_OK;
+        }
+        uint8_t nv[16] = {0};
+        if (versioning == S3_VERSIONING_ENABLED && random_vid(nv) < 0)
+            return S3_ERR_INTERNAL;
+        char tmp[4096];
+        s3_err_t e = make_marker_tmp(s, key, nv, tmp, sizeof(tmp));
+        if (e != S3_OK) return e;
+        pthread_mutex_lock(&s->ns_mu);
+        if (!store_bucket_exists(s, bucket)) e = S3_ERR_NO_SUCH_BUCKET;
+        if (e == S3_OK) e = link_aside_locked(s, bucket, hex, path, versioning);
+        if (e == S3_OK && (mkdir_p(dir, 0700) < 0 || rename(tmp, path) < 0))
+            e = map_io_err(errno);
+        pthread_mutex_unlock(&s->ns_mu);
+        if (e != S3_OK) { unlink(tmp); return e; }
+        fsync_dir(dir);
+        res->delete_marker = 1;
+        store_vid_format(nv, res->version_id);
+        return S3_OK;
+    }
+
+    /* Permanent removal of one version. */
+    store_vid_format(vid, res->version_id);
+    if (have_cur && memcmp(cur.version_id, vid, 16) == 0) {
+        s3_err_t g = guard_check(s, bucket, key, &cur);
+        if (g != S3_OK) return g;
+        res->delete_marker = (cur.flags & S3_OBJF_DELETE_MARKER) != 0;
+        size_t n;
+        vname_t *v = vdir_list(vdir, &n);
+        int rc;
+        if (n) {
+            char vp[4400];
+            snprintf(vp, sizeof(vp), "%s/%s", vdir, v[0].name);
+            rc = rename(vp, path);                 /* promote the newest */
+            fsync_dir(vdir);
+        } else {
+            rc = unlink(path);
+        }
+        free(v);
+        if (rc < 0) return map_io_err(errno);
+        fsync_dir(dir);
+        return S3_OK;
+    }
+    size_t n;
+    vname_t *v = vdir_list(vdir, &n);
+    char want[33];
+    vid_hex(vid, want);
+    s3_err_t e = S3_OK;
+    int found = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (strcmp(v[i].name + 17, want) != 0) continue;
+        char vp[4400];
+        snprintf(vp, sizeof(vp), "%s/%s", vdir, v[i].name);
+        s3_obj_meta_t m;
+        if (peek_meta(vp, &m) < 0) { e = S3_ERR_INTERNAL; break; }
+        e = guard_check(s, bucket, key, &m);
+        if (e != S3_OK) break;
+        res->delete_marker = (m.flags & S3_OBJF_DELETE_MARKER) != 0;
+        if (unlink(vp) < 0) e = map_io_err(errno);
+        fsync_dir(vdir);
+        found = 1;
+        break;
+    }
+    free(v);
+    /* S3: deleting a version id that does not exist succeeds. */
+    (void)found;
+    return e;
+}
+
+s3_err_t store_delete_ex(s3_store_t *s, s3_str_t bucket, s3_str_t key,
+                         const uint8_t *vid, store_delete_result_t *res) {
+    store_delete_result_t tmp;
+    if (!res) res = &tmp;
+    memset(res, 0, sizeof(*res));
+    int bypass = g_guard_bypass;
+    g_guard_bypass = 0;
+    if (!s) return S3_ERR_INVALID_ARGUMENT;
+    if (!valid_bucket_name(bucket)) return S3_ERR_INVALID_BUCKET_NAME;
+    if (!valid_key(key))            return S3_ERR_INVALID_ARGUMENT;
+    if (!store_bucket_exists(s, bucket)) return S3_ERR_NO_SUCH_BUCKET;
+    char hex[65];
+    hash_bucket_key(bucket, key, hex);
+    pthread_mutex_t *km = key_lock(s, hex);
+    pthread_mutex_lock(km);
+    g_guard_bypass = bypass;
+    s3_err_t e = delete_locked(s, bucket, key, hex, vid, 0, res);
+    g_guard_bypass = 0;
+    pthread_mutex_unlock(km);
+    return e;
+}
+
+s3_err_t store_list_noncurrent(s3_store_t *s, s3_str_t bucket, s3_str_t key,
+                               s3_noncurrent_t **out, size_t *n_out) {
+    *out = NULL;
+    *n_out = 0;
+    char hex[65], vdir[4300], path[4096];
+    hash_bucket_key(bucket, key, hex);
+    if (vdir_path(s, bucket, hex, vdir, sizeof(vdir)) < 0
+        || obj_path(s, bucket, hex, path, sizeof(path)) < 0) return S3_ERR_INTERNAL;
+    size_t n;
+    vname_t *v = vdir_list(vdir, &n);
+    if (!n) { free(v); return S3_OK; }
+    s3_noncurrent_t *r = calloc(n, sizeof(*r));
+    if (!r) { free(v); return S3_ERR_INTERNAL; }
+    s3_obj_meta_t cur;
+    uint64_t newer = peek_meta(path, &cur) == 0 ? cur.mtime_ms : 0;
+    size_t k = 0;
+    for (size_t i = 0; i < n; i++) {
+        char vp[4400];
+        snprintf(vp, sizeof(vp), "%s/%s", vdir, v[i].name);
+        if (peek_meta(vp, &r[k].meta) < 0) continue;
+        memcpy(r[k].vid, r[k].meta.version_id, 16);
+        r[k].noncurrent_since_ms = newer ? newer : r[k].meta.mtime_ms;
+        newer = r[k].meta.mtime_ms;
+        k++;
+    }
+    free(v);
+    *out = r;
+    *n_out = k;
+    return S3_OK;
+}
+
+/* ---- ListObjectVersions ----------------------------------------------- */
+
+typedef struct { char *key; size_t kn; char hex[65]; } vkey_t;
+
+static int vkey_cmp(const void *a, const void *b) {
+    const vkey_t *x = a, *y = b;
+    size_t n = x->kn < y->kn ? x->kn : y->kn;
+    int r = memcmp(x->key, y->key, n);
+    return r ? r : (x->kn < y->kn ? -1 : x->kn > y->kn);
+}
+
+typedef struct { vkey_t *v; size_t n, cap; s3_str_t prefix; } vkcollect_t;
+
+static int vk_add(vkcollect_t *c, const char *key, size_t kn) {
+    if (c->prefix.n && (kn < c->prefix.n || memcmp(key, c->prefix.p, c->prefix.n)))
+        return 0;
+    if (c->n == c->cap) {
+        size_t nc = c->cap ? c->cap * 2 : 64;
+        vkey_t *nv = realloc(c->v, nc * sizeof(*nv));
+        if (!nv) return -1;
+        c->v = nv; c->cap = nc;
+    }
+    char *k = malloc(kn + 1);
+    if (!k) return -1;
+    memcpy(k, key, kn);
+    k[kn] = '\0';
+    c->v[c->n++] = (vkey_t){ k, kn, "" };
+    return 0;
+}
+
+static int vk_walk_cb(void *u, s3_str_t key, const s3_obj_meta_t *m) {
+    (void)m;
+    return vk_add(u, key.p, key.n) < 0;
+}
+
+s3_err_t store_list_versions(s3_store_t *s, s3_str_t bucket,
+                             const s3_version_list_opts_t *o,
+                             s3_version_info_t **out, size_t *n_out,
+                             int *truncated, char **next_key,
+                             char next_vid[33]) {
+    *out = NULL; *n_out = 0; *truncated = 0; *next_key = NULL; next_vid[0] = '\0';
+    if (!store_bucket_exists(s, bucket)) return S3_ERR_NO_SUCH_BUCKET;
+    int max = o->max_keys > 0 && o->max_keys <= 1000 ? o->max_keys : 1000;
+
+    /* Keys: every current object (markers included) plus keys that only
+     * have noncurrent versions (read from their newest version file). */
+    vkcollect_t kc = { .prefix = o->prefix };
+    store_walk_objects(s, bucket, vk_walk_cb, &kc);
+    char vb[4200];
+    snprintf(vb, sizeof(vb), "%s/" S3_STR_FMT, s->versions_dir, S3_STR_ARG(bucket));
+    DIR *d1 = opendir(vb);
+    if (d1) {
+        struct dirent *e1;
+        while ((e1 = readdir(d1)) != NULL) {
+            if (e1->d_name[0] == '.') continue;
+            char p1[4500];
+            snprintf(p1, sizeof(p1), "%s/%s", vb, e1->d_name);
+            DIR *d2 = opendir(p1);
+            if (!d2) continue;
+            struct dirent *e2;
+            while ((e2 = readdir(d2)) != NULL) {
+                if (e2->d_name[0] == '.') continue;
+                char p2[4800];
+                snprintf(p2, sizeof(p2), "%s/%s", p1, e2->d_name);
+                DIR *d3 = opendir(p2);
+                if (!d3) continue;
+                struct dirent *e3;
+                while ((e3 = readdir(d3)) != NULL) {
+                    if (e3->d_name[0] == '.') continue;
+                    char cur[5100];
+                    snprintf(cur, sizeof(cur), "%s/" S3_STR_FMT "/%s/%s/%s", s->data_dir,
+                             S3_STR_ARG(bucket), e1->d_name, e2->d_name, e3->d_name);
+                    struct stat st;
+                    if (stat(cur, &st) == 0) continue;     /* already listed */
+                    char vdir[5100];
+                    snprintf(vdir, sizeof(vdir), "%s/%s", p2, e3->d_name);
+                    size_t nv;
+                    vname_t *vn = vdir_list(vdir, &nv);
+                    if (nv) {
+                        char vp[5400];
+                        snprintf(vp, sizeof(vp), "%s/%s", vdir, vn[0].name);
+                        list_entry_t ent;
+                        if (load_entry(vp, &ent) == 0) {
+                            vk_add(&kc, ent.key, ent.key_len);
+                            free(ent.key);
+                        }
+                    }
+                    free(vn);
+                }
+                closedir(d3);
+            }
+            closedir(d2);
+        }
+        closedir(d1);
+    }
+    if (kc.n) qsort(kc.v, kc.n, sizeof(*kc.v), vkey_cmp);
+
+    s3_version_info_t *res = NULL;
+    size_t rn = 0, rcap = 0;
+    int emitted = 0;
+    char *last_prefix = NULL;
+    for (size_t i = 0; i < kc.n && !*truncated; i++) {
+        s3_str_t key = { kc.v[i].key, kc.v[i].kn };
+        /* key-marker: keys after it (or, with version-id-marker, the rest
+         * of that key's versions after the marker). */
+        int cmpm = 0;
+        if (o->key_marker.n) {
+            size_t n = key.n < o->key_marker.n ? key.n : o->key_marker.n;
+            cmpm = memcmp(key.p, o->key_marker.p, n);
+            if (!cmpm) cmpm = key.n < o->key_marker.n ? -1 : key.n > o->key_marker.n;
+            if (cmpm < 0 || (cmpm == 0 && !o->version_id_marker.n)) continue;
+        }
+        if (o->delimiter.n) {
+            const char *after = key.p + o->prefix.n;
+            size_t an = key.n - o->prefix.n;
+            const char *dl = memmem(after, an, o->delimiter.p, o->delimiter.n);
+            if (dl) {
+                size_t pn = (size_t)(dl - key.p) + o->delimiter.n;
+                if (last_prefix && strlen(last_prefix) == pn && !memcmp(last_prefix, key.p, pn))
+                    continue;
+                if (emitted >= max) { *truncated = 1; break; }
+                if (rn == rcap) {
+                    rcap = rcap ? rcap * 2 : 32;
+                    s3_version_info_t *nr = realloc(res, rcap * sizeof(*nr));
+                    if (!nr) break;
+                    res = nr;
+                }
+                memset(&res[rn], 0, sizeof(res[rn]));
+                res[rn].prefix = strndup(key.p, pn);
+                free(last_prefix);
+                last_prefix = strndup(key.p, pn);
+                rn++;
+                emitted++;
+                continue;
+            }
+        }
+        /* Versions of this key: current, then noncurrent newest first. */
+        char hex[65], path[4096], vdir[4300];
+        hash_bucket_key(bucket, key, hex);
+        obj_path(s, bucket, hex, path, sizeof(path));
+        vdir_path(s, bucket, hex, vdir, sizeof(vdir));
+        size_t nv;
+        vname_t *vn = vdir_list(vdir, &nv);
+        int skipping = cmpm == 0 && o->version_id_marker.n;
+        for (size_t j = 0; j <= nv; j++) {
+            s3_obj_meta_t m;
+            int latest = 0;
+            if (j == 0) {
+                if (peek_meta(path, &m) < 0) continue;
+                latest = 1;
+            } else {
+                char vp[4400];
+                snprintf(vp, sizeof(vp), "%s/%s", vdir, vn[j-1].name);
+                if (peek_meta(vp, &m) < 0) continue;
+            }
+            char vs[33];
+            store_vid_format(m.version_id, vs);
+            if (skipping) {
+                if (o->version_id_marker.n == strlen(vs)
+                    && !memcmp(o->version_id_marker.p, vs, strlen(vs)))
+                    skipping = 0;
+                continue;
+            }
+            if (emitted >= max) {
+                *truncated = 1;
+                break;
+            }
+            if (rn == rcap) {
+                rcap = rcap ? rcap * 2 : 32;
+                s3_version_info_t *nr = realloc(res, rcap * sizeof(*nr));
+                if (!nr) break;
+                res = nr;
+            }
+            memset(&res[rn], 0, sizeof(res[rn]));
+            res[rn].key = strndup(key.p, key.n);
+            memcpy(res[rn].version_id, vs, sizeof(vs));
+            res[rn].is_latest = latest;
+            res[rn].meta = m;
+            rn++;
+            emitted++;
+        }
+        free(vn);
+    }
+    if (*truncated && rn) {
+        s3_version_info_t *l = &res[rn - 1];
+        *next_key = strdup(l->key ? l->key : l->prefix);
+        if (l->key) memcpy(next_vid, l->version_id, 33);
+    }
+    free(last_prefix);
+    for (size_t i = 0; i < kc.n; i++) free(kc.v[i].key);
+    free(kc.v);
+    *out = res;
+    *n_out = rn;
+    return S3_OK;
+}
+
+void store_versions_free(s3_version_info_t *v, size_t n) {
+    for (size_t i = 0; i < n; i++) { free(v[i].key); free(v[i].prefix); }
+    free(v);
+}
+
+/* ===================================================================== */
+/* Object lock sidecars (item 10)                                         */
+/* ===================================================================== */
+
+static int lock_path(const s3_store_t *s, s3_str_t bucket, s3_str_t key,
+                     const uint8_t vid[16], char *dir, size_t dcap,
+                     char *path, size_t pcap) {
+    char hex[65], vh[33];
+    hash_bucket_key(bucket, key, hex);
+    vid_hex(vid, vh);
+    int n = snprintf(dir, dcap, "%s/" S3_STR_FMT "/%c%c/%c%c/%s", s->locks_dir,
+                     S3_STR_ARG(bucket), hex[0], hex[1], hex[2], hex[3], hex);
+    if (n <= 0 || (size_t)n >= dcap) return -1;
+    n = snprintf(path, pcap, "%s/%s", dir, vh);
+    return (n > 0 && (size_t)n < pcap) ? 0 : -1;
+}
+
+int store_lock_read(s3_store_t *s, s3_str_t bucket, s3_str_t key,
+                    const uint8_t vid[16], s3_lock_t *out) {
+    memset(out, 0, sizeof(*out));
+    char dir[4300], path[4400];
+    if (!valid_bucket_name(bucket) || !valid_key(key)
+        || lock_path(s, bucket, key, vid, dir, sizeof(dir), path, sizeof(path)) < 0)
+        return -1;
+    FILE *f = fopen(path, "re");
+    if (!f) return errno == ENOENT ? 1 : -1;
+    char line[128];
+    int ok = 0;
+    while (fgets(line, sizeof(line), f)) {
+        line[strcspn(line, "\r\n")] = '\0';
+        if (!strcmp(line, "mode=GOVERNANCE")) out->mode = S3_LOCK_GOVERNANCE;
+        else if (!strcmp(line, "mode=COMPLIANCE")) out->mode = S3_LOCK_COMPLIANCE;
+        else if (!strcmp(line, "mode=NONE")) out->mode = S3_LOCK_NONE;
+        else if (!strncmp(line, "until_ms=", 9)) out->until_ms = strtoull(line + 9, NULL, 10);
+        else if (!strcmp(line, "legal_hold=1")) out->legal_hold = 1;
+        else if (!strcmp(line, "legal_hold=0")) out->legal_hold = 0;
+        else if (!strcmp(line, "v=1")) ok = 1;
+    }
+    fclose(f);
+    return ok ? 0 : -1;
+}
+
+s3_err_t store_lock_write(s3_store_t *s, s3_str_t bucket, s3_str_t key,
+                          const uint8_t vid[16], const s3_lock_t *l) {
+    char dir[4300], path[4400], tmp[4500];
+    if (!valid_bucket_name(bucket) || !valid_key(key)
+        || lock_path(s, bucket, key, vid, dir, sizeof(dir), path, sizeof(path)) < 0)
+        return S3_ERR_INVALID_ARGUMENT;
+    if (mkdir_p(dir, 0700) < 0) return map_io_err(errno);
+    snprintf(tmp, sizeof(tmp), "%s.tmp.XXXXXX", path);
+    int fd = mkstemp(tmp);
+    if (fd < 0) return map_io_err(errno);
+    char buf[160];
+    int n = snprintf(buf, sizeof(buf), "v=1\nmode=%s\nuntil_ms=%" PRIu64 "\nlegal_hold=%d\n",
+                     l->mode == S3_LOCK_COMPLIANCE ? "COMPLIANCE"
+                     : l->mode == S3_LOCK_GOVERNANCE ? "GOVERNANCE" : "NONE",
+                     l->until_ms, l->legal_hold ? 1 : 0);
+    if (xwrite(fd, buf, (size_t)n) != n || xfsync(fd) < 0) {
+        s3_err_t e = map_io_err(errno);
+        close(fd); unlink(tmp);
+        return e;
+    }
+    close(fd);
+    if (rename(tmp, path) < 0) { s3_err_t e = map_io_err(errno); unlink(tmp); return e; }
+    fsync_dir(dir);
+    return S3_OK;
+}
+
+void store_get_raw(const s3_reader_t *r, int *fd, off_t *off, uint64_t *remaining) {
+    *fd = r->fd;
+    *off = (off_t)(r->data_off + r->pos);
+    *remaining = r->pos < r->data_size ? r->data_size - r->pos : 0;
+}
+
+void store_get_advance(s3_reader_t *r, uint64_t n) {
+    r->pos += n;
+    if (r->pos > r->data_size) r->pos = r->data_size;
 }

@@ -32,7 +32,16 @@ typedef struct fs3_metrics {
     uint64_t bytes_out_total;         /* response bytes written (head + body) */
     double   duration_seconds_sum;    /* summary: _sum / _count */
     uint64_t duration_seconds_count;
+    /* S3 error responses by code (BadDigest, expired presign, policy and
+     * lock denials, auth failures, ...). */
+    uint64_t errors[S3_ERR_MAX];
+    /* Lifecycle sweeper (updated from a worker: atomic adds). */
+    uint64_t lifecycle_expired_total;
+    uint64_t lifecycle_aborted_mpu_total;
+    uint64_t lifecycle_runs_total;
 } fs3_metrics_t;
+
+void metrics_error(fs3_metrics_t *m, s3_err_t e);
 
 /* Account one finished request. method is the request method token;
  * status the HTTP status sent; dur_s wall seconds from first parsed

@@ -1541,6 +1541,170 @@ static void t_recover_leaves_fresh_mpu(void) {
 
 /* ---- Main --------------------------------------------------------- */
 
+/* ---- F1: schema 2 objects stay readable; new writes are schema 3 ---- */
+
+static void install_fixture(const char *bucket, const char *key,
+                            const char *fixture) {
+    /* data/<bucket>/<xx>/<yy>/<sha256(bucket\0key)> */
+    char cmd[8192];
+    snprintf(cmd, sizeof(cmd),
+             "h=$(printf '%%s\\0%%s' '%s' '%s' | sha256sum | cut -c1-64); "
+             "d=%s/data/%s/$(echo $h | cut -c1-2)/$(echo $h | cut -c3-4); "
+             "mkdir -p $d && cp %s $d/$h",
+             bucket, key, g_root, bucket, fixture);
+    CHECK_EQ(system(cmd), 0, "install fixture");
+}
+
+static void t_reads_schema_v2_fixture(void) {
+    setup_root();
+    s3_store_t *s;
+    CHECK_EQ(store_open(&s, g_root), S3_OK, "open");
+    CHECK_EQ(store_bucket_create(s, S3_STR_LIT("buk")), S3_OK, "create");
+    install_fixture("buk", "legacy.txt", "tests/fixtures/obj_v2_legacy.bin");
+
+    s3_obj_meta_t m;
+    s3_reader_t *r;
+    CHECK_EQ(store_get_open(s, S3_STR_LIT("buk"), S3_STR_LIT("legacy.txt"),
+                            &r, &m), S3_OK, "v2 open");
+    char buf[64] = {0};
+    ssize_t n = store_get_read(r, buf, sizeof(buf));
+    store_get_close(r);
+    CHECK_EQ(n, 20, "v2 body length");
+    CHECK(memcmp(buf, "hello from schema 2\n", 20) == 0, "v2 body");
+    CHECK(strcmp(m.content_type, "text/plain") == 0, "v2 content type");
+    CHECK_EQ(m.mtime_ms, 1700000000123ULL, "v2 mtime");
+    CHECK_EQ(m.cksum_algo, 0, "v2 has no checksum");
+
+    /* Listing sees it with its key. */
+    s3_list_opts_t lo = {0};
+    s3_lister_t *l;
+    CHECK_EQ(store_list_begin(s, S3_STR_LIT("buk"), &lo, &l), S3_OK, "list");
+    s3_str_t k; int isp;
+    CHECK_EQ(store_list_next(l, &k, &m, &isp), S3_OK, "list next");
+    CHECK(s3_str_eq_lit(k, "legacy.txt"), "list key");
+    store_list_close(l);
+
+    /* Overwrite → schema 3 with a stored checksum round-trips. */
+    store_put_opts_t o = { .content_type = "a/b", .cksum_algo = S3_CKSUM_CRC32,
+                           .have_cksum = 1, .cksum = { 1, 2, 3, 4 } };
+    s3_writer_t *w;
+    CHECK_EQ(store_put_begin_opts(s, S3_STR_LIT("buk"),
+                                  S3_STR_LIT("legacy.txt"), &o, &w),
+             S3_OK, "v3 begin");
+    store_put_write(w, "new", 3);
+    CHECK_EQ(store_put_commit(w, NULL), S3_OK, "v3 commit");
+    CHECK_EQ(store_head(s, S3_STR_LIT("buk"), S3_STR_LIT("legacy.txt"), &m),
+             S3_OK, "v3 head");
+    CHECK_EQ(m.size, 3, "v3 size");
+    CHECK_EQ(m.cksum_algo, S3_CKSUM_CRC32, "v3 cksum algo");
+    CHECK(m.cksum[0] == 1 && m.cksum[3] == 4, "v3 cksum bytes");
+    CHECK(strcmp(m.content_type, "a/b") == 0, "v3 ct");
+
+    store_close(s);
+    teardown_root();
+}
+
+/* S5: header fields are untrusted — a file whose header_size or
+ * data_size disagrees with its length is refused, not served. */
+static void t_rejects_corrupt_header(void) {
+    setup_root();
+    s3_store_t *s;
+    CHECK_EQ(store_open(&s, g_root), S3_OK, "open");
+    CHECK_EQ(store_bucket_create(s, S3_STR_LIT("buk")), S3_OK, "create");
+    const char *variants[][2] = {
+        /* offset, byte: header_size low byte, data_size low byte, schema */
+        { "12", "\\377" }, { "16", "\\177" }, { "8", "\\011" },
+    };
+    for (size_t i = 0; i < 3; i++) {
+        char fx[512];
+        snprintf(fx, sizeof(fx), "%s/corrupt.bin", g_root);
+        char cmd[2048];
+        snprintf(cmd, sizeof(cmd),
+                 "cp tests/fixtures/obj_v2_legacy.bin %s && "
+                 "printf '%s' | dd of=%s bs=1 seek=%s conv=notrunc 2>/dev/null",
+                 fx, variants[i][1], fx, variants[i][0]);
+        CHECK_EQ(system(cmd), 0, "make corrupt");
+        install_fixture("buk", "legacy.txt", fx);
+        s3_obj_meta_t m;
+        s3_reader_t *r = NULL;
+        s3_err_t e = store_get_open(s, S3_STR_LIT("buk"),
+                                    S3_STR_LIT("legacy.txt"), &r, &m);
+        CHECK(e != S3_OK, "corrupt header refused");
+        if (e == S3_OK) store_get_close(r);
+    }
+    store_close(s);
+    teardown_root();
+}
+
+/* ---- Item 3: grants sidecar ---------------------------------------- */
+static void t_bucket_grants(void) {
+    setup_root();
+    s3_store_t *s;
+    CHECK_EQ(store_open(&s, g_root), S3_OK, "open");
+    s3_str_t b = S3_STR_LIT("gbk");
+    CHECK_EQ(store_bucket_create_owned(s, b, "alice"), S3_OK, "create");
+    CHECK_EQ(store_bucket_grant_perms(s, b, "bob"), 0, "no grant");
+    CHECK_EQ(store_bucket_grant_set(s, b, "bob", S3_GRANT_R | S3_GRANT_W), S3_OK, "set");
+    CHECK_EQ(store_bucket_grant_set(s, b, "carol", S3_GRANT_O), S3_OK, "set 2");
+    CHECK_EQ(store_bucket_grant_perms(s, b, "bob"), S3_GRANT_R | S3_GRANT_W, "bob rw");
+    CHECK_EQ(store_bucket_grant_set(s, b, "bob", S3_GRANT_R), S3_OK, "narrow");
+    CHECK_EQ(store_bucket_grant_perms(s, b, "bob"), S3_GRANT_R, "bob r");
+    CHECK_EQ(store_bucket_grant_perms(s, b, "carol"), S3_GRANT_O, "carol kept");
+    /* S3: names that could forge a line are refused at the write path. */
+    CHECK(store_bucket_grant_set(s, b, "evil\nroot", 7) != S3_OK, "newline user");
+    CHECK(store_bucket_grant_set(s, b, "a:b", 7) != S3_OK, "colon user");
+    CHECK(store_bucket_grant_set(s, b, "", 7) != S3_OK, "empty user");
+    CHECK_EQ(store_grant_parse_perms("rwo", 3), 7, "parse rwo");
+    CHECK_EQ(store_grant_parse_perms("rr", 2), -1, "parse dup");
+    CHECK_EQ(store_grant_parse_perms("x", 1), -1, "parse bad");
+    s3_grant_t *g; size_t n;
+    CHECK_EQ(store_bucket_grants_get(s, b, &g, &n), S3_OK, "list");
+    CHECK_EQ(n, 2, "two grants");
+    free(g);
+    CHECK_EQ(store_bucket_grant_set(s, b, "bob", 0), S3_OK, "remove");
+    CHECK_EQ(store_bucket_grant_perms(s, b, "bob"), 0, "removed");
+    /* Delete + re-create: new id, no grants. */
+    CHECK_EQ(store_bucket_delete(s, b), S3_OK, "delete with sidecars");
+    CHECK_EQ(store_bucket_create_owned(s, b, "alice"), S3_OK, "re-create");
+    CHECK_EQ(store_bucket_grant_perms(s, b, "carol"), 0, "grants gone");
+    store_close(s);
+    teardown_root();
+}
+
+static int walk_count_cb(void *u, s3_str_t k, const s3_obj_meta_t *m) {
+    (void)k; (void)m; (*(int *)u)++; return 0;
+}
+
+/* ---- Item 5 / S4: lifecycle expiry never deletes a newer PUT --------- */
+static void t_expire_if_unchanged(void) {
+    setup_root();
+    s3_store_t *s;
+    CHECK_EQ(store_open(&s, g_root), S3_OK, "open");
+    s3_str_t b = S3_STR_LIT("lcb"), k = S3_STR_LIT("tmp/a");
+    CHECK_EQ(store_bucket_create(s, b), S3_OK, "create");
+    CHECK_EQ(put(s, "lcb", "tmp/a", "old", 3, "", NULL), S3_OK, "put old");
+    s3_obj_meta_t m1, m2;
+    CHECK_EQ(store_head(s, b, k, &m1), S3_OK, "head old");
+    struct timespec ts = { 0, 5 * 1000000 };
+    nanosleep(&ts, NULL);
+    CHECK_EQ(put(s, "lcb", "tmp/a", "newer", 5, "", NULL), S3_OK, "put new");   /* "mid-sweep" PUT */
+    CHECK_EQ(store_expire_if_unchanged(s, b, k, m1.mtime_ms), S3_ERR_INVALID_REQUEST,
+             "changed object skipped");
+    CHECK_EQ(store_head(s, b, k, &m2), S3_OK, "newer survives");
+    CHECK_EQ(m2.size, 5, "newer content");
+    uint64_t mt = m2.mtime_ms;
+    CHECK_EQ(store_expire_if_unchanged(s, b, k, mt), S3_OK, "unchanged expires");
+    CHECK_EQ(store_head(s, b, k, &m2), S3_ERR_NO_SUCH_KEY, "gone");
+    CHECK_EQ(store_expire_if_unchanged(s, b, k, mt), S3_ERR_NO_SUCH_KEY, "absent");
+    /* store_walk_objects visits every object once. */
+    put(s, "lcb", "x1", "1", 1, "", NULL); put(s, "lcb", "x2", "2", 1, "", NULL);
+    int count = 0;
+    CHECK_EQ(store_walk_objects(s, b, walk_count_cb, &count), S3_OK, "walk");
+    CHECK_EQ(count, 2, "walked two");
+    store_close(s);
+    teardown_root();
+}
+
 int main(void) {
     log_init(LOG_WARN);  /* suppress info chatter during tests */
 
@@ -1587,6 +1751,10 @@ int main(void) {
     t_recover_clears_orphan_tmp();
     t_recover_preserves_committed();
     t_recover_leaves_fresh_mpu();
+    t_reads_schema_v2_fixture();
+    t_rejects_corrupt_header();
+    t_bucket_grants();
+    t_expire_if_unchanged();
 
     if (failures == 0) { printf("ALL TESTS PASSED\n"); return 0; }
     printf("%d FAILURES\n", failures);

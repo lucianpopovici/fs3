@@ -72,6 +72,16 @@ void sigv4_set_clock(sigv4_verifier_t *v, int64_t fixed_now);
  * in seconds. Default is 900 (15 minutes). */
 void sigv4_set_max_skew(sigv4_verifier_t *v, int max_skew_seconds);
 
+/* Presigned-URL policy: reject X-Amz-Expires above `max_expires`
+ * seconds (default 86400; AWS's own cap of 604800 always applies), and,
+ * if `no_admin`, presigned URLs signed by an admin identity. */
+void sigv4_set_presign_policy(sigv4_verifier_t *v, int64_t max_expires,
+                              int no_admin);
+
+/* 1 if the request carries a presigned-URL signature (X-Amz-Signature
+ * in the query). */
+int sigv4_has_presign(const struct conn *c);
+
 /* Verify the signature on a parsed request.
  *
  * Returns:
@@ -89,7 +99,9 @@ s3_err_t sigv4_verify(const sigv4_verifier_t *v, const struct conn *c);
 /* Who signed a verified request. */
 typedef struct {
     char user[SIGV4_USER_MAX + 1];
+    char access_key[SIGV4_USER_MAX + 1];   /* for the audit log */
     int  is_admin;
+    int  presigned;                        /* verified via query string */
 } sigv4_id_t;
 
 /* sigv4_verify, also filling *id_out (if non-NULL) on S3_OK. */
@@ -100,6 +112,15 @@ s3_err_t sigv4_verify_id(const sigv4_verifier_t *v, const struct conn *c,
  * (x-amz-content-sha256: STREAMING-AWS4-HMAC-SHA256-PAYLOAD). Call
  * after sigv4_verify returned S3_OK. Returns 1 if chunked, 0 otherwise. */
 int sigv4_is_chunked(const struct conn *c);
+
+/* Which aws-chunked body framing the request declares. */
+typedef enum {
+    SIGV4_STREAM_NONE = 0,
+    SIGV4_STREAM_SIGNED,            /* STREAMING-AWS4-HMAC-SHA256-PAYLOAD */
+    SIGV4_STREAM_SIGNED_TRAILER,    /* ...-PAYLOAD-TRAILER */
+    SIGV4_STREAM_UNSIGNED_TRAILER,  /* STREAMING-UNSIGNED-PAYLOAD-TRAILER */
+} sigv4_stream_mode_t;
+sigv4_stream_mode_t sigv4_stream_mode(const struct conn *c);
 
 /* ===================================================================== */
 /* Body-hash verification                                                 */
@@ -172,6 +193,23 @@ sigv4_chunk_decoder_t *sigv4_chunk_begin(const sigv4_verifier_t *v,
                                          uint64_t expected_decoded_length,
                                          sigv4_chunk_data_cb on_data,
                                          void *user_data);
+
+/* Like sigv4_chunk_begin, for any framing mode. `verify` = 0 decodes
+ * the framing without checking chunk/trailer signatures (open mode, or
+ * the unsigned variant, which has none); v may then be NULL. Trailer
+ * names must be announced in x-amz-trailer. */
+sigv4_chunk_decoder_t *sigv4_chunk_begin_mode(const sigv4_verifier_t *v,
+                                              const struct conn *c,
+                                              sigv4_stream_mode_t mode,
+                                              int verify,
+                                              uint64_t expected_decoded_length,
+                                              sigv4_chunk_data_cb on_data,
+                                              void *user_data);
+
+/* After a successful finish(): the value of trailer `name` (lowercase),
+ * or NULL if it was not sent. */
+const char *sigv4_chunk_trailer(const sigv4_chunk_decoder_t *d,
+                                const char *name, size_t *len_out);
 
 /* Feed `len` bytes of raw HTTP body. Returns 0 on success, -1 on
  * malformed framing or signature mismatch (request should be rejected
