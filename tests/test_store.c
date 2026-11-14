@@ -1064,7 +1064,7 @@ static void t_mpu_invalid_part_list(void) {
     parts[1].part_number = 1;
     CHECK(store_mpu_complete(s, S3_STR_LIT("buk"), S3_STR_LIT("k1"),
                               upload_id, parts, 2, etag, &meta)
-          == S3_ERR_INVALID_ARGUMENT, "mpu: out-of-order parts rejected");
+          == S3_ERR_INVALID_PART_ORDER, "mpu: out-of-order parts rejected");
 
     /* Cleanup */
     store_mpu_abort(s, S3_STR_LIT("buk"), S3_STR_LIT("k1"), upload_id);

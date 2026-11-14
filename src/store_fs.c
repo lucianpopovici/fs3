@@ -161,6 +161,7 @@ struct s3_store {
     pthread_mutex_t key_mu[256];
 
     int  pad_headers;        /* schema-4 headers padded to 4096 */
+    uint64_t mpu_min_part;   /* minimum size of non-final parts (0 = none) */
     int  reflink;            /* filesystem supports FICLONE (probed) */
 
     int  (*mpu_gc_filter)(void *user, s3_str_t bucket, s3_str_t key);
@@ -2574,6 +2575,57 @@ static s3_err_t mpu_read_meta(const s3_store_t *s, s3_str_t bucket,
     return S3_OK;
 }
 
+/* ---- Part records (round 2, item 1a) ---------------------------------
+ *
+ * part-NNNNN.rec, written for every part next to part-NNNNN: the part's
+ * MD5 (its ETag), size, mtime, verified checksum and payload CRC64. It
+ * is renamed in *before* the part, in the same ns_mu section, so a part
+ * without a record is treated as absent and a record without a part is
+ * garbage for the GC. Complete verifies the client's ETag list against
+ * these records and builds the multipart ETag from them, never from
+ * request bytes. Uploads begun before records existed fall back to
+ * hashing the part file (and their .ck sidecar). */
+#define PART_REC_MAGIC "FS3PREC1"
+
+typedef struct __attribute__((packed)) {
+    char     magic[8];
+    uint32_t version;          /* 1 */
+    uint8_t  md5[16];
+    uint64_t size;
+    uint64_t mtime_ms;
+    uint8_t  ck_algo;
+    uint8_t  ck_n;
+    uint8_t  has_crc;
+    uint8_t  pad0;
+    uint8_t  ck[32];
+    uint8_t  crc64[8];         /* CRC64NVME of the part bytes, BE */
+} part_rec_t;
+
+_Static_assert(sizeof(part_rec_t) == 88, "part_rec_t layout");
+
+/* 0 ok, 1 absent, -1 corrupt (fields bounded: the share is untrusted). */
+static int part_rec_read(const char *part_path, part_rec_t *r) {
+    char rp[4200];
+    snprintf(rp, sizeof(rp), "%s.rec", part_path);
+    int fd = open(rp, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return errno == ENOENT ? 1 : -1;
+    ssize_t n = read(fd, r, sizeof(*r));
+    close(fd);
+    if (n != (ssize_t)sizeof(*r) || memcmp(r->magic, PART_REC_MAGIC, 8) != 0
+        || r->version != 1 || r->ck_algo >= S3_CKSUM_MAX
+        || r->ck_n > sizeof(r->ck) || (r->ck_algo && r->ck_n != cksum_digest_len(r->ck_algo)))
+        return -1;
+    return 0;
+}
+
+/* mpu_read_meta plus the TLV area captured at Create ("tlv=<hex>" line,
+ * item 1e). out_tlv is malloc'd (NULL if none). */
+static s3_err_t mpu_read_meta2(const s3_store_t *s, s3_str_t bucket,
+                               const char *upload_id,
+                               char **out_key, size_t *out_key_n, char **out_ct,
+                               uint8_t *out_algo, uint8_t *out_type,
+                               uint8_t **out_tlv, size_t *out_tlv_n);
+
 s3_err_t store_mpu_part_begin(s3_store_t *s, s3_str_t bucket, s3_str_t key,
                               const char *upload_id, int part_number,
                               s3_writer_t **out) {
@@ -2605,6 +2657,7 @@ s3_err_t store_mpu_part_begin(s3_store_t *s, s3_str_t bucket, s3_str_t key,
     w->fd = -1;
     w->is_part = 1;
     w->mpu_algo = mpu_algo;
+    if (cksum_begin(&w->pcrc, S3_CKSUM_CRC64NVME) < 0) { writer_free(w); return S3_ERR_INTERNAL; }
 
     /* Final destination: <mpu>/<bucket>/<upload_id>/part-NNNNN */
     if (mpu_part_path(s, bucket, upload_id, part_number,
@@ -2649,6 +2702,7 @@ s3_err_t store_mpu_part_write(s3_writer_t *w, const void *buf, size_t n) {
         off += r;
     }
     EVP_DigestUpdate(w->md5_ctx, buf, n);
+    if (w->pcrc.algo) cksum_update(&w->pcrc, buf, n);
     w->data_written += n;
     return S3_OK;
 }
@@ -2682,40 +2736,52 @@ s3_err_t store_mpu_part_commit(s3_writer_t *w, char etag_hex_out[33]) {
     }
     close(w->fd); w->fd = -1;
 
-    /* Part checksum sidecar part-NNNNN.ck: [algo][digest]. Staged in
-     * tmp/ and renamed in with the part. */
-    char ck_tmp[4096] = "", ck_final[4200] = "";
+    /* Part record, staged in tmp/ and renamed in first (see above). */
+    part_rec_t rec;
+    memset(&rec, 0, sizeof(rec));
+    memcpy(rec.magic, PART_REC_MAGIC, 8);
+    rec.version = 1;
+    memcpy(rec.md5, mac, 16);
+    rec.size = w->data_written;
+    {
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        rec.mtime_ms = (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
+    }
     if (w->ext.cksum_algo) {
-        size_t dn = cksum_digest_len(w->ext.cksum_algo);
-        uint8_t rec[1 + 32];
-        rec[0] = w->ext.cksum_algo;
-        memcpy(rec + 1, w->ext.cksum, dn);
-        snprintf(ck_final, sizeof(ck_final), "%s.ck", w->final_path);
-        int cfd = tmp_open(w->store, ck_tmp, sizeof(ck_tmp));
-        if (cfd < 0) { s3_err_t e = map_io_err(errno); writer_free(w); return e; }
-        if (xwrite(cfd, rec, 1 + dn) != (ssize_t)(1 + dn) || xfsync(cfd) < 0) {
-            s3_err_t e = map_io_err(errno);
-            close(cfd); unlink(ck_tmp); writer_free(w); return e;
+        rec.ck_algo = w->ext.cksum_algo;
+        rec.ck_n = (uint8_t)cksum_digest_len(w->ext.cksum_algo);
+        memcpy(rec.ck, w->ext.cksum, rec.ck_n);
+    }
+    if (w->pcrc.algo) {
+        uint8_t d[CKSUM_MAX_DIGEST]; size_t dn;
+        if (cksum_final(&w->pcrc, d, &dn) == 0 && dn == 8) {
+            memcpy(rec.crc64, d, 8);
+            rec.has_crc = 1;
         }
-        close(cfd);
     }
+    char rec_tmp[4096], rec_final[4200], ck_old[4200];
+    snprintf(rec_final, sizeof(rec_final), "%s.rec", w->final_path);
+    snprintf(ck_old, sizeof(ck_old), "%s.ck", w->final_path);
+    int rfd = tmp_open(w->store, rec_tmp, sizeof(rec_tmp));
+    if (rfd < 0) { s3_err_t e = map_io_err(errno); writer_free(w); return e; }
+    if (xwrite(rfd, &rec, sizeof(rec)) != (ssize_t)sizeof(rec) || xfsync(rfd) < 0) {
+        s3_err_t e = map_io_err(errno);
+        close(rfd); unlink(rec_tmp); writer_free(w); return e;
+    }
+    close(rfd);
     /* ns_mu: an rm_rf of the upload dir (abort, GC, complete, bucket
-     * delete) must not interleave with this rename, or its final rmdir
-     * would fail on the newly-arrived part. */
+     * delete) must not interleave with these renames, and Complete reads
+     * record + part under the same lock. */
     pthread_mutex_lock(&w->store->ns_mu);
-    int rc = 0;
-    if (ck_tmp[0]) {
-        rc = rename(ck_tmp, ck_final);
-    } else {
-        /* A re-upload without a checksum must not inherit a stale one. */
-        char stale[4200];
-        snprintf(stale, sizeof(stale), "%s.ck", w->final_path);
-        unlink(stale);
+    int rc = rename(rec_tmp, rec_final);
+    if (rc == 0) {
+        unlink(ck_old);                       /* superseded by the record */
+        rc = rename(w->tmp_path, w->final_path);
     }
-    if (rc == 0) rc = rename(w->tmp_path, w->final_path);
     int rename_errno = errno;
     pthread_mutex_unlock(&w->store->ns_mu);
-    if (rc < 0 && ck_tmp[0]) unlink(ck_tmp);
+    if (rc < 0) unlink(rec_tmp);
     if (rc < 0) {
         /* ENOENT: the upload dir vanished mid-stream (abort, GC, or
          * bucket delete ran while this part was uploading). */
@@ -2801,347 +2867,298 @@ static int read_part_cksum(const char *part_path, uint8_t algo_want,
     return (int)dn;
 }
 
+/* One listed part, snapshotted under ns_mu: its record and an open fd on
+ * exactly the bytes that record describes. */
+typedef struct {
+    int        fd;
+    part_rec_t rec;
+    int        legacy;        /* no .rec: hash the file now */
+} part_snap_t;
+
+static void snaps_close(part_snap_t *ps, size_t n) {
+    if (!ps) return;
+    for (size_t i = 0; i < n; i++) if (ps[i].fd >= 0) close(ps[i].fd);
+    free(ps);
+}
+
+static int hexval1(char c) {
+    return (c >= '0' && c <= '9') ? c - '0' : (c >= 'a' && c <= 'f') ? c - 'a' + 10
+         : (c >= 'A' && c <= 'F') ? c - 'A' + 10 : -1;
+}
+
+/* Hash a legacy part (no record): MD5 + CRC64 over the file. */
+static s3_err_t legacy_part_hash(part_snap_t *p) {
+    EVP_MD_CTX *md = EVP_MD_CTX_new();
+    cksum_ctx_t crc;
+    if (!md || EVP_DigestInit_ex(md, EVP_md5(), NULL) != 1
+        || cksum_begin(&crc, S3_CKSUM_CRC64NVME) < 0) {
+        EVP_MD_CTX_free(md);
+        return S3_ERR_INTERNAL;
+    }
+    char buf[64 * 1024];
+    off_t off = 0;
+    for (;;) {
+        ssize_t r = pread(p->fd, buf, sizeof(buf), off);
+        if (r < 0) { if (errno == EINTR) continue; EVP_MD_CTX_free(md); cksum_free(&crc); return S3_ERR_INTERNAL; }
+        if (r == 0) break;
+        EVP_DigestUpdate(md, buf, (size_t)r);
+        cksum_update(&crc, buf, (size_t)r);
+        off += r;
+    }
+    unsigned int mn = 16;
+    EVP_DigestFinal_ex(md, p->rec.md5, &mn);
+    EVP_MD_CTX_free(md);
+    uint8_t d[CKSUM_MAX_DIGEST]; size_t dn;
+    if (cksum_final(&crc, d, &dn) == 0) { memcpy(p->rec.crc64, d, 8); p->rec.has_crc = 1; }
+    cksum_free(&crc);
+    p->rec.size = (uint64_t)off;
+    return S3_OK;
+}
+
 s3_err_t store_mpu_complete2(s3_store_t *s, s3_str_t bucket, s3_str_t key,
                              const char *upload_id,
                              const s3_part_ref_t *parts, size_t n_parts,
                              const uint8_t *full_expect, size_t full_n,
                              char etag_out[40], s3_obj_meta_t *meta_out) {
     if (!s || !upload_id || !parts || n_parts == 0) return S3_ERR_INVALID_ARGUMENT;
-    cksum_ctx_t comp, full;        /* composite / full-object checksum */
-    memset(&comp, 0, sizeof(comp));
-    memset(&full, 0, sizeof(full));
     if (n_parts > 10000) return S3_ERR_INVALID_ARGUMENT;
     if (!valid_bucket_name(bucket)) return S3_ERR_INVALID_BUCKET_NAME;
     if (!valid_key(key))            return S3_ERR_INVALID_ARGUMENT;
     if (!store_bucket_exists(s, bucket)) return S3_ERR_NO_SUCH_BUCKET;
 
-    /* Verify the upload exists and the key matches. */
-    char *stored_key = NULL;
-    size_t stored_key_n = 0;
-    char *stored_ct = NULL;
-    uint8_t mpu_algo = 0, mpu_type = 0;
-    s3_err_t err = mpu_read_meta(s, bucket, upload_id,
-                                  &stored_key, &stored_key_n, &stored_ct,
-                                  &mpu_algo, &mpu_type);
-    if (err != S3_OK) {
-        free(stored_key); free(stored_ct); cksum_free(&comp); cksum_free(&full);
-        return err;
+    /* Part numbers strictly increasing, 1..10000. */
+    for (size_t i = 0; i < n_parts; i++) {
+        if (parts[i].part_number < 1 || parts[i].part_number > 10000
+            || (i && parts[i].part_number <= parts[i-1].part_number))
+            return S3_ERR_INVALID_PART_ORDER;
     }
-    if (stored_key_n != key.n
-        || memcmp(stored_key, key.p, key.n) != 0) {
-        free(stored_key); free(stored_ct); cksum_free(&comp); cksum_free(&full);
-        return S3_ERR_NO_SUCH_UPLOAD;
-    }
-    free(stored_key);
-    /* stored_ct may be NULL/empty; we'll use it for the new object. */
-    const uint8_t *mpu_tlv = NULL;      /* TLVs captured at Create (item 1e) */
-    size_t mpu_tlv_n = 0;
 
-    /* Validate the parts list:
-     *   - part_numbers strictly increasing, each in [1,10000]
-     *   - each part file exists and has the right size
-     *   - each part's MD5 (recomputed via stat? — no, we trust the
-     *     filename and the etag in the request body. Real S3 verifies
-     *     against the server-side ETag stored when the part was committed.
-     *     We don't persist that today; the part file's MD5 is the etag.
-     *     For now, accept whatever etag the client sent — and trust
-     *     that if a wrong part file is on disk somehow, the resulting
-     *     object will be wrong but we haven't actively misbehaved.)
-     *
-     * Compute total size and the multipart-style ETag:
-     *   ETag = MD5(concat of raw 16-byte MD5s of each part) + "-N"
-     */
+    char *stored_key = NULL, *stored_ct = NULL;
+    size_t stored_key_n = 0;
+    uint8_t mpu_algo = 0, mpu_type = 0;
+    uint8_t *mpu_tlv = NULL;
+    size_t mpu_tlv_n = 0;
+    s3_err_t err = mpu_read_meta2(s, bucket, upload_id, &stored_key, &stored_key_n,
+                                  &stored_ct, &mpu_algo, &mpu_type, &mpu_tlv, &mpu_tlv_n);
+    if (err != S3_OK) { free(stored_key); free(stored_ct); free(mpu_tlv); return err; }
+    int key_ok = stored_key_n == key.n && memcmp(stored_key, key.p, key.n) == 0;
+    free(stored_key);
+    if (!key_ok) { free(stored_ct); free(mpu_tlv); return S3_ERR_NO_SUCH_UPLOAD; }
+
+    part_snap_t *ps = calloc(n_parts, sizeof(*ps));
+    cksum_ctx_t comp, full;
+    memset(&comp, 0, sizeof(comp));
+    memset(&full, 0, sizeof(full));
+    int tfd = -1;
+    char tmp_path[4096] = "";
+    s3_err_t e = S3_OK;
+    if (!ps) { e = S3_ERR_INTERNAL; goto out; }
+    for (size_t i = 0; i < n_parts; i++) ps[i].fd = -1;
+
+    /* 1. Snapshot record + part under ns_mu: a concurrent re-upload of a
+     *    part number can't pair an old record with new bytes (the open fd
+     *    keeps the bytes the record describes). */
+    pthread_mutex_lock(&s->ns_mu);
+    for (size_t i = 0; i < n_parts && e == S3_OK; i++) {
+        char pp[4096];
+        if (mpu_part_path(s, bucket, upload_id, parts[i].part_number, pp, sizeof(pp)) < 0) {
+            e = S3_ERR_INTERNAL; break;
+        }
+        int rr = part_rec_read(pp, &ps[i].rec);
+        if (rr < 0) { e = S3_ERR_INVALID_PART; break; }
+        ps[i].fd = open(pp, O_RDONLY | O_CLOEXEC);
+        if (ps[i].fd < 0) { e = S3_ERR_INVALID_PART; break; }
+        if (rr == 1) {
+            /* Pre-upgrade part: no record; honour its .ck, hash later. */
+            ps[i].legacy = 1;
+            memset(&ps[i].rec, 0, sizeof(ps[i].rec));
+            if (mpu_algo) {
+                int n = read_part_cksum(pp, mpu_algo, ps[i].rec.ck);
+                if (n > 0) { ps[i].rec.ck_algo = mpu_algo; ps[i].rec.ck_n = (uint8_t)n; }
+            }
+        } else {
+            struct stat st;
+            if (fstat(ps[i].fd, &st) < 0 || (uint64_t)st.st_size != ps[i].rec.size)
+                e = S3_ERR_INVALID_PART;      /* record and part disagree */
+        }
+    }
+    pthread_mutex_unlock(&s->ns_mu);
+    if (e != S3_OK) goto out;
+
+    /* 2. Verify every listed part against its record. */
+    uint64_t total_size = 0, crc = 0;
+    int crc_ok = 1;
     EVP_MD_CTX *etag_md = EVP_MD_CTX_new();
     if (!etag_md || EVP_DigestInit_ex(etag_md, EVP_md5(), NULL) != 1) {
-        if (etag_md) EVP_MD_CTX_free(etag_md);
-        free(stored_ct); cksum_free(&comp); cksum_free(&full);
-        return S3_ERR_INTERNAL;
+        EVP_MD_CTX_free(etag_md); e = S3_ERR_INTERNAL; goto out;
     }
-
-    int prev_pn = 0;
-    /* First pass: validate ordering and ranges (cheap, no disk access). */
-    for (size_t i = 0; i < n_parts; i++) {
-        if (parts[i].part_number <= prev_pn
-            || parts[i].part_number < 1
-            || parts[i].part_number > 10000) {
-            EVP_MD_CTX_free(etag_md);
-            free(stored_ct); cksum_free(&comp); cksum_free(&full);
-            return S3_ERR_INVALID_ARGUMENT;
-        }
-        prev_pn = parts[i].part_number;
-    }
-
     if (mpu_algo) {
         int a = mpu_type == S3_CKSUM_TYPE_COMPOSITE ? cksum_begin(&comp, mpu_algo)
                                                     : cksum_begin(&full, mpu_algo);
-        if (a < 0) {
-            EVP_MD_CTX_free(etag_md);
-            free(stored_ct); cksum_free(&comp); cksum_free(&full);
-            return S3_ERR_INTERNAL;
-        }
+        if (a < 0) { EVP_MD_CTX_free(etag_md); e = S3_ERR_INTERNAL; goto out; }
     }
-
-    /* Second pass: stat each part, accumulate sizes + multipart-MD5. */
-    uint64_t total_size = 0;
     for (size_t i = 0; i < n_parts; i++) {
-        char pp[4096];
-        if (mpu_part_path(s, bucket, upload_id, parts[i].part_number,
-                          pp, sizeof(pp)) < 0) {
-            EVP_MD_CTX_free(etag_md);
-            free(stored_ct); cksum_free(&comp); cksum_free(&full);
-            return S3_ERR_INTERNAL;
+        part_snap_t *p = &ps[i];
+        if (p->legacy && (e = legacy_part_hash(p)) != S3_OK) break;
+        /* Client ETag (32 hex, any case) must equal the recorded MD5. */
+        uint8_t want[16];
+        int hex_ok = strlen(parts[i].etag_hex) == 32;
+        for (int j = 0; j < 16 && hex_ok; j++) {
+            int hi = hexval1(parts[i].etag_hex[2*j]), lo = hexval1(parts[i].etag_hex[2*j+1]);
+            if (hi < 0 || lo < 0) hex_ok = 0;
+            else want[j] = (uint8_t)(hi << 4 | lo);
         }
-        struct stat st;
-        if (stat(pp, &st) < 0) {
-            EVP_MD_CTX_free(etag_md);
-            free(stored_ct); cksum_free(&comp); cksum_free(&full);
-            return S3_ERR_INVALID_PART;
-        }
-        total_size += (uint64_t)st.st_size;
-
+        if (!hex_ok || memcmp(want, p->rec.md5, 16) != 0) { e = S3_ERR_INVALID_PART; break; }
+        /* S3: every part but the last must be at least the minimum size. */
+        if (i + 1 < n_parts && p->rec.size < s->mpu_min_part) { e = S3_ERR_ENTITY_TOO_SMALL; break; }
         if (mpu_algo) {
-            uint8_t pck[32];
-            int pn = read_part_cksum(pp, mpu_algo, pck);
-            if (pn <= 0 || (parts[i].cksum_n
-                            && (parts[i].cksum_n != pn
-                                || memcmp(parts[i].cksum, pck, (size_t)pn)))) {
-                EVP_MD_CTX_free(etag_md);
-                free(stored_ct); cksum_free(&comp); cksum_free(&full);
-                return S3_ERR_INVALID_PART;
+            if (p->rec.ck_algo != mpu_algo
+                || (parts[i].cksum_n && (parts[i].cksum_n != p->rec.ck_n
+                                         || memcmp(parts[i].cksum, p->rec.ck, p->rec.ck_n)))) {
+                e = S3_ERR_INVALID_PART; break;
             }
-            if (comp.algo) cksum_update(&comp, pck, (size_t)pn);
+            if (comp.algo) cksum_update(&comp, p->rec.ck, p->rec.ck_n);
         }
-
-        /* Decode the etag hex into 16 raw bytes and feed into multipart-MD5. */
-        uint8_t raw[16];
-        for (int j = 0; j < 16; j++) {
-            char hi = parts[i].etag_hex[2*j];
-            char lo = parts[i].etag_hex[2*j + 1];
-            int hv = (hi >= '0' && hi <= '9') ? hi - '0'
-                   : (hi >= 'a' && hi <= 'f') ? hi - 'a' + 10
-                   : (hi >= 'A' && hi <= 'F') ? hi - 'A' + 10 : -1;
-            int lv = (lo >= '0' && lo <= '9') ? lo - '0'
-                   : (lo >= 'a' && lo <= 'f') ? lo - 'a' + 10
-                   : (lo >= 'A' && lo <= 'F') ? lo - 'A' + 10 : -1;
-            if (hv < 0 || lv < 0) {
-                EVP_MD_CTX_free(etag_md);
-                free(stored_ct); cksum_free(&comp); cksum_free(&full);
-                return S3_ERR_INVALID_PART;
-            }
-            raw[j] = (uint8_t)((hv << 4) | lv);
+        EVP_DigestUpdate(etag_md, p->rec.md5, 16);
+        if (p->rec.has_crc) {
+            uint64_t pc = crc64nvme_from_be(p->rec.crc64);
+            crc = i ? crc64nvme_combine(crc, pc, p->rec.size) : pc;
+        } else {
+            crc_ok = 0;
         }
-        EVP_DigestUpdate(etag_md, raw, 16);
+        total_size += p->rec.size;
     }
-
     uint8_t mp_md5[16];
     unsigned int mp_md5_n = 16;
     EVP_DigestFinal_ex(etag_md, mp_md5, &mp_md5_n);
     EVP_MD_CTX_free(etag_md);
-    static const char H[] = "0123456789abcdef";
-    char mp_hex[33];
-    for (int i = 0; i < 16; i++) {
-        mp_hex[2*i + 0] = H[(mp_md5[i] >> 4) & 0xF];
-        mp_hex[2*i + 1] = H[ mp_md5[i]       & 0xF];
-    }
-    mp_hex[32] = '\0';
+    if (e != S3_OK) goto out;
 
-    /* Now assemble the object file. We mirror the single-PUT layout:
-     * obj_header_t + content_type + key + concatenated part data.
-     * The header.etag is the raw 16 bytes of mp_md5.
-     */
-
-    /* Build target dir + path using the same hash + obj_dir/obj_path
-     * helpers as single-PUT. */
-    char hex[65];
+    char hex[65], target_dir[4096], target_path[4096];
     hash_bucket_key(bucket, key, hex);
-    char target_dir[4096];
-    if (obj_dir(s, bucket, hex, target_dir, sizeof(target_dir)) < 0) {
-        free(stored_ct); cksum_free(&comp); cksum_free(&full);
-        return S3_ERR_INTERNAL;
+    if (obj_dir(s, bucket, hex, target_dir, sizeof(target_dir)) < 0
+        || obj_path(s, bucket, hex, target_path, sizeof(target_path)) < 0) {
+        e = S3_ERR_INTERNAL; goto out;
     }
-    char target_path[4096];
-    if (obj_path(s, bucket, hex, target_path, sizeof(target_path)) < 0) {
-        free(stored_ct); cksum_free(&comp); cksum_free(&full);
-        return S3_ERR_INTERNAL;
-    }
-
-    /* Open temp file in tmp/ */
-    char tmp_path[4096];
     snprintf(tmp_path, sizeof(tmp_path), "%s/mpu.XXXXXX", s->tmp_dir);
-    int tfd = mkstemp(tmp_path);
-    if (tfd < 0) {
-        s3_err_t e = map_io_err(errno);
-        free(stored_ct); cksum_free(&comp); cksum_free(&full);
-        return e;
-    }
+    tfd = mkstemp(tmp_path);
+    if (tfd < 0) { tmp_path[0] = '\0'; e = map_io_err(errno); goto out; }
 
-    /* Build header — native byte order, like single-PUT. */
-    obj_header_t hdr = {0};
-    memcpy(hdr.magic, OBJ_MAGIC, OBJ_MAGIC_LEN);
-    hdr.schema = OBJ_SCHEMA;
+    /* 3. Assemble: prefix, then the snapshotted part bytes. */
+    obj_header_t hdr;
+    obj_ext_v3_t ext;
+    obj_ext_v4_t ext4;
+    memset(&hdr, 0, sizeof(hdr));
+    memset(&ext, 0, sizeof(ext));
+    memset(&ext4, 0, sizeof(ext4));
     size_t ct_n = stored_ct ? strlen(stored_ct) : 0;
-    if (ct_n > UINT16_MAX || key.n > UINT16_MAX) {
-        close(tfd); unlink(tmp_path); free(stored_ct); cksum_free(&comp); cksum_free(&full);
-        return S3_ERR_INVALID_ARGUMENT;
-    }
     hdr.part_count = (uint16_t)n_parts;
     hdr.data_size = total_size;
-    obj_ext_v3_t ext;
-    memset(&ext, 0, sizeof(ext));
-    obj_ext_v4_t ext4;
-    memset(&ext4, 0, sizeof(ext4));
+    memcpy(hdr.etag, mp_md5, 16);
     ext4.stored_size = total_size;
-    cksum_ctx_t pcrc;
-    if (cksum_begin(&pcrc, S3_CKSUM_CRC64NVME) < 0) {
-        close(tfd); unlink(tmp_path); free(stored_ct); cksum_free(&comp); cksum_free(&full);
-        return S3_ERR_INTERNAL;
-    }
     int versioning = bucket_versioning(s, bucket);
     if (versioning == S3_VERSIONING_ENABLED && random_vid(ext.version_id) < 0) {
-        close(tfd); unlink(tmp_path); free(stored_ct); cksum_free(&comp); cksum_free(&full);
-        return S3_ERR_INTERNAL;
+        e = S3_ERR_INTERNAL; goto out;
     }
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
-    uint64_t mtime_ms = (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
-    hdr.mtime_ms = mtime_ms;
-    memcpy(hdr.etag, mp_md5, 16);
-
+    hdr.mtime_ms = (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
     if (obj_write_prefix(s, tfd, &hdr, &ext, &ext4, stored_ct, ct_n,
                          key.p, key.n, mpu_tlv, mpu_tlv_n) < 0) {
-        s3_err_t e = map_io_err(errno);
-        close(tfd); unlink(tmp_path); free(stored_ct); cksum_free(&comp); cksum_free(&full);
-        cksum_free(&pcrc);
-        return e;
+        e = map_io_err(errno); goto out;
     }
-
-    /* Concatenate part files. */
-    for (size_t i = 0; i < n_parts; i++) {
-        char pp[4096];
-        mpu_part_path(s, bucket, upload_id, parts[i].part_number,
-                      pp, sizeof(pp));
-        int pfd = open(pp, O_RDONLY | O_CLOEXEC);
-        if (pfd < 0) {
-            close(tfd); unlink(tmp_path); free(stored_ct); cksum_free(&comp); cksum_free(&full);
-            return S3_ERR_INVALID_PART;
-        }
+    for (size_t i = 0; i < n_parts && e == S3_OK; i++) {
         char buf[64 * 1024];
+        off_t off = 0;
         for (;;) {
-            ssize_t r = read(pfd, buf, sizeof(buf));
+            ssize_t r = pread(ps[i].fd, buf, sizeof(buf), off);
             if (r == 0) break;
-            if (r < 0) {
-                if (errno == EINTR) continue;
-                close(pfd); close(tfd); unlink(tmp_path); free(stored_ct); cksum_free(&comp); cksum_free(&full);
-                return S3_ERR_INTERNAL;
-            }
+            if (r < 0) { if (errno == EINTR) continue; e = S3_ERR_INTERNAL; break; }
             if (full.algo) cksum_update(&full, buf, (size_t)r);
-            cksum_update(&pcrc, buf, (size_t)r);
-            ssize_t off = 0;
-            while (off < r) {
-                ssize_t wr = xwrite(tfd, buf + off, (size_t)(r - off));
-                if (wr < 0) {
-                    if (errno == EINTR) continue;
-                    s3_err_t e = map_io_err(errno);
-                    close(pfd); close(tfd); unlink(tmp_path); free(stored_ct); cksum_free(&comp); cksum_free(&full);
-                    return e;
-                }
-                off += wr;
-            }
+            if (xwrite(tfd, buf, (size_t)r) != r) { e = map_io_err(errno); break; }
+            off += r;
         }
-        close(pfd);
+        if (e == S3_OK && (uint64_t)off != ps[i].rec.size) e = S3_ERR_INVALID_PART;
     }
+    if (e != S3_OK) goto out;
 
-    /* Object checksum into the v3 extension. */
+    /* Object checksum (v3) and payload CRC (v4, combined from the parts). */
     if (mpu_algo) {
         uint8_t dg[32]; size_t dn = 0;
         cksum_ctx_t *k = comp.algo ? &comp : &full;
-        if (cksum_final(k, dg, &dn) < 0) {
-            close(tfd); unlink(tmp_path); free(stored_ct); cksum_free(&comp); cksum_free(&full);
-            return S3_ERR_INTERNAL;
-        }
+        if (cksum_final(k, dg, &dn) < 0) { e = S3_ERR_INTERNAL; goto out; }
         if (!comp.algo && full_expect
             && (full_n != dn || memcmp(full_expect, dg, dn) != 0)) {
-            close(tfd); unlink(tmp_path); free(stored_ct); cksum_free(&comp); cksum_free(&full);
-            return S3_ERR_CHECKSUM_MISMATCH;
+            e = S3_ERR_CHECKSUM_MISMATCH; goto out;
         }
         ext.cksum_algo = mpu_algo;
         ext.cksum_type = mpu_type;
         ext.cksum_parts = mpu_type == S3_CKSUM_TYPE_COMPOSITE ? (uint16_t)n_parts : 0;
         memcpy(ext.cksum, dg, dn);
-        /* written with the fixed blocks below */
     }
-    cksum_free(&comp);
-    cksum_free(&full);
-    {
-        uint8_t d[CKSUM_MAX_DIGEST]; size_t dn;
-        if (cksum_final(&pcrc, d, &dn) == 0 && dn == 8) {
-            memcpy(ext4.payload_crc64, d, 8);
-            ext.flags |= S3_OBJF_PAYLOAD_CRC;
-        }
-        cksum_free(&pcrc);
+    if (crc_ok) {
+        crc64nvme_to_be(crc, ext4.payload_crc64);
+        ext.flags |= S3_OBJF_PAYLOAD_CRC;
     }
-    if (obj_rewrite_fixed(tfd, &hdr, &ext, &ext4) < 0) {
-        s3_err_t e = map_io_err(errno);
-        close(tfd); unlink(tmp_path); free(stored_ct);
-        return e;
-    }
-
-    if (xfsync(tfd) < 0) {
-        s3_err_t e = map_io_err(errno);
-        close(tfd); unlink(tmp_path); free(stored_ct); cksum_free(&comp); cksum_free(&full);
-        return e;
+    if (obj_rewrite_fixed(tfd, &hdr, &ext, &ext4) < 0 || xfsync(tfd) < 0) {
+        e = map_io_err(errno); goto out;
     }
     close(tfd);
+    tfd = -1;
 
-    /* Publish under ns_mu. The concatenation above can take a long time
-     * on a worker thread, so re-check that neither the bucket (delete)
-     * nor the upload (abort/GC) went away meanwhile — if one did, the
-     * later operation wins and nothing is published. The staging dir is
-     * removed in the same critical section, so no concurrent abort can
-     * observe a half-removed upload. */
+    /* 4. Publish under the key stripe + ns_mu. The assembly can take a
+     *    long time on a worker, so re-check bucket and upload; the
+     *    staging dir goes in the same critical section. */
     char up_dir[4096], up_meta[4200];
     mpu_dir_path(s, bucket, upload_id, up_dir, sizeof(up_dir));
     snprintf(up_meta, sizeof(up_meta), "%s/meta", up_dir);
     pthread_mutex_t *km = key_lock(s, hex);
     pthread_mutex_lock(km);
     pthread_mutex_lock(&s->ns_mu);
-    s3_err_t pe = S3_OK;
-    if (!store_bucket_exists(s, bucket))          pe = S3_ERR_NO_SUCH_BUCKET;
-    else if (access(up_meta, F_OK) < 0)           pe = S3_ERR_NO_SUCH_UPLOAD;
-    else if ((pe = link_aside_locked(s, bucket, hex, target_path, versioning)) != S3_OK) ;
+    if (!store_bucket_exists(s, bucket))          e = S3_ERR_NO_SUCH_BUCKET;
+    else if (access(up_meta, F_OK) < 0)           e = S3_ERR_NO_SUCH_UPLOAD;
+    else if ((e = link_aside_locked(s, bucket, hex, target_path, versioning)) != S3_OK) ;
     else if (mkdir_p(target_dir, 0700) < 0
-             || rename(tmp_path, target_path) < 0) pe = map_io_err(errno);
-    else                                          rm_rf(up_dir);
+             || rename(tmp_path, target_path) < 0) e = map_io_err(errno);
+    else { rm_rf(up_dir); tmp_path[0] = '\0'; }
     pthread_mutex_unlock(&s->ns_mu);
     pthread_mutex_unlock(km);
-    if (pe != S3_OK) {
-        unlink(tmp_path); free(stored_ct); cksum_free(&comp); cksum_free(&full);
-        return pe;
-    }
+    if (e != S3_OK) goto out;
     fsync_dir(target_dir);
 
-    /* Fill outputs. */
     if (etag_out) {
-        snprintf(etag_out, 40, "%s-%zu", mp_hex, n_parts);
+        static const char H[] = "0123456789abcdef";
+        char mh[33];
+        for (int i = 0; i < 16; i++) { mh[2*i] = H[mp_md5[i] >> 4]; mh[2*i+1] = H[mp_md5[i] & 15]; }
+        mh[32] = '\0';
+        snprintf(etag_out, 40, "%s-%zu", mh, n_parts);
     }
     if (meta_out) {
         memset(meta_out, 0, sizeof(*meta_out));
         meta_out->size = total_size;
-        meta_out->mtime_ms = mtime_ms;
+        meta_out->stored_size = total_size;
+        meta_out->mtime_ms = hdr.mtime_ms;
         meta_out->part_count = (uint16_t)n_parts;
         memcpy(meta_out->etag, mp_md5, 16);
         memcpy(meta_out->version_id, ext.version_id, 16);
+        meta_out->flags = ext.flags;
         meta_out->cksum_algo  = ext.cksum_algo;
         meta_out->cksum_type  = ext.cksum_type;
         meta_out->cksum_parts = ext.cksum_parts;
         memcpy(meta_out->cksum, ext.cksum, 32);
-        if (stored_ct) {
-            strncpy(meta_out->content_type, stored_ct,
-                    sizeof(meta_out->content_type) - 1);
-        }
+        memcpy(meta_out->payload_crc64, ext4.payload_crc64, 8);
+        meta_out->header_size = hdr.header_size;
+        if (stored_ct) snprintf(meta_out->content_type, sizeof(meta_out->content_type), "%s", stored_ct);
     }
-    free(stored_ct); cksum_free(&comp); cksum_free(&full);
-    return S3_OK;
+out:
+    if (tfd >= 0) close(tfd);
+    if (tmp_path[0]) unlink(tmp_path);
+    snaps_close(ps, n_parts);
+    cksum_free(&comp);
+    cksum_free(&full);
+    free(stored_ct);
+    free(mpu_tlv);
+    return e;
 }
 
 /* ===================================================================== */
@@ -4166,3 +4183,45 @@ void store_get_advance(s3_reader_t *r, uint64_t n) {
     r->pos += n;
     if (r->pos > r->data_size) r->pos = r->data_size;
 }
+
+static s3_err_t mpu_read_meta2(const s3_store_t *s, s3_str_t bucket,
+                               const char *upload_id,
+                               char **out_key, size_t *out_key_n, char **out_ct,
+                               uint8_t *out_algo, uint8_t *out_type,
+                               uint8_t **out_tlv, size_t *out_tlv_n) {
+    *out_tlv = NULL;
+    *out_tlv_n = 0;
+    s3_err_t e = mpu_read_meta(s, bucket, upload_id, out_key, out_key_n, out_ct,
+                               out_algo, out_type);
+    if (e != S3_OK) return e;
+    char dir[4096], meta[4200];
+    if (mpu_dir_path(s, bucket, upload_id, dir, sizeof(dir)) < 0) return S3_ERR_INTERNAL;
+    snprintf(meta, sizeof(meta), "%s/meta", dir);
+    FILE *fp = fopen(meta, "re");
+    if (!fp) return S3_OK;
+    char *line = NULL;
+    size_t cap = 0;
+    ssize_t r;
+    while ((r = getline(&line, &cap, fp)) > 0) {
+        if (strncmp(line, "tlv=", 4)) continue;
+        size_t hn = (size_t)r - 4;
+        while (hn && (line[4 + hn - 1] == '\n' || line[4 + hn - 1] == '\r')) hn--;
+        if (hn % 2 || hn / 2 > OBJ_MAX_TLV) break;
+        uint8_t *t = malloc(hn / 2 + 1);
+        if (!t) break;
+        size_t i;
+        for (i = 0; i < hn / 2; i++) {
+            int hi = hexval1(line[4 + 2*i]), lo = hexval1(line[5 + 2*i]);
+            if (hi < 0 || lo < 0) break;
+            t[i] = (uint8_t)(hi << 4 | lo);
+        }
+        if (i == hn / 2 && tlv_validate(t, hn / 2) == 0) { *out_tlv = t; *out_tlv_n = hn / 2; }
+        else free(t);
+        break;
+    }
+    free(line);
+    fclose(fp);
+    return S3_OK;
+}
+
+void store_set_mpu_min_part_size(s3_store_t *s, uint64_t n) { if (s) s->mpu_min_part = n; }

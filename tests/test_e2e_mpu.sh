@@ -24,7 +24,7 @@ BUILD_FLAGS=""
 [ "${DEBUG:-0}" = "1" ] && BUILD_FLAGS="DEBUG=1"
 (cd "$ROOT" && make $BUILD_FLAGS fs3 >/dev/null 2>&1)
 
-"$ROOT/fs3" -p "$PORT" -d "$DATA" >"$LOG" 2>&1 &
+"$ROOT/fs3" -p "$PORT" -d "$DATA" --mpu-min-part-size 0 >"$LOG" 2>&1 &
 SP=$!
 sleep 0.4
 if ! kill -0 "$SP" 2>/dev/null; then

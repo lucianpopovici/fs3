@@ -85,6 +85,8 @@ static void usage(const char *argv0) {
         "      --tls-addr <ip>        TLS bind address (default: --addr)\n"
         "      --tls-cert <pem>       certificate chain; --tls-key <pem> key (mode 0600)\n"
         "                             SIGHUP re-reads both (a bad file keeps the old ones)\n"
+        "      --mpu-min-part-size N  minimum size of every multipart part but the last\n"
+        "                             (default 5M, as S3; 0 = none)\n"
         "      --audit-log <file>     append one JSON line per request + admin change\n"
         "                             (no query strings / signatures); SIGHUP reopens\n"
         "      --auth-fail-limit N    auth failures per client IP per minute before\n"
@@ -297,6 +299,7 @@ enum {
     OPT_TLS_MAX_PER_IP,
     OPT_AUDIT_LOG,
     OPT_AUTH_FAIL_LIMIT,
+    OPT_MPU_MIN_PART_SIZE,
 };
 
 #ifndef FS3_MAIN_TESTING
@@ -366,6 +369,7 @@ int main(int argc, char **argv) {
     int max_retention_days = 3650;
     const char *audit_log = NULL;
     int auth_fail_limit = 20;
+    uint64_t mpu_min_part = 5ULL * 1024 * 1024;   /* S3's minimum */
     int tls_port = 0, require_tls = 0, require_signed_payload = 0, tls_max_per_ip = 32;
     const char *tls_addr = NULL, *tls_cert = NULL, *tls_key = NULL;
     char trusted_proxies[1024] = "";
@@ -413,6 +417,7 @@ int main(int argc, char **argv) {
         { "tls-max-per-ip",   required_argument, NULL, OPT_TLS_MAX_PER_IP },
         { "audit-log",        required_argument, NULL, OPT_AUDIT_LOG },
         { "auth-fail-limit",  required_argument, NULL, OPT_AUTH_FAIL_LIMIT },
+        { "mpu-min-part-size", required_argument, NULL, OPT_MPU_MIN_PART_SIZE },
         { "require-signed-payload", no_argument, NULL, OPT_REQUIRE_SIGNED_PAYLOAD },
         { "verbose",          no_argument,       NULL, 'v' },
         { "help",             no_argument,       NULL, 'h' },
@@ -605,6 +610,13 @@ int main(int argc, char **argv) {
                 break;
             case OPT_TLS_ADDR: tls_addr = optarg; break;
             case OPT_AUDIT_LOG: audit_log = optarg; break;
+            case OPT_MPU_MIN_PART_SIZE:
+                mpu_min_part = strcmp(optarg, "0") == 0 ? 0 : parse_size(optarg);
+                if (strcmp(optarg, "0") && mpu_min_part == 0) {
+                    fprintf(stderr, "--mpu-min-part-size: invalid size '%s'\n", optarg);
+                    return 2;
+                }
+                break;
             case OPT_AUTH_FAIL_LIMIT:
                 auth_fail_limit = atoi(optarg);
                 if (auth_fail_limit < 0) { fprintf(stderr, "--auth-fail-limit must be >= 0\n"); return 2; }
@@ -732,6 +744,7 @@ int main(int argc, char **argv) {
         .allow_public    = allow_public,
         .allow_public_write = allow_public_write,
         .max_retention_days = max_retention_days,
+        .mpu_min_part_size = mpu_min_part,
         .tls_port        = (uint16_t)tls_port,
         .tls_addr        = tls_addr,
         .tls_cert        = tls_cert,

@@ -414,6 +414,10 @@ s3_err_t store_mpu_checksum_info(s3_store_t *s, s3_str_t bucket,
                                  const char *upload_id,
                                  uint8_t *algo, uint8_t *type);
 
+/* S3's rule: every part but the last must be at least this many bytes
+ * (Complete answers S3_ERR_ENTITY_TOO_SMALL). 0 = no minimum. */
+void     store_set_mpu_min_part_size(s3_store_t *s, uint64_t n);
+
 /* Abort: remove the staging dir and all part files. */
 s3_err_t store_mpu_abort(s3_store_t *s, s3_str_t bucket, s3_str_t key,
                          const char *upload_id);

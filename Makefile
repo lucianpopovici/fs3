@@ -135,6 +135,8 @@ test: check-test-deps $(TEST_BINS) fs3
 	@./tests/test_e2e_auth.sh
 	@echo "=== test_e2e_mpu (multipart integration) ==="
 	@./tests/test_e2e_mpu.sh
+	@echo "=== test_e2e_parts (round 2: part records, ListParts, UploadPartCopy) ==="
+	@./tests/test_e2e_parts.sh
 	@echo "=== test_e2e_phase9 (range / bulk-delete / bucket-subresources) ==="
 	@./tests/test_e2e_phase9.sh
 	@echo "=== test_e2e_phase10 (object copy / ?acl stub) ==="

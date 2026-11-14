@@ -463,6 +463,7 @@ server_t *server_create(const server_cfg_t *cfg) {
     /* Object lock is enforced in the store: no path deletes a locked
      * version (item 10). */
     store_set_version_guard(s->store, olock_guard, s->store);
+    store_set_mpu_min_part_size(s->store, cfg->mpu_min_part_size);
     return s;
 
 fail:

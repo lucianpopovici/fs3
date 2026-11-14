@@ -91,6 +91,7 @@ typedef struct {
     int                    require_signed_payload;  /* S2 */
     /* Longest retention a client may set (S9), days; 0 = default 3650. */
     int                    max_retention_days;
+    uint64_t               mpu_min_part_size;   /* Complete: EntityTooSmall below */
 
     /* Admin API (item 11): /v1 on the metrics listener needs this bearer
      * token (NULL = disabled there); admin_socket adds a Unix-socket
