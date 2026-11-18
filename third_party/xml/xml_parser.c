@@ -206,7 +206,7 @@ static int w(xml_write_fn cb, void *ctx, const char *p, size_t n) {
 
 /* Write an indent of `n` spaces. */
 static int w_indent(xml_write_fn cb, void *ctx, int n) {
-    static const char spaces[64] =
+    static const char spaces[] =
         "                                                                ";
     while (n > 0) {
         int chunk = n > 64 ? 64 : n;

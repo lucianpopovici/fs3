@@ -602,6 +602,9 @@ seconds.
 | suite aborts immediately on the NAS | the `make` shim is missing from `PATH` (D5.3) |
 | botocore stalls 60 s after a refused upload | fixed in this tree (a connection refused before `100 Continue` is closed); if seen, report it |
 | `--lock-immutable … refusing to start` | `fs3-lockd` isn't running, its socket isn't owned by the fs3 uid, or the filesystem refuses `chattr +i` |
+| `RNDGETENTCNT on /dev/urandom indicates that the entropy pool does not have enough entropy` in Python test output on DSM | `awscrt` (`aws-c-common`) checks `RNDGETENTCNT` on kernel 3.10 when `getrandom()` is absent and writes a warning to `stdout`; SigV4 test helpers set `sys.modules["awscrt"] = None` before importing `botocore` |
+| `CERTIFICATE_VERIFY_FAILED: unable to get local issuer certificate` in `test_e2e_tls.sh` / `test_e2e_ssec.sh` on DSM | DSM's `/etc/ssl/openssl.cnf` already defines `[v3_ca]`; using `openssl req -x509 -addext` on OpenSSL 1.1.1t emits duplicate `Basic Constraints` / `Subject Key Identifier` extensions. Use `-config` with a clean `[v3_ca]` section |
+| `sudo: synopkg: command not found` | DSM's `sudo` `secure_path` omits `/usr/syno/bin`; invoke `/usr/syno/bin/synopkg` with its full path |
 
 ---
 
@@ -621,4 +624,64 @@ NAS D6 SPK:        install / start-stop / tile / watchdog / reverse proxy / upgr
 NAS D7 features:   reflink / dedup / compression / scrub / quotas / SSE-C / lock-immutable: PASS/FAIL/N.A.
 NAS D8 resources:  peak RSS <MB>, CPU <%> during 1 GiB upload
 Open issues:       <bugs with exact commands, logs, expected vs actual>
+```
+
+---
+
+## 4. Recorded Test Run (2026-11-18)
+
+```
+Build host:        Fedora Linux 45 (kernel 7.3.4-300.fc45.x86_64, gcc 16); Part B container: debian:stretch (glibc 2.24, gcc 6.3.0, static OpenSSL 1.1.1w)
+NAS:               DS1515+ (192.168.1.3), DSM 7.1.1-42962 (Update 9), kernel 3.10.108, glibc 2.26, volume btrfs (/volume1)
+Binaries:          fs3-static 021fc8f77e9e73d73afef0f7b81421d943a23090c697e1a4e8f4a4e51c786cdd,
+                   fs3-tls-static 1dbbdf24c40b24eaf41907ffe35331c01e8c76f148f92b5be89f132c1299fd4a,
+                   fs3-lockd a6ce617150c766014725cb252d63b9e21af8a6a93e678558ae6b0d1322db99ae;
+                   max GLIBC symbol 2.17 (fs3-lockd: fully static)
+Part A make test:  PASS (15 C unit/fuzz suites + 29 e2e suites); DEBUG run: PASS (after 1 retry of known test_store flake); skips: test_e2e_immutable.sh on host (non-root)
+Part B B4 suites:  test_e2e: PASS (23/23), test_e2e_auth: PASS (28/28), test_e2e_mpu: PASS (26/26),
+                   test_e2e_parts: PASS (53/53), test_e2e_metadata: PASS (46/46 + rclone),
+                   test_e2e_quota: PASS (61/61), test_e2e_scrub: PASS (30/30), test_e2e_keys: PASS (30/30),
+                   test_e2e_versioning: PASS (38/38), test_e2e_objlock: PASS (26/26),
+                   test_e2e_tls: PASS (19/19), test_e2e_ssec: PASS (43/43),
+                   test_e2e_reflink: PASS (45/45 + fs-compress auto/all),
+                   test_e2e_immutable: SKIP on host (non-root), PASS on NAS (25/25)
+NAS D2 probe:      runs: yes; seccomp filter supported: no (no Seccomp field in /proc/self/status; kernel 3.10.108 lacks CONFIG_SECCOMP_FILTER); reflink: yes (Btrfs)
+NAS D3 seccomp:    blocked syscalls found: none on NAS (kernel lacks CONFIG_SECCOMP_FILTER, so enforce logs a warning and runs unfiltered).
+                   In Part B4 on the 7.3 host, building src/sandbox.c against debian:stretch's 4.9 kernel headers omitted post-4.9 syscall numbers
+                   (__NR_clone3, __NR_rseq, __NR_statx, __NR_faccessat2, __NR_epoll_pwait2); added #ifndef __NR_* x86_64 definitions in src/sandbox.c.
+NAS D4 smoke:      PASS (both --seccomp=log and default --seccomp=enforce; /_health OK; fs3_reflink_clones_total=4)
+NAS D5 e2e:        test_e2e: PASS (23/23), test_e2e_auth: PASS (28/28), test_e2e_mpu: PASS (26/26),
+                   test_e2e_parts: PASS (53/53), test_e2e_metadata: PASS (46/46; rclone sub-case skipped: rclone not installed on NAS),
+                   test_e2e_listing: PASS (20/20), test_e2e_quota: PASS (61/61), test_e2e_scrub: PASS (30/30),
+                   test_e2e_keys: PASS (30/30), test_e2e_phase9: PASS (57/57), test_e2e_phase10: PASS (28/28),
+                   test_e2e_phase11: PASS (18/18), test_e2e_phase12: PASS (39/39), test_e2e_isolation: PASS (74/74),
+                   test_e2e_subresources: PASS (113/113), test_e2e_versioning: PASS (38/38),
+                   test_e2e_objlock: PASS (26/26), test_e2e_checksum: PASS (75/75), test_e2e_audit: PASS (10/10),
+                   test_e2e_policy: PASS (29/29), test_e2e_admin: PASS (33/33), test_e2e_website: PASS (35/35),
+                   test_e2e_lifecycle: PASS (20/20), test_e2e_cors: PASS (24/24), test_e2e_presign: PASS (23/23),
+                   test_e2e_tls: PASS (19/19), test_e2e_ssec: PASS (43/43),
+                   test_e2e_reflink: PASS (45/45 + fs-compress auto/all),
+                   test_e2e_immutable: PASS (25/25 as root on Btrfs with Python setpriv shim),
+                   test_ui_cgi: PASS (60/60)
+NAS D6 SPK:        install: PASS (0.9.0-5 via /usr/syno/bin/synopkg)
+                   start-stop: PASS (status running/stopped, runs as user `fs3`, /_health & /healthz OK)
+                   tile: PASS (bucket table with Objects/Size/Quota loaded; credential add/remove via CGI verified; 60/60 in test_ui_cgi.sh)
+                   watchdog: PASS (kill -9 of child PID 14827 respawned as PID 15172 within 2s)
+                   reverse proxy: PASS (D4 smoke suite passed over https://s3.beci.local:8443 -> http://localhost:9000 with verify=False for self-signed cert)
+                   upgrade: PASS (0.9.0-5 -> 0.9.0-6 preserved fs3.conf, credentials, and FS3_REQUIRE_AUTH=1)
+                   uninstall: PASS (synopkg uninstall preserved data folder /volume1/fs3-test/pkgdata; production package and config restored afterwards)
+NAS D7 features:   reflink: PASS (fs3_reflink_clones_total +4)
+                   dedup: PASS (fs3_dedup_hits_total=1, cas/u-746573746572/... created)
+                   compression: PASS (fs-compress: auto logged; lsattr shows --------c-------------)
+                   scrub: PASS (6 files, 42,110,979 bytes verified in 5s, corrupt: 0, RSS 1.4 MB, CPU 4.3%–8.5%)
+                   quotas: PASS (PUT /v1/buckets/d7-reflink/quota 1 MiB → 2 MiB PUT rejected with 403 QuotaExceeded)
+                   SSE-C: PASS (AES256 PUT/GET over TLS 9343 succeeded; plain HTTP refused with InvalidRequest)
+                   lock-immutable: PASS (COMPLIANCE version file shows ----i----------------- in lsattr; rm as non-root failed with Operation not permitted)
+NAS D8 resources:  peak RSS 2.67 MB (2,672 KB), CPU 74.2%–84.7% during 1 GiB multipart upload (sustained 46.7 MiB/s, 0 [ERR] lines)
+Open issues:       1. Fixed in tree (Makefile): LLHTTP_CFLAGS lacked -fPIE (failed PIE link on Fedora GCC 16) and kept -D_FORTIFY_SOURCE=2 under DEBUG=1 (-O0).
+                   2. Fixed in tree (src/sigv4.c, third_party/xml/xml_parser.c): fixed-size char[64] string initializers triggered GCC 16 -Wunterminated-string-initialization.
+                   3. Fixed in tree (src/scrub.c): scrub_run called state_save_locked (2 fsyncs) on all 256 shards per bucket/tree even when the shard directory did not exist (4,608 fsyncs across 3 buckets), timing out test_e2e_reflink.sh on physical Btrfs.
+                   4. Fixed in tree (src/sandbox.c, src/store_fs.c): added #ifndef __NR_* x86_64 definitions for post-3.10/4.9 syscalls (clone3, rseq, statx, faccessat2, epoll_pwait2, etc.) and guarded -Wstringop-overread for GCC < 11.
+                   5. Fixed in tree (tests/sign_request.py, tests/sign_slow_put.py, tests/test_e2e_auth.sh, tests/test_e2e_tls.sh, tests/test_e2e_ssec.sh, tests/test_e2e_immutable.sh): avoided importing awscrt on Linux 3.10 (where aws-c-common prints an RNDGETENTCNT warning to stdout when /dev/urandom entropy is low), used explicit -config for test CA generation on DSM's OpenSSL 1.1.1t (avoiding duplicate [v3_ca] extensions), and used FS3_REFLINK_DIR in test_e2e_immutable.sh when /tmp is tmpfs.
+                   6. Open observation (kernel 3.10 Btrfs): when --dedup and --fs-compress auto are enabled together on DSM's 3.10.108 Btrfs, dedup_commit runs before xfsync(w->fd) while delalloc compression pages are still uncommitted and tf (the pool file) lacks FS_COMPR_FL, causing FICLONERANGE into cas/ to return -1 (leaving objects intact as normal copies with 0 dedup hits).
 ```

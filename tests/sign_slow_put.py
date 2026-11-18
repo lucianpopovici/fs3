@@ -25,6 +25,8 @@ import os
 import socket
 import sys
 
+sys.modules["awscrt"] = None
+
 from botocore.auth import S3SigV4Auth
 from botocore.awsrequest import AWSRequest
 from botocore.credentials import Credentials

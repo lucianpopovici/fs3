@@ -1230,7 +1230,7 @@ static int parse_size_line(sigv4_chunk_decoder_t *d, const char *line, size_t n)
 
 /* Verify the current chunk's signature (data hash finalized here). */
 static int verify_chunk_sig(sigv4_chunk_decoder_t *d) {
-    static const char EMPTY_HASH[64] =
+    static const char EMPTY_HASH[] =
         "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
     uint8_t data_mac[32];
     char    data_hex[64];

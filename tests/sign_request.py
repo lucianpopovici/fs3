@@ -31,6 +31,11 @@ import sys
 import urllib.request
 import urllib.error
 
+# SigV4 signing uses pure-Python HMAC-SHA256; avoid importing awscrt on
+# Linux 3.10 (DSM), where aws-c-common checks RNDGETENTCNT on /dev/urandom
+# and writes an entropy warning to stdout when the pool is low.
+sys.modules["awscrt"] = None
+
 from botocore.auth import S3SigV4Auth
 from botocore.awsrequest import AWSRequest
 from botocore.credentials import Credentials

@@ -101,7 +101,7 @@ fi
 # --- t5: tampered signature ---
 # Sign normally, then mangle the last char of the signature.
 FS3_AK="$AK" FS3_SK="$SK" python3 - <<EOF > /tmp/fs3-auth-out.$$ 2>&1
-import os, urllib.request, urllib.error
+import sys, os, urllib.request, urllib.error; sys.modules["awscrt"] = None
 from botocore.auth import S3SigV4Auth
 from botocore.awsrequest import AWSRequest
 from botocore.credentials import Credentials
@@ -193,7 +193,7 @@ fi
 # send "second-payload". Server must reject with XAmzContentSHA256Mismatch
 # and the object must NOT be in the bucket afterwards.
 FS3_AK="$AK" FS3_SK="$SK" python3 - <<EOF > /tmp/fs3-auth-out.$$ 2>&1
-import urllib.request, urllib.error
+import sys, urllib.request, urllib.error; sys.modules["awscrt"] = None
 from botocore.auth import S3SigV4Auth
 from botocore.awsrequest import AWSRequest
 from botocore.credentials import Credentials
@@ -237,7 +237,7 @@ check_eq "lying body left no object" "$status" "STATUS=404"
 # When the client says UNSIGNED-PAYLOAD, we must NOT body-verify.
 # Sign claiming UNSIGNED-PAYLOAD, send arbitrary bytes, expect 200.
 FS3_AK="$AK" FS3_SK="$SK" python3 - <<EOF > /tmp/fs3-auth-out.$$ 2>&1
-import urllib.request, urllib.error
+import sys, urllib.request, urllib.error; sys.modules["awscrt"] = None
 from botocore.auth import S3SigV4Auth
 from botocore.awsrequest import AWSRequest
 from botocore.credentials import Credentials

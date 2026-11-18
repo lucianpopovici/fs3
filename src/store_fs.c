@@ -31,7 +31,7 @@
  * packed struct whose first field is a small array as a pointer to that
  * array only, generating false-positive warnings on full-struct
  * read/write/pread calls. We silence that single diagnostic locally. */
-#if defined(__GNUC__) && !defined(__clang__)
+#if defined(__GNUC__) && !defined(__clang__) && __GNUC__ >= 11
 #pragma GCC diagnostic ignored "-Wstringop-overread"
 #endif
 

@@ -14,7 +14,7 @@ fi
 command -v setpriv >/dev/null || { echo "SKIP: setpriv missing"; exit 0; }
 SVC=65534
 PORT=${FS3_TEST_PORT:-$(( 28300 + RANDOM % 150 ))}
-T=/tmp/fs3-imm-$$
+T=${FS3_REFLINK_DIR:-/tmp}/fs3-imm-$$
 DATA=$T/data
 SOCK=$T/lockd.sock
 JOURNAL=/tmp/fs3-imm-journal-$$
@@ -65,7 +65,7 @@ start_fs3 --lock-immutable --lockd-socket "$SOCK"
 kill -0 "$SP" 2>/dev/null || { echo "server did not start"; cat "$LOG"; exit 1; }
 
 python3 -u - "$URL" "$AK" "$SK" "$DATA" "$SOCK" "$SVC" "$T" <<'PY'
-import sys, os, glob, time, datetime, subprocess, boto3, botocore
+import sys, os, glob, time, datetime, subprocess; sys.modules["awscrt"] = None; import boto3, botocore
 from botocore.config import Config
 url, ak, sk, data, sock, svc_uid, T = sys.argv[1:8]
 s3 = boto3.client("s3", endpoint_url=url, aws_access_key_id=ak, aws_secret_access_key=sk,

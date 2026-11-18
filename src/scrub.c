@@ -320,14 +320,14 @@ static int is_ventry(const char *n) {
 
 /* Files under dir: data shard → objects named <hex>; versions shard →
  * <hex>/<entry>; mpu → <upload>/part-NNNNN. */
-static void scrub_shard(scrub_job_t *j, int tree, const char *bucket, int shard) {
+static int scrub_shard(scrub_job_t *j, int tree, const char *bucket, int shard) {
     scrub_t *sc = j->sc;
     const char *root = store_root(sc->cfg.store);
     char base[4400];
     if (tree == TREE_MPU) snprintf(base, sizeof(base), "%s/mpu/%s", root, bucket);
     else snprintf(base, sizeof(base), "%s/%s/%s/%02x", root, TREE_NAME[tree], bucket, shard);
     DIR *d1 = opendir(base);
-    if (!d1) return;
+    if (!d1) return 0;
     struct dirent *e1;
     while ((e1 = readdir(d1)) != NULL && !stopping(sc)) {
         if (e1->d_name[0] == '.') continue;
@@ -364,6 +364,7 @@ static void scrub_shard(scrub_job_t *j, int tree, const char *bucket, int shard)
         closedir(d2);
     }
     closedir(d1);
+    return 1;
 }
 
 static int dg_cmp32(const void *a, const void *b) { return memcmp(a, b, 32); }
@@ -418,13 +419,13 @@ static void scrub_run(iojob_t *jb) {
             int first = (same && !strcmp(b, cur.bucket)) ? cur.shard : 0;
             int nshards = tree == TREE_MPU ? 1 : 256;
             for (int sh = first; sh < nshards && !stopping(sc); sh++) {
-                scrub_shard(j, tree, b, sh);
+                int did = scrub_shard(j, tree, b, sh);
                 if (stopping(sc)) break;     /* shard incomplete: redo it on resume */
                 pthread_mutex_lock(&sc->mu);
                 sc->st.tree = tree;
                 snprintf(sc->st.bucket, sizeof(sc->st.bucket), "%s", b);
                 sc->st.shard = sh + 1;
-                state_save_locked(sc);
+                if (did || sh + 1 == nshards) state_save_locked(sc);
                 pthread_mutex_unlock(&sc->mu);
             }
         }

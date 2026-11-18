@@ -45,6 +45,37 @@
 
 #if defined(__x86_64__)
 #define SB_ARCH AUDIT_ARCH_X86_64
+/* Old kernel headers (3.10 in DSM 7 toolchains, 4.9 in debian:stretch)
+ * lack post-3.10 syscall numbers, while the runtime glibc (on DSM or on a
+ * newer build host in Part B4) still probes them and expects ENOSYS from
+ * the kernel rather than SIGSYS from seccomp. */
+#ifndef __NR_renameat2
+#define __NR_renameat2       316
+#endif
+#ifndef __NR_getrandom
+#define __NR_getrandom       318
+#endif
+#ifndef __NR_membarrier
+#define __NR_membarrier      324
+#endif
+#ifndef __NR_copy_file_range
+#define __NR_copy_file_range 326
+#endif
+#ifndef __NR_statx
+#define __NR_statx           332
+#endif
+#ifndef __NR_rseq
+#define __NR_rseq            334
+#endif
+#ifndef __NR_clone3
+#define __NR_clone3          435
+#endif
+#ifndef __NR_faccessat2
+#define __NR_faccessat2      439
+#endif
+#ifndef __NR_epoll_pwait2
+#define __NR_epoll_pwait2    441
+#endif
 #elif defined(__aarch64__)
 #define SB_ARCH AUDIT_ARCH_AARCH64
 #endif

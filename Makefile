@@ -25,7 +25,7 @@ ifeq ($(TLS),1)
 endif
 
 ifeq ($(DEBUG),1)
-  CFLAGS  := $(filter-out -O2,$(CFLAGS)) -O0 \
+  CFLAGS  := $(filter-out -O2 -D_FORTIFY_SOURCE=2,$(CFLAGS)) -O0 \
              -fsanitize=address,undefined -fno-omit-frame-pointer
   LDFLAGS += -fsanitize=address,undefined
 endif
@@ -49,7 +49,7 @@ OBJS := $(SRV_OBJS) $(LLHTTP_OBJS) $(XML_OBJS)
 
 # llhttp's generated state machine has a few diagnostic noise warnings;
 # build it with relaxed warnings while keeping our code strict.
-LLHTTP_CFLAGS := -std=c11 -O2 -g -Wall -D_GNU_SOURCE -MMD -MP
+LLHTTP_CFLAGS := -std=c11 -O2 -g -Wall -D_GNU_SOURCE -fPIE -MMD -MP
 ifeq ($(DEBUG),1)
   LLHTTP_CFLAGS := $(filter-out -O2,$(LLHTTP_CFLAGS)) -O0 \
                    -fsanitize=address,undefined -fno-omit-frame-pointer
@@ -75,7 +75,7 @@ ALL_C_SRCS := $(SRV_SRCS) $(LLHTTP_OBJS:.o=.c) $(XML_OBJS:.o=.c)
 comma := ,
 TLS_SAN := $(if $(filter 1,$(DEBUG)),-O0 -fsanitize=address$(comma)undefined -fno-omit-frame-pointer,-O2)
 fs3-tls: $(ALL_C_SRCS) $(wildcard include/*.h)
-	$(CC) $(filter-out -O2 -MMD -MP,$(CFLAGS)) -DFS3_TLS $(INCLUDES) -fsyntax-only src/tls.c src/conn.c src/server.c
+	$(CC) $(filter-out -MMD -MP,$(CFLAGS)) -DFS3_TLS $(INCLUDES) -fsyntax-only src/tls.c src/conn.c src/server.c
 	$(CC) -std=c11 -g -D_GNU_SOURCE -DFS3_TLS -pthread $(TLS_SAN) $(INCLUDES) \
 	    $(ALL_C_SRCS) -o $@ -lssl -lcrypto -pthread
 

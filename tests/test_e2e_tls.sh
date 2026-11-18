@@ -28,11 +28,12 @@ BUILD_FLAGS=""
 [ "${DEBUG:-0}" = "1" ] && BUILD_FLAGS="DEBUG=1"
 (cd "$ROOT" && make $BUILD_FLAGS fs3-tls >/dev/null 2>&1) || { echo "fs3-tls build failed" >&2; exit 1; }
 
-# Test CA + server cert for 127.0.0.1/localhost.
+# Test CA + server cert for 127.0.0.1/localhost. Use an explicit -config so
+# OpenSSL 1.1.1 with a system [v3_ca] section (e.g. DSM) does not emit
+# duplicate Basic Constraints / Subject Key Identifier extensions.
+printf '[req]\ndistinguished_name=dn\nx509_extensions=v3_ca\n[dn]\n[v3_ca]\nbasicConstraints=critical,CA:TRUE\nkeyUsage=critical,keyCertSign,cRLSign\nsubjectKeyIdentifier=hash\n' > "$T.cacnf"
 openssl req -x509 -newkey rsa:2048 -nodes -days 2 -subj "/CN=fs3 test CA" \
-    -addext "basicConstraints=critical,CA:TRUE" -addext "keyUsage=critical,keyCertSign,cRLSign" \
-    -addext "subjectKeyIdentifier=hash" \
-    -keyout "$T.cakey" -out "$T.ca" >/dev/null 2>&1
+    -config "$T.cacnf" -keyout "$T.cakey" -out "$T.ca" >/dev/null 2>&1
 mkcert() {
     openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -subj "/CN=$1" \
         -keyout "$T.key" -out "$T.csr" >/dev/null 2>&1
@@ -64,7 +65,7 @@ kill -0 "$SP" 2>/dev/null || { echo "server did not start" >&2; cat "$LOG" >&2; 
 
 export FS3_TLS_URL="https://127.0.0.1:$TPORT" FS3_CA="$T.ca" FS3_AK="$AK" FS3_SK="$SK"
 out=$(python3 - <<'PY'
-import os, boto3, hashlib
+import sys, os, hashlib; sys.modules["awscrt"] = None; import boto3
 from boto3.s3.transfer import TransferConfig
 s3 = boto3.client("s3", endpoint_url=os.environ["FS3_TLS_URL"], verify=os.environ["FS3_CA"],
                   aws_access_key_id=os.environ["FS3_AK"], aws_secret_access_key=os.environ["FS3_SK"],

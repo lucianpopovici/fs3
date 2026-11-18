@@ -23,9 +23,9 @@ BUILD_FLAGS=""
 [ "${DEBUG:-0}" = "1" ] && BUILD_FLAGS="DEBUG=1"
 (cd "$ROOT" && make $BUILD_FLAGS fs3-tls >/dev/null 2>&1) || { echo "fs3-tls build failed" >&2; exit 1; }
 
+printf '[req]\ndistinguished_name=dn\nx509_extensions=v3_ca\n[dn]\n[v3_ca]\nbasicConstraints=critical,CA:TRUE\nkeyUsage=critical,keyCertSign,cRLSign\nsubjectKeyIdentifier=hash\n' > "$T.cacnf"
 openssl req -x509 -newkey rsa:2048 -nodes -days 2 -subj "/CN=fs3 test CA" \
-    -addext "basicConstraints=critical,CA:TRUE" -addext "keyUsage=critical,keyCertSign,cRLSign" \
-    -addext "subjectKeyIdentifier=hash" -keyout "$T.cakey" -out "$T.ca" >/dev/null 2>&1
+    -config "$T.cacnf" -keyout "$T.cakey" -out "$T.ca" >/dev/null 2>&1
 openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -subj "/CN=localhost" \
     -keyout "$T.key" -out "$T.csr" >/dev/null 2>&1
 printf 'subjectAltName=IP:127.0.0.1,DNS:localhost\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=serverAuth\nauthorityKeyIdentifier=keyid\nsubjectKeyIdentifier=hash\nbasicConstraints=CA:FALSE\n' > "$T.ext"
@@ -42,7 +42,7 @@ for _ in $(seq 50); do curl -s -o /dev/null "http://127.0.0.1:$PORT/" && break; 
 kill -0 "$SP" 2>/dev/null || { echo "server did not start" >&2; cat "$LOG" >&2; exit 1; }
 
 python3 -u - "$PORT" "$TPORT" "$AK" "$SK" "$T" "$DATA" <<'PY'
-import sys, os, glob, json, hashlib, base64, subprocess, time, urllib.request, ssl, boto3, botocore
+import sys, os, glob, json, hashlib, base64, subprocess, time, urllib.request, ssl; sys.modules["awscrt"] = None; import boto3, botocore
 from botocore.config import Config
 port, tport, ak, sk, T, data = sys.argv[1:7]
 def mk(url):
