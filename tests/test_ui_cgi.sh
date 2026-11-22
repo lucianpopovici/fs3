@@ -8,6 +8,8 @@
 #   3. addkey / delkey: validation, atomic 0600 writes, last-key guard
 #   4. SIGHUP delivery to the recorded child pid
 #   5. live bucket stats through a real fs3 admin listener
+#   6. DSM sign-in / administrators gate
+#   7. settings form: rendering, validation, conf writes, restart, restore
 #
 set -eu
 
@@ -54,23 +56,26 @@ check_lacks() {  # $1=desc $2=haystack $3=needle
     fi
 }
 
+# DSM sign-in is simulated: AUTH_CMD prints the signed-in user, GROUPS_CMD
+# that user's groups (on DSM the CGI runs authenticate.cgi and `id -Gn`).
+AUTH_CMD="echo admin"
+GROUPS_CMD="echo administrators users"
+PKG="$ROOT/packaging/synology"
+cgi_env() {
+    env -i PATH="$PATH" FS3_VAR_DIR="$VAR" FS3_PKG_DIR="$PKG" \
+        FS3_UI_AUTH_CMD="$AUTH_CMD" FS3_UI_GROUPS_CMD="$GROUPS_CMD" \
+        SCRIPT_NAME=/webman/3rdparty/fs3/index.cgi HTTP_HOST=nas.local:5000 "$@"
+}
 cgi_get() {  # [query-string]
-    env -i PATH="$PATH" FS3_VAR_DIR="$VAR" REQUEST_METHOD=GET \
-        QUERY_STRING="${1:-}" SCRIPT_NAME=/webman/3rdparty/fs3/index.cgi \
-        HTTP_HOST=nas.local:5000 sh "$CGI"
+    cgi_env REQUEST_METHOD=GET QUERY_STRING="${1:-}" sh "$CGI"
 }
 cgi_post() {  # $1=urlencoded-body [$2=Origin header]
     local body="$1"
     if [ -n "${2:-}" ]; then
-        printf '%s' "$body" | env -i PATH="$PATH" FS3_VAR_DIR="$VAR" \
-            REQUEST_METHOD=POST CONTENT_LENGTH="${#body}" \
-            SCRIPT_NAME=/webman/3rdparty/fs3/index.cgi \
-            HTTP_HOST=nas.local:5000 HTTP_ORIGIN="$2" sh "$CGI"
+        printf '%s' "$body" | cgi_env REQUEST_METHOD=POST CONTENT_LENGTH="${#body}" \
+            HTTP_ORIGIN="$2" sh "$CGI"
     else
-        printf '%s' "$body" | env -i PATH="$PATH" FS3_VAR_DIR="$VAR" \
-            REQUEST_METHOD=POST CONTENT_LENGTH="${#body}" \
-            SCRIPT_NAME=/webman/3rdparty/fs3/index.cgi \
-            HTTP_HOST=nas.local:5000 sh "$CGI"
+        printf '%s' "$body" | cgi_env REQUEST_METHOD=POST CONTENT_LENGTH="${#body}" sh "$CGI"
     fi
 }
 
@@ -260,6 +265,7 @@ FS3_REQUIRE_AUTH=0
 FS3_METRICS_PORT=$MPORT
 EOF
 echo "$SP" > "$VAR/fs3.pid"
+echo "$SP" > "$VAR/fs3.child.pid"
 
 page=$(cgi_get)
 check_has "live page shows running"     "$page" ">running</span>"
@@ -268,6 +274,153 @@ check_has "live page shows object count" "$page" "<td>1</td>"
 check_has "live page shows size"        "$page" "5 B"
 
 kill "$SP" 2>/dev/null; wait "$SP" 2>/dev/null || true; SP=
+rm -f "$VAR/fs3.pid" "$VAR/fs3.child.pid"
+
+# ===================================================================
+# 6. DSM sign-in / administrators gate
+# ===================================================================
+TOKEN=$(cat "$TOK_FILE")
+AUTH_CMD="true"                                   # not signed in to DSM
+page=$(cgi_get)
+check_has   "not signed in → 403"             "$page" "Status: 403"
+check_lacks "not signed in → no token"        "$page" "$TOKEN"
+check_lacks "not signed in → no keys"         "$page" "testkey"
+check_lacks "not signed in → no settings"     "$page" "FS3_TRUSTED_PROXY"
+cp "$CRED" "$VAR/cred.before"
+out=$(cgi_post "action=addkey&ak=sneaky&sk=sneakysecret&tok=$TOKEN")
+check_has   "not signed in → POST refused"    "$out" "Status: 403"
+check_eq    "refused POST wrote nothing" "$(cmp -s "$CRED" "$VAR/cred.before" && echo same)" "same"
+AUTH_CMD="echo bob"; GROUPS_CMD="echo users"      # signed in, not an admin
+page=$(cgi_get)
+check_has   "non-admin → 403"                 "$page" "Only DSM administrators"
+check_lacks "non-admin → no token"            "$page" "$TOKEN"
+out=$(cgi_post "action=savecfg&tok=$TOKEN&FS3_PORT=9555")
+check_has   "non-admin → POST refused"        "$out" "Status: 403"
+AUTH_CMD="echo admin"; GROUPS_CMD="echo administrators users"
+page=$(cgi_get)
+check_has   "admin → page"                    "$page" "Signed in as"
+check_has   "admin → token"                   "$page" "$TOKEN"
+
+# ===================================================================
+# 7. Settings form
+# ===================================================================
+printf '# kept comment\nFS3_DATA=%s\nFS3_REQUIRE_AUTH=1\nFS3_UNKNOWN=keepme\n' "$DATA" > "$CONF"
+page=$(cgi_get)
+check_has   "settings section"                "$page" "<h3>Settings</h3>"
+check_has   "trusted proxy field, default"    "$page" 'name="FS3_TRUSTED_PROXY" id="FS3_TRUSTED_PROXY" value="127.0.0.1"'
+check_has   "dedup select"                    "$page" '<select name="FS3_DEDUP"'
+check_has   "audit checkbox"                  "$page" 'name="FS3_AUDIT_LOG" id="FS3_AUDIT_LOG" value="1"'
+check_lacks "no restore button without backup" "$page" "restorecfg"
+
+form() {  # the form at the current defaults, then overrides "K=V"...
+    local b="action=savecfg&tok=$TOKEN&FS3_PORT=9000&FS3_BIND=127.0.0.1&FS3_TRUSTED_PROXY=127.0.0.1"
+    b="$b&FS3_METRICS_PORT=9101&FS3_DEDUP=off&FS3_FS_COMPRESS=off&FS3_REFLINK=auto&FS3_SECCOMP=enforce"
+    for o in "$@"; do b="$b&$o"; done
+    printf '%s' "$b"
+}
+out=$(cgi_post "$(form)")
+check_has "unchanged form → cfg_same"         "$out" "m=cfg_same"
+check_eq  "unchanged form → no backup" "$([ -f "$CONF.bak" ] && echo yes || echo no)" "no"
+
+out=$(cgi_post "$(form FS3_PORT=9555 FS3_DEDUP=owner FS3_AUDIT_LOG=1 'FS3_TRUSTED_PROXY=127.0.0.1%2C+10.0.0.1' FS3_WEB_ROOT_DOMAIN=web.lan FS3_NOT_A_KEY=1)")
+check_has "valid save, stopped → cfg_saved"   "$out" "m=cfg_saved"
+check_eq  "port written"        "$(grep -c '^FS3_PORT=9555$' "$CONF" || true)" "1"
+check_eq  "dedup written"       "$(grep -c '^FS3_DEDUP=owner$' "$CONF" || true)" "1"
+check_eq  "checkbox written"    "$(grep -c '^FS3_AUDIT_LOG=1$' "$CONF" || true)" "1"
+check_eq  "list stored without spaces" "$(grep -c '^FS3_TRUSTED_PROXY=127.0.0.1,10.0.0.1$' "$CONF" || true)" "1"
+check_eq  "defaults omitted"    "$(grep -c '^FS3_BIND=' "$CONF" || true)" "0"
+check_eq  "unknown form key ignored" "$(grep -c 'FS3_NOT_A_KEY' "$CONF" || true)" "0"
+check_eq  "comment kept"        "$(grep -c '^# kept comment$' "$CONF" || true)" "1"
+check_eq  "data folder kept"    "$(grep -cx "FS3_DATA=$DATA" "$CONF" || true)" "1"
+check_eq  "auth switch kept"    "$(grep -c '^FS3_REQUIRE_AUTH=1$' "$CONF" || true)" "1"
+check_eq  "unknown conf key kept" "$(grep -c '^FS3_UNKNOWN=keepme$' "$CONF" || true)" "1"
+check_eq  "conf is 0600"        "$(stat -c %a "$CONF")" "600"
+check_eq  "backup made"         "$([ -f "$CONF.bak" ] && echo yes || echo no)" "yes"
+page=$(cgi_get)
+check_has "saved value rendered"   "$page" 'name="FS3_PORT" id="FS3_PORT" value="9555"'
+check_has "restore button offered" "$page" "restorecfg"
+
+# A second save keeps one managed block, and an unchecked box turns off.
+out=$(cgi_post "$(form FS3_PORT=9555 FS3_DEDUP=owner 'FS3_TRUSTED_PROXY=127.0.0.1,10.0.0.1' FS3_WEB_ROOT_DOMAIN=web.lan)")
+check_eq  "one managed block"   "$(grep -c '^# Settings below are managed' "$CONF" || true)" "1"
+check_eq  "unchecked box off"   "$(grep -c '^FS3_AUDIT_LOG=' "$CONF" || true)" "0"
+
+# Validation: nothing is written on any error.
+cp "$CONF" "$VAR/conf.before"
+unchanged() { cmp -s "$CONF" "$VAR/conf.before" && echo same || echo changed; }
+out=$(cgi_post "$(form FS3_PORT=99999)")
+check_has "bad port → e_cfg.FS3_PORT"         "$out" "m=e_cfg.FS3_PORT"
+check_eq  "bad port wrote nothing" "$(unchanged)" "same"
+page=$(cgi_get "m=e_cfg.FS3_PORT")
+check_has "error names the field label"       "$page" "invalid value for <b>S3 port</b>"
+page=$(cgi_get "m=e_cfg.<script>")
+check_lacks "error never reflects input"      "$page" "<script>"
+out=$(cgi_post "$(form 'FS3_WEB_ROOT_DOMAIN=evil.lan%0AFS3_ALLOW_PUBLIC%3D1')")
+check_has "newline smuggling rejected"        "$out" "m=e_cfg.FS3_WEB_ROOT_DOMAIN"
+check_eq  "smuggling wrote nothing" "$(unchanged)" "same"
+out=$(cgi_post "$(form 'FS3_ADMIN=al%24(id)ice')")
+check_has "shell metacharacters rejected"     "$out" "m=e_cfg.FS3_ADMIN"
+out=$(cgi_post "$(form FS3_DEDUP=everything)")
+check_has "bad enum rejected"                 "$out" "m=e_cfg.FS3_DEDUP"
+out=$(cgi_post "$(form 'FS3_TRUSTED_PROXY=1.2.3.4,nas.local')")
+check_has "host name in proxy list rejected"  "$out" "m=e_cfg.FS3_TRUSTED_PROXY"
+out=$(cgi_post "$(form FS3_MAX_BODY_SIZE=5T)")
+check_has "bad size rejected"                 "$out" "m=e_cfg.FS3_MAX_BODY_SIZE"
+out=$(cgi_post "$(form FS3_METRICS_PORT=9000)")
+check_has "port clash → e_ports"              "$out" "m=e_ports"
+out=$(cgi_post "$(form FS3_WEB_PORT=9101)")
+check_has "website/admin port clash"          "$out" "m=e_ports"
+out=$(cgi_post "$(form FS3_LOCK_IMMUTABLE=1)")
+check_has "immutable without lockd → e_lockd" "$out" "m=e_lockd"
+out=$(cgi_post "action=savecfg&tok=WRONG&FS3_PORT=9600")
+check_has "settings need the CSRF token"      "$out" "m=e_csrf"
+check_eq  "rejected posts wrote nothing" "$(unchanged)" "same"
+out=$(cgi_post "$(form FS3_SECCOMP=require)")
+if grep -q '^Seccomp:' /proc/self/status 2>/dev/null; then
+    check_has "require accepted where seccomp exists" "$out" "m=cfg_saved"
+else
+    check_has "require refused without seccomp"       "$out" "m=e_seccomp"
+fi
+# Public write implies public.
+out=$(cgi_post "$(form FS3_PORT=9555 FS3_DEDUP=owner 'FS3_TRUSTED_PROXY=127.0.0.1,10.0.0.1' FS3_WEB_ROOT_DOMAIN=web.lan FS3_ALLOW_PUBLIC_WRITE=1)")
+check_eq  "public write implies public" "$(grep -c '^FS3_ALLOW_PUBLIC=1$' "$CONF" || true)" "1"
+
+# Save while running: the watchdog is asked to restart fs3.
+( trap 'exit 0' TERM; while :; do sleep 0.1; done ) &
+WD=$!
+( trap 'echo term > "$VAR/child-term"; exit 0' TERM; while :; do sleep 0.1; done ) &
+CH=$!
+echo "$WD" > "$VAR/fs3.pid"; echo "$CH" > "$VAR/fs3.child.pid"
+page=$(cgi_get)
+check_has "running → restart button"          "$page" 'value="restart"'
+out=$(cgi_post "$(form FS3_PORT=9556)")
+check_has "save while running → cfg_restarted" "$out" "m=cfg_restarted"
+check_eq  "restart request left for the watchdog" "$([ -f "$VAR/fs3.restart" ] && echo yes || echo no)" "yes"
+for _ in $(seq 1 30); do [ -f "$VAR/child-term" ] && break; sleep 0.1; done
+check_eq  "fs3 child got SIGTERM" "$([ -f "$VAR/child-term" ] && echo yes || echo no)" "yes"
+wait "$CH" 2>/dev/null || true
+rm -f "$VAR/fs3.child.pid" "$VAR/fs3.restart"
+echo "fs3: listen 127.0.0.1:9556: Address in use <b>" >> "$VAR/fs3.log"
+page=$(cgi_get)
+check_has "watchdog without child → restarting" "$page" ">restarting</span>"
+check_has "log tail shown, escaped"           "$page" "Address in use &lt;b&gt;"
+out=$(cgi_post "action=restart&tok=$TOKEN")
+check_has "restart button works"              "$out" "m=restarted"
+kill "$WD" 2>/dev/null; wait "$WD" 2>/dev/null || true
+rm -f "$VAR/fs3.pid" "$VAR/fs3.restart"
+
+# Restore swaps the previous settings back in.
+before="$(cat "$CONF.bak")"
+out=$(cgi_post "action=restorecfg&tok=$TOKEN")
+check_has "restore → cfg_restored"            "$out" "m=cfg_restored"
+check_eq  "restored conf is the old backup"   "$(cat "$CONF")" "$before"
+check_eq  "previous conf became the backup"   "$(grep -c '^FS3_PORT=9556$' "$CONF.bak" || true)" "1"
+out=$(cgi_post "action=restart&tok=$TOKEN")
+check_has "restart while stopped → error"     "$out" "m=e_notrunning"
+
+# The package is incomplete without the shared schema: fail clearly.
+out=$(env -i PATH="$PATH" FS3_VAR_DIR="$VAR" FS3_PKG_DIR=/nonexistent REQUEST_METHOD=GET sh "$CGI")
+check_has "missing lib → clear 500"           "$out" "lib/fs3-conf.sh is missing"
 
 printf '\n===== ui cgi: %d passed, %d failed =====\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

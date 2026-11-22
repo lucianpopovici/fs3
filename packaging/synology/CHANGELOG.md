@@ -6,10 +6,24 @@
   that measures how much block-level dedup would save on an existing data
   root. Not shipped in the SPK yet; copy the static binary to the NAS to
   run it.
-- Known limitation: `fs3.conf` only exposes the basic keys (bind, port,
-  data, auth, legacy owner, admin, metrics port, MPU GC). The newer
-  options (trusted proxy, audit log, admin socket, scrub, quotas, dedup,
-  compression, lock helper, TLS) can't be set through the package yet.
+- **Settings in the DSM tile.** About 40 options (network, access, limits
+  and quotas, lifecycle and scrub, dedup and compression, Object Lock,
+  websites, audit log, admin socket, seccomp, debug logging) can be edited
+  in the tile. Values are validated, saving restarts fs3 through the
+  watchdog, and the previous settings can be restored from the page. The
+  schema lives in the new `lib/fs3-conf.sh`, shared with the start script,
+  which now re-reads `fs3.conf` on every (re)start. Hand-edited invalid
+  values fall back to the default with a log line.
+- **The tile now requires DSM sign-in as an administrator.** DSM does not
+  authenticate third-party CGIs; before this change anyone who could
+  reach the DSM web port could open the tile and add credentials. The app
+  is also no longer listed for non-admin users (`allUsers: false`).
+- New default: fs3 trusts `X-Forwarded-For`/`-Proto` from 127.0.0.1 (the
+  DSM reverse proxy), so auth-failure throttling and policy IP
+  conditions see real clients. Applies to existing installs on upgrade;
+  set *Trusted proxies* to empty to turn it off.
+- The first credential added in the tile now restarts fs3 with
+  authentication on, instead of asking for a manual restart.
 
 - Multipart: part records + ETag verification at Complete (InvalidPart,
   InvalidPartOrder, EntityTooSmall below `--mpu-min-part-size`, default
@@ -48,10 +62,8 @@
   in Task Scheduler running
   `/var/packages/fs3/target/bin/fs3-lockd --root <data dir> --socket
   /var/packages/fs3/var/lockd.sock --journal /var/packages/fs3/var/lockd.journal`),
-  then add `--lock-immutable --lockd-socket /var/packages/fs3/var/lockd.sock`
-  to the fs3 command line. `fs3.conf` has no key for these yet, so that
-  means editing `scripts/start-stop-status`, and a package upgrade
-  overwrites the edit. Without it the status stays "API-level WORM".
+  then turn on *Immutable COMPLIANCE versions* in the tile's settings
+  (`FS3_LOCK_IMMUTABLE=1`). Without it the status stays "API-level WORM".
 - Audit log lines carry the S3 error code (`"error":"…"`).
 - Fix: a request refused before `100 Continue` now closes the connection
   (botocore stalled 60 s on the next request).

@@ -715,24 +715,44 @@ runbook for a DS1515+, including a recorded run.
   that are parsed, never sourced as shell. Credentials are kept separately
   in `/var/packages/fs3/var/credentials` (mode 0600), so secrets never
   appear in the conf file or on the command line.
-- The DSM tile shows buckets (objects, size, quota usage) and manages
-  credentials, with an optional *User* field. Replacing a key's secret
-  keeps its attributes (expiry, disabled, read-only). To rotate a key
-  without losing access to your buckets, add the new key with the same
-  user, then remove the old one.
+- The DSM tile (open it from the DSM main menu) is for DSM
+  administrators only. It checks your DSM session with DSM's
+  `authenticate.cgi` and membership of the `administrators` group on every
+  request; everyone else gets a 403 with nothing in it. It shows buckets
+  (objects, size, quota usage), manages credentials and edits the server
+  settings.
+- **Credentials:** add or replace keys, with an optional *User* field.
+  Replacing a key's secret keeps its attributes (expiry, disabled,
+  read-only). To rotate a key without losing access to your buckets, add
+  the new key with the same user, then remove the old one. The first key
+  turns authentication on and restarts fs3.
+- **Settings:** network, access, limits and quotas, background jobs,
+  storage efficiency, Object Lock, websites, logging and hardening, about
+  40 options in all. Every value is validated before anything is written,
+  and port clashes, an absent `fs3-lockd` helper or `--seccomp=require` on
+  a kernel without seccomp are refused. Saving writes `fs3.conf` (only
+  non-default values, previous file kept as `fs3.conf.bak`) and restarts
+  fs3 through the watchdog within a few seconds. If fs3 then fails to
+  start, the tile shows the end of the log and a *Restore previous
+  settings* button. Files fs3 needs for a feature (audit log, admin
+  socket, lock helper socket) always live in the package folder; the form
+  can't point fs3 at other paths.
+- **`fs3.conf`:** the keys, their types, defaults and the fs3 flags they
+  map to are defined once, in `packaging/synology/lib/fs3-conf.sh`, which
+  both the start script and the tile use. You can still edit the file
+  over SSH: unknown keys are ignored, and an invalid value falls back to
+  its default with a line in `fs3.log`. The data folder (`FS3_DATA`) is
+  not editable in the tile, since moving it means moving the data.
 - `FS3_LEGACY_OWNER` (default: the first user in the credentials file)
   receives buckets that predate per-user isolation. `FS3_ADMIN=<user>`
   names an admin.
 - An admin listener runs on `127.0.0.1:9101` (`FS3_METRICS_PORT`; 0
   disables it). To scrape it from elsewhere, use a reverse-proxy entry or
   an SSH tunnel.
-- **`fs3.conf` keys:** `FS3_BIND`, `FS3_PORT`, `FS3_DATA`,
-  `FS3_REQUIRE_AUTH`, `FS3_LEGACY_OWNER`, `FS3_ADMIN`, `FS3_METRICS_PORT`,
-  `FS3_GC_INTERVAL` and `FS3_GC_MAX_AGE`. The package does not yet pass
-  any other option (trusted proxy, audit log, admin socket, scrub,
-  quotas, dedup, compression, lock helper, TLS). Using those on DSM
-  currently means editing `scripts/start-stop-status`, and a package
-  upgrade overwrites that edit. This is on the [roadmap](#roadmap).
+- **Not available through the package:** native TLS (the SPK ships the
+  non-TLS build; use the DSM reverse proxy). If you change the S3 port,
+  also update the DSM firewall rule, which still lists the install-time
+  port.
 - **Data folder:** by default `/var/packages/fs3/var/data`. If you point
   it at a shared folder, grant the package user write permission in
   Control Panel → Shared Folder → Edit → Permissions. The package checks
@@ -754,14 +774,14 @@ The SPK binds fs3 to `127.0.0.1`, so the proxy is the only public face.
 - Clients sign the `Host` header they connect to, so the proxy must
   forward it unchanged. DSM's proxy does by default; if signed requests
   fail through the proxy but work directly, check this first.
-- fs3 needs `--trusted-proxy 127.0.0.1` behind the proxy so throttling,
-  `aws:SourceIp` and `aws:SecureTransport` see the real client. The SPK
-  doesn't set it yet (see `fs3.conf` keys above).
+- The package trusts the proxy's `X-Forwarded-For`/`-Proto` by default
+  (`FS3_TRUSTED_PROXY=127.0.0.1`), so throttling, `aws:SourceIp` and
+  `aws:SecureTransport` see the real client.
 - The DSM nginx access log records full presigned URLs, which are bearer
   credentials until they expire.
 - To expose plain HTTP on the LAN instead, tick "Expose on the LAN" in
-  the install wizard, or set `FS3_BIND=0.0.0.0`. Only do this on a
-  network where you trust every host.
+  the install wizard, or set the listen address to `0.0.0.0` in the
+  tile's settings. Only do this on a network where you trust every host.
 
 ### Immutable locks on DSM
 
@@ -769,7 +789,9 @@ DSM 7 runs packages as an unprivileged user, and kernel 3.10 has no
 ambient capabilities. `fs3-lockd` therefore has to be started as root
 outside the normal package model, for example from a root-run boot task.
 This is a manual, explicit opt-in; without it, Object Lock is API-level
-WORM.
+WORM. Once the helper's socket exists at
+`/var/packages/fs3/var/lockd.sock`, turn on *Immutable COMPLIANCE
+versions* in the tile's settings.
 
 ---
 
@@ -901,7 +923,7 @@ need `curl` and `openssl`.
 | core e2e | `test_e2e`, `test_e2e_auth`, `test_e2e_mpu`, `test_e2e_parts`, `test_e2e_listing`, `test_e2e_metadata`, `test_e2e_phase9`–`12`, `test_e2e_subresources` |
 | access control | `test_e2e_isolation`, `test_e2e_policy`, `test_e2e_keys`, `test_e2e_presign`, `test_e2e_admin`, `test_e2e_audit` |
 | features | `test_e2e_checksum`, `test_e2e_versioning`, `test_e2e_objlock`, `test_e2e_immutable`, `test_e2e_lifecycle`, `test_e2e_cors`, `test_e2e_website`, `test_e2e_quota`, `test_e2e_scrub`, `test_e2e_ssec`, `test_e2e_tls`, `test_e2e_reflink` |
-| tools and packaging | `test_e2e_dedup_estimate`, `test_ui_cgi` (DSM tile CGI) |
+| tools and packaging | `test_e2e_dedup_estimate`, `test_ui_cgi` (DSM tile: sign-in gate, credentials, settings), `test_spk_scripts` (start script, conf → flags, watchdog) |
 
 All suites run under both the release and the ASan/UBSan builds. The
 e2e suites use real clients (botocore, boto3, the AWS CLI, curl) as the
@@ -964,11 +986,9 @@ Next:
   Btrfs actually frees space. Object files stay complete, and there is no
   chunk store or refcounting. Gated on `fs3-dedup-estimate` showing about
   10% or more savings on real data. Plan: `docs/block-dedup-plan.md`.
-- **SPK options:** expose the newer flags (trusted proxy, audit log,
-  admin socket, scrub, quotas, dedup, compression, lock helper, TLS)
-  through `fs3.conf` keys, or a validated extra-arguments key, so they
-  survive package upgrades. Set `--trusted-proxy 127.0.0.1` by default,
-  since the SPK always runs behind the DSM proxy.
+- **Verify the tile's DSM sign-in check on hardware** (DSM 7.1 on the
+  DS1515+), including the SynoToken fallback; until then the settings
+  can also be edited over SSH.
 - **Dedup together with compression on DSM 7.1:** fsync the object, or
   set `FS_COMPR_FL` on pool files, before cloning into `cas/`.
 - **Production soak:** long-running use on real data, plus a periodic

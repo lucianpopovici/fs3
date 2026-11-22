@@ -22,7 +22,7 @@ briefs if you need the original reasoning.
 | 05 resource bounds | `--max-body-size`, `--idle-timeout`, `--max-conns`, TLS handshake limits |
 | 06 startup recovery | temp files, half-written sidecars and duplicate version links cleaned at `store_open` |
 | 07 metrics and health | localhost admin listener with `/healthz` and Prometheus `/metrics`; S3-port `/_health` without auth |
-| 11 desktop console | DSM tile: bucket stats (objects, size, quota) and credential management with CSRF/Origin checks |
+| 11 desktop console | DSM tile: bucket stats (objects, size, quota), credential management and a settings form for every NAS-relevant option (schema in `packaging/synology/lib/fs3-conf.sh`), behind DSM sign-in + administrators group, CSRF token and Origin check |
 | 12 DSM identity binding | per-user buckets (`ak:sk[:user]`, owner + random bucket id), admins, legacy owner; the planned management socket became the `/v1` admin API (`--admin-socket`) |
 
 Two present-tense packaging bugs were also fixed along the way: `fs3.conf`
@@ -40,14 +40,12 @@ the existing conf and credentials instead of resetting
 
 ## Not yet briefed
 
-- **SPK options.** `fs3.conf` exposes only the basic keys (`FS3_BIND`,
-  `FS3_PORT`, `FS3_DATA`, `FS3_REQUIRE_AUTH`, `FS3_LEGACY_OWNER`,
-  `FS3_ADMIN`, `FS3_METRICS_PORT`, `FS3_GC_INTERVAL`, `FS3_GC_MAX_AGE`).
-  None of the newer features can be enabled without editing
-  `start-stop-status`, and an upgrade overwrites that edit. Most urgent:
-  the SPK always runs behind the DSM proxy but doesn't pass
-  `--trusted-proxy 127.0.0.1`, so auth-failure throttling and
-  `aws:SourceIp` see every client as loopback.
+- **Tile sign-in on hardware.** The tile authenticates with DSM's
+  `authenticate.cgi`, falling back to the session's SynoToken from
+  `login.cgi` when DSM's CSRF protection is on. That fallback is the
+  documented community pattern but hasn't been run on the DS1515+ yet;
+  if it fails there, the tile answers 403 for everyone and settings have
+  to be edited over SSH until it is fixed.
 - **Per-user views in the DSM tile** (the old 12c): the tile shows every
   bucket and key to the DSM admin. Mapping DSM users to fs3 users needs a
   spike on real hardware first.

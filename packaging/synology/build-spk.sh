@@ -37,6 +37,10 @@ cp "${PROJ_ROOT}/LICENSE"    "${BUILD}/pkg/LICENSE"     2>/dev/null || true
 
 # ui directory ships inside package.tgz and is linked into webman by DSM
 cp -r "${HERE}/ui" "${BUILD}/pkg/ui"
+# conf schema shared by start-stop-status and the tile (ui/index.cgi)
+mkdir -p "${BUILD}/pkg/lib"
+cp "${HERE}/lib/fs3-conf.sh" "${BUILD}/pkg/lib/fs3-conf.sh"
+chmod 644 "${BUILD}/pkg/lib/fs3-conf.sh"
 
 ( cd "${BUILD}/pkg" && tar czf "${BUILD}/package.tgz" . )
 
