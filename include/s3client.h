@@ -38,6 +38,7 @@ typedef struct {
     char     code[64];            /* S3 <Code> from an error body */
     char     upload_id[256];      /* CreateMultipartUpload */
     char     version_id[80];      /* x-amz-version-id, if any */
+    char     src_etag[80];        /* x-amz-meta-fs3-source-etag (replication) */
 } s3c_resp_t;
 
 typedef struct s3c s3c_t;
@@ -50,6 +51,9 @@ void   s3c_free(s3c_t *c);
 const char *s3c_err(const s3c_t *c);
 /* Connections opened so far (keep-alive reuse keeps this at 1). */
 unsigned s3c_connects(const s3c_t *c);
+/* While *flag is non-zero, transfers stop at the next 64 KiB and the
+ * call fails as a transport error (used at shutdown). */
+void   s3c_set_cancel(s3c_t *c, const int *flag);
 /* 1 if the outcome (rc, resp) is worth retrying. */
 int    s3c_retryable(int rc, const s3c_resp_t *resp);
 

@@ -28,7 +28,7 @@ typedef struct {
     int      tree;
     char     bucket[64];
     int      shard;
-    uint64_t objects, bytes, unverifiable, corrupt, gone;
+    uint64_t objects, bytes, unverifiable, corrupt, gone, repaired;
 } scrub_state_t;
 
 struct scrub {
@@ -40,7 +40,9 @@ struct scrub {
     int             stop;            /* atomic */
     char            dir[4200], state_path[4300], log_path[4300];
     /* Prometheus counters (atomic). */
-    uint64_t        m_objects, m_bytes, m_unverifiable, m_corrupt;
+    uint64_t        m_objects, m_bytes, m_unverifiable, m_corrupt, m_repaired;
+    scrub_repair_fn repair;
+    void           *repair_user;
 };
 
 typedef struct { uint64_t dev, ino; } inode_t;
@@ -58,6 +60,7 @@ typedef struct {
     /* inodes with several links already verified this run */
     inode_t  *seen;
     size_t    seen_n, seen_cap;
+    int       tree;              /* tree being walked */
 } scrub_job_t;
 
 static uint64_t now_s(void) { return (uint64_t)time(NULL); }
@@ -163,6 +166,9 @@ scrub_t *scrub_create(const scrub_cfg_t *cfg) {
 }
 
 void scrub_set_pool(scrub_t *sc, struct iopool *pool) { if (sc) sc->cfg.pool = pool; }
+void scrub_set_repair(scrub_t *sc, scrub_repair_fn fn, void *user) {
+    if (sc) { sc->repair = fn; sc->repair_user = user; }
+}
 
 void scrub_stop(scrub_t *sc) { if (sc) __atomic_store_n(&sc->stop, 1, __ATOMIC_RELAXED); }
 
@@ -253,6 +259,49 @@ static void report_corrupt(scrub_t *sc, const char *bucket, const char *rel,
     __atomic_fetch_add(&sc->m_corrupt, 1, __ATOMIC_RELAXED);
 }
 
+/* Ask replication for a good copy; log the outcome next to the report. */
+static void try_repair(scrub_t *sc, const char *bucket, const char *rel,
+                       const store_scrub_result_t *r) {
+    char why[256] = "";
+    int rc = sc->repair(sc->repair_user, bucket, r->key, r->ino, r->logical_size, why, sizeof(why));
+    if (rc == 0) return;
+    char line[2048], ts[32];
+    time_t t = time(NULL);
+    struct tm tm;
+    gmtime_r(&t, &tm);
+    strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%SZ", &tm);
+    size_t o = (size_t)snprintf(line, sizeof(line), "{\"ts\":\"%s\",\"bucket\":", ts);
+    json_put_str(line, sizeof(line), &o, bucket);
+    o += (size_t)snprintf(line + o, sizeof(line) - o, ",\"key\":");
+    json_put_str(line, sizeof(line), &o, r->key);
+    o += (size_t)snprintf(line + o, sizeof(line) - o, ",\"path\":");
+    json_put_str(line, sizeof(line), &o, rel);
+    o += (size_t)snprintf(line + o, sizeof(line) - o, ",\"repaired\":%s,\"detail\":",
+                          rc > 0 ? "true" : "false");
+    json_put_str(line, sizeof(line), &o, rc > 0 ? "restored from the replica" : why);
+    if (o + 2 < sizeof(line)) { line[o++] = '\n'; line[o] = 0; }
+    int fd = open(sc->log_path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0600);
+    if (fd >= 0) {
+        if (write(fd, line, o) < 0) LOG_W("scrub: cannot append %s", sc->log_path);
+        fsync(fd);
+        close(fd);
+    }
+    char ev[1400];
+    if (rc > 0) {
+        LOG_I("scrub: REPAIRED %s from the replica", rel);
+        snprintf(ev, sizeof(ev), "repaired bucket=%s key=%.1024s path=%s", bucket, r->key, rel);
+        __atomic_fetch_add(&sc->m_repaired, 1, __ATOMIC_RELAXED);
+        pthread_mutex_lock(&sc->mu);
+        sc->st.repaired++;
+        pthread_mutex_unlock(&sc->mu);
+    } else {
+        LOG_W("scrub: repair of %s refused: %s", rel, why);
+        snprintf(ev, sizeof(ev), "repair refused bucket=%s key=%.1024s path=%s reason=%s",
+                 bucket, r->key, rel, why);
+    }
+    audit_event("scrub", ev);
+}
+
 /* Verify one file; re-confirm a failure under the key's stripe lock. */
 static void check_file(scrub_job_t *j, const char *bucket, const char *path, int kind,
                        const char *lock_hex) {
@@ -280,7 +329,11 @@ static void check_file(scrub_job_t *j, const char *bucket, const char *path, int
     if (r.verdict != SCRUB_GONE) __atomic_fetch_add(&sc->m_objects, 1, __ATOMIC_RELAXED);
     if (r.verdict == SCRUB_UNVERIFIABLE) __atomic_fetch_add(&sc->m_unverifiable, 1, __ATOMIC_RELAXED);
     __atomic_fetch_add(&sc->m_bytes, r.bytes_read, __ATOMIC_RELAXED);
-    if (r.verdict == SCRUB_CORRUPT) report_corrupt(sc, bucket, rel, &r);
+    if (r.verdict == SCRUB_CORRUPT) {
+        report_corrupt(sc, bucket, rel, &r);
+        if (sc->repair && j->tree == TREE_DATA && kind == STORE_SCRUB_OBJECT && r.key[0])
+            try_repair(sc, bucket, rel, &r);
+    }
     if (j->collect_sha && kind == STORE_SCRUB_OBJECT && r.verdict != SCRUB_GONE) {
         uint8_t dg[32];
         if (store_object_content_sha256(path, dg)) {
@@ -322,6 +375,7 @@ static int is_ventry(const char *n) {
  * <hex>/<entry>; mpu → <upload>/part-NNNNN. */
 static int scrub_shard(scrub_job_t *j, int tree, const char *bucket, int shard) {
     scrub_t *sc = j->sc;
+    j->tree = tree;
     const char *root = store_root(sc->cfg.store);
     char base[4400];
     if (tree == TREE_MPU) snprintf(base, sizeof(base), "%s/mpu/%s", root, bucket);
@@ -521,10 +575,11 @@ size_t scrub_status_json(scrub_t *sc, char *out, size_t cap) {
         "{\"running\":%s,\"pass\":%" PRIu64 ",\"started\":%" PRIu64 ",\"finished\":%" PRIu64
         ",\"last_success\":%" PRIu64 ",\"cursor\":{\"tree\":\"%s\",\"bucket\":\"%s\",\"shard\":%d},"
         "\"files\":%" PRIu64 ",\"bytes\":%" PRIu64 ",\"unverifiable\":%" PRIu64
-        ",\"corrupt\":%" PRIu64 ",\"gone\":%" PRIu64 ",\"interval_days\":%d,\"rate\":%" PRIu64 "}",
+        ",\"corrupt\":%" PRIu64 ",\"repaired\":%" PRIu64 ",\"gone\":%" PRIu64
+        ",\"interval_days\":%d,\"rate\":%" PRIu64 "}",
         sc->running ? "true" : "false", st.pass, st.started, st.finished, st.last_success,
         st.tree < TREE_N ? TREE_NAME[st.tree] : "end", st.bucket, st.shard, st.objects, st.bytes,
-        st.unverifiable, st.corrupt, st.gone, sc->cfg.interval_days, sc->cfg.rate);
+        st.unverifiable, st.corrupt, st.repaired, st.gone, sc->cfg.interval_days, sc->cfg.rate);
     return n > 0 && (size_t)n < cap ? (size_t)n : 0;
 }
 
@@ -542,11 +597,14 @@ int scrub_metrics(scrub_t *sc, char *out, size_t cap) {
         "# TYPE fs3_scrub_unverifiable_total counter\nfs3_scrub_unverifiable_total %" PRIu64 "\n"
         "# HELP fs3_scrub_corrupt_total Corrupt files found by the integrity scrub.\n"
         "# TYPE fs3_scrub_corrupt_total counter\nfs3_scrub_corrupt_total %" PRIu64 "\n"
+        "# HELP fs3_scrub_repaired_total Corrupt objects restored from a replica.\n"
+        "# TYPE fs3_scrub_repaired_total counter\nfs3_scrub_repaired_total %" PRIu64 "\n"
         "# HELP fs3_scrub_last_success_timestamp End of the last pass that found no corruption.\n"
         "# TYPE fs3_scrub_last_success_timestamp gauge\nfs3_scrub_last_success_timestamp %" PRIu64 "\n",
         __atomic_load_n(&sc->m_objects, __ATOMIC_RELAXED),
         __atomic_load_n(&sc->m_bytes, __ATOMIC_RELAXED),
         __atomic_load_n(&sc->m_unverifiable, __ATOMIC_RELAXED),
-        __atomic_load_n(&sc->m_corrupt, __ATOMIC_RELAXED), last);
+        __atomic_load_n(&sc->m_corrupt, __ATOMIC_RELAXED),
+        __atomic_load_n(&sc->m_repaired, __ATOMIC_RELAXED), last);
     return n > 0 && (size_t)n < cap ? n : -1;
 }

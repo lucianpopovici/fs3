@@ -41,7 +41,7 @@ INCLUDES   := -Iinclude -I$(LLHTTP_DIR)/include -I$(XML_DIR)
 # Server objects
 SRV_SRCS := src/main.c src/server.c src/conn.c src/log.c src/store_fs.c \
             src/route.c src/response.c src/sigv4.c src/metrics.c \
-            src/iopool.c src/action.c src/checksum.c src/query.c src/cors.c src/lifecycle.c src/website.c src/json.c src/admin.c src/policy.c src/objlock.c src/tls.c src/audit.c src/objmeta.c src/scrub.c src/sandbox.c src/ssec.c src/lockc.c src/s3client.c
+            src/iopool.c src/action.c src/checksum.c src/query.c src/cors.c src/lifecycle.c src/website.c src/json.c src/admin.c src/policy.c src/objlock.c src/tls.c src/audit.c src/objmeta.c src/scrub.c src/sandbox.c src/ssec.c src/lockc.c src/s3client.c src/repl.c
 SRV_OBJS := $(SRV_SRCS:.c=.o)
 
 LLHTTP_OBJS := $(LLHTTP_DIR)/src/api.o $(LLHTTP_DIR)/src/http.o \
@@ -107,7 +107,7 @@ $(XML_DIR)/%.o: $(XML_DIR)/%.c
 
 # ----- Tests --------------------------------------------------------
 
-TEST_BINS := tests/test_log tests/test_ssec tests/test_sandbox tests/test_objmeta tests/test_policy tests/test_json tests/test_config_fuzz tests/test_chunk_fuzz tests/test_checksum tests/test_store tests/test_conn tests/test_xml tests/test_xml_legacy tests/test_xml_fuzz tests/test_sigv4 tests/test_credfile
+TEST_BINS := tests/test_repl tests/test_log tests/test_ssec tests/test_sandbox tests/test_objmeta tests/test_policy tests/test_json tests/test_config_fuzz tests/test_chunk_fuzz tests/test_checksum tests/test_store tests/test_conn tests/test_xml tests/test_xml_legacy tests/test_xml_fuzz tests/test_sigv4 tests/test_credfile
 
 # Fail fast, with the install line, if a test dependency is missing —
 # otherwise e.g. a missing awscrt shows up as checksum "server bugs".
@@ -131,6 +131,8 @@ test: check-test-deps $(TEST_BINS) fs3 fs3-lockd fs3-dedup-estimate
 	@./tests/test_ssec 50000
 	@echo "=== test_sandbox (seccomp filter) ==="
 	@./tests/test_sandbox
+	@echo "=== test_repl (replication journal + rule parser, 50000 fuzz iterations) ==="
+	@./tests/test_repl 50000
 	@echo "=== test_log (rotated log files) ==="
 	@./tests/test_log
 	@echo "=== test_objmeta (+50000 fuzz iterations) ==="
@@ -167,6 +169,8 @@ test: check-test-deps $(TEST_BINS) fs3 fs3-lockd fs3-dedup-estimate
 	@./tests/test_e2e_quota.sh
 	@echo "=== test_e2e_s3client (outbound S3 client for replication) ==="
 	@./tests/test_e2e_s3client.sh
+	@echo "=== test_e2e_repl (bucket replication between two fs3 instances) ==="
+	@./tests/test_e2e_repl.sh
 	@echo "=== test_e2e_logs (log file rotation) ==="
 	@./tests/test_e2e_logs.sh
 	@echo "=== test_e2e_dedup_estimate (fs3-dedup-estimate) ==="
@@ -238,6 +242,11 @@ tests/test_chunk_fuzz: tests/test_chunk_fuzz.c src/sigv4.o src/query.o src/log.o
 
 tests/test_ssec: tests/test_ssec.c src/ssec.o
 	$(CC) $(CFLAGS) $(INCLUDES) tests/test_ssec.c src/ssec.o $(LDFLAGS) -o $@
+
+REPL_TEST_OBJS := src/repl.o src/s3client.o src/sigv4.o src/query.o src/json.o src/objmeta.o \
+                  src/tls.o src/store_fs.o src/ssec.o src/checksum.o src/log.o
+tests/test_repl: tests/test_repl.c $(REPL_TEST_OBJS)
+	$(CC) $(CFLAGS) $(INCLUDES) tests/test_repl.c $(REPL_TEST_OBJS) $(LDFLAGS) -lpthread -o $@
 
 tests/test_log: tests/test_log.c src/log.o
 	$(CC) $(CFLAGS) $(INCLUDES) tests/test_log.c src/log.o $(LDFLAGS) -lpthread -o $@

@@ -631,6 +631,17 @@ s3_err_t store_scrub_file(s3_store_t *s, const char *path, int kind, const char 
 void     store_scrub_fail_reads(int on);
 void     store_scrub_mark_corrupt(uint64_t dev, uint64_t ino, uint64_t mtime_ms);
 const char *store_root(const s3_store_t *s);
+/* Self-healing scrub (replication): replace the payload of the current
+ * object `key` — still the file with inode `ino` — with `len` bytes from
+ * src_fd (a copy fetched from the replica). The local header is kept
+ * (version id, metadata, checksums) and the new bytes must verify
+ * against it exactly as the scrub verifies (payload CRC, MD5 or a
+ * full-object checksum); otherwise nothing changes and S3_ERR_BAD_DIGEST
+ * is returned. The swap happens under the key's stripe lock and only if
+ * the object wasn't replaced meanwhile. Not for Object Lock (layout 2),
+ * SSE-C or compressed objects. `why` gets a reason on failure. */
+s3_err_t store_repair_object(s3_store_t *s, s3_str_t bucket, s3_str_t key, uint64_t ino,
+                             int src_fd, uint64_t len, char *why, size_t whycap);
 
 /* ---- Multipart GC ----
  *
@@ -697,6 +708,17 @@ s3_err_t store_delete_ex(s3_store_t *s, s3_str_t bucket, s3_str_t key,
 /* Veto hook for permanently removing a version (item 10). Return S3_OK to
  * allow. Called with the key's stripe lock held: must not call back into
  * mutating store functions. */
+/* Replication (repl.c): called after every change to a key's current
+ * state — PUT/copy/multipart commit, delete (including delete markers,
+ * version deletes and lifecycle expiry) — while the key's stripe lock is
+ * held, so calls for one key arrive in commit order. The callback must
+ * not block on I/O beyond an append and must take only leaf locks. */
+#define STORE_CHANGE_PUT    1
+#define STORE_CHANGE_DELETE 2
+typedef void (*store_change_fn)(void *user, s3_str_t bucket, s3_str_t key, int op,
+                                uint64_t mtime_ms);
+void     store_set_change_hook(s3_store_t *s, store_change_fn fn, void *user);
+
 typedef s3_err_t (*store_version_guard_fn)(void *user, s3_str_t bucket,
                                            s3_str_t key, const s3_obj_meta_t *m,
                                            int bypass);

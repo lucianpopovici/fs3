@@ -33,6 +33,7 @@ struct s3c {
     int            fd;
     int            reused;            /* the current connection served a request */
     unsigned       connects;
+    const int     *cancel;
 #ifdef FS3_TLS
     SSL_CTX       *ctx;
     SSL           *ssl;
@@ -53,6 +54,11 @@ static void set_err(s3c_t *c, const char *fmt, ...) {
 }
 const char *s3c_err(const s3c_t *c) { return c->err; }
 unsigned s3c_connects(const s3c_t *c) { return c->connects; }
+void s3c_set_cancel(s3c_t *c, const int *flag) { c->cancel = flag; }
+static int cancelled(s3c_t *c) {
+    if (c->cancel && __atomic_load_n(c->cancel, __ATOMIC_RELAXED)) { set_err(c, "cancelled"); return 1; }
+    return 0;
+}
 
 int s3c_retryable(int rc, const s3c_resp_t *r) {
     if (rc != 0) return 1;
@@ -328,6 +334,7 @@ typedef struct {
 } sink_t;
 
 static int sink_put(s3c_t *c, sink_t *s, const char *p, size_t n) {
+    if (cancelled(c)) return -1;
     s->total += n;
     if (s->max && s->total > s->max) { s->too_big = 1; set_err(c, "response body too large"); return -1; }
     if (s->fd >= 0) {
@@ -501,6 +508,7 @@ static int send_body(s3c_t *c, const req_t *r) {
     uint64_t done = 0;
     int rc = 0;
     while (done < r->len) {
+        if (cancelled(c)) { rc = -1; break; }
         size_t want = r->len - done < S3C_IO_CHUNK ? (size_t)(r->len - done) : S3C_IO_CHUNK;
         ssize_t n = pread(r->fd, buf, want, r->off + (off_t)done);
         if (n <= 0) { set_err(c, "read source: %s", n < 0 ? strerror(errno) : "short file"); rc = -1; break; }
@@ -594,16 +602,23 @@ static int do_request_once(s3c_t *c, const req_t *r, s3c_resp_t *resp, int *stal
     if (o >= cap) { free(head); set_err(c, "request head too large"); return -1; }
     int wrc = write_all(c, head, o);
     free(head);
+    int send_failed = 0;
     if (wrc < 0 || send_body(c, r) < 0) {
-        if (was_reused) *stale = 1;
-        conn_close(c);
-        return -1;
+        /* The server may have answered early (403, 413) and closed: try to
+         * read that answer before giving up. */
+        if (was_reused || cancelled(c)) {
+            if (was_reused) *stale = 1;
+            conn_close(c);
+            return -1;
+        }
+        send_failed = 1;
     }
 
     /* Response head. */
     char line[8192];
     int lr = read_line(c, line, sizeof(line));
     if (lr != 1) {
+        if (send_failed) { conn_close(c); return -1; }   /* keep the send error */
         if (was_reused && lr == 0) *stale = 1;
         set_err(c, lr == 0 ? "connection closed before response" : "read: %s", strerror(errno));
         conn_close(c);
@@ -627,6 +642,8 @@ static int do_request_once(s3c_t *c, const req_t *r, s3c_resp_t *resp, int *stal
         else if (!strcmp(line, "transfer-encoding") && strstr(v, "chunked")) chunked = 1;
         else if (!strcmp(line, "connection") && (!strncasecmp(v, "close", 5))) close_after = 1;
         else if (!strcmp(line, "etag")) strip_etag(v, resp->etag, sizeof(resp->etag));
+        else if (!strcmp(line, "x-amz-meta-fs3-source-etag"))
+            snprintf(resp->src_etag, sizeof(resp->src_etag), "%s", v);
         else if (!strcmp(line, "x-amz-version-id"))
             snprintf(resp->version_id, sizeof(resp->version_id), "%s", v);
     }
@@ -668,7 +685,7 @@ static int do_request_once(s3c_t *c, const req_t *r, s3c_resp_t *resp, int *stal
         free(xml);
     }
     if (body_rc < 0) { conn_close(c); return -1; }
-    if (close_after) conn_close(c);
+    if (close_after || send_failed) conn_close(c);
     else c->reused = 1;
     return 0;
 }

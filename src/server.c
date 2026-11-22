@@ -15,6 +15,7 @@
 #include "action.h"
 #include "lifecycle.h"
 #include "scrub.h"
+#include "repl.h"
 #include "sandbox.h"
 #include "lockc.h"
 #include "sigv4.h"
@@ -67,6 +68,7 @@ struct server {
     time_t        gc_last_run;       /* monotonic seconds */
     int           lc_running;        /* a sweep job is in flight */
     scrub_t      *scrub;             /* integrity scrub (item 3) */
+    repl_t       *repl;              /* bucket replication */
     int           lc_last_yday;      /* day of year of the last scheduled run */
     int           lc_pending_now;    /* run at the first tick (--lifecycle-now) */
     time_t        clock_wall_last;   /* clock-jump detection (item 10.6) */
@@ -279,6 +281,10 @@ static void admin_serve_fd(server_t *s, int fd, int via_uds) {
             blen = sn < 0 ? -1 : blen + sn;
         }
         if (blen >= 0) {
+            int rn = repl_metrics(s->repl, body + blen, sizeof(body) - (size_t)blen);
+            blen = rn < 0 ? -1 : blen + rn;
+        }
+        if (blen >= 0) {
             int kn = render_key_metrics(s->cfg.auth, body + blen, sizeof(body) - (size_t)blen);
             blen = kn < 0 ? -1 : blen + kn;
         }
@@ -443,10 +449,24 @@ server_t *server_create(const server_cfg_t *cfg) {
         if (!s->scrub) goto fail;
     }
 
+    /* Bucket replication: rules and journals load now; threads start
+     * after the seccomp filter (end of server_create). */
+    {
+        repl_cfg_t rc = {
+            .store = s->store, .root = cfg->data_root, .workers = cfg->repl_workers,
+            .rate = cfg->repl_rate, .ca_file = cfg->repl_ca_file,
+            .part_size = cfg->repl_part_size, .timeout_s = cfg->repl_timeout_s,
+        };
+        s->repl = repl_create(&rc);
+        if (!s->repl) goto fail;
+        scrub_set_repair(s->scrub, repl_scrub_repair, s->repl);
+    }
+
     /* Admin API (item 11). */
     {
         admin_cfg_t ac = {
             .scrub = s->scrub,
+            .repl = s->repl,
             .auth = cfg->auth,
             .key_max_age_days = cfg->key_max_age_days,
             .store = s->store, .token = cfg->admin_token,
@@ -573,6 +593,11 @@ server_t *server_create(const server_cfg_t *cfg) {
         }
         scrub_set_pool(s->scrub, s->pool);
     }
+    /* After the seccomp filter, like the io pool, so the threads inherit it. */
+    if (repl_start(s->repl) < 0) {
+        LOG_E("replication: cannot start worker threads");
+        goto fail;
+    }
     return s;
 
 fail:
@@ -598,6 +623,8 @@ void server_destroy(server_t *s) {
     scrub_stop(s->scrub);
     iopool_destroy(s->pool);
     scrub_destroy(s->scrub);
+    /* After the pool: its last commits still feed the journal. */
+    repl_destroy(s->repl);
     if (s->listen_fd >= 0) close(s->listen_fd);
     if (s->web_fd >= 0) close(s->web_fd);
     if (s->tls_fd >= 0) close(s->tls_fd);
@@ -860,6 +887,7 @@ int server_run(server_t *s) {
 
         lc_maybe_start(s, now);
         scrub_tick(s->scrub, now);
+        repl_tick(s->repl, now);
 
         /* Retention trusts the wall clock: warn if it jumps backwards by
          * more than an hour relative to the monotonic clock. */
