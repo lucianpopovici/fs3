@@ -1217,6 +1217,10 @@ Next:
 - **Replication on hardware:** a DS1515+ run replicating to B2 or a second
   box, which also confirms the DSM CA bundle path
   (`docs/AGENT-REPLICATION-DS1515-TEST.md`).
+- **Baseline benchmarks before any performance work:** a warp run on
+  the DS1515+ recording throughput, latency and the bottleneck per
+  workload (`docs/AGENT-BENCHMARK-WARP-DS1515.md`); later changes are
+  compared against it with `warp cmp`.
 - **SSE-S3, webhooks and the object browser on hardware:** a DS1515+
   run measuring encryption cost, webhook delivery under seccomp, and how
   large an upload DSM's web server passes to the tile
