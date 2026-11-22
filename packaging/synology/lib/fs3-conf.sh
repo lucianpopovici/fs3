@@ -15,7 +15,7 @@
 #          enum:a/b/c, iplist (up to 4 comma-separated IPv4/IPv6
 #          addresses, may be empty), host (empty or a lowercase host
 #          name), user (empty or an fs3 user name)
-#   sections: net, access, limits, jobs, storage, lock, web, ops
+#   sections: net, access, limits, jobs, storage, lock, web, repl, ops
 # Defaults equal fs3's own defaults unless noted, and a flag is passed
 # only when its value differs, so the command line stays short.
 
@@ -58,10 +58,13 @@ FS3_MAX_RETENTION_DAYS|int:1:36500|3650|lock|Longest Object Lock retention (days
 FS3_LOCK_IMMUTABLE|bool|0|lock|Immutable COMPLIANCE versions (fs3-lockd)|Needs the fs3-lockd helper running as root (see the package notes). fs3 refuses to start without it, so this can only be turned on while the helper's socket exists.
 FS3_WEB_PORT|port0|0|web|Website port|Serves buckets with a website configuration anonymously (GET/HEAD) on this port, on the listen address above. Needs public buckets allowed. 0 disables.
 FS3_WEB_ROOT_DOMAIN|host||web|Website root domain|Sites at <bucket>.<domain>. Empty: the Host header must equal the bucket name (custom domains through the reverse proxy).
+FS3_REPL_WORKERS|int:0:16|2|repl|Replication threads|Buckets with a replication rule are copied to their target by this many threads. 0 turns replication off (rules are kept but nothing is sent).
+FS3_REPL_RATE|size|20M|repl|Replication upload rate (per second)|Shared by all buckets. 0 = unthrottled.
+FS3_REPL_TIMEOUT|int:1:3600|30|repl|Replication timeout (seconds)|Per network operation; a slower target counts as unreachable and is retried with backoff.
 FS3_AUDIT_LOG|bool|0|ops|Audit log|One JSON line per request and admin change in audit.jsonl in the package folder. Rotated like the server log.
 FS3_LOG_MAX_SIZE|size|10M|ops|Rotate logs at|fs3.log and audit.jsonl are rotated when they reach this size (K, M, G suffixes). 0 never rotates.
 FS3_LOG_KEEP|int:1:50|5|ops|Rotated logs kept|fs3.log.1 … fs3.log.N (and the same for the audit log).
-FS3_ADMIN_SOCKET|bool|0|ops|Admin API socket|Serves the /v1 admin API on admin.sock in the package folder (mode 0600, package user only).
+FS3_ADMIN_SOCKET|bool|1|ops|Admin API socket|Serves the /v1 admin API on admin.sock in the package folder (mode 0600, package user only). The Replication section of this page uses it.
 FS3_SECCOMP|enum:enforce/log/require/off|enforce|ops|System call filter (seccomp)|DSM 7.1's kernel has no seccomp filter support, so on a DS1515+ enforce only logs a warning; require would keep fs3 from starting there.
 FS3_VERBOSE|bool|0|ops|Debug logging|Much more output in fs3.log.
 SCHEMA
@@ -82,6 +85,7 @@ jobs|Background jobs
 storage|Storage efficiency
 lock|Object Lock
 web|Static websites
+repl|Replication
 ops|Logging and hardening
 SECTIONS
 }
@@ -281,6 +285,9 @@ fs3_conf_args() {
         FS3_LIFECYCLE_RATE:--lifecycle-rate \
         FS3_SCRUB_INTERVAL_DAYS:--scrub-interval-days \
         FS3_SCRUB_RATE:--scrub-rate \
+        FS3_REPL_WORKERS:--repl-workers \
+        FS3_REPL_RATE:--repl-rate \
+        FS3_REPL_TIMEOUT:--repl-timeout \
         FS3_REFLINK:--reflink \
         FS3_DEDUP:--dedup \
         FS3_DEDUP_MIN_SIZE:--dedup-min-size \
@@ -310,6 +317,7 @@ fs3_conf_args() {
         printf '%s\n' --lock-immutable --lockd-socket "${_vd}/lockd.sock"
     [ "${FS3_AUDIT_LOG}" = "1" ]    && printf '%s\n' --audit-log "${_vd}/audit.jsonl"
     [ "${FS3_ADMIN_SOCKET}" = "1" ] && printf '%s\n' --admin-socket "${_vd}/admin.sock"
+    [ -r "${_vd}/repl-ca.pem" ]     && printf '%s\n' --repl-ca-file "${_vd}/repl-ca.pem"
 
     if [ "${FS3_WEB_PORT}" != "0" ]; then
         printf '%s\n' --web-port "${FS3_WEB_PORT}" --web-addr "${FS3_BIND}"

@@ -78,6 +78,9 @@ has_arg "admin listener"         --metrics-port 9101
 has_arg "fs3 writes its own rotated log" --log-file "$VAR/fs3.log"
 lacks_arg "default rotation not passed" --log-max-size
 lacks_arg "no dedup by default"  --dedup
+has_arg "admin socket on by default" --admin-socket "$VAR/admin.sock"
+lacks_arg "default replication threads not passed" --repl-workers
+lacks_arg "no CA bundle without repl-ca.pem" --repl-ca-file
 lacks_arg "no auth without credentials" --require-auth
 sss status && st=0 || st=$?
 check_eq "status running" "$st" "0"
@@ -95,8 +98,13 @@ FS3_ALLOW_PUBLIC=1
 FS3_SECCOMP=log
 FS3_LOG_MAX_SIZE=2M
 FS3_LOG_KEEP=7
+FS3_REPL_WORKERS=4
+FS3_REPL_RATE=5M
+FS3_REPL_TIMEOUT=60
+FS3_ADMIN_SOCKET=0
 EOF
 mkdir -p "$VAR/my data"
+: > "$VAR/repl-ca.pem"
 mark
 : > "$VAR/fs3.restart"
 kill "$(cat "$VAR/fs3.child.pid")"
@@ -112,6 +120,11 @@ has_arg "public allowed"         --allow-public
 has_arg "seccomp mode"           --seccomp log
 has_arg "log rotation size"      --log-max-size 2M
 has_arg "log rotation count"     --log-keep 7
+has_arg "replication threads"    --repl-workers 4
+has_arg "replication rate"       --repl-rate 5M
+has_arg "replication timeout"    --repl-timeout 60
+has_arg "fixed CA bundle file"   --repl-ca-file "$VAR/repl-ca.pem"
+lacks_arg "admin socket can be turned off" --admin-socket
 check_eq "restart request consumed" "$([ -f "$VAR/fs3.restart" ] && echo yes || echo no)" "no"
 check_eq "restart logged, no backoff" "$(grep -c 'restarting to apply new settings' "$VAR/fs3.start.log" || true)" "1"
 

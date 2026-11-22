@@ -72,6 +72,10 @@ tests/test_objmeta
 tests/test_policy
 tests/test_sandbox
 tests/test_ssec
+tests/test_log
+tests/test_repl
+tests/s3c_cli
+tests/s3c_cli_tls
 
 # Python bytecode from test helpers
 __pycache__/

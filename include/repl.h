@@ -77,6 +77,11 @@ void    repl_bucket_summary(repl_t *r, const char *bucket, char *out, size_t cap
 int     repl_scrub_repair(void *repl, const char *bucket, const char *key, uint64_t ino,
                           uint64_t size, char *why, size_t whycap);
 
+/* GET /replication on the localhost metrics listener (the DSM tile):
+ * one line per rule, "<bucket> <queue> <failed> <lag-s> <target> <last error…>",
+ * no credentials, no object keys. Returns bytes or -1 on overflow. */
+int     repl_render_text(repl_t *r, char *out, size_t cap);
+
 /* Prometheus text; returns bytes written or -1 on overflow. */
 int     repl_metrics(repl_t *r, char *out, size_t cap);
 

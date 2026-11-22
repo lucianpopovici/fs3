@@ -2,6 +2,21 @@
 
 ## Unreleased (round 2)
 
+- **Bucket replication.** A bucket can replicate, asynchronously and one
+  way, to a bucket on another S3 endpoint (B2, AWS, MinIO, Garage, a
+  second fs3). Configure it in the tile (*Replication*) or through the
+  admin API (`/v1/buckets/<b>/replication`). Changes are queued durably
+  under `repl/` in the data folder and survive restarts and crashes;
+  `Sync` copies objects that existed before the rule. A corrupt object
+  found by the scrub is restored from the replica when the replica's copy
+  verifies. New settings: *Replication threads*, *Replication upload
+  rate*, *Replication timeout*. A CA bundle for private endpoints can be
+  placed at `repl-ca.pem` in the package folder.
+- The admin API socket is now **on by default** (the tile's replication
+  controls use it). It is mode 0600 and only the package user can connect.
+- Fix: error responses to `HEAD` no longer carry an XML body, which a
+  keep-alive client would read as the start of its next response.
+
 - The package now ships the **TLS build** of fs3 (`fs3-tls-static`:
   libssl + libcrypto linked statically), needed for replication to HTTPS
   targets. The binary is larger; behaviour is unchanged unless TLS

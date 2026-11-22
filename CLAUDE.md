@@ -4,7 +4,7 @@ Read `README.md` first for what fs3 is and what it supports. This file
 holds the facts you shouldn't have to relearn: the rules the code depends
 on, where things live, how to extend it safely, and environment gotchas.
 
-Current state (November 2026): about 20,000 lines of C. The original
+Current state (November 2026): about 24,000 lines of C. The original
 twelve phases, the gap-closure plan (Garage comparison and security
 addendum) and round 2 are all implemented. Everything passes `make test`
 under both `-O2` and ASan + UBSan, and on a DS1515+ (recorded run in
@@ -60,6 +60,8 @@ The module list is in README, "Source layout". Feature → code → tests:
 | admin API | `src/admin.c` | `test_e2e_admin.sh` |
 | audit log, throttling | `src/audit.c` | `test_e2e_audit.sh` |
 | logging, rotated log files | `src/log.c` (`log_msg`, `logfile_t`: one `write()` per line, size rotation, SIGHUP reopen) | `test_log`, `test_e2e_logs.sh` |
+| replication | `src/repl.c` (journal, workers, admin endpoints, backfill, `repl_scrub_repair`); store hook `store_set_change_hook`; `store_repair_object` | `test_repl`, `test_e2e_repl.sh` |
+| outbound S3 client, SigV4 signing | `src/s3client.c`; `sigv4_sign` / `req_view_t` in `src/sigv4.c` (shared canonicalisation with the verifier) | `test_sigv4`, `test_e2e_s3client.sh` (driver `tests/s3c_cli.c`) |
 | seccomp | `src/sandbox.c` (`ALLOW[]`), `tests/tools/seccomp_profile.sh` | `test_sandbox`, every e2e suite (a SIGSYS is reported) |
 | credentials file | `parse_and_add_cred`, `load_credentials_file` in `src/main.c` | `test_credfile` (seam: `FS3_MAIN_TESTING`) |
 | dedup estimator | `src/dedup_estimate.c` (standalone; mirrors the header format, keep in sync) | `test_e2e_dedup_estimate.sh` |
@@ -91,6 +93,11 @@ Don't quietly undo these.
   - `q_mu` (quota counters) and `cfg_mu` (sidecar cache) are leaves: take
     nothing while holding them.
   - Never hold a lock across fsync of object data.
+- The store's change hook (replication) runs under the key's stripe
+  lock: it appends one journal record with `write()` and takes only the
+  replication mutex, a leaf. Nothing in it may take a store lock (it
+  reads the bucket meta file, which needs none) or do network I/O. Any new path that changes a key's current state
+  must call `notify_change()` before releasing the stripe.
 - **Committed object files are never modified in place.** Writes go
   tmp → fsync → rename → fsync(parent). Versioning uses `link()`, and lock
   immutability only sets a flag. Readers rely on this and take no locks,
@@ -106,8 +113,10 @@ Don't quietly undo these.
   (`sigv4_swap_creds`). Identities are copied out at verify time
   (`sigv4_verify_id`), so a reload during a request can't free them.
 - The seccomp filter is installed at the end of startup, and the worker
-  pool is created *after* it (end of `server_create`) so workers inherit
-  it. Keep that order.
+  pool and the replication threads are created *after* it (end of
+  `server_create`) so they inherit it. Keep that order.
+- Shutdown destroys replication after the iopool (its last commits still
+  feed the journal) and before `store_close`.
 
 **Request handling**
 - `s3_str_t` (`p`, `n`) is the string type everywhere; helpers are in
@@ -230,6 +239,9 @@ fixed message codes (never reflect input).
 - **Round 2:** schema 4, part records and ETag checks, ListParts,
   UploadPartCopy, metadata, ListObjectsV2, quotas, scrub, key hygiene,
   seccomp, reflink, dedup, compression, SSE-C, layout 2 and fs3-lockd.
+- **Since:** log rotation, the TLS build in the SPK, bucket replication
+  (outbound S3 client, journal, backfill, self-healing scrub). Plan and
+  deviations: `docs/plan-logs-replication-compat.md`.
 
 The design plans for the last two rounds lived outside the repo. The
 code and this file are the reference now.

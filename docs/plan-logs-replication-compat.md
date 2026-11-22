@@ -1,13 +1,30 @@
 # Plan: log rotation, bucket replication, backup-tool compatibility
 
-Status: item 1 (log rotation) **implemented**; items 2 and 3 are roadmap.
-Each item is sized for its own branch and PR. Section 1.5 (the tile
-sign-in check on hardware) is still open.
+Status: items 1 (log rotation) and 2 (replication) **implemented**;
+item 3 is roadmap. Each item is sized for its own branch and PR. Still
+open: section 1.5 (the tile sign-in check on hardware) and the phase-d
+hardware run for replication (DS1515+ replicating to B2 or a second box).
+
+Where the implementation of item 2 departs from the plan below:
+- The journal is one file per bucket, truncated once fully replicated
+  and past 1 MiB, instead of 16 MiB segments; the cursor stores a
+  sequence number, so a truncation is never ambiguous.
+- Records carry no ETag or size: the worker always replicates the key's
+  current local state, which makes lost or duplicated records harmless.
+- Workers are dedicated threads, not iopool jobs, so a slow remote never
+  holds up client commits.
+- 4xx answers that mean the rule itself is wrong (bad credentials,
+  missing remote bucket, clock skew, redirects) back off and keep the
+  record instead of skipping it; other 4xx are skipped as planned.
+- Backfills start over after a restart rather than resuming.
+- Self-healing reuses the scrub's own verifier on the repaired file, and
+  covers layout-1 buckets only (no Object Lock buckets, SSE-C or zstd
+  payloads).
 
 | # | Item | Size | Why first |
 |---|---|---|---|
 | 1 | Log rotation (+ verify the tile sign-in on hardware) | S | Unbounded logs eventually fill the volume; readiness brief 09 |
-| 2 | Asynchronous bucket replication | L | The one capability Garage and MinIO have that fs3 lacks; enables self-healing scrub |
+| 2 | Asynchronous bucket replication (**implemented**) | L | The one capability Garage and MinIO have that fs3 lacks; enables self-healing scrub |
 | 3 | Compatibility matrix with real backup tools | M | Most homelab S3 traffic is backups; finds the bugs users would hit |
 
 House rules as always (`CLAUDE.md`): release and ASan/UBSan green, every

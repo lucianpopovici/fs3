@@ -273,6 +273,15 @@ static void admin_serve_fd(server_t *s, int fd, int via_uds) {
         } else {
             admin_respond(fd, "200 OK", "text/plain", body, (size_t)blen);
         }
+    } else if (strncmp(req, "GET /replication", 16) == 0) {
+        static char body[64 * 1024];
+        int blen = repl_render_text(s->repl, body, sizeof(body));
+        if (blen < 0) {
+            admin_respond(fd, "500 Internal Server Error",
+                          "text/plain", "render overflow\n", 16);
+        } else {
+            admin_respond(fd, "200 OK", "text/plain", body, (size_t)blen);
+        }
     } else if (strncmp(req, "GET /metrics", 12) == 0) {
         static char body[64 * 1024];
         int blen = metrics_render(&s->metrics, s->store, body, sizeof(body));

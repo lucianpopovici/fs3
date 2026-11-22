@@ -1418,7 +1418,11 @@ char *repl_admin(repl_t *r, const char *method, const char *bucket, const char *
         return out;
     }
     if (!strcmp(method, "DELETE")) {
-        s3_err_t e = store_bucket_sidecar_delete(r->cfg.store, bn, "replication.json");
+        repl_rule_t gone;
+        int had = load_rule(r, bucket, &gone) != 1;     /* present, even if invalid */
+        memset(&gone, 0, sizeof(gone));
+        s3_err_t e = had ? store_bucket_sidecar_delete(r->cfg.store, bn, "replication.json")
+                         : S3_ERR_NO_SUCH_KEY;
         pthread_mutex_lock(&r->mu);
         rb_t *b = find_name(r, bucket, strlen(bucket));
         if (b) rb_kill(r, b, 1);
@@ -1480,6 +1484,33 @@ char *repl_admin(repl_t *r, const char *method, const char *bucket, const char *
 /* ===================================================================== */
 /* Metrics                                                               */
 /* ===================================================================== */
+
+int repl_render_text(repl_t *r, char *out, size_t cap) {
+    if (!cap) return -1;
+    out[0] = 0;
+    if (!r || r->cfg.workers <= 0) return 0;
+    size_t o = 0;
+    uint64_t now = wall_ms();
+    pthread_mutex_lock(&r->mu);
+    for (rb_t *b = r->head; b; b = b->next) {
+        if (b->dead) continue;
+        uint64_t q = b->next_seq - 1 - b->cursor_seq;
+        uint64_t lag = q && b->oldest_ms && now > b->oldest_ms ? (now - b->oldest_ms) / 1000 : 0;
+        char err[200];
+        size_t k = 0;
+        for (const char *p = b->last_error; *p && k + 1 < sizeof(err); p++)
+            err[k++] = ((unsigned char)*p < 0x20 || *p == 0x7f) ? ' ' : *p;
+        err[k] = 0;
+        int n = snprintf(out + o, cap - o, "%s %llu %llu %llu %s/%s %s\n", b->name,
+                         (unsigned long long)q, (unsigned long long)b->n_fail,
+                         (unsigned long long)lag, b->rule.endpoint, b->rule.bucket,
+                         err[0] ? err : "-");
+        if (n < 0 || (size_t)n >= cap - o) { pthread_mutex_unlock(&r->mu); return -1; }
+        o += (size_t)n;
+    }
+    pthread_mutex_unlock(&r->mu);
+    return (int)o;
+}
 
 int repl_metrics(repl_t *r, char *out, size_t cap) {
     if (!r || r->cfg.workers <= 0) return 0;
