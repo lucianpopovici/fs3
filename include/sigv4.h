@@ -138,6 +138,29 @@ typedef struct {
  * presigned X-Amz-SignedHeaders). */
 int sigv4_header_signed(const struct conn *c, const char *lc_name);
 
+/* ---- Signing outbound requests (used by s3client.c) ---------------- */
+
+typedef struct { s3_str_t k, v; } sigv4_hdr_t;   /* same layout as conn_header_t */
+
+typedef struct {
+    const char        *method;        /* "PUT" */
+    const char        *path;          /* canonical, URI-encoded once: "/bkt/my%20key" */
+    const char        *query;         /* raw query without '?', or NULL */
+    const sigv4_hdr_t *headers;       /* names lowercase, sorted by name; all are signed */
+    size_t             n_headers;
+    const char        *payload_hash;  /* hex SHA-256 of the body, or "UNSIGNED-PAYLOAD" */
+} sigv4_sign_req_t;
+
+/* Build the Authorization header value for `r` with the same
+ * canonicalisation the verifier uses. amz_date is "YYYYMMDDTHHMMSSZ" and
+ * must equal the request's x-amz-date header. Returns 0, or -1 if
+ * `out` is too small or the input is malformed. */
+int sigv4_sign(const sigv4_sign_req_t *r, const char *access_key, const char *secret,
+               const char *region, const char *amz_date, char *out, size_t cap);
+
+/* Lowercase hex SHA-256 of `n` bytes (65 bytes incl. NUL). */
+void sigv4_sha256_hex(const void *data, size_t n, char out[65]);
+
 /* sigv4_verify, also filling *id_out (if non-NULL) on S3_OK. */
 s3_err_t sigv4_verify_id(const sigv4_verifier_t *v, const struct conn *c,
                          sigv4_id_t *id_out);

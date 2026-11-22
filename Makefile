@@ -41,7 +41,7 @@ INCLUDES   := -Iinclude -I$(LLHTTP_DIR)/include -I$(XML_DIR)
 # Server objects
 SRV_SRCS := src/main.c src/server.c src/conn.c src/log.c src/store_fs.c \
             src/route.c src/response.c src/sigv4.c src/metrics.c \
-            src/iopool.c src/action.c src/checksum.c src/query.c src/cors.c src/lifecycle.c src/website.c src/json.c src/admin.c src/policy.c src/objlock.c src/tls.c src/audit.c src/objmeta.c src/scrub.c src/sandbox.c src/ssec.c src/lockc.c
+            src/iopool.c src/action.c src/checksum.c src/query.c src/cors.c src/lifecycle.c src/website.c src/json.c src/admin.c src/policy.c src/objlock.c src/tls.c src/audit.c src/objmeta.c src/scrub.c src/sandbox.c src/ssec.c src/lockc.c src/s3client.c
 SRV_OBJS := $(SRV_SRCS:.c=.o)
 
 LLHTTP_OBJS := $(LLHTTP_DIR)/src/api.o $(LLHTTP_DIR)/src/http.o \
@@ -165,6 +165,8 @@ test: check-test-deps $(TEST_BINS) fs3 fs3-lockd fs3-dedup-estimate
 	@./tests/test_e2e_listing.sh
 	@echo "=== test_e2e_quota (round 2: bucket/user quotas) ==="
 	@./tests/test_e2e_quota.sh
+	@echo "=== test_e2e_s3client (outbound S3 client for replication) ==="
+	@./tests/test_e2e_s3client.sh
 	@echo "=== test_e2e_logs (log file rotation) ==="
 	@./tests/test_e2e_logs.sh
 	@echo "=== test_e2e_dedup_estimate (fs3-dedup-estimate) ==="
@@ -273,6 +275,13 @@ tests/test_xml_fuzz: $(XML_DIR)/tests/test_fuzz.c $(XML_DIR)/xml_parser.o
 	$(CC) $(CFLAGS) $(INCLUDES) $(XML_DIR)/tests/test_fuzz.c \
 	    $(XML_DIR)/xml_parser.o $(LDFLAGS) -o $@
 
+# Outbound S3 client driver (replication), plain and TLS builds.
+S3C_SRCS := tests/s3c_cli.c src/s3client.c src/sigv4.c src/query.c
+tests/s3c_cli: $(S3C_SRCS) include/s3client.h include/sigv4.h
+	$(CC) $(filter-out -DFS3_TLS,$(CFLAGS)) $(INCLUDES) $(S3C_SRCS) $(filter-out -lssl,$(LDFLAGS)) -o $@
+tests/s3c_cli_tls: $(S3C_SRCS) include/s3client.h include/sigv4.h
+	$(CC) $(CFLAGS) -DFS3_TLS $(INCLUDES) $(S3C_SRCS) -lssl $(filter-out -lssl,$(LDFLAGS)) -o $@
+
 # test_sigv4 needs the SIGV4_TESTING macro to expose internal helpers,
 # so we recompile sigv4.c instead of using the cached .o from the
 # server build.
@@ -289,7 +298,7 @@ tests/test_credfile: tests/test_credfile.c src/main.c src/sigv4.c src/log.c src/
 	    $(LDFLAGS) -o $@
 
 clean:
-	rm -f fs3 fs3-tls fs3-static fs3-tls-static fs3-lockd fs3-dedup-estimate $(OBJS) $(OBJS:.o=.d) $(TEST_BINS) tests/*.d
+	rm -f fs3 fs3-tls fs3-static fs3-tls-static fs3-lockd fs3-dedup-estimate $(OBJS) $(OBJS:.o=.d) $(TEST_BINS) tests/s3c_cli tests/s3c_cli_tls tests/*.d
 
 # Auto-include compiler-generated dependency files so header changes
 # correctly invalidate object files. Created via -MMD -MP above.
