@@ -62,6 +62,8 @@ The module list is in README, "Source layout". Feature → code → tests:
 | logging, rotated log files | `src/log.c` (`log_msg`, `logfile_t`: one `write()` per line, size rotation, SIGHUP reopen) | `test_log`, `test_e2e_logs.sh` |
 | replication | `src/repl.c` (journal, workers, admin endpoints, backfill, `repl_scrub_repair`); store hook `store_set_change_hook`; `store_repair_object` | `test_repl`, `test_e2e_repl.sh` |
 | outbound S3 client, SigV4 signing | `src/s3client.c`; `sigv4_sign` / `req_view_t` in `src/sigv4.c` (shared canonicalisation with the verifier) | `test_sigv4`, `test_e2e_s3client.sh` (driver `tests/s3c_cli.c`) |
+| keep-alive, pipelining | `conn_on_readable` / `conn_on_writable` in `src/conn.c` (bytes arriving while a response is written are buffered, not parsed: `parked_paused`) | `test_e2e_keepalive.sh` |
+| backup-tool compatibility | `tests/compat/` (one script per tool, shared `lib.sh`; `make compat`, not part of `make test`) | results in `docs/compatibility.md` |
 | seccomp | `src/sandbox.c` (`ALLOW[]`), `tests/tools/seccomp_profile.sh` | `test_sandbox`, every e2e suite (a SIGSYS is reported) |
 | credentials file | `parse_and_add_cred`, `load_credentials_file` in `src/main.c` | `test_credfile` (seam: `FS3_MAIN_TESTING`) |
 | dedup estimator | `src/dedup_estimate.c` (standalone; mirrors the header format, keep in sync) | `test_e2e_dedup_estimate.sh` |

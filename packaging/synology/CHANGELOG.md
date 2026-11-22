@@ -2,6 +2,15 @@
 
 ## Unreleased (round 2)
 
+- Fix: a request sent on a keep-alive connection while fs3 was still
+  writing the previous response could be dropped, and the client then
+  waited for the 60 s idle timeout. restic (and other minio-go/Go
+  clients) hit this over plain HTTP, so some backups and restores
+  stalled for a minute. Found by the new backup-tool compatibility
+  matrix (`docs/compatibility.md`): restic, rclone, Kopia, Duplicati and
+  the AWS CLI v2 now pass backup, verify, restore and prune against fs3,
+  including Object Lock buckets and a crash mid-backup.
+
 - **Bucket replication.** A bucket can replicate, asynchronously and one
   way, to a bucket on another S3 endpoint (B2, AWS, MinIO, Garage, a
   second fs3). Configure it in the tile (*Replication*) or through the

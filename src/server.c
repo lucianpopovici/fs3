@@ -656,7 +656,7 @@ static int reset_conn_events(server_t *s, conn_t *c) {
     uint32_t ev = EPOLLRDHUP;
     /* Once peer has closed write-side, no point asking for more EPOLLIN
      * (level-triggered EOF would busy-loop). */
-    if (!c->eof_seen) ev |= EPOLLIN;
+    if (!c->eof_seen && !conn_rbuf_full_parked(c)) ev |= EPOLLIN;
     if (conn_wants_write(c)) ev |= EPOLLOUT;
     /* Parked on an iopool job: nothing to read or write until it's done,
      * and a level-triggered RDHUP would spin. Only ERR/HUP (always

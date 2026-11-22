@@ -341,6 +341,7 @@ int     conn_on_readable(conn_t *c);
 int     conn_on_writable(conn_t *c);
 
 int     conn_wants_write(const conn_t *c);
+int     conn_rbuf_full_parked(const conn_t *c);
 
 /* Peer hung up (EPOLLRDHUP): is it safe to close now? False while there is
  * a response to send or still to be built (CST_WAIT_JOB), buffered request
