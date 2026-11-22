@@ -90,19 +90,21 @@ On a Synology NAS, install the SPK instead
 | Auth | SigV4 header, streaming chunked, trailer variants, presigned URLs; per-user isolation, grants, bucket policies, read-only and expiring keys |
 | Data protection | Versioning, Object Lock (GOVERNANCE / COMPLIANCE / legal hold), optional `FS_IMMUTABLE_FL` through a root helper, lifecycle expiry |
 | Web | CORS, static website hosting on a separate listener, block-public-access by default |
-| Encryption | SSE-C (AES-256-GCM, chunked), native TLS (optional build) |
+| Encryption | SSE-S3 (server-managed keys, bucket default encryption) and SSE-C (AES-256-GCM, chunked), native TLS (optional build) |
 | Storage efficiency | Reflink fast paths, opt-in whole-object dedup, Btrfs transparent compression |
 | Backup tools | restic, rclone, Kopia, Duplicati and AWS CLI v2 tested end to end (plain, TLS, versioning, Object Lock, crash mid-backup): [docs/compatibility.md](docs/compatibility.md) |
 | Replication | Asynchronous one-way bucket replication to any S3 endpoint (another fs3, Garage, MinIO, B2, AWS) with a durable queue, backfill and a self-healing scrub |
-| Operations | Quotas, admin API (Unix socket), Prometheus metrics, JSON audit log, auth-failure throttling, seccomp, Synology SPK with DSM tile |
+| Events | Webhook notifications on object create/delete (S3 event JSON, HMAC-signed, durable queue with retries) |
+| Operations | Quotas, admin API (Unix socket), Prometheus metrics, JSON audit log, auth-failure throttling, seccomp, Synology SPK with DSM tile (settings, keys, replication, object browser) |
 
 Not implemented (all answer `501 NotImplemented`, never silently
 ignored): object tagging and tag-based lifecycle filters, lifecycle
 transitions, website routing rules, ACLs beyond stubs,
-`GetObjectAttributes`, SSE-S3/SSE-KMS, STS, the S3 replication API
-(`PutBucketReplication`; fs3 configures replication through its admin
-API instead, see [Bucket replication](#bucket-replication)), browser POST
-uploads.
+`GetObjectAttributes`, SSE-KMS (`aws:kms` gives `501`), STS, the S3
+replication and notification APIs (`PutBucketReplication`,
+`PutBucketNotificationConfiguration`; fs3 configures both through its
+admin API instead, see [Bucket replication](#bucket-replication) and
+[Event notifications](#event-notifications-webhooks)), browser POST uploads.
 
 ---
 
@@ -595,6 +597,37 @@ TLS listeners can run together.
 - SSE-C objects are never deduplicated, compressed or served on the
   website listener. The scrub verifies their ciphertext without the key.
 
+### SSE-S3
+
+Server-side encryption with keys fs3 manages, for data at rest on a disk
+or volume someone else may read (a pulled drive, a backup of the share).
+
+- Start fs3 with `--sse-key-file PATH`. The file holds one key per line,
+  `<id> <64 hex digits>` (ids `[A-Za-z0-9._-]{1,32}`, `#` comments, up to
+  64 keys); the **last** key encrypts new objects and every key can still
+  decrypt. It must be a regular file, mode 0600 or stricter, owned by root
+  or the service user, or fs3 refuses to start. Make one with
+  `printf 'k1 %s\n' "$(openssl rand -hex 32)" > sse.keys; chmod 600 sse.keys`.
+- Rotation: append a new key and send SIGHUP. A reload that removes or
+  changes an existing key is refused (objects sealed with it would become
+  unreadable) and the old ring stays.
+- Clients ask with `x-amz-server-side-encryption: AES256` on PUT,
+  CreateMultipartUpload and CopyObject, or the bucket encrypts by
+  default: `PutBucketEncryption` with an `AES256` rule
+  (`aws s3api put-bucket-encryption`). `aws:kms` answers `501`; asking
+  for SSE-S3 without a key file answers `400`.
+- Sealing is the SSE-C format (per-object HKDF key and salt, 64 KiB
+  AES-256-GCM segments), keyed from the ring; the object records only
+  the key id. GET, HEAD and ranges decrypt transparently and echo the
+  header. ETags stay the plaintext MD5, so clients that compare them
+  keep working.
+- Copies decrypt the source and re-encrypt by the destination's request
+  or bucket default. Replication sends plaintext over its (TLS)
+  connection; the target applies its own encryption. SSE-S3 objects are
+  not deduplicated or compressed; the scrub verifies their ciphertext.
+- Losing the key file loses the data. Back it up separately from the
+  data folder.
+
 ### Logs, audit log and throttling
 
 - **Server log:** stderr by default. `--log-file <file>` writes it to a
@@ -672,6 +705,10 @@ TLS listeners can run together.
 | `POST /v1/scrub`, `GET /v1/scrub` | start a scrub pass; progress and last result |
 | `GET/PUT/DELETE /v1/buckets/<b>/replication` | replication rule (the secret is never returned) |
 | `POST /v1/buckets/<b>/replication/sync`, `GET …/status` | backfill existing objects; queue, lag, counters, recent errors |
+| `GET/PUT/DELETE /v1/buckets/<b>/notification` | webhook rule (the secret is never returned) |
+| `GET /v1/buckets/<b>/notification/status`, `POST …/test` | queue, sent, dropped, last error; send an `s3:TestEvent` |
+| `GET /v1/buckets/<b>/objects?prefix=&after=&delimiter=/&max=&format=json\|tsv` | one page of a listing (up to 1000); `tsv` URI-encodes keys for shell clients |
+| `POST /v1/buckets/<b>/presign` `{"key":…,"method":"GET","host":…,"expires":N}` | presigned URL signed with a key of the bucket's owner (else an admin); audited |
 
 - **Prefer the Unix socket** (`--admin-socket PATH`). It is mode 0600 and
   the peer uid is checked with `SO_PEERCRED`; every local user and
@@ -761,6 +798,44 @@ curl --unix-socket /path/admin.sock http://x/v1/buckets/photos/replication/statu
   never remotely. Quotas, dedup and reflink are unaffected (replication
   reads logical bytes).
 
+### Event notifications (webhooks)
+
+A bucket can POST a JSON event to an HTTP endpoint whenever an object is
+created or removed, for indexing, thumbnails or alerting.
+
+```sh
+curl --unix-socket /path/admin.sock -X PUT http://x/v1/buckets/photos/notification \
+  -d '{"endpoint":"https://hooks.example.com/fs3","secret":"…",
+       "events":["s3:ObjectCreated:*","s3:ObjectRemoved:*"],"prefix":"incoming/","suffix":".jpg"}'
+curl --unix-socket /path/admin.sock http://x/v1/buckets/photos/notification/status
+curl --unix-socket /path/admin.sock -X POST http://x/v1/buckets/photos/notification/test
+```
+
+- **Rule:** one per bucket, stored in `buckets/<b>/notification.json`
+  (mode 0600). Events: `s3:ObjectCreated:{Put,Copy,CompleteMultipartUpload}`,
+  `s3:ObjectRemoved:{Delete,DeleteMarkerCreated}`,
+  `s3:LifecycleExpiration:{Delete,DeleteMarkerCreated}`, or `:*` per group
+  (default: created and removed). `prefix`/`suffix` filter keys.
+  `max_age_hours` (default 24) bounds retries.
+- **Endpoint policy:** https, verified against the system CAs plus
+  `--repl-ca-file`. Plain `http://` only to loopback/private addresses with
+  `"allow_plain_http": true`, and `"verify_tls": false` only for those.
+- **Body:** S3's event record format (`eventVersion` 2.1, `eventSource`
+  `fs3:s3`, `eventName`, bucket, URL-encoded key, size, eTag, versionId,
+  a per-bucket increasing `sequencer`). Headers: `X-Fs3-Event`,
+  `X-Fs3-Delivery: <bucket-id>-<seq>` (idempotency key), and with a
+  secret `X-Fs3-Signature: sha256=<hex HMAC-SHA256(secret, body)>`.
+- **Delivery:** at least once, in order per bucket. Events are appended
+  to `notify/<bucket-id>/queue` under the key's lock as part of the
+  change, fsynced in groups, and survive restarts and kill -9. 2xx
+  delivers; 5xx, 408, 429, 401/403/404/405 and network errors retry with
+  backoff (1 s doubling to 10 min); other 4xx and events older than
+  `max_age_hours` are dropped, logged and audited.
+- **Options:** `--notify on|off` (default on), `--notify-timeout N`
+  (default 10 s). Metrics: `fs3_notify_queue_depth{bucket}`,
+  `fs3_notify_events_total{bucket,result}`,
+  `fs3_notify_failed_attempts_total{bucket}`.
+
 ### Metrics and health
 
 `--metrics-port N` serves `/healthz` and Prometheus `/metrics` on
@@ -773,6 +848,7 @@ series:
 | capacity | `fs3_buckets_total`, `fs3_mpu_inflight`, `fs3_storage_used_bytes`, `fs3_storage_free_bytes`, `fs3_bucket_bytes`, `fs3_bucket_quota_bytes`, `fs3_quota_rejections_total` |
 | background | `fs3_lifecycle_{expired,aborted_mpu,runs}_total`, `fs3_scrub_{objects,bytes,unverifiable,corrupt,repaired}_total`, `fs3_scrub_last_success_timestamp` |
 | replication | `fs3_repl_queue_depth{bucket}`, `fs3_repl_lag_seconds{bucket}`, `fs3_repl_bytes_total{bucket}`, `fs3_repl_ops_total{bucket,op,result}`, `fs3_repl_errors_total{bucket}` |
+| notifications | `fs3_notify_queue_depth{bucket}`, `fs3_notify_events_total{bucket,result}`, `fs3_notify_failed_attempts_total{bucket}` |
 | storage efficiency | `fs3_reflink_clones_total`, `fs3_dedup_hits_total`, `fs3_dedup_pool_adds_total` |
 | keys | `fs3_keys_expiring_soon`, `fs3_keys_unused_90d` |
 
@@ -794,10 +870,12 @@ series:
 | storage efficiency | `--reflink`, `--dedup`, `--dedup-min-size`, `--dedup-verify`, `--fs-compress` |
 | scrub | `--scrub-interval-days`, `--scrub-now`, `--scrub-rate`, `--scrub-fail-reads` |
 | replication | `--repl-workers`, `--repl-rate`, `--repl-ca-file`, `--repl-part-size`, `--repl-timeout` |
+| notifications | `--notify on\|off`, `--notify-timeout` |
+| encryption | `--sse-key-file` |
 | operations | `--metrics-port`, `--admin-socket`, `--admin-token-file`, `--audit-log`, `--log-file`, `--log-max-size`, `--log-keep`, `--seccomp`, `--seccomp-list`, `--build-info` |
 
 Size options accept K/M/G suffixes. SIGHUP re-reads credentials, TLS
-certificates and the audit log file.
+certificates, the SSE-S3 key file and the audit log file.
 
 ---
 
@@ -823,7 +901,7 @@ runbook for a DS1515+, including a recorded run.
   `authenticate.cgi` and membership of the `administrators` group on every
   request; everyone else gets a 403 with nothing in it. It shows buckets
   (objects, size, quota usage), manages credentials and replication rules,
-  and edits the server settings.
+  browses buckets, and edits the server settings.
 - **Credentials:** add or replace keys, with an optional *User* field.
   Replacing a key's secret keeps its attributes (expiry, disabled,
   read-only). To rotate a key without losing access to your buckets, add
@@ -851,6 +929,17 @@ runbook for a DS1515+, including a recorded run.
   CA, put the CA certificate (PEM) at
   `/var/packages/fs3/var/repl-ca.pem`; it is passed as `--repl-ca-file`
   at the next start.
+- **Object browser:** click a bucket name to browse it: folders,
+  objects with size and date, *Download*, *Share* (a presigned link for 1
+  hour, 1 day or 7 days) and *Delete*, plus a multi-file upload with
+  progress. Uploads and downloads stream through the tile to fs3 on
+  127.0.0.1 (nothing is buffered, up to 5 GiB per file; DSM's web server
+  may cap uploads lower). The tile holds no S3 key: it asks the admin API
+  socket for short-lived presigned URLs signed with a key of the bucket's
+  owner (or the admin user), so bucket policies, Object Lock and
+  read-only keys still apply, and each one is logged. Share links use
+  *Public host for share links* (behind the DSM reverse proxy) or, when
+  fs3 listens on the LAN, this page's host and the S3 port.
 - **`fs3.conf`:** the keys, their types, defaults and the fs3 flags they
   map to are defined once, in `packaging/synology/lib/fs3-conf.sh`, which
   both the start script and the tile use. You can still edit the file
@@ -1040,16 +1129,16 @@ need `curl` and `openssl`.
 
 | kind | suites |
 |---|---|
-| C unit tests | `test_store`, `test_conn`, `test_sigv4`, `test_repl`, `test_checksum`, `test_objmeta`, `test_policy`, `test_json`, `test_ssec`, `test_sandbox`, `test_credfile`, `test_xml`, `test_xml_legacy` |
+| C unit tests | `test_store`, `test_conn`, `test_sigv4`, `test_repl`, `test_notify`, `test_ssekeys`, `test_checksum`, `test_objmeta`, `test_policy`, `test_json`, `test_ssec`, `test_sandbox`, `test_credfile`, `test_xml`, `test_xml_legacy` |
 | fuzzers (50,000 iterations each) | `test_xml_fuzz`, `test_chunk_fuzz`, `test_config_fuzz`, plus fuzz passes in the policy, JSON and credentials suites |
 | core e2e | `test_e2e`, `test_e2e_auth`, `test_e2e_mpu`, `test_e2e_parts`, `test_e2e_listing`, `test_e2e_metadata`, `test_e2e_phase9`–`12`, `test_e2e_subresources` |
 | access control | `test_e2e_isolation`, `test_e2e_policy`, `test_e2e_keys`, `test_e2e_presign`, `test_e2e_admin`, `test_e2e_audit` |
-| features | `test_e2e_checksum`, `test_e2e_versioning`, `test_e2e_objlock`, `test_e2e_immutable`, `test_e2e_lifecycle`, `test_e2e_cors`, `test_e2e_website`, `test_e2e_quota`, `test_e2e_scrub`, `test_e2e_ssec`, `test_e2e_tls`, `test_e2e_reflink` |
+| features | `test_e2e_checksum`, `test_e2e_versioning`, `test_e2e_objlock`, `test_e2e_immutable`, `test_e2e_lifecycle`, `test_e2e_cors`, `test_e2e_website`, `test_e2e_quota`, `test_e2e_scrub`, `test_e2e_ssec`, `test_e2e_sse_s3`, `test_e2e_tls`, `test_e2e_reflink`, `test_e2e_notify` (webhooks: format, filters, HMAC, retries, kill -9) |
 | logging | `test_log` (rotation, concurrency, failure handling), `test_e2e_logs` |
 | replication | `test_repl` (journal records and rule parser, plus a 50,000-iteration fuzz), `test_sigv4` (outbound signer against the botocore vector), `test_e2e_s3client` (outbound client, plain and TLS), `test_e2e_repl` (two fs3 instances: arrival, coalescing, outage, backfill, permanent and rule-level errors, crash recovery, SSE-C, https, self-healing scrub) |
 | keep-alive | `test_e2e_keepalive` (a request sent while a large response is still going out, pipelining, split requests, an early error mid-body) |
 | backup tools (`make compat`, not in `make test`) | `tests/compat/`: restic, rclone, Kopia, Duplicati, AWS CLI v2 × plain / TLS / versioning / Object Lock / crash; see [docs/compatibility.md](docs/compatibility.md) |
-| tools and packaging | `test_e2e_dedup_estimate`, `test_ui_cgi` (DSM tile: sign-in gate, credentials, settings), `test_spk_scripts` (start script, conf → flags, watchdog) |
+| tools and packaging | `test_e2e_dedup_estimate`, `test_ui_cgi` (DSM tile: sign-in gate, credentials, settings, object browser), `test_spk_scripts` (start script, conf → flags, watchdog) |
 
 All suites run under both the release and the ASan/UBSan builds. The
 e2e suites use real clients (botocore, boto3, the AWS CLI, curl) as the
@@ -1076,6 +1165,8 @@ src/
   cors.c website.c lifecycle.c objlock.c scrub.c ssec.c
   admin.c         /v1 admin API
   repl.c          bucket replication: journal, workers, backfill, self-healing
+  notify.c        bucket event notifications (webhooks): journal, delivery, admin endpoints
+  ssekeys.c       SSE-S3 key ring (key file, rotation, object marker)
   s3client.c      outbound S3 client (HTTP/1.1, optional TLS, SigV4 signing)
   audit.c         audit log, auth-failure throttling
   metrics.c       Prometheus metrics
@@ -1104,8 +1195,8 @@ Done: the gap-closure plan (versioning, Object Lock, policies, TLS,
 presign, CORS, lifecycle, website, admin API, audit) and round 2 (part
 records, ListParts, UploadPartCopy, metadata, quotas, scrub, key
 hygiene, seccomp, reflink, dedup, compression, SSE-C, immutable locks),
-log rotation and bucket replication (with backfill and a self-healing
-scrub).
+log rotation, bucket replication (with backfill and a self-healing
+scrub), SSE-S3, webhooks and the tile's object browser.
 
 Next:
 
@@ -1126,6 +1217,14 @@ Next:
 - **Replication on hardware:** a DS1515+ run replicating to B2 or a second
   box, which also confirms the DSM CA bundle path
   (`docs/AGENT-REPLICATION-DS1515-TEST.md`).
+- **Baseline benchmarks before any performance work:** a warp run on
+  the DS1515+ recording throughput, latency and the bottleneck per
+  workload (`docs/AGENT-BENCHMARK-WARP-DS1515.md`); later changes are
+  compared against it with `warp cmp`.
+- **SSE-S3, webhooks and the object browser on hardware:** a DS1515+
+  run measuring encryption cost, webhook delivery under seccomp, and how
+  large an upload DSM's web server passes to the tile
+  (`docs/AGENT-SSE-EVENTS-BROWSER-DS1515-TEST.md`).
 - **Backup-tool matrix, GUI part:** recorded Hyper Backup and Veeam runs
   (`docs/AGENT-COMPAT-HYPERBACKUP-VEEAM.md`). The scripted part is done:
   `make compat`, results in `docs/compatibility.md`.
@@ -1137,4 +1236,4 @@ Next:
 
 Out of scope by design: multi-node clustering and two-way replication,
 content-addressed chunk
-storage, SSE-S3/KMS, STS, object tagging.
+storage, SSE-KMS, STS, object tagging.

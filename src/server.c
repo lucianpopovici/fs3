@@ -16,6 +16,7 @@
 #include "lifecycle.h"
 #include "scrub.h"
 #include "repl.h"
+#include "notify.h"
 #include "sandbox.h"
 #include "lockc.h"
 #include "sigv4.h"
@@ -69,6 +70,7 @@ struct server {
     int           lc_running;        /* a sweep job is in flight */
     scrub_t      *scrub;             /* integrity scrub (item 3) */
     repl_t       *repl;              /* bucket replication */
+    notify_t     *notify;            /* event notifications */
     int           lc_last_yday;      /* day of year of the last scheduled run */
     int           lc_pending_now;    /* run at the first tick (--lifecycle-now) */
     time_t        clock_wall_last;   /* clock-jump detection (item 10.6) */
@@ -252,7 +254,13 @@ static void admin_serve_fd(server_t *s, int fd, int via_uds) {
         size_t rn = 0;
         char *resp = s->admin ? admin_handle_v1(s->admin, req, (size_t)r, via_uds, &rn) : NULL;
         if (resp) {
-            (void)!write(fd, resp, rn);
+            /* Object listings can exceed one socket buffer. */
+            for (size_t off = 0; off < rn; ) {
+                ssize_t w = write(fd, resp + off, rn - off);
+                if (w < 0 && errno == EINTR) continue;
+                if (w <= 0) break;
+                off += (size_t)w;
+            }
             free(resp);
         }
         return;
@@ -292,6 +300,10 @@ static void admin_serve_fd(server_t *s, int fd, int via_uds) {
         if (blen >= 0) {
             int rn = repl_metrics(s->repl, body + blen, sizeof(body) - (size_t)blen);
             blen = rn < 0 ? -1 : blen + rn;
+        }
+        if (blen >= 0) {
+            int nn = notify_metrics(s->notify, body + blen, sizeof(body) - (size_t)blen);
+            blen = nn < 0 ? -1 : blen + nn;
         }
         if (blen >= 0) {
             int kn = render_key_metrics(s->cfg.auth, body + blen, sizeof(body) - (size_t)blen);
@@ -470,12 +482,21 @@ server_t *server_create(const server_cfg_t *cfg) {
         if (!s->repl) goto fail;
         scrub_set_repair(s->scrub, repl_scrub_repair, s->repl);
     }
+    {
+        notify_cfg_t nc = {
+            .store = s->store, .root = cfg->data_root, .enabled = cfg->notify_enabled,
+            .ca_file = cfg->repl_ca_file, .timeout_s = cfg->notify_timeout_s,
+        };
+        s->notify = notify_create(&nc);
+        if (!s->notify) goto fail;
+    }
 
     /* Admin API (item 11). */
     {
         admin_cfg_t ac = {
             .scrub = s->scrub,
             .repl = s->repl,
+            .notify = s->notify,
             .auth = cfg->auth,
             .key_max_age_days = cfg->key_max_age_days,
             .store = s->store, .token = cfg->admin_token,
@@ -607,6 +628,10 @@ server_t *server_create(const server_cfg_t *cfg) {
         LOG_E("replication: cannot start worker threads");
         goto fail;
     }
+    if (notify_start(s->notify) < 0) {
+        LOG_E("notify: cannot start threads");
+        goto fail;
+    }
     return s;
 
 fail:
@@ -634,6 +659,7 @@ void server_destroy(server_t *s) {
     scrub_destroy(s->scrub);
     /* After the pool: its last commits still feed the journal. */
     repl_destroy(s->repl);
+    notify_destroy(s->notify);
     if (s->listen_fd >= 0) close(s->listen_fd);
     if (s->web_fd >= 0) close(s->web_fd);
     if (s->tls_fd >= 0) close(s->tls_fd);
@@ -897,6 +923,7 @@ int server_run(server_t *s) {
         lc_maybe_start(s, now);
         scrub_tick(s->scrub, now);
         repl_tick(s->repl, now);
+        notify_tick(s->notify, now);
 
         /* Retention trusts the wall clock: warn if it jumps backwards by
          * more than an hour relative to the monotonic clock. */

@@ -105,6 +105,7 @@ void conn_destroy(conn_t *c) {
     if (c->job) c->job->conn = NULL;
     OPENSSL_cleanse(c->ssec_key, sizeof(c->ssec_key));
     OPENSSL_cleanse(c->ssec_src_key, sizeof(c->ssec_src_key));
+    OPENSSL_cleanse(c->sse_s3_key, sizeof(c->sse_s3_key));
     /* Release any handler-owned state (request was abandoned mid-flight). */
     if (c->put_writer) store_put_abort(c->put_writer);
     if (c->get_reader) store_get_close(c->get_reader);
@@ -233,7 +234,9 @@ static void request_reset(conn_t *c) {
     c->deny_reason = NULL;
     OPENSSL_cleanse(c->ssec_key, sizeof(c->ssec_key));
     OPENSSL_cleanse(c->ssec_src_key, sizeof(c->ssec_src_key));
+    OPENSSL_cleanse(c->sse_s3_key, sizeof(c->sse_s3_key));
     c->ssec_on = c->ssec_src_on = 0;
+    c->sse_s3_on = c->sse_src_s3 = 0;
 
     /* Belt-and-suspenders: by the time we reset, route_dispatch_complete
      * (PUT path) or route_dispatch_send_body (GET path) should have

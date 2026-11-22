@@ -291,7 +291,8 @@ int objmeta_copy_filter(const uint8_t *t, size_t n, uint8_t **out, size_t *out_n
         unsigned type = get16(t + o);
         uint32_t len = get32(t + o + 2);
         int drop = type == S3_TLV_CONTENT_SHA256 || type == S3_TLV_PART_TABLE
-                || type == S3_TLV_SSEC || type == S3_TLV_ZSTD_SEEK;
+                || type == S3_TLV_SSEC || type == S3_TLV_ZSTD_SEEK
+                || type == S3_TLV_SSE_S3;
         if (!drop) put(&b, t + o, 6 + len);
         o += 6 + len;
     }

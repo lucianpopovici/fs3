@@ -154,6 +154,10 @@ typedef struct conn {
     /* SSE-C keys for this request only (item 8): cleansed at request end. */
     int                ssec_on, ssec_src_on;
     uint8_t            ssec_key[32], ssec_src_key[32];
+    /* SSE-S3 (ssekeys.h): the destination is sealed with an fs3 key. */
+    int                sse_s3_on, sse_src_s3;
+    uint8_t            sse_s3_key[32];
+    char               sse_s3_id[33];
     char               ssec_md5[32];      /* base64 key MD5, echoed */      /* s3_err_t of the error response, for the audit log */
 
     /* Read buffer: bytes are fed to llhttp via llhttp_execute() */

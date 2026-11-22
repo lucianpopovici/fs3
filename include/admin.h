@@ -17,6 +17,9 @@
  *   GET|PUT|DELETE /v1/buckets/<b>/replication   rule (secret never returned)
  *   POST   /v1/buckets/<b>/replication/sync      backfill existing objects
  *   GET    /v1/buckets/<b>/replication/status    queue, lag, errors
+ *   GET|PUT|DELETE /v1/buckets/<b>/notification  webhook rule (secret never returned)
+ *   GET    /v1/buckets/<b>/notification/status   queue, sent, dropped, errors
+ *   POST   /v1/buckets/<b>/notification/test     queue an s3:TestEvent
  *
  * TCP requests need "Authorization: Bearer <token>" (--admin-token-file,
  * compared in constant time, failures back off exponentially), a
@@ -35,6 +38,7 @@
 struct s3_store;
 struct scrub;
 struct repl;
+struct notify;
 struct sigv4_verifier;
 
 typedef struct {
@@ -45,6 +49,7 @@ typedef struct {
     void            *reload_user;
     struct scrub    *scrub;        /* POST/GET /v1/scrub (item 3) */
     struct repl     *repl;         /* /v1/buckets/<b>/replication */
+    struct notify   *notify;       /* /v1/buckets/<b>/notification */
     const struct sigv4_verifier *auth;   /* live keys: last-used times (item 4) */
     int              key_max_age_days;   /* default expiry of new keys, 0 = none */
 } admin_cfg_t;

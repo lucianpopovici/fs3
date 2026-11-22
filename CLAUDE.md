@@ -60,14 +60,17 @@ The module list is in README, "Source layout". Feature → code → tests:
 | admin API | `src/admin.c` | `test_e2e_admin.sh` |
 | audit log, throttling | `src/audit.c` | `test_e2e_audit.sh` |
 | logging, rotated log files | `src/log.c` (`log_msg`, `logfile_t`: one `write()` per line, size rotation, SIGHUP reopen) | `test_log`, `test_e2e_logs.sh` |
-| replication | `src/repl.c` (journal, workers, admin endpoints, backfill, `repl_scrub_repair`); store hook `store_set_change_hook`; `store_repair_object` | `test_repl`, `test_e2e_repl.sh` |
+| replication | `src/repl.c` (journal, workers, admin endpoints, backfill, `repl_scrub_repair`); store hook `store_add_change_hook`; `store_repair_object` | `test_repl`, `test_e2e_repl.sh` |
+| event notifications (webhooks) | `src/notify.c` (rule parser, per-bucket journal under `notify/<id>/`, delivery worker, group fsync, admin endpoints); events come from the same change hook (`store_change_t`, origin set per writer with `store_put_set_origin`); POSTs via `s3c_post_raw` | `test_notify`, `test_e2e_notify.sh` |
+| SSE-S3 | `src/ssekeys.c` (key file, rotation, `S3_TLV_SSE_S3` marker); `req_sse_s3`, `bucket_default_sse` and friends in `src/route.c`; sealing is the SSE-C writer/reader transform | `test_ssekeys`, `test_e2e_sse_s3.sh` |
+| object browser (admin side) | `objects_route`, `presign_route` in `src/admin.c`; `sigv4_presign` in `src/sigv4.c` | `test_e2e_admin.sh`, `test_ui_cgi.sh` |
 | outbound S3 client, SigV4 signing | `src/s3client.c`; `sigv4_sign` / `req_view_t` in `src/sigv4.c` (shared canonicalisation with the verifier) | `test_sigv4`, `test_e2e_s3client.sh` (driver `tests/s3c_cli.c`) |
 | keep-alive, pipelining | `conn_on_readable` / `conn_on_writable` in `src/conn.c` (bytes arriving while a response is written are buffered, not parsed: `parked_paused`) | `test_e2e_keepalive.sh` |
 | backup-tool compatibility | `tests/compat/` (one script per tool, shared `lib.sh`; `make compat`, not part of `make test`) | results in `docs/compatibility.md` |
 | seccomp | `src/sandbox.c` (`ALLOW[]`), `tests/tools/seccomp_profile.sh` | `test_sandbox`, every e2e suite (a SIGSYS is reported) |
 | credentials file | `parse_and_add_cred`, `load_credentials_file` in `src/main.c` | `test_credfile` (seam: `FS3_MAIN_TESTING`) |
 | dedup estimator | `src/dedup_estimate.c` (standalone; mirrors the header format, keep in sync) | `test_e2e_dedup_estimate.sh` |
-| Synology package and tile | `packaging/synology/`; conf schema in `lib/fs3-conf.sh` (shared by `scripts/start-stop-status` and `ui/index.cgi`) | `test_ui_cgi.sh`, `test_spk_scripts.sh` |
+| Synology package and tile | `packaging/synology/`; conf schema in `lib/fs3-conf.sh` (shared by `scripts/start-stop-status` and `ui/index.cgi`); the tile's object browser (`browse_page`, `handle_upload`, `handle_download`, `share_page`) | `test_ui_cgi.sh`, `test_spk_scripts.sh` |
 
 ## Rules the code depends on
 
@@ -95,9 +98,9 @@ Don't quietly undo these.
   - `q_mu` (quota counters) and `cfg_mu` (sidecar cache) are leaves: take
     nothing while holding them.
   - Never hold a lock across fsync of object data.
-- The store's change hook (replication) runs under the key's stripe
-  lock: it appends one journal record with `write()` and takes only the
-  replication mutex, a leaf. Nothing in it may take a store lock (it
+- The store's change hooks (up to 4 listeners: replication and
+  notifications) run under the key's stripe lock. Each appends one
+  journal record with `write()` and takes only its own mutex, a leaf. Nothing in it may take a store lock (it
   reads the bucket meta file, which needs none) or do network I/O. Any new path that changes a key's current state
   must call `notify_change()` before releasing the stripe.
 - **Committed object files are never modified in place.** Writes go
@@ -115,10 +118,10 @@ Don't quietly undo these.
   (`sigv4_swap_creds`). Identities are copied out at verify time
   (`sigv4_verify_id`), so a reload during a request can't free them.
 - The seccomp filter is installed at the end of startup, and the worker
-  pool and the replication threads are created *after* it (end of
+  pool, the replication threads and the notification threads are created *after* it (end of
   `server_create`) so they inherit it. Keep that order.
-- Shutdown destroys replication after the iopool (its last commits still
-  feed the journal) and before `store_close`.
+- Shutdown destroys replication and notifications after the iopool (its
+  last commits still feed their journals) and before `store_close`.
 
 **Request handling**
 - `s3_str_t` (`p`, `n`) is the string type everywhere; helpers are in
@@ -209,8 +212,11 @@ the package folder. Extend `tests/test_spk_scripts.sh`.
 
 **The DSM tile** (`ui/index.cgi`) gates every request on DSM sign-in plus
 the `administrators` group before anything else runs. Keep new output
-and actions behind that gate, behind the CSRF token for POSTs, and use
-fixed message codes (never reflect input).
+and actions behind that gate, behind the CSRF token for POSTs (the
+upload POST carries it in `X-Fs3-Token`), and use fixed message codes
+(never reflect input). The object browser holds no S3 key: it gets
+presigned URLs from the admin socket and keeps keys URI-encoded
+throughout (`valid_enc`), decoding only for display (`enc_html`).
 
 ## Gotchas
 
@@ -242,7 +248,8 @@ fixed message codes (never reflect input).
   UploadPartCopy, metadata, ListObjectsV2, quotas, scrub, key hygiene,
   seccomp, reflink, dedup, compression, SSE-C, layout 2 and fs3-lockd.
 - **Since:** log rotation, the TLS build in the SPK, bucket replication
-  (outbound S3 client, journal, backfill, self-healing scrub). Plan and
+  (outbound S3 client, journal, backfill, self-healing scrub), the
+  backup-tool matrix, SSE-S3, webhooks and the tile's object browser. Plan and
   deviations: `docs/plan-logs-replication-compat.md`.
 
 The design plans for the last two rounds lived outside the repo. The

@@ -25,6 +25,7 @@ FS3_PORT|port|9000|net|S3 port|Port of the S3 endpoint. Point the DSM reverse-pr
 FS3_BIND|enum:127.0.0.1/0.0.0.0|127.0.0.1|net|Listen address|127.0.0.1: reachable only through the DSM reverse proxy, which adds HTTPS (recommended). 0.0.0.0: plain HTTP on the LAN; credentials and data travel unencrypted.
 FS3_TRUSTED_PROXY|iplist|127.0.0.1|net|Trusted proxies|Proxies whose X-Forwarded-For/-Proto headers fs3 believes, comma-separated. Keep 127.0.0.1 behind the DSM reverse proxy, or throttling and IP conditions in bucket policies see every client as the NAS itself.
 FS3_METRICS_PORT|port0|9101|net|Admin listener port|Local-only /healthz and Prometheus /metrics (127.0.0.1). This page reads bucket statistics from it. 0 disables it.
+FS3_PUBLIC_HOST|host||net|Public host for share links|Host name clients use to reach fs3 through the DSM reverse proxy (https on 443). The object browser signs share links for it; empty: links use this page's host and the S3 port, and only when fs3 listens on the LAN. Not passed to fs3.
 FS3_ADMIN|user||access|Admin user|fs3 user who can see and manage every bucket. Empty: none.
 FS3_LEGACY_OWNER|user||access|Owner of older buckets|Receives buckets created before per-user isolation or with authentication off. Empty: the first user in the credentials list.
 FS3_AUTH_FAIL_LIMIT|int:0:100000|20|access|Failed sign-ins before throttling|Per client address and minute; that address then gets 503 SlowDown for a growing period. 0 disables throttling.
@@ -61,6 +62,7 @@ FS3_WEB_ROOT_DOMAIN|host||web|Website root domain|Sites at <bucket>.<domain>. Em
 FS3_REPL_WORKERS|int:0:16|2|repl|Replication threads|Buckets with a replication rule are copied to their target by this many threads. 0 turns replication off (rules are kept but nothing is sent).
 FS3_REPL_RATE|size|20M|repl|Replication upload rate (per second)|Shared by all buckets. 0 = unthrottled.
 FS3_REPL_TIMEOUT|int:1:3600|30|repl|Replication timeout (seconds)|Per network operation; a slower target counts as unreachable and is retried with backoff.
+FS3_SSE_S3|bool|0|storage|Server-side encryption keys (SSE-S3)|Creates sse.keys in the package folder on the next start. Objects are then encrypted on disk when a client asks for it (x-amz-server-side-encryption: AES256) or the bucket has default encryption. BACK UP sse.keys apart from the data: without it, encrypted objects cannot be read. Turning this off later keeps using the existing file.
 FS3_AUDIT_LOG|bool|0|ops|Audit log|One JSON line per request and admin change in audit.jsonl in the package folder. Rotated like the server log.
 FS3_LOG_MAX_SIZE|size|10M|ops|Rotate logs at|fs3.log and audit.jsonl are rotated when they reach this size (K, M, G suffixes). 0 never rotates.
 FS3_LOG_KEEP|int:1:50|5|ops|Rotated logs kept|fs3.log.1 … fs3.log.N (and the same for the audit log).

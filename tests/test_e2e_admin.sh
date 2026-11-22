@@ -123,6 +123,37 @@ check_eq "UDS list keys without token" \
     "$(curl -sS --unix-socket "$SOCK" http://x/v1/keys | python3 -c 'import sys,json; print(len(json.load(sys.stdin)["keys"]))')" "1"
 check_eq "UDS serves only /v1" "$(curl -sS -o /dev/null -w '%{http_code}' --unix-socket "$SOCK" http://x/metrics)" "404"
 
+# Object listing and presigned URLs (the DSM tile's object browser).
+uds() { curl -sS --unix-socket "$SOCK" "$@"; }
+ucode() { curl -sS -o /dev/null -w '%{http_code}' --unix-socket "$SOCK" "$@"; }
+check_eq "browser bucket" "$(s3 "$URL" "$AK" "$SK" mk brws)" "ok"
+pre() { uds -X POST --data "$1" http://x/v1/buckets/brws/presign; }
+pcode() { ucode -X POST --data "$1" http://x/v1/buckets/brws/presign; }
+H="127.0.0.1:$PORT"
+u=$(pre '{"key":"d/k 1.txt","method":"PUT","host":"'$H'"}' | python3 -c 'import sys,json; print(json.load(sys.stdin)["url"])')
+check_eq "presigned PUT works" "$(printf 'abc' | curl -s -o /dev/null -w '%{http_code}' -X PUT --data-binary @- "$u")" "200"
+u=$(pre '{"key_enc":"d/k%201.txt","host":"'$H'"}' | python3 -c 'import sys,json; print(json.load(sys.stdin)["url"])')
+check_eq "presigned GET via key_enc" "$(curl -s "$u")" "abc"
+check_eq "listing (json)" "$(uds "http://x/v1/buckets/brws/objects" | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d["prefixes"], d["truncated"])')" "['d/'] False"
+check_eq "listing (tsv, encoded)" "$(uds "http://x/v1/buckets/brws/objects?prefix=d/&format=tsv" | cut -f1,2,5 | tr '\t\n' ' ')" "T 0 O 3 d/k%201.txt "
+check_eq "listing: bad max" "$(ucode "http://x/v1/buckets/brws/objects?max=0")" "400"
+check_eq "listing: bad delimiter" "$(ucode "http://x/v1/buckets/brws/objects?delimiter=x")" "400"
+check_eq "listing: bad escape" "$(ucode "http://x/v1/buckets/brws/objects?prefix=%zz")" "400"
+check_eq "listing: unknown bucket" "$(ucode "http://x/v1/buckets/nope/objects")" "404"
+check_eq "listing: POST refused" "$(ucode -X POST "http://x/v1/buckets/brws/objects")" "405"
+check_eq "presign: bad host" "$(pcode '{"key":"a","host":"h/x"}')" "400"
+check_eq "presign: no host" "$(pcode '{"key":"a"}')" "400"
+check_eq "presign: bad method" "$(pcode '{"key":"a","host":"'$H'","method":"POST"}')" "400"
+check_eq "presign: bad scheme" "$(pcode '{"key":"a","host":"'$H'","scheme":"ftp"}')" "400"
+check_eq "presign: bad key_enc" "$(pcode '{"key_enc":"a%2","host":"'$H'"}')" "400"
+check_eq "presign: key_enc with raw space" "$(pcode '{"key_enc":"a b","host":"'$H'"}')" "400"
+check_eq "presign: over --presign-max-expires" "$(pcode '{"key":"a","host":"'$H'","expires":604800}')" "400"
+check_eq "presign: GET via admin" "$(ucode -X GET http://x/v1/buckets/brws/presign)" "405"
+uds -X PUT --data '{"owner":"ghost"}' http://x/v1/buckets/brws/owner >/dev/null
+check_eq "presign: owner has no key and there is no admin → 409" \
+    "$(pcode '{"key":"a","host":"'$H'"}')" "409"
+check_eq "presign audited" "$(grep -c 'admin: presign PUT bucket brws key d/k%201.txt' "$LOG" || true)" "1"
+
 echo
 echo "===== admin e2e: $PASS passed, $FAIL failed ====="
 [ "$FAIL" -eq 0 ]

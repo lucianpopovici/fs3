@@ -1643,6 +1643,75 @@ int sigv4_sign(const sigv4_sign_req_t *r, const char *access_key, const char *se
 }
 
 
+/* ---- Presigned URLs minted by the server (admin API) ---------------- */
+
+static int cred_usable(const sigv4_verifier_t *v, const cred_t *cr, int need_write,
+                       int64_t now, int64_t expires) {
+    if (cr->attrs.disabled) return 0;
+    if (cr->attrs.expires && now + expires > cr->attrs.expires) return 0;
+    if (need_write && cr->attrs.read_only) return 0;
+    if (is_admin(v, cr->user) && v->no_presign_admin) return 0;
+    return 1;
+}
+
+int sigv4_presign(const sigv4_verifier_t *v, const sigv4_presign_req_t *r,
+                  char *query_out, size_t cap, char *ak_out, size_t akcap) {
+    if (!v || !r || !r->method || !r->host || !r->path || r->expires < 1) return SIGV4_PRESIGN_BAD;
+    int64_t max = v->presign_max_expires > 0 ? v->presign_max_expires : 604800;
+    if (r->expires > max) return SIGV4_PRESIGN_TOO_LONG;
+    int64_t now = v->fixed_now ? v->fixed_now : (int64_t)time(NULL);
+    const cred_t *pick = NULL;
+    if (r->user && *r->user)
+        for (const cred_t *cr = v->creds; cr && !pick; cr = cr->next)
+            if (!strcmp(cr->user, r->user) && cred_usable(v, cr, r->need_write, now, r->expires)) pick = cr;
+    if (!pick && r->allow_admin)
+        for (const cred_t *cr = v->creds; cr && !pick; cr = cr->next)
+            if (is_admin(v, cr->user) && cred_usable(v, cr, r->need_write, now, r->expires)) pick = cr;
+    if (!pick) return SIGV4_PRESIGN_NO_KEY;
+
+    char amz_date[17], scope[128];
+    time_t t = (time_t)now;
+    struct tm tm;
+    gmtime_r(&t, &tm);
+    strftime(amz_date, sizeof(amz_date), "%Y%m%dT%H%M%SZ", &tm);
+    int sn = snprintf(scope, sizeof(scope), "%.8s/us-east-1/s3/aws4_request", amz_date);
+    char q[1024];
+    int qn = snprintf(q, sizeof(q),
+        "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=%s%%2F%.8s%%2Fus-east-1%%2Fs3%%2Faws4_request"
+        "&X-Amz-Date=%s&X-Amz-Expires=%lld&X-Amz-SignedHeaders=host",
+        pick->access_key, amz_date, amz_date, (long long)r->expires);
+    if (qn < 0 || (size_t)qn >= sizeof(q) || sn < 0 || (size_t)sn >= sizeof(scope)) return SIGV4_PRESIGN_BAD;
+    conn_header_t h = { { "host", 4 }, { r->host, strlen(r->host) } };
+    req_view_t rv = { { r->method, strlen(r->method) }, { r->path, strlen(r->path) },
+                      { q, (size_t)qn }, &h, 1 };
+    char *cr_buf = malloc(CR_BUF_SZ);
+    if (!cr_buf) return SIGV4_PRESIGN_BAD;
+    int cr_n = build_canonical_request(&rv, (s3_str_t){ "host", 4 }, (s3_str_t){ "UNSIGNED-PAYLOAD", 16 },
+                                       "X-Amz-Signature", cr_buf, CR_BUF_SZ);
+    if (cr_n < 0) { free(cr_buf); return SIGV4_PRESIGN_BAD; }
+    uint8_t cr_hash[32];
+    sha256(cr_buf, (size_t)cr_n, cr_hash);
+    free(cr_buf);
+    char sts[STS_BUF_SZ];
+    int sts_n = build_string_to_sign((s3_str_t){ amz_date, 16 }, (s3_str_t){ scope, (size_t)sn },
+                                     cr_hash, sts, sizeof(sts));
+    if (sts_n < 0) return SIGV4_PRESIGN_BAD;
+    uint8_t k_signing[32], mac[32];
+    derive_signing_key(pick->secret_key, pick->secret_len, (s3_str_t){ amz_date, 8 },
+                       (s3_str_t){ "us-east-1", 9 }, (s3_str_t){ "s3", 2 }, k_signing);
+    hmac_sha256(k_signing, 32, sts, (size_t)sts_n, mac);
+    OPENSSL_cleanse(k_signing, sizeof(k_signing));
+    char sig[65];
+    hex_encode(mac, 32, sig);
+    sig[64] = 0;
+    OPENSSL_cleanse(mac, sizeof(mac));
+    int n = snprintf(query_out, cap, "%s&X-Amz-Signature=%s", q, sig);
+    if (n < 0 || (size_t)n >= cap) return SIGV4_PRESIGN_BAD;
+    if (ak_out) snprintf(ak_out, akcap, "%s", pick->access_key);
+    return 0;
+}
+
+
 /* ===================================================================== */
 /* Test hooks (only enabled when SIGV4_TESTING is defined)                */
 /* ===================================================================== */

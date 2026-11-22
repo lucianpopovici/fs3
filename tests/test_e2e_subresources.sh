@@ -75,13 +75,19 @@ body_is_original "POST ?restore"
 
 # Bucket level: DELETE ?cors must not delete the bucket; PUT ?versioning
 # must not try to create it.
-for sub in tagging encryption \
+for sub in tagging \
            replication publicAccessBlock; do
     check_eq "bucket DELETE ?$sub → 501" "$(code -X DELETE "$URL/subb?$sub")" "501"
     check_eq "bucket PUT ?$sub → 501" \
         "$(code -X PUT --data-binary '<x/>' "$URL/subb?$sub")" "501"
     check_eq "bucket GET ?$sub → 501" "$(code "$URL/subb?$sub")" "501"
 done
+# ?encryption (bucket default encryption, SSE-S3) is implemented: no
+# configuration yet → 404; a malformed one → 400; DELETE is idempotent.
+check_eq "bucket GET ?encryption (none) → 404" "$(code "$URL/subb?encryption")" "404"
+check_eq "bucket PUT ?encryption malformed → 400" \
+    "$(code -X PUT --data-binary '<x/>' "$URL/subb?encryption")" "400"
+check_eq "bucket DELETE ?encryption → 204" "$(code -X DELETE "$URL/subb?encryption")" "204"
 check_eq "bucket PUT ?versioning malformed → 400" "$(code -X PUT --data-binary '<x/>' "$URL/subb?versioning")" "400"
 check_eq "bucket survives" "$(code -I "$URL/subb")" "200"
 body_is_original "bucket-level probes"

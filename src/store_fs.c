@@ -41,6 +41,7 @@
 #include "store.h"
 #include "checksum.h"
 #include "ssec.h"
+#include "ssekeys.h"
 #include "log.h"
 
 #include <dirent.h>
@@ -165,8 +166,7 @@ struct s3_store {
     char    *locks_dir;      /* ROOT/locks — object lock sidecars (item 10) */
     store_version_guard_fn vguard;   /* object-lock veto (item 10) */
     void    *vguard_user;
-    store_change_fn change_fn;      /* replication journal (repl.c) */
-    void    *change_user;
+    struct { store_change_fn fn; void *user; } change[4];   /* repl.c, notify.c */
     uint64_t min_free_bytes; /* 0 = no quota check */
     /* Namespace lock. Commits run on iopool worker threads while the
      * event loop keeps serving other requests, so the short steps that
@@ -216,8 +216,17 @@ struct s3_store {
     size_t           cfg_count;
 };
 
-static void notify_change(s3_store_t *s, s3_str_t bucket, s3_str_t key, int op, uint64_t mtime_ms) {
-    if (s->change_fn) s->change_fn(s->change_user, bucket, key, op, mtime_ms);
+static void notify_change(s3_store_t *s, const store_change_t *ev) {
+    for (int i = 0; i < 4; i++)
+        if (s->change[i].fn) s->change[i].fn(s->change[i].user, ev);
+}
+
+static void ev_vid_hex(const uint8_t v[16], char out[33]) {
+    static const char H[] = "0123456789abcdef";
+    static const uint8_t zero[16];
+    if (!memcmp(v, zero, 16)) { out[0] = 0; return; }
+    for (int i = 0; i < 16; i++) { out[2 * i] = H[v[i] >> 4]; out[2 * i + 1] = H[v[i] & 15]; }
+    out[32] = 0;
 }
 
 static uint64_t now_ms_wall(void) {
@@ -1565,6 +1574,8 @@ struct s3_writer {
     uint32_t    ssec_part;
     uint64_t    ssec_idx;
     uint8_t    *ssec_buf;           /* SSEC_SEG plaintext + SSEC_TAG */
+    int         md5_plain;          /* SSE-S3: the ETag is the plaintext MD5, as on AWS */
+    int         origin;             /* STORE_ORIGIN_* for change listeners */
     size_t      ssec_len;
     uint64_t    stored_written;     /* on-disk payload bytes */
 
@@ -1673,6 +1684,8 @@ s3_err_t store_put_begin_opts(s3_store_t *s, s3_str_t bucket, s3_str_t key,
         s3_err_t se = ssec_info_new(opts->ssec_key, &ssec_si) < 0 ? S3_ERR_INTERNAL
                     : writer_ssec_on(w, opts->ssec_key, &ssec_si, 0);
         if (se != S3_OK) { writer_free(w); return se; }
+        char sid[SSEKEYS_ID_MAX + 1];
+        w->md5_plain = ssekeys_tlv_find(opts->tlv, opts->tlv_len, sid) == 1;
     }
     /* Quota: room for one more object before any byte is written. */
     if (q_reserve(s, (snprintf(w->q_bucket, sizeof(w->q_bucket), S3_STR_FMT,
@@ -1790,7 +1803,7 @@ s3_err_t store_put_begin_opts(s3_store_t *s, s3_str_t bucket, s3_str_t key,
 
 /* On-disk payload bytes: written, and hashed for the ETag and payload CRC. */
 static s3_err_t writer_emit(s3_writer_t *w, const void *buf, size_t n) {
-    if (EVP_DigestUpdate(w->md5_ctx, buf, n) != 1) return S3_ERR_INTERNAL;
+    if (!w->md5_plain && EVP_DigestUpdate(w->md5_ctx, buf, n) != 1) return S3_ERR_INTERNAL;
     if (w->pcrc.algo) cksum_update(&w->pcrc, buf, n);
     const char *p = buf;
     size_t left = n;
@@ -1822,6 +1835,7 @@ static s3_err_t writer_feed(s3_writer_t *w, const void *buf, size_t n) {
         if (e == S3_OK) w->data_written += n;
         return e;
     }
+    if (w->md5_plain && EVP_DigestUpdate(w->md5_ctx, buf, n) != 1) return S3_ERR_INTERNAL;
     const uint8_t *p = buf;
     while (n) {
         if (w->ssec_len == SSEC_SEG) {
@@ -1999,8 +2013,14 @@ s3_err_t store_put_commit(s3_writer_t *w, s3_obj_meta_t *meta_out) {
                  (int64_t)q_o1 - (int64_t)q_o0);
         writer_release_quota(w);
     }
-    notify_change(w->store, bucket, (s3_str_t){ w->key_dup, w->hdr.key_len },
-                  STORE_CHANGE_PUT, w->hdr.mtime_ms);
+    {
+        store_change_t ev = { .bucket = bucket, .key = { w->key_dup, w->hdr.key_len },
+                              .op = STORE_CHANGE_PUT, .origin = w->origin,
+                              .mtime_ms = w->hdr.mtime_ms, .size = w->hdr.data_size,
+                              .etag = w->hdr.etag };
+        ev_vid_hex(w->ext.version_id, ev.version_id);
+        notify_change(w->store, &ev);
+    }
     pthread_mutex_unlock(km);
     /* tmp_path is gone; clear so writer_free doesn't unlink the live file. */
     w->tmp_path[0] = '\0';
@@ -3065,6 +3085,8 @@ s3_err_t store_mpu_part_begin_ssec(s3_store_t *s, s3_str_t bucket, s3_str_t key,
         free(k2); free(c2);
         ssec_info_t si;
         int r = ssec_tlv_find(mt, mtn, &si);
+        char sid[SSEKEYS_ID_MAX + 1];
+        w->md5_plain = ssekeys_tlv_find(mt, mtn, sid) == 1;
         free(mt);
         s3_err_t se = S3_OK;
         if (r < 0) se = S3_ERR_INTERNAL;
@@ -3270,6 +3292,17 @@ s3_err_t store_mpu_complete(s3_store_t *s, s3_str_t bucket, s3_str_t key,
                             char etag_out[40], s3_obj_meta_t *meta_out) {
     return store_mpu_complete2(s, bucket, key, upload_id, parts, n_parts,
                                NULL, 0, etag_out, meta_out);
+}
+
+s3_err_t store_mpu_upload_tlv(s3_store_t *s, s3_str_t bucket, const char *upload_id,
+                              uint8_t **tlv, size_t *tlv_n) {
+    *tlv = NULL; *tlv_n = 0;
+    if (!s || !upload_id) return S3_ERR_INVALID_ARGUMENT;
+    if (!valid_bucket_name(bucket)) return S3_ERR_INVALID_BUCKET_NAME;
+    char *k = NULL, *ct = NULL;
+    s3_err_t e = mpu_read_meta2(s, bucket, upload_id, &k, NULL, &ct, NULL, NULL, tlv, tlv_n);
+    free(k); free(ct);
+    return e;
 }
 
 s3_err_t store_mpu_checksum_info(s3_store_t *s, s3_str_t bucket,
@@ -3616,7 +3649,12 @@ s3_err_t store_mpu_complete2(s3_store_t *s, s3_str_t bucket, s3_str_t key,
         snprintf(bn, sizeof(bn), S3_STR_FMT, S3_STR_ARG(bucket));
         q_charge(s, bn, (int64_t)q_b1 - (int64_t)q_b0 - (int64_t)q_parts,
                  (int64_t)q_o1 - (int64_t)q_o0);
-        notify_change(s, bucket, key, STORE_CHANGE_PUT, hdr.mtime_ms);
+        store_change_t ev = { .bucket = bucket, .key = key, .op = STORE_CHANGE_PUT,
+                              .origin = STORE_ORIGIN_MPU, .mtime_ms = hdr.mtime_ms,
+                              .size = hdr.data_size, .etag = hdr.etag,
+                              .part_count = hdr.part_count };
+        ev_vid_hex(ext.version_id, ev.version_id);
+        notify_change(s, &ev);
     }
     pthread_mutex_unlock(km);
     if (e != S3_OK) goto out;
@@ -4071,7 +4109,13 @@ s3_err_t store_expire_if_unchanged(s3_store_t *s, s3_str_t bucket,
     store_delete_result_t res;
     memset(&res, 0, sizeof(res));
     s3_err_t e = delete_locked(s, bucket, key, hex, NULL, mtime_ms, &res);
-    if (e == S3_OK) notify_change(s, bucket, key, STORE_CHANGE_DELETE, now_ms_wall());
+    if (e == S3_OK) {
+        store_change_t ev = { .bucket = bucket, .key = key, .op = STORE_CHANGE_DELETE,
+                              .origin = STORE_ORIGIN_LIFECYCLE, .mtime_ms = now_ms_wall(),
+                              .delete_marker = res.delete_marker };
+        snprintf(ev.version_id, sizeof(ev.version_id), "%s", res.version_id);
+        notify_change(s, &ev);
+    }
     pthread_mutex_unlock(km);
     return e;
 }
@@ -4086,11 +4130,21 @@ static __thread int g_guard_bypass;
 
 void store_set_guard_bypass(int bypass) { g_guard_bypass = bypass; }
 
-void store_set_change_hook(s3_store_t *s, store_change_fn fn, void *user) {
-    if (!s) return;
-    s->change_fn = fn;
-    s->change_user = user;
+/* Listeners are registered at startup and removed at shutdown, when no
+ * commit can run, so the array needs no lock. */
+void store_add_change_hook(s3_store_t *s, store_change_fn fn, void *user) {
+    if (!s || !fn) return;
+    for (int i = 0; i < 4; i++)
+        if (!s->change[i].fn) { s->change[i].fn = fn; s->change[i].user = user; return; }
 }
+
+void store_remove_change_hook(s3_store_t *s, void *user) {
+    if (!s) return;
+    for (int i = 0; i < 4; i++)
+        if (s->change[i].fn && s->change[i].user == user) { s->change[i].fn = NULL; s->change[i].user = NULL; }
+}
+
+void store_put_set_origin(s3_writer_t *w, int origin) { if (w) w->origin = origin; }
 
 void store_set_version_guard(s3_store_t *s, store_version_guard_fn fn, void *user) {
     if (!s) return;
@@ -4690,7 +4744,13 @@ s3_err_t store_delete_ex(s3_store_t *s, s3_str_t bucket, s3_str_t key,
     g_guard_bypass = bypass;
     s3_err_t e = delete_locked(s, bucket, key, hex, vid, 0, res);
     g_guard_bypass = 0;
-    if (e == S3_OK) notify_change(s, bucket, key, STORE_CHANGE_DELETE, now_ms_wall());
+    if (e == S3_OK) {
+        store_change_t ev = { .bucket = bucket, .key = key, .op = STORE_CHANGE_DELETE,
+                              .origin = STORE_ORIGIN_DELETE, .mtime_ms = now_ms_wall(),
+                              .delete_marker = res->delete_marker };
+        snprintf(ev.version_id, sizeof(ev.version_id), "%s", res->version_id);
+        notify_change(s, &ev);
+    }
     pthread_mutex_unlock(km);
     return e;
 }

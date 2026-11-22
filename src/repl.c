@@ -8,9 +8,11 @@
 #include "objmeta.h"
 #include "s3client.h"
 #include "store.h"
+#include "ssekeys.h"
 #include "tls.h"
 
 #include <arpa/inet.h>
+#include <openssl/crypto.h>
 #include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
@@ -486,8 +488,11 @@ static int rb_append(repl_t *r, rb_t *b, int op, const char *key, size_t kn, uin
 }
 
 /* The store's change hook: runs under the key's stripe lock. */
-static void on_change(void *user, s3_str_t bucket, s3_str_t key, int op, uint64_t mtime_ms) {
+static void on_change(void *user, const store_change_t *ev) {
     repl_t *r = user;
+    s3_str_t bucket = ev->bucket, key = ev->key;
+    int op = ev->op;
+    uint64_t mtime_ms = ev->mtime_ms;
     if (!__atomic_load_n(&r->n_rules, __ATOMIC_RELAXED)) return;
     char id[33];
     pthread_mutex_lock(&r->mu);
@@ -605,7 +610,7 @@ repl_t *repl_create(const repl_cfg_t *cfg) {
         }
         store_buckets_free(bl, nb);
     }
-    store_set_change_hook(cfg->store, on_change, r);
+    store_add_change_hook(cfg->store, on_change, r);
     return r;
 }
 
@@ -630,7 +635,7 @@ int repl_start(repl_t *r) {
 
 void repl_destroy(repl_t *r) {
     if (!r) return;
-    store_set_change_hook(r->cfg.store, NULL, NULL);
+    store_remove_change_hook(r->cfg.store, r);
     pthread_mutex_lock(&r->mu);
     __atomic_store_n(&r->stop, 1, __ATOMIC_RELAXED);
     pthread_cond_broadcast(&r->work_cv);
@@ -811,7 +816,22 @@ static int put_object(wctx_t *w, const char *key, int hint_del) {
         snprintf(w->err, sizeof(w->err), "open local object: error %d", (int)e);
         return RS_RETRY;
     }
-    if (m.flags & S3_OBJF_SSEC) { store_get_close(rd); w->skip_ssec = 1; return RS_SKIP; }
+    int sse_s3 = 0;
+    if (m.flags & S3_OBJF_SSEC) {
+        /* SSE-S3 (fs3 holds the key): replicate the plaintext; the target
+         * applies its own encryption. SSE-C: fs3 has no key; skip. */
+        uint8_t *t = NULL, skey[32];
+        size_t tn = 0;
+        char kid[SSEKEYS_ID_MAX + 1];
+        if (store_reader_tlv(rd, &t, &tn) == S3_OK && ssekeys_tlv_find(t, tn, kid) == 1
+            && ssekeys_find(kid, skey) == 0) {
+            s3_str_t bn2 = { w->bucket, strlen(w->bucket) };
+            sse_s3 = store_reader_ssec(w->r->cfg.store, bn2, rd, skey) == S3_OK;
+            OPENSSL_cleanse(skey, sizeof(skey));
+        }
+        free(t);
+        if (!sse_s3) { store_get_close(rd); w->skip_ssec = 1; return RS_SKIP; }
+    }
 
     char local_etag[48];
     etag_hex(&m, local_etag);
@@ -839,7 +859,7 @@ static int put_object(wctx_t *w, const char *key, int hint_del) {
     }
     if (h->meta_bytes + 64 <= OBJMETA_MAX_USER) hdr_add(h, "x-amz-meta-fs3-source-etag", local_etag);
     if (w->rule.storage_class[0]) hdr_add(h, "x-amz-storage-class", w->rule.storage_class);
-    int raw = !(m.flags & S3_OBJF_ZSTD);
+    int raw = !(m.flags & S3_OBJF_ZSTD) && !sse_s3;
     if (raw && !m.part_count) {
         char b64[32];
         size_t bl = base64_encode(m.etag, 16, b64);
@@ -1094,7 +1114,8 @@ static int walk_cb(void *user, s3_str_t key, const s3_obj_meta_t *m) {
     pthread_mutex_lock(&wk->r->mu);
     wk->b->bf_scanned++;
     pthread_mutex_unlock(&wk->r->mu);
-    if (m->flags & S3_OBJF_SSEC) return 0;
+    /* SSE objects are compared like the rest: an SSE-S3 ETag is the
+     * plaintext MD5; SSE-C ones end up skipped (and counted) by the worker. */
     char le[48];
     etag_hex(m, le);
     s3c_resp_t resp;

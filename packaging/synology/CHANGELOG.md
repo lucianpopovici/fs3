@@ -2,6 +2,26 @@
 
 ## Unreleased (round 2)
 
+- **Object browser in the tile.** Click a bucket to list its folders
+  and objects, download, delete, upload several files with progress
+  (streamed to fs3, up to 5 GiB each), or create a share link valid for
+  1 hour, 1 day or 7 days. The tile holds no S3 key: it asks fs3's admin
+  socket for short-lived presigned URLs signed with a key of the bucket's
+  owner (or the admin user), and each one is logged. New setting:
+  *Public host for share links* (for fs3 behind the DSM reverse proxy).
+- **Event notifications (webhooks).** A bucket can POST an S3-style JSON
+  event to an HTTPS endpoint on every object create or delete (with
+  prefix/suffix filters and an HMAC signature). Events are queued
+  durably under `notify/` in the data folder and retried with backoff
+  for up to 24 hours. Configured through the admin API
+  (`/v1/buckets/<b>/notification`).
+- **SSE-S3.** With *Server-side encryption keys (SSE-S3)* on, the package
+  creates `sse.keys` (mode 0600) in the package folder and objects can be
+  encrypted at rest with keys fs3 manages: per request
+  (`x-amz-server-side-encryption: AES256`) or by default for a bucket
+  (`PutBucketEncryption`). **Back up `sse.keys` separately: without it
+  the encrypted objects can't be read.**
+
 - Fix: a request sent on a keep-alive connection while fs3 was still
   writing the previous response could be dropped, and the client then
   waited for the 60 s idle timeout. restic (and other minio-go/Go

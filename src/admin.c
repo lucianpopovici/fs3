@@ -6,13 +6,16 @@
 #include "log.h"
 #include "scrub.h"
 #include "repl.h"
+#include "notify.h"
 #include "sigv4.h"
 #include "store.h"
 
 #include <openssl/crypto.h>
 #include <openssl/rand.h>
 
+#include <ctype.h>
 #include <errno.h>
+#include <stdarg.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -698,6 +701,297 @@ static char *buckets_list(admin_ctx_t *a, size_t *rn) {
     return r;
 }
 
+/* ---- Object browser support: listing and presigned URLs ---------------- */
+
+/* URI-encode for an S3 path: unreserved and '/' stay, the rest is %XX. */
+static size_t pct_enc(const char *p, size_t n, char *out, size_t cap) {
+    static const char H[] = "0123456789ABCDEF";
+    size_t o = 0;
+    for (size_t i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)p[i];
+        int raw = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')
+               || c == '-' || c == '.' || c == '_' || c == '~' || c == '/';
+        if (o + (raw ? 1 : 3) >= cap) return (size_t)-1;
+        if (raw) out[o++] = (char)c;
+        else { out[o++] = '%'; out[o++] = H[c >> 4]; out[o++] = H[c & 15]; }
+    }
+    out[o] = 0;
+    return o;
+}
+
+static int hexv(char c) {
+    return c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10
+         : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1;
+}
+
+/* Query parameter `name` of "a=b&c=d", form-decoded. Length, -1 if
+ * absent, -2 if malformed, too long or containing NUL. */
+static long qparam(const char *q, const char *name, char *out, size_t cap) {
+    size_t nl = strlen(name);
+    for (const char *p = q; p && *p; ) {
+        const char *amp = strchr(p, '&');
+        size_t seg = amp ? (size_t)(amp - p) : strlen(p);
+        if (seg > nl && p[nl] == '=' && !strncmp(p, name, nl)) {
+            size_t o = 0;
+            for (size_t i = nl + 1; i < seg; i++) {
+                char c = p[i];
+                if (c == '+') c = ' ';
+                else if (c == '%') {
+                    if (i + 2 >= seg) return -2;
+                    int hi = hexv(p[i + 1]), lo = hexv(p[i + 2]);
+                    if (hi < 0 || lo < 0) return -2;
+                    c = (char)(hi * 16 + lo);
+                    i += 2;
+                }
+                if (!c || o + 1 >= cap) return -2;
+                out[o++] = c;
+            }
+            out[o] = 0;
+            return (long)o;
+        }
+        if (seg == nl && !strncmp(p, name, nl)) { out[0] = 0; return 0; }
+        p = amp ? amp + 1 : NULL;
+    }
+    return -1;
+}
+
+typedef struct { char *p; size_t n, cap; int oom; } abuf_t;
+static void ab_put(abuf_t *b, const char *s, size_t n) {
+    if (b->oom) return;
+    if (b->n + n + 1 > b->cap) {
+        size_t nc = b->cap ? b->cap : 4096;
+        while (nc < b->n + n + 1) nc *= 2;
+        char *np = realloc(b->p, nc);
+        if (!np) { b->oom = 1; return; }
+        b->p = np; b->cap = nc;
+    }
+    memcpy(b->p + b->n, s, n);
+    b->n += n;
+    b->p[b->n] = 0;
+}
+static void ab_fmt(abuf_t *b, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+static void ab_fmt(abuf_t *b, const char *fmt, ...) {
+    char t[512];
+    va_list ap;
+    va_start(ap, fmt);
+    int k = vsnprintf(t, sizeof(t), fmt, ap);
+    va_end(ap);
+    if (k > 0) ab_put(b, t, (size_t)k < sizeof(t) ? (size_t)k : sizeof(t) - 1);
+}
+static void ab_jstr(abuf_t *b, const char *s, size_t n) {
+    char *t = malloc(n * 6 + 3);
+    if (!t) { b->oom = 1; return; }
+    char *z = malloc(n + 1);
+    if (!z) { free(t); b->oom = 1; return; }
+    memcpy(z, s, n);
+    z[n] = 0;
+    size_t o = 0;
+    json_put_str(t, n * 6 + 3, &o, z);
+    ab_put(b, t, o);
+    free(t);
+    free(z);
+}
+
+/* GET /v1/buckets/<b>/objects?prefix=&after=&delimiter=/&max=200&format=json|tsv
+ * TSV (for the DSM tile's shell CGI): keys and prefixes URI-encoded, so
+ * no field can hold a tab, newline or markup:
+ *   T <truncated 0|1> <next marker, encoded or "-">
+ *   P <prefix>
+ *   O <size> <mtime_ms> <etag> <key> */
+static char *objects_route(admin_ctx_t *a, const areq_t *rq, const char *name, const char *query,
+                           size_t *rn) {
+    if (strcmp(rq->method, "GET")) return err_json(405, "Method Not Allowed", "use GET", rn);
+    char prefix[1025] = "", after[1025] = "", delim[8] = "/", maxs[8] = "", fmt[8] = "json";
+    if (qparam(query, "prefix", prefix, sizeof(prefix)) < -1 || qparam(query, "after", after, sizeof(after)) < -1
+        || qparam(query, "delimiter", delim, sizeof(delim)) < -1 || qparam(query, "max", maxs, sizeof(maxs)) < -1
+        || qparam(query, "format", fmt, sizeof(fmt)) < -1)
+        return err_json(400, "Bad Request", "malformed query", rn);
+    if (*delim && strcmp(delim, "/")) return err_json(400, "Bad Request", "delimiter must be \"/\" or empty", rn);
+    int tsv = !strcmp(fmt, "tsv");
+    if (!tsv && strcmp(fmt, "json")) return err_json(400, "Bad Request", "format must be json or tsv", rn);
+    long max = 200;
+    if (*maxs) {
+        char *end;
+        max = strtol(maxs, &end, 10);
+        if (*end || max < 1 || max > 1000) return err_json(400, "Bad Request", "max must be 1..1000", rn);
+    }
+    s3_str_t b = { name, strlen(name) };
+    s3_list_opts_t lo = { { prefix, strlen(prefix) }, { after, strlen(after) },
+                          { delim, strlen(delim) }, (int)max };
+    s3_lister_t *l = NULL;
+    if (store_list_begin(a->cfg.store, b, &lo, &l) != S3_OK)
+        return err_json(500, "Internal Server Error", "cannot list the bucket", rn);
+    abuf_t pre = { 0 }, obj = { 0 };
+    char *last = NULL;
+    size_t last_n = 0;
+    int np = 0, no = 0;
+    char *enc = malloc(3 * 1024 * 3 + 4);
+    s3_str_t k;
+    s3_obj_meta_t m;
+    int isp;
+    while (enc && store_list_next(l, &k, &m, &isp) == S3_OK) {
+        free(last);
+        last = malloc(k.n + 1);
+        if (!last) break;
+        memcpy(last, k.p, k.n);
+        last[k.n] = 0;
+        last_n = k.n;
+        if (tsv) {
+            if (pct_enc(k.p, k.n, enc, 3 * 1024 * 3 + 4) == (size_t)-1) continue;
+            if (isp) { ab_fmt(&pre, "P\t"); ab_put(&pre, enc, strlen(enc)); ab_put(&pre, "\n", 1); }
+            else {
+                char et[48];
+                for (int i = 0; i < 16; i++) snprintf(et + 2 * i, 3, "%02x", m.etag[i]);
+                if (m.part_count) snprintf(et + 32, 16, "-%u", m.part_count);
+                ab_fmt(&obj, "O\t%llu\t%llu\t%s\t", (unsigned long long)m.size,
+                       (unsigned long long)m.mtime_ms, et);
+                ab_put(&obj, enc, strlen(enc));
+                ab_put(&obj, "\n", 1);
+            }
+        } else if (isp) {
+            if (np++) ab_put(&pre, ",", 1);
+            ab_jstr(&pre, k.p, k.n);
+        } else {
+            char et[48];
+            for (int i = 0; i < 16; i++) snprintf(et + 2 * i, 3, "%02x", m.etag[i]);
+            if (m.part_count) snprintf(et + 32, 16, "-%u", m.part_count);
+            if (no++) ab_put(&obj, ",", 1);
+            ab_put(&obj, "{\"key\":", 7);
+            ab_jstr(&obj, k.p, k.n);
+            ab_fmt(&obj, ",\"size\":%llu,\"mtime_ms\":%llu,\"etag\":\"%s\"}",
+                   (unsigned long long)m.size, (unsigned long long)m.mtime_ms, et);
+        }
+    }
+    int trunc = store_list_truncated(l);
+    store_list_close(l);
+    abuf_t out = { 0 };
+    if (tsv) {
+        ab_fmt(&out, "T\t%d\t", trunc);
+        if (trunc && last && enc && pct_enc(last, last_n, enc, 3 * 1024 * 3 + 4) != (size_t)-1)
+            ab_put(&out, enc, strlen(enc));
+        else ab_put(&out, "-", 1);
+        ab_put(&out, "\n", 1);
+        if (pre.p) ab_put(&out, pre.p, pre.n);
+        if (obj.p) ab_put(&out, obj.p, obj.n);
+    } else {
+        ab_put(&out, "{\"prefixes\":[", 13);
+        if (pre.p) ab_put(&out, pre.p, pre.n);
+        ab_put(&out, "],\"objects\":[", 13);
+        if (obj.p) ab_put(&out, obj.p, obj.n);
+        ab_fmt(&out, "],\"truncated\":%s,\"next\":", trunc ? "true" : "false");
+        if (trunc && last) ab_jstr(&out, last, last_n); else ab_put(&out, "null", 4);
+        ab_put(&out, "}\n", 2);
+    }
+    int oom = !enc || pre.oom || obj.oom || out.oom;
+    free(enc); free(last); free(pre.p); free(obj.p);
+    if (oom) { free(out.p); return err_json(500, "Internal Server Error", "out of memory", rn); }
+    char *r = respond(200, "OK", out.p, rn);
+    free(out.p);
+    return r;
+}
+
+/* POST /v1/buckets/<b>/presign {"key","method","expires","host","scheme"}
+ * → {"url","access_key","expires"}: a presigned URL made with a key of
+ * the bucket's owner (or, failing that, of an admin). */
+static char *presign_route(admin_ctx_t *a, const areq_t *rq, const char *name, size_t *rn) {
+    if (strcmp(rq->method, "POST")) return err_json(405, "Method Not Allowed", "use POST", rn);
+    json_t *j = json_parse(rq->body, rq->body_n, 4, 32);
+    if (!j || j->type != JSON_OBJ) { json_free(j); return err_json(400, "Bad Request", "body must be a JSON object", rn); }
+    /* "key_enc": the key URI-encoded (what the objects listing's TSV
+     * gives), so a shell client never has to decode or JSON-escape it. */
+    const json_t *jke = json_get(j, "key_enc");
+    char kdec[1025];
+    json_t kfake;
+    if (jke && !json_get(j, "key")) {
+        size_t o = 0;
+        int ok = jke->type == JSON_STR && jke->str_n <= 3 * 1024;
+        for (size_t i = 0; ok && i < jke->str_n; i++) {
+            char c = jke->str[i];
+            if (c == '%') {
+                int hi = i + 2 < jke->str_n ? hexv(jke->str[i + 1]) : -1;
+                int lo = i + 2 < jke->str_n ? hexv(jke->str[i + 2]) : -1;
+                if (hi < 0 || lo < 0) { ok = 0; break; }
+                c = (char)(hi * 16 + lo);
+                i += 2;
+            } else if (!(isalnum((unsigned char)c) || c == '-' || c == '.' || c == '_' || c == '~' || c == '/')) {
+                ok = 0; break;
+            }
+            if (!c || o >= 1024) { ok = 0; break; }
+            kdec[o++] = c;
+        }
+        kdec[o] = 0;
+        memset(&kfake, 0, sizeof(kfake));
+        kfake.type = ok ? JSON_STR : JSON_NULL;
+        kfake.str = kdec;
+        kfake.str_n = o;
+    }
+    const json_t *jk = jke && !json_get(j, "key") ? &kfake : json_get(j, "key"), *jm = json_get(j, "method"), *je = json_get(j, "expires"),
+                 *jh = json_get(j, "host"), *js = json_get(j, "scheme");
+    char key[1025], method[8] = "GET", host[300], scheme[8] = "http";
+    int bad = !jk || jk->type != JSON_STR || !jk->str_n || jk->str_n > 1024 || memchr(jk->str, 0, jk->str_n)
+           || !jh || jh->type != JSON_STR || !jh->str_n || jh->str_n >= sizeof(host)
+           || (jm && (jm->type != JSON_STR || jm->str_n >= sizeof(method)))
+           || (js && (js->type != JSON_STR || js->str_n >= sizeof(scheme)))
+           || (je && je->type != JSON_NUM);
+    long long expires = 3600;
+    if (!bad) {
+        memcpy(key, jk->str, jk->str_n); key[jk->str_n] = 0;
+        memcpy(host, jh->str, jh->str_n); host[jh->str_n] = 0;
+        if (jm) { memcpy(method, jm->str, jm->str_n); method[jm->str_n] = 0; }
+        if (js) { memcpy(scheme, js->str, js->str_n); scheme[js->str_n] = 0; }
+        if (je) {
+            char t[24]; size_t l = je->str_n < 23 ? je->str_n : 23;
+            memcpy(t, je->str, l); t[l] = 0;
+            char *end; expires = strtoll(t, &end, 10);
+            if (*end || expires < 1 || expires > 604800) bad = 1;
+        }
+    }
+    json_free(j);
+    if (bad) return err_json(400, "Bad Request", "need key (1..1024 bytes), host, and optional method, expires (1..604800 s), scheme", rn);
+    for (const char *p = host; *p; p++)
+        if (!(isalnum((unsigned char)*p) || *p == '.' || *p == ':' || *p == '-' || *p == '[' || *p == ']'))
+            return err_json(400, "Bad Request", "invalid host", rn);
+    if (strcmp(scheme, "http") && strcmp(scheme, "https")) return err_json(400, "Bad Request", "scheme must be http or https", rn);
+    int need_write = !strcmp(method, "PUT") || !strcmp(method, "DELETE");
+    if (!need_write && strcmp(method, "GET") && strcmp(method, "HEAD"))
+        return err_json(400, "Bad Request", "method must be GET, HEAD, PUT or DELETE", rn);
+    char path[64 + 3 * 1024 + 4];
+    int po = snprintf(path, sizeof(path), "/%s/", name);
+    if (pct_enc(key, strlen(key), path + po, sizeof(path) - (size_t)po) == (size_t)-1)
+        return err_json(400, "Bad Request", "key too long", rn);
+    s3_bucket_meta_t bm;
+    s3_str_t b = { name, strlen(name) };
+    if (store_bucket_meta(a->cfg.store, b, &bm) != S3_OK) return err_json(404, "Not Found", "no such bucket", rn);
+    char q[1400] = "", ak[160] = "";
+    int signed_url = a->cfg.auth != NULL;
+    if (signed_url) {
+        sigv4_presign_req_t pr = { .method = method, .host = host, .path = path, .user = bm.owner,
+                                   .expires = expires, .need_write = need_write, .allow_admin = 1 };
+        int rc = sigv4_presign(a->cfg.auth, &pr, q, sizeof(q), ak, sizeof(ak));
+        if (rc == SIGV4_PRESIGN_NO_KEY)
+            return err_json(409, "Conflict", "no usable key: the bucket owner (or an admin) needs an enabled key "
+                                 "that is not read-only for writes and does not expire first", rn);
+        if (rc == SIGV4_PRESIGN_TOO_LONG) return err_json(400, "Bad Request", "expires is over --presign-max-expires", rn);
+        if (rc) return err_json(500, "Internal Server Error", "cannot sign", rn);
+    }
+    abuf_t out = { 0 };
+    ab_fmt(&out, "{\"url\":\"%s://%s", scheme, host);
+    ab_put(&out, path, strlen(path));
+    if (*q) { ab_put(&out, "?", 1); ab_put(&out, q, strlen(q)); }
+    ab_fmt(&out, "\",\"method\":\"%s\",\"access_key\":", method);
+    ab_jstr(&out, ak, strlen(ak));
+    ab_fmt(&out, ",\"signed\":%s,\"expires\":%lld}\n", signed_url ? "true" : "false", expires);
+    if (out.oom) { free(out.p); return err_json(500, "Internal Server Error", "out of memory", rn); }
+    char ev[1400];
+    snprintf(ev, sizeof(ev), "presign %s bucket %s key %.1024s by %s for %llds", method, name, path + po,
+             *ak ? ak : "(no auth)", expires);
+    LOG_I("admin: %s", ev);
+    audit_event("admin-api", ev);
+    char *r = respond(200, "OK", out.p, rn);
+    free(out.p);
+    return r;
+}
+
 static char *bucket_route(admin_ctx_t *a, const areq_t *rq, const char *rest,
                           size_t *rn) {
     /* rest: "<b>" | "<b>/owner" | "<b>/grants/<user>" */
@@ -711,6 +1005,9 @@ static char *bucket_route(admin_ctx_t *a, const areq_t *rq, const char *rest,
     if (!store_valid_bucket_name(b) || !store_bucket_exists(a->cfg.store, b))
         return err_json(404, "Not Found", "no such bucket", rn);
     const char *sub = sl ? sl + 1 : "";
+    if (!strncmp(sub, "objects", 7) && (!sub[7] || sub[7] == '?'))
+        return objects_route(a, rq, name, sub[7] ? sub + 8 : "", rn);
+    if (!strcmp(sub, "presign")) return presign_route(a, rq, name, rn);
 
     if (!*sub && !strcmp(rq->method, "GET")) {
         char out[8192];
@@ -740,6 +1037,18 @@ static char *bucket_route(admin_ctx_t *a, const areq_t *rq, const char *rest,
         int st = 500;
         char *body = repl_admin(a->cfg.repl, rq->method, name, sub[11] ? sub + 12 : "",
                                 rq->body, rq->body_n, &st);
+        if (!body) return err_json(500, "Internal Server Error", "out of memory", rn);
+        const char *reason = st == 200 ? "OK" : st == 202 ? "Accepted" : st == 400 ? "Bad Request"
+                           : st == 404 ? "Not Found" : st == 405 ? "Method Not Allowed"
+                           : st == 409 ? "Conflict" : st == 501 ? "Not Implemented" : "Internal Server Error";
+        char *resp = respond(st, reason, body, rn);
+        free(body);
+        return resp;
+    }
+    if (!strcmp(sub, "notification") || !strncmp(sub, "notification/", 13)) {
+        int st = 500;
+        char *body = notify_admin(a->cfg.notify, rq->method, name, sub[12] ? sub + 13 : "",
+                                  rq->body, rq->body_n, &st);
         if (!body) return err_json(500, "Internal Server Error", "out of memory", rn);
         const char *reason = st == 200 ? "OK" : st == 202 ? "Accepted" : st == 400 ? "Bad Request"
                            : st == 404 ? "Not Found" : st == 405 ? "Method Not Allowed"
