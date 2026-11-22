@@ -1121,7 +1121,8 @@ Next:
 - **Production soak:** long-running use on real data, plus a periodic
   restore drill from the plain object files.
 - **Replication on hardware:** a DS1515+ run replicating to B2 or a second
-  box, which also confirms the DSM CA bundle path.
+  box, which also confirms the DSM CA bundle path
+  (`docs/AGENT-REPLICATION-DS1515-TEST.md`).
 - **Backup-tool compatibility matrix** (item 3 of
   `docs/plan-logs-replication-compat.md`).
 - **An offline converter** from layout 1 to layout 2 for existing Object
