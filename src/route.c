@@ -1,17 +1,18 @@
-/* src/route.c — request dispatcher and per-method handlers
+/* src/route.c — request classification and per-operation handlers
  *
- * Path shape determines handler family:
- *   /                                 → service ops (list buckets — TODO)
- *   /<bucket>                         → bucket ops (create/delete/list)
- *   /<bucket>/<key...>                → object ops (PUT/GET/HEAD/DELETE)
- *
- * Query string matters for some bucket ops:
- *   GET /<bucket>?location            → location subresource (TODO)
- *   GET /<bucket>?list-type=2&...     → ListObjectsV2
- *   GET /<bucket>?prefix=&delimiter=  → ListObjectsV1
- *
- * For simplicity right now we treat any GET on /<bucket> (with or
- * without query) as a list. Full subresource handling lands in 3.1.
+ * route_classify() maps method + path shape + query subresource to
+ * exactly one S3 operation (an s3_action_t, see action.c):
+ *   /                      → service ops (ListAllMyBuckets)
+ *   /<bucket>[?sub]        → bucket ops and bucket subresources
+ *                            (?versioning, ?policy, ?cors, ?lifecycle,
+ *                             ?website, ?object-lock, ?uploads, ?versions,
+ *                             ?location, ?delete, list-type=2, …)
+ *   /<bucket>/<key>[?sub]  → object ops (?uploadId, ?partNumber,
+ *                             ?retention, ?legal-hold, ?versionId, …)
+ * A recognised S3 subresource that fs3 doesn't implement answers 501 and
+ * never reaches the store. authz() then checks the action against
+ * ownership, grants, bucket policy and key attributes before a handler
+ * runs. web_dispatch() serves the separate website listener.
  */
 
 #include "route.h"

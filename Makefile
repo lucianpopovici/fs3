@@ -1,12 +1,15 @@
-# fs3 — Phase 2 build (llhttp + filesystem store + extended XML)
+# fs3 build
 #
 # Targets:
-#   make              build ./fs3
-#   make DEBUG=1      build with -O0 + ASan + UBSan
-#   make clean        remove all build artifacts
-#   make test         build and run all test binaries
-#   make smoketest    runs ./fs3 briefly and probes with curl
-#   make fetch-llhttp re-fetch llhttp sources (requires pip + network)
+#   make                  build fs3, fs3-lockd and fs3-dedup-estimate
+#   make DEBUG=1          -O0 + ASan + UBSan (switching needs `make clean`)
+#   make TLS=1            fs3 with native TLS (libssl); `make fs3-tls` for a separate binary
+#   make *-static         static binaries for the Synology package
+#   make test             unit, fuzz and e2e suites (checks test deps first)
+#   make smoketest        run ./fs3 briefly and probe it with curl
+#   make seccomp-profile  diff the syscalls the suites use against the allowlist
+#   make clean            remove all build artifacts
+#   make fetch-llhttp     re-fetch llhttp sources (requires pip + network)
 
 CC      ?= gcc
 CFLAGS  := -std=c11 -O2 -g -Wall -Wextra -Wpedantic \
@@ -55,7 +58,7 @@ ifeq ($(DEBUG),1)
                    -fsanitize=address,undefined -fno-omit-frame-pointer
 endif
 
-all: fs3 fs3-lockd
+all: fs3 fs3-lockd fs3-dedup-estimate
 
 fs3: $(OBJS)
 	$(CC) $(OBJS) -o $@ $(LDFLAGS)
@@ -115,7 +118,7 @@ check-test-deps:
 	    echo "missing tool '$$t' (aws: pip install -r tests/requirements.txt; curl/openssl: apt-get install curl openssl)" >&2; \
 	    exit 1; }; done
 
-test: check-test-deps $(TEST_BINS) fs3 fs3-lockd
+test: check-test-deps $(TEST_BINS) fs3 fs3-lockd fs3-dedup-estimate
 	@echo "=== test_policy (+50000 fuzz iterations) ==="
 	@./tests/test_policy 50000
 	@echo "=== test_json (+50000 fuzz iterations) ==="
@@ -160,6 +163,8 @@ test: check-test-deps $(TEST_BINS) fs3 fs3-lockd
 	@./tests/test_e2e_listing.sh
 	@echo "=== test_e2e_quota (round 2: bucket/user quotas) ==="
 	@./tests/test_e2e_quota.sh
+	@echo "=== test_e2e_dedup_estimate (fs3-dedup-estimate) ==="
+	@./tests/test_e2e_dedup_estimate.sh
 	@echo "=== test_e2e_scrub (round 2: integrity scrub) ==="
 	@./tests/test_e2e_scrub.sh
 	@echo "=== test_e2e_keys (round 2: key expiry / disable / read-only / last-used) ==="
@@ -275,7 +280,7 @@ tests/test_credfile: tests/test_credfile.c src/main.c src/sigv4.c src/log.c src/
 	    $(LDFLAGS) -o $@
 
 clean:
-	rm -f fs3 fs3-tls fs3-static fs3-tls-static fs3-lockd $(OBJS) $(OBJS:.o=.d) $(TEST_BINS) tests/*.d
+	rm -f fs3 fs3-tls fs3-static fs3-tls-static fs3-lockd fs3-dedup-estimate $(OBJS) $(OBJS:.o=.d) $(TEST_BINS) tests/*.d
 
 # Auto-include compiler-generated dependency files so header changes
 # correctly invalidate object files. Created via -MMD -MP above.
@@ -327,3 +332,10 @@ fs3-lockd: src/lockd.c
 # Static helper for the Synology package (no libcrypto needed).
 fs3-lockd-static: src/lockd.c
 	$(CC) $(CFLAGS) -static src/lockd.c -o fs3-lockd
+
+# Read-only block-dedup estimator; standalone, no libcrypto.
+fs3-dedup-estimate: src/dedup_estimate.c
+	$(CC) $(CFLAGS) src/dedup_estimate.c -o $@
+
+fs3-dedup-estimate-static: src/dedup_estimate.c
+	$(CC) $(CFLAGS) -static src/dedup_estimate.c -o fs3-dedup-estimate

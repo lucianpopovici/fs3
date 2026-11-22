@@ -1,6 +1,8 @@
 /* src/server.c — epoll accept loop + connection dispatch
  *
- * Single-threaded for Phase 0. The hot path:
+ * One event-loop thread owns all sockets; blocking store work runs on
+ * iopool worker threads, and background jobs (lifecycle, scrub) are
+ * scheduled from the loop's 1 s tick. The hot path:
  *   epoll_wait → accept new conns or deliver readable/writable events
  *   to existing conn_t objects, which run their own state machine.
  *

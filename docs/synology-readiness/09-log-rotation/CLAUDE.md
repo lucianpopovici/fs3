@@ -14,13 +14,17 @@ DSM itself.
 
 ## Current state
 
-`packaging/synology/scripts/start-stop-status`:
+`packaging/synology/scripts/start-stop-status` runs fs3 under the
+watchdog (see 08) and appends the watchdog's output, fs3's stderr
+included, to the log:
 ```sh
-"${BIN}" ${ARGS} >> "${LOG_FILE}" 2>&1 &
+watchdog "$@" >> "${LOG_FILE}" 2>&1 &
 ```
 Pure append, forever. `fs3` itself (`src/log.c`) writes leveled lines to
 stderr; it has no file handling, no rotation, no size awareness. The
-`log` subcommand just prints the path for DSM's log viewer.
+`log` subcommand just prints the path for DSM's log viewer. (The separate
+`--audit-log` file is reopened on SIGHUP, but the SPK doesn't enable it
+yet, and that reopen doesn't cover stderr.)
 
 ## Approach — prefer the platform, keep fs3 dumb
 

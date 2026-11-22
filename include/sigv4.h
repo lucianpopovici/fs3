@@ -5,19 +5,21 @@
  *
  * Lifecycle:
  *   sigv4_verifier_t *v = sigv4_create();
- *   sigv4_add_cred(v, "AKIA...", "secret...");
+ *   sigv4_add_cred_user(v, "AKIA...", "secret...", "alice");
  *   ...
- *   s3_err_t e = sigv4_verify(v, c);
+ *   s3_err_t e = sigv4_verify_id(v, c, &id);   (identity out)
  *   ...
  *   sigv4_destroy(v);
  *
- * The verifier struct is intended to live for the life of the server
- * and be shared (read-only after construction) across all connections.
+ * The verifier lives for the life of the server and is shared read-only
+ * across connections; credential reloads build a new set and swap it in
+ * (sigv4_swap_creds).
  *
- * Phase 1 scope: header-mode SigV4 only. The body hash declared in
- * x-amz-content-sha256 is used verbatim in the canonical request; we
- * do NOT independently hash the body to verify it matches. That's a
- * Phase 2 add-on.
+ * Covers header-mode and presigned (query) SigV4, streaming chunked and
+ * trailer payloads (via the chunk decoder below), key attributes
+ * (expiry, disabled, read-only) and presign policy. Body hashes declared
+ * in x-amz-content-sha256 are verified by the connection as the body
+ * streams in; checksums by src/checksum.c.
  */
 #ifndef FS3_SIGV4_H
 #define FS3_SIGV4_H

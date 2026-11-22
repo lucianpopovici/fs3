@@ -10,16 +10,19 @@
  * and <yy> are the first two bytes of <hex>. The two-level prefix keeps
  * fan-out under any directory below a few thousand at homelab scale.
  *
- * Each object file is self-contained:
+ * Each object file is self-contained (schema 4; 2 and 3 are still read):
  *
- *   [obj_header_t (52 bytes)][content_type (var)][key (var)][data (var)]
+ *   [obj_header_t][obj_ext_v3_t][obj_ext_v4_t][content_type][key][TLV][pad][data]
  *
- * Header has magic, schema version, sizes, mtime, raw MD5 etag, plus
- * lengths for content_type and key. Reading the file means reading the
- * header, skipping past header bytes, then streaming data. Writing means
- * reserving header space, appending data while accumulating MD5 + size,
- * then pwrite-ing the finalized header back at offset 0 before the
- * atomic rename.
+ * The header has magic, schema, sizes, mtime, raw MD5 etag, checksum,
+ * version id, flags and a CRC64 of the stored payload; the TLV area holds
+ * user metadata and other per-object records; padding makes header_size a
+ * multiple of 4096 on reflink-capable filesystems. Reading means parsing
+ * the header and streaming data from header_size. Writing reserves header
+ * space, appends data while accumulating MD5/CRC/size, then pwrites the
+ * finalized header at offset 0 before the atomic rename. Other trees:
+ * versions/, locks/, mpu/, cas/, users/, scrub/ (see README, "On-disk
+ * layout").
  *
  * Crash safety: every write goes through a temp file, fsync, rename,
  * fsync(parent_dir). Concurrent writers to the same key serialize at
@@ -2244,13 +2247,13 @@ s3_err_t store_delete(s3_store_t *s, s3_str_t bucket, s3_str_t key) {
 }
 
 /* ===================================================================== */
-/* List (FS-walk implementation; replaced by LMDB in Phase 2.2)          */
+/* List (filesystem walk)                                                */
 /* ===================================================================== */
 
 /* The lister loads ALL keys for the bucket into memory at begin time,
  * sorts them lexicographically, then iterates with marker / prefix /
- * delimiter applied. For homelab scale this is fine; at >1M keys it
- * becomes painful, which is exactly why Phase 2.2 swaps in LMDB.
+ * delimiter applied. For homelab scale this is fine; at >1M keys per
+ * bucket it becomes slow (see store.h, "List").
  *
  * "Common prefix" handling: when delimiter is set, keys sharing a
  * prefix up to the next delimiter character are rolled up into a

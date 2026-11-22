@@ -1,464 +1,227 @@
-# CLAUDE.md — orientation for the next session
+# CLAUDE.md — working notes for contributors and agents
 
-This file is the bridge from "I just unpacked the tarball" to "I know
-where the load-bearing parts are." Read the README first for what fs3
-is. This file is the working notes — the *don't relearn these* facts.
+Read `README.md` first for what fs3 is and what it supports. This file
+holds the facts you shouldn't have to relearn: the rules the code depends
+on, where things live, how to extend it safely, and environment gotchas.
 
-The project has been built up across twelve phases. Current state: a
-~11,000-line single-node S3-compatible server in C, with header-mode +
-streaming-chunked SigV4, multipart upload, service-level listing,
-periodic GC of abandoned multipart uploads, HTTP Range requests,
-bulk-delete (`?delete`), bucket subresources (location/versioning
-stubs), server-side object copy, ACL stubs, health + Prometheus
-metrics endpoints, disk-full/quota handling, startup crash recovery,
-request resource bounds, SIGHUP credential rotation, and a DSM-tile
-admin console (live bucket stats + credential management). ~340
-explicit tests + 50K fuzz iterations green under both `-O2` and
-ASan + UBSan.
+Current state (November 2026): about 20,000 lines of C. The original
+twelve phases, the gap-closure plan (Garage comparison and security
+addendum) and round 2 are all implemented. Everything passes `make test`
+under both `-O2` and ASan + UBSan, and on a DS1515+ (recorded run in
+`docs/AGENT-BUILD-AND-DS1515-TEST.md`). Open work is in the README's
+"Roadmap" and in `docs/synology-readiness/CLAUDE.md`.
 
-## Gap-closure work (Nov 2026)
-
-The gap-closure plan (Garage comparison + security addendum) is
-implemented on top of phase 12. Quick map of what it added:
-
-| area | where | tests |
-|---|---|---|
-| S0 subresource routing + F2 `authz(c,b,k,act)` | `src/route.c` (`route_classify`), `src/action.c` (exhaustive table; server refuses to start if incomplete) | `test_e2e_subresources.sh` |
-| F1 object header schema 3 (checksum, version id, flags) | `src/store_fs.c` (`obj_read_hdr` validates every length) | `test_store`, `tests/fixtures/obj_v2_legacy.bin` |
-| Item 1 trailer SigV4 + `x-amz-checksum-*` | `src/checksum.c`, decoder in `src/sigv4.c`, `checksum_setup/finish` in `src/conn.c` | `test_checksum`, `test_chunk_fuzz`, `test_e2e_checksum.sh` |
-| Item 2 presigned URLs + S1 | `extract_auth_params`/`verify_params` in `src/sigv4.c` | `test_sigv4`, `test_e2e_presign.sh` |
-| Item 3 grants, config sidecars + id-keyed cache | `store_bucket_sidecar_*`, `store_sidecar_get[_ttl]` | `test_store`, `test_e2e_isolation.sh` §10 |
-| Item 4 CORS (+ nosniff, CSP sandbox) | `src/cors.c`, `route_cors_decorate` | `test_e2e_cors.sh` |
-| Item 5 lifecycle, S4 striped key locks | `src/lifecycle.c`, `key_lock()` in store | `test_e2e_lifecycle.sh` |
-| Item 6 website listener | `web_dispatch` in route.c, `src/website.c` | `test_e2e_website.sh` |
-| Item 7 native TLS (`make TLS=1` / `make fs3-tls`) | `src/tls.c`, `conn_io_*` in conn.c | `test_e2e_tls.sh` |
-| Item 8 versioning | versioning section at end of store_fs.c | `test_e2e_versioning.sh` |
-| Item 9 bucket policies | `src/policy.c`, `src/json.c` | `test_policy`, `test_json`, `test_e2e_policy.sh` |
-| Item 10 object lock | `src/objlock.c`, store lock sidecars, version guard | `test_e2e_objlock.sh` |
-| Item 11 admin API | `src/admin.c` | `test_e2e_admin.sh` |
-| audit log, auth throttling | `src/audit.c` | `test_e2e_audit.sh` |
-
-Load-bearing rules added on the way:
-- **Lock order:** a key stripe lock (`key_lock(hex)`) before `ns_mu`, never
-  two stripe locks. Every multi-step mutation of one key holds its stripe.
-  `q_mu` (quota counters) is a leaf: take nothing while holding it.
-- **Quota accounting (round 2):** every key mutation measures
-  `key_usage()` before/after under its stripe and charges the delta; a
-  new path that adds or removes files in `data/`, `versions/` or `mpu/`
-  must do the same (or go through `delete_locked`/writer commit).
-  Writers own their reservation; `writer_free` releases it.
-- **Extra response headers** go through `conn_add_header()`; they are
-  spliced into whatever head is built (`apply_extra_headers`). Don't add
-  new parameters to the head builders.
-- **Unauthenticated paths** (CORS preflight, website) read bucket config
-  with `store_sidecar_get_ttl` (1 s, negative entries cached) — no
-  per-request disk I/O, no bucket enumeration by timing.
-- **Version ids** must pass `store_vid_parse` before any path is built.
-- **Expect: 100-continue** is answered in `cb_on_headers_complete`; without
-  it botocore stalls 1 s per upload.
-- New on-disk trees: `versions/`, `locks/`; new bucket sidecars:
-  `grants`, `cors.xml`, `lifecycle.xml`, `website.xml`, `policy.json`,
-  `object-lock.xml`; bucket `meta` gained `versioning=` / `object_lock=1`.
-
-Round 2 (Nov 2026) added part records, ListParts, UploadPartCopy,
-user metadata, ListObjectsV2, quotas (`q_*` in store_fs.c) and the
-integrity scrub (`src/scrub.c`, `store_scrub_file`) and key hygiene
-(`sigv4_cred_attrs_t`, read-only check at the top of `authz()`),
-seccomp (`src/sandbox.c`) and reflink fast paths (`clone_range`,
-`store_writer_clone`), dedup (`dedup_commit`, `cas/`), Btrfs
-compression (`set_compr_flag`) and SSE-C (`src/ssec.c`, writer/reader
-transform in store_fs.c) and layout 2 + `fs3-lockd` (`src/lockd.c`,
-`src/lockc.c`, `l2_publish`/`l2_point`, `resolve_current`).
-
-- **Layout 2 (object-lock buckets):** `data/<hex>` is a symlink into
-  `versions/`. Open current objects with `open_cur()` (never plain
-  `open()` on a data path); `vdir_list()` leaves the current entry out so
-  "versions dir = noncurrent" holds in both layouts. Version files are
-  unlinked through `unlink_version_file()` (the fs3-lockd hook).
-
-- **Writer byte counts:** `data_written` is plaintext (quota, data_size),
-  `stored_written` is on disk (stored_size, part records). Any new path
-  that puts bytes into a writer must advance both (see `writer_feed`,
-  `store_writer_clone`). Run `tests/test_e2e_reflink.sh` with
-  `FS3_REFLINK_DIR` on a Btrfs loopback; it skips otherwise.
-
-- **seccomp is on by default.** A new syscall in a runtime path (not
-  startup) kills the server with SIGSYS; the test harness says so. Add it
-  to `ALLOW[]` in `src/sandbox.c` and rerun `make seccomp-profile`.
-  The worker pool is created *after* the filter is installed, at the end
-  of `server_create`; keep it last.
-
-## First five minutes on a fresh box
-
-The sandbox doesn't persist between sessions, so you'll restore from
-the latest tarball under `/mnt/user-data/outputs/`. After
-`tar xzf` + `cd fs3`:
+## First five minutes
 
 ```sh
-apt-get install -y libssl-dev          # for openssl/evp.h
-pip install --break-system-packages -r tests/requirements.txt
-                                        # for tests/sign_request.py and aws cli
-chmod +x tests/*.sh                     # tar may not preserve +x in this env
+git clone https://github.com/lucianpopovici/fs3 && cd fs3
+apt-get install -y build-essential libssl-dev curl openssl
+pip install --break-system-packages -r tests/requirements.txt   # boto3, botocore[crt], awscli
 mkdir -p ~/.aws && cat > ~/.aws/config <<EOF
 [default]
 region = us-east-1
 s3 =
     addressing_style = path
 EOF
-                                        # AWS CLI v-host default doesn't work
-                                        # against 127.0.0.1
-
-make test                               # ~3 min for the full pyramid
+make && make test
 ```
 
-If `make test` fails on `test_e2e_auth.sh` with no output, 9 times out
-of 10 it's the botocore install missing. Run
-`bash -x tests/test_e2e_auth.sh 2>&1 | head -30` to confirm.
+- The AWS CLI's virtual-hosted default doesn't work against `127.0.0.1`,
+  which is why the config sets path-style.
+- `make test` stops early with an install hint if a test dependency is
+  missing (`make check-test-deps`).
+- The release and sanitizer builds share object files: `make clean`
+  whenever you switch `DEBUG` or `TLS`, or mixed objects link silently.
+- A few cases skip unless their environment is there (see README,
+  "Tests"). Set `FS3_TEST_STRICT=1` to make skips fail.
 
-## Working directory conventions
+## Where things are
 
-- Working tree lives at `/home/claude/fs3/`. It usually persists across
-  turns within a session; never across sessions.
-- Output artifacts go to `/mnt/user-data/outputs/`. The most recent
-  tarball name is `fs3-phase8-listing-and-gc.tar.gz`.
-- Don't trust the `fs3` binary across sessions — always `make clean
-  && make` after a restore. The release and sanitizer builds use the
-  same object files, so mixing them silently links wrong code.
+The module list is in README, "Source layout". Feature → code → tests:
 
-## What is wired
-
-```
-src/main.c          CLI parsing, server bring-up
-src/server.c        accept/epoll loop, MPU GC scheduling
-src/conn.c          per-conn state machine, llhttp callbacks, SigV4 invoke
-src/route.c         path parse, dispatch, all S3 handlers
-src/response.c      response builders, XML rendering, error mapping, ETag fmt
-src/store_fs.c      filesystem-backed store: PUT/GET/HEAD/DELETE/LIST/MPU/GC
-src/sigv4.c         header-mode + streaming-chunked SigV4 verifier
-src/iopool.c        worker threads for commit/copy/MPU-complete jobs
-src/log.c           leveled logger
-include/*.h         public APIs
-tests/              test_store.c, test_sigv4.c, three .sh suites
-third_party/llhttp/ vendored llhttp v9.3.0 (parser, MIT)
-third_party/xml/    extended XML library (parsing + rendering + fuzz tests)
-```
-
-The protocol surface covered today:
-
-- Bucket: PUT / GET (list objects, paginated, with prefix/delimiter) /
-  DELETE / HEAD
-- Object: PUT (single + streaming) / GET (full body, sendfile) / HEAD
-  / DELETE
-- Multipart: initiate / upload-part / complete / abort, plus the AWS-
-  style `"<md5-of-md5s>-<n>"` ETag carried through to GETs and listings
-- Service: ListAllMyBuckets (`GET /`)
-- Bucket: ListMultipartUploads (`GET /bucket?uploads`) with optional
-  `prefix` filter
-- Background: 60s-cadence MPU GC with 24h TTL (both flag-tunable)
-- Auth: SigV4 header mode AND streaming chunked mode
-  (`STREAMING-AWS4-HMAC-SHA256-PAYLOAD`), per-chunk signature chaining
-  verified before bytes hit the store writer
-- Range GET: `Range: bytes=A-B/A-/-N` → 206 Partial Content with
-  `Content-Range`; invalid ranges → 416
-- Bulk delete: `POST /<bucket>?delete` with `<Delete>` XML body,
-  returns `<DeleteResult>` with `<Deleted>`/`<Error>` elements, supports
-  `<Quiet>true</Quiet>` mode
-- Bucket subresources: `?location` and `?versioning` stubs return
-  sensible empty XML (no-region, no versioning)
-- Server-side copy: `PUT /<bucket>/<key>` with
-  `x-amz-copy-source: [/]src-bucket/src-key`, returns
-  `<CopyObjectResult>` with ETag + LastModified; preserves source
-  content-type; URL-decodes the source path
-- ACL stub: `GET /<bucket>?acl` and `GET /<bucket>/<key>?acl` return a
-  static FULL_CONTROL ACL; `PUT` accepts and discards the body → 200
-- Per-user bucket isolation (auth only): credentials are
-  `ak:sk[:user]` (user defaults to the access key); a bucket is owned by
-  its creator's user; `authz_bucket()` in `route.c` gates every bucket/
-  object request (and the copy source) — owner or `--admin`, else 403.
-  `ListAllMyBuckets` is filtered. Ownerless buckets (pre-isolation, or
-  made with auth off) are admin-only until `--legacy-owner <user>`.
-  Anonymous requests under auth (no `--require-auth`) get 403. No auth
-  configured = no identities, no checks.
-
-What we *don't* do:
-- HTTP `Range:` multi-range (`bytes=A-B,C-D`; only single-range spec)
-- SigV4 trailer variants (`STREAMING-...-TRAILER`)
-- Bucket subresources: `?lifecycle`, `?cors` (location + versioning are stubs)
-- Pagination on ListMultipartUploads (always `IsTruncated=false`)
-- Any kind of IAM beyond static `access_key:secret_key[:user]` pairs and
-  bucket ownership. No policies, grants, shared buckets, STS, or console.
-- Replication, versioning, lifecycle rules, server-side encryption
-
-## On-disk layout
-
-```
-<root>/
-  buckets/<bucket>/                 # one dir per bucket
-    meta                            # id=<32 hex>, owner=<user> (absent on
-                                    # pre-isolation buckets: ownerless).
-                                    # The id changes on delete+re-create;
-                                    # commits re-check it (writer.bucket_id)
-  data/<bucket>/<NN>/<NN>/<hex>     # objects, sharded by hash prefix
-                                    # file = obj_header_t + content_type
-                                    # + key + body
-  mpu/<bucket>/<upload_id>/         # one dir per in-flight multipart upload
-    meta                            # key, ct, ctime_ms (one per line)
-    part-00001, part-00002, ...     # each part's bytes verbatim, named
-                                    # with MD5 in the dir
-  tmp/                              # staging area for atomic renames
-                                    # (files, and bucket.XXXXXX dirs being
-                                    # assembled by bucket create)
-```
-
-Object header is `obj_header_t`, schema 2 (bumped from 1 when we added
-`part_count` for multipart-ETag preservation across GETs). All fields
-little-endian, packed, with a magic prefix `YS3OBJ\0\0`. If you change
-the on-disk format again, bump the schema and reject mismatches at
-read time — the read path already does this.
-
-## Tests and what each covers
-
-| target | language | what it exercises |
+| feature | code | tests |
 |---|---|---|
-| `tests/test_store` | C | 43 unit tests: bucket CRUD (incl. delete racing an in-flight PUT/MPU, a threaded commit-vs-bucket-delete race on `ns_mu`, and a bucket-meta write failure under ENOSPC leaving no half-created marker dir), bucket owner/id meta, legacy buckets can't be taken over and are assigned by `--legacy-owner`, a commit into a deleted-then-re-created bucket is refused, single PUT/GET round-trip, sendfile, listing with prefix/delimiter, persistence across `store_open`/`store_close`, multipart lifecycle, list_buckets, bucket_stats, list_mpu_uploads (with prefix filter), mpu_gc reaping behavior |
-| `tests/test_conn` | C | 5 unit tests of the per-connection request path over a pipe: the per-event read budget yields and resumes, a yielded conn isn't closed on peer hangup; PUT commit, copy, MPU part and MPU complete park the conn and run on an iopool worker (a blocking fsync hook proves the loop thread is free); an orphaned job completes safely; pool shutdown drains queued jobs |
-| `tests/test_xml` | C | 25 tests of the extended XML library (escaping, parsing, security limits) |
-| `tests/test_xml_legacy` | C | one round-trip showing the original calling style still works |
-| `tests/test_xml_fuzz` | C | 50,000 random inputs through the parser, must not crash |
-| `tests/test_sigv4` | C | 43 unit tests of canonical request, string-to-sign, signing key derivation against AWS test vectors, plus `sigv4_verify_id`'s user/admin capture (including the access-key-default and untouched-on-failure cases) |
-| `tests/test_credfile` | C | 24 unit tests of `main.c`'s credentials parser via a `FS3_MAIN_TESTING` test seam: `ak:sk[:user]` line parsing, `valid_identity` field validation, and `load_credentials_file`'s fail-closed-on-a-malformed-line behavior |
-| `tests/test_e2e.sh` | bash + curl | 23 integration tests: every bucket/object verb, listing edge cases, keep-alive pipelining, large objects, ext_body spillover, ListAllMyBuckets |
-| `tests/test_e2e_auth.sh` | bash + python | 28 integration tests of SigV4 with real signatures from botocore (header mode + streaming chunked) |
-| `tests/test_e2e_mpu.sh` | bash + curl | 26 integration tests of the full multipart lifecycle including ListMultipartUploads, prefix filter, abort, malformed XML, large parts |
-| `tests/test_e2e_phase9.sh` | bash + curl | 45 integration tests of Range GET (206/416), bulk delete (`?delete`), and bucket subresources (`?location`, `?versioning`) |
-| `tests/test_e2e_phase10.sh` | bash + curl | 27 integration tests of server-side object copy and `?acl` stub |
-| `tests/test_e2e_phase11.sh` | bash + curl + python | 18 integration tests of `/_health`, `--credentials-file`, `--min-free-bytes` quota |
-| `tests/test_e2e_isolation.sh` | bash + python | 52 integration tests of per-user bucket isolation: every verb denied cross-user, shared users and key-as-user, filtered ListAllMyBuckets, copy source/destination checks, `--admin`, SIGHUP key rotation keeping buckets, ownerless buckets + `--legacy-owner`, anonymous requests under auth, and a SIGHUP-vs-in-flight-request ASan/UBSan use-after-free regression (`tests/sign_slow_put.py`) |
-| `tests/test_e2e_phase12.sh` | bash + curl + python | 39 integration tests of startup recovery, `--max-body-size` (413), `--idle-timeout`, `--max-conns`, SIGHUP credential reload, the `--metrics-port` admin listener (`/healthz`, `/metrics`, `/buckets`), and half-closed large uploads |
-| `tests/test_ui_cgi.sh` | bash | 56 tests of the DSM-tile admin console CGI driven against a scratch var dir: conf parsing without sourcing, HTML escaping, CSRF token + Origin checks, credential add/replace/remove with validation, the optional user field (kept when a secret is replaced) and the last-key lockout guard, SIGHUP delivery, live bucket stats via a real admin listener |
+| request classification, `authz()` | `route_classify`, `authz` in `src/route.c`; action table in `src/action.c` (exhaustive; the server refuses to start if an action is unmapped) | `test_e2e_subresources.sh` |
+| SigV4 header / chunked / trailer / presigned, key attributes | `src/sigv4.c` (`extract_auth_params`, `verify_params`, chunk decoder, `sigv4_cred_attrs_t`) | `test_sigv4`, `test_chunk_fuzz`, `test_e2e_auth.sh`, `test_e2e_presign.sh`, `test_e2e_keys.sh` |
+| checksums | `src/checksum.c`; `checksum_setup`/`checksum_finish` in `src/conn.c` | `test_checksum`, `test_e2e_checksum.sh` |
+| object format (schema 4, TLV, padding, payload CRC) | `obj_read_hdr4` and friends in `src/store_fs.c`; metadata TLVs in `src/objmeta.c` | `test_store`, `test_objmeta`, `tests/fixtures/` |
+| multipart, part records, ListParts, UploadPartCopy | MPU section of `src/store_fs.c`, handlers in `src/route.c` | `test_e2e_mpu.sh`, `test_e2e_parts.sh` |
+| listing | lister in `src/store_fs.c`, list handlers in `src/route.c` | `test_e2e_listing.sh` |
+| grants, config sidecars, id-keyed cache | `store_bucket_sidecar_*`, `store_sidecar_get[_ttl]` | `test_store`, `test_e2e_isolation.sh` |
+| versioning | versioning section of `src/store_fs.c` | `test_e2e_versioning.sh` |
+| Object Lock, layout 2, fs3-lockd | `src/objlock.c`, lock sidecars, version guard; `l2_publish`/`l2_point`/`resolve_current`; `src/lockd.c`, `src/lockc.c` | `test_e2e_objlock.sh`, `test_e2e_immutable.sh` |
+| bucket policies | `src/policy.c`, `src/json.c` | `test_policy`, `test_json`, `test_e2e_policy.sh` |
+| CORS, website, lifecycle | `src/cors.c` (`route_cors_decorate`), `src/website.c` + `web_dispatch`, `src/lifecycle.c` | `test_e2e_cors.sh`, `test_e2e_website.sh`, `test_e2e_lifecycle.sh` |
+| quotas | `q_*` in `src/store_fs.c` | `test_e2e_quota.sh` |
+| scrub | `src/scrub.c`, `store_scrub_file` | `test_e2e_scrub.sh` |
+| reflink, dedup, compression | `clone_range`, `store_writer_clone`, `dedup_commit` (`cas/`), `set_compr_flag` | `test_e2e_reflink.sh` |
+| SSE-C | `src/ssec.c`, writer/reader transform in `src/store_fs.c` | `test_ssec`, `test_e2e_ssec.sh` |
+| native TLS | `src/tls.c`, `conn_io_*` in `src/conn.c` | `test_e2e_tls.sh` |
+| admin API | `src/admin.c` | `test_e2e_admin.sh` |
+| audit log, throttling | `src/audit.c` | `test_e2e_audit.sh` |
+| seccomp | `src/sandbox.c` (`ALLOW[]`), `tests/tools/seccomp_profile.sh` | `test_sandbox`, every e2e suite (a SIGSYS is reported) |
+| credentials file | `parse_and_add_cred`, `load_credentials_file` in `src/main.c` | `test_credfile` (seam: `FS3_MAIN_TESTING`) |
+| dedup estimator | `src/dedup_estimate.c` (standalone; mirrors the header format, keep in sync) | `test_e2e_dedup_estimate.sh` |
+| Synology package and tile | `packaging/synology/` | `test_ui_cgi.sh` |
 
-All targets pass under both `-O2` and DEBUG (ASan + UBSan), except one
-pre-existing, unrelated flake under DEBUG:
-`t_commit_races_bucket_delete` in `tests/test_store` (a tight two-thread
-race on `ns_mu`) reproduces on unmodified `main` too in this sandbox —
-not caused by any brief-12a change. Worth its own session.
+## Rules the code depends on
 
-`make test` runs everything sequentially; each suite is also runnable
-standalone. The auth suite is the slowest (~30s; chunked SigV4 tests
-upload real payloads).
+Don't quietly undo these.
 
-## Architecture choices to keep in mind
+**Threads and locks**
+- One event-loop thread owns every `conn_t`, all parsing, auth and
+  routing. Socket I/O is non-blocking and epoll is level-triggered. Each
+  readable event reads at most `CONN_READ_BUDGET` (256 KB) before
+  yielding, so one fast uploader can't starve the others.
+- Blocking store work (PUT/part commit, MPU complete, copies) runs as
+  jobs on `src/iopool.c` (`--io-threads`, default 4; 0 runs them inline).
+  - The conn parks in `CST_WAIT_JOB`.
+  - A job's `run()` touches only what the job owns. Its `done()` runs back
+    on the loop through an eventfd.
+  - A disconnect orphans the job (`job->conn = NULL`), which still
+    completes.
+- Background passes (lifecycle, scrub) are scheduled from the loop's 1 s
+  tick and run on a worker.
+- **Lock order:** a key stripe lock (`key_lock(hex)`, 256 stripes) comes
+  before `ns_mu`, and you never hold two stripe locks. Every multi-step
+  mutation of one key holds its stripe.
+  - `ns_mu` covers namespace steps (bucket create/delete, MPU directories,
+    part renames).
+  - `q_mu` (quota counters) and `cfg_mu` (sidecar cache) are leaves: take
+    nothing while holding them.
+  - Never hold a lock across fsync of object data.
+- **Committed object files are never modified in place.** Writes go
+  tmp → fsync → rename → fsync(parent). Versioning uses `link()`, and lock
+  immutability only sets a flag. Readers rely on this and take no locks,
+  and so will block dedup (`docs/block-dedup-plan.md`).
 
-These are decisions made early that the rest of the code depends on.
-Don't quietly undo them.
+**Lifetimes**
+- `conn_t` is per connection. `s3_store_t`, `sigv4_verifier_t` and the
+  iopool live for the whole server. Never free `c->store` in
+  `conn_destroy`.
+- Shutdown order: `server_destroy` closes conns, then `iopool_destroy`
+  (drains jobs), then `store_close`.
+- Credential reloads build a new set and swap it in
+  (`sigv4_swap_creds`). Identities are copied out at verify time
+  (`sigv4_verify_id`), so a reload during a request can't free them.
+- The seccomp filter is installed at the end of startup, and the worker
+  pool is created *after* it (end of `server_create`) so workers inherit
+  it. Keep that order.
 
-- **Single-threaded epoll event loop, plus an I/O worker pool.** All
-  connection state, parsing, auth and routing live on the one loop
-  thread; `conn_t` is never touched from another thread. Socket I/O is
-  non-blocking. Epoll is level-triggered, and each readable event reads
-  at most `CONN_READ_BUDGET` (256 KB) before yielding, so one fast
-  uploader can't starve the other connections.
+**Request handling**
+- `s3_str_t` (`p`, `n`) is the string type everywhere; helpers are in
+  `include/s3.h`. Short-lived allocations go in the per-request arena
+  (`scratch_alloc(c, n)`).
+- Extra response headers go through `conn_add_header()`, and are spliced
+  into whatever head is built. Don't add parameters to the head builders.
+- `Expect: 100-continue` is answered in `cb_on_headers_complete`.
+  Without it, botocore stalls 1 s per upload.
+- Unauthenticated paths (CORS preflight, website) read bucket config
+  with `store_sidecar_get_ttl` (1 s, negative entries cached), so there
+  is no per-request disk I/O and no bucket enumeration by timing.
+- Values that become paths are validated first: bucket names
+  (`store_valid_bucket_name`), version ids (`store_vid_parse`), upload
+  ids and user names (`[A-Za-z0-9._@-]`).
+- Metadata values are echoed into response headers, so CR, LF and NUL
+  are refused on write *and* re-checked on read.
 
-  The slow, blocking store steps — PUT/part commit (fsync + rename),
-  CompleteMultipartUpload (concatenate + fsync) and server-side copy —
-  run as jobs on `src/iopool.c` (`--io-threads`, default 4; 0 runs them
-  inline, the old behaviour). The conn parks in `CST_WAIT_JOB` with no
-  epoll interest; the job's `run()` executes on a worker and only
-  touches what the job owns, and its `done()` runs back on the loop
-  (via an eventfd, reaped *after* each event batch) to build the
-  response. If the client disconnects, `conn_destroy` orphans the job
-  (`job->conn = NULL`) and it still completes. Everything else in the
-  store (listing, HEAD, GET open, delete, MPU create/abort, GC) stays
-  synchronous on the loop.
-
-  The store has exactly one lock, `ns_mu`, held only around the
-  namespace steps that must be atomic against a concurrent commit:
-  bucket-exists check + `mkdir_p` + `rename`, and `rm_rf` of bucket /
-  upload dirs. Never hold it across data writes or fsync of object
-  bytes, and never call another locking store function while holding it.
-
-- **`s3_str_t` is the universal string type.** `(const char *p, size_t
-  n)`. Length-bounded, no NUL terminator required. Don't strdup unless
-  the lifetime needs to outlive the request. Macros:
-  `S3_STR_LIT("x")`, `S3_STR_FMT` / `S3_STR_ARG(s)` for printf,
-  `s3_str_eq` / `s3_str_eq_lit` for comparisons. All in `include/s3.h`.
-
-- **Per-request bump arena.** `c->req_scratch` is a 4 KB arena reset
-  between requests. Use `scratch_alloc(c, n)` for short-lived
-  allocations during request handling (decoded query values, parsed
-  Authorization fields, etc.). Falls back to `malloc` when needed.
-
-- **The on-disk format is the persistence story.** No database, no
-  index. Listing iterates `readdir()`. This is fine for homelab scale
-  (≪10⁶ objects per bucket). At larger scale we'd want an index, but
-  that's a different project.
-
-- **Atomic writes via tmp + fsync + rename + fsync(parent_dir).** Every
-  PUT and every CompleteMultipartUpload follows this discipline. Test
-  failures involving "object missing after PUT returned 200" almost
-  always trace back to a missing `fsync` somewhere.
-
-- **The XML library is in `third_party/xml/`.** It's the same library
-  used by yours3 phase 0; it has its own tests and fuzz suite. Don't
-  inline XML generation; use `create_node`/`xml_text_child`/etc., then
-  `xml_render_with_decl`.
-
-- **`conn_t` and `s3_store_t` are *not* the same lifetime.** `conn_t`
-  is per-connection; `s3_store_t` is server-lifetime. Same for
-  `sigv4_verifier_t` and the `iopool_t`. Don't free `c->store` in
-  `conn_destroy`. An `iojob_t` can outlive its conn (orphaned) and is
-  freed by its own `done()`; `server_destroy` closes conns, then
-  `iopool_destroy` (drains jobs), then `store_close` — keep that order.
-
-## Sandbox / tooling gotchas
-
-These are environment artifacts that have bitten me, not project
-issues:
-
-- **`pkill -9 -f "fs3 -p"` sometimes hangs the shell** for unknown
-  reasons. When it does, the previous tool call returns with empty
-  output and the next one needs to be a `echo a` canary to confirm
-  the shell is still alive. Avoid `pkill` if there are no fs3
-  processes around; check with `ps aux | grep fs3 | grep -v grep`
-  first.
-
-- **Backgrounded servers and `aws cli` invocations in the same cell
-  can race.** If you start a server with `&` and then run `aws s3 mb`
-  immediately, sometimes the server hasn't bound the port yet. Sleep
-  0.4s. If it still fails, do it in two separate cells.
-
-- **`make test` output sometimes gets truncated** when one suite hangs
-  but eventually returns. Run suites individually
-  (`./tests/test_e2e.sh`, `./tests/test_e2e_auth.sh`, etc.) to confirm
-  green if `make test` looks weird.
-
-- **`set -eu` in bash scripts will kill the script** when
-  `grep -c PATTERN` returns 0 matches (exit 1). Append `|| true` to
-  count expressions in test scripts; we hit this twice while writing
-  `test_e2e_mpu.sh`.
-
-- **A leftover `./fs3` from a previous session may be the sanitizer
-  binary**, which is slower and pulls in `libasan.so`. Always
-  `make clean && make` after restoring from tarball.
+**Store**
+- **Quota accounting:** every key mutation measures `key_usage()` before
+  and after, under its stripe, and charges the delta. A new path that
+  adds or removes files in `data/`, `versions/` or `mpu/` must do the
+  same, or go through `delete_locked` or a writer commit. Writers own
+  their reservation, and `writer_free` releases it.
+- **Writer byte counts:** `data_written` is plaintext (quota,
+  `data_size`); `stored_written` is what's on disk (`stored_size`, part
+  records). A new path that feeds a writer must advance both (see
+  `writer_feed`, `store_writer_clone`).
+- **Layout 2** (Object Lock buckets): `data/<hex>` is a symlink into
+  `versions/`.
+  - Open current objects with `open_cur()`, never plain `open()` on a data
+    path.
+  - `vdir_list()` leaves the current entry out, so "versions dir =
+    noncurrent" holds in both layouts.
+  - Version files are unlinked through `unlink_version_file()`, the
+    fs3-lockd hook.
+- Per-bucket caches are keyed by bucket **id**, not name, so a deleted
+  and re-created bucket never inherits stale config or grants.
+- Every sidecar is written tmp → fsync → rename → fsync(dir), and startup
+  recovery removes its leftover temp files.
+- No database, no index: the files are the source of truth, and listing
+  walks the filesystem. That is fine well below 10⁶ objects per bucket.
 
 ## How to extend
 
-Common patterns for adding a new feature:
+**A new S3 operation**
+1. Add an `s3_action_t` in `include/action.h` and its row in
+   `src/action.c` (IAM name, permission, owner flag). The startup check
+   fails if you forget.
+2. Classify it in `route_classify` (method, path shape, subresource).
+   Anything unrecognised must stay 501.
+3. Write the handler in `src/route.c`, with response builders in
+   `src/response.c`. Use `conn_add_header()` for extra headers.
+4. Add e2e tests that use botocore or the AWS CLI as the oracle.
 
-**Adding a new HTTP endpoint:**
-1. Add the handler in `src/route.c`. Existing handlers are good
-   templates — `handle_service`, `handle_bucket`, `handle_object_get`,
-   etc.
-2. Add response builders in `src/response.c` and declare them in
-   `include/response.h`. Use `ship_xml_200(c, body, blen)` for the
-   ext_body spill case.
-3. Wire it into `route_dispatch_headers` or a query-param branch.
-4. Add e2e tests to the appropriate `tests/test_e2e*.sh`.
+**A new store operation:** declare it in `include/store.h` with a doc
+comment and implement it in `src/store_fs.c` (`s3_err_t` return,
+`s3_str_t` inputs). Respect the lock order and quota accounting above.
+Add a `t_xxx()` case to `tests/test_store.c`.
 
-**Adding a new store operation:**
-1. Add to `include/store.h` with a doc comment.
-2. Implement in `src/store_fs.c`. The header has `s3_err_t` returns
-   and `s3_str_t` inputs; don't deviate.
-3. Add to `tests/test_store.c` with the `t_xxx()` + register-in-main
-   pattern.
+**A new error code:** add it to the enum in `include/s3.h` and to
+`ERR_TABLE` in `src/response.c` (HTTP status, S3 code, message). It is
+counted in `fs3_errors_total` automatically.
 
-**Adding a new error code:**
-1. Add to the enum in `include/s3.h`.
-2. Add to `ERR_TABLE` in `src/response.c` (HTTP status + S3 code + msg).
-3. That's it — `rsp_build_s3_error` handles the rest.
+**A new per-object field:** add a TLV type (`[u16 type][u32 len][bytes]`)
+rather than changing the fixed header. Readers skip unknown types and
+copies preserve them, so this is not a migration. If the fixed header
+really has to change, bump `OBJ_SCHEMA`, keep reading the old schemas,
+add a fixture under `tests/fixtures/`, call it out as one-way in
+`packaging/synology/CHANGELOG.md`, and update `src/dedup_estimate.c`,
+which mirrors the header.
 
-**Adding a new on-disk field:**
-1. Bump `OBJ_SCHEMA` in `src/store_fs.c`.
-2. Add the field to `obj_header_t`. Use `reserved[]` padding if
-   possible, otherwise grow it.
-3. Update `read_header` to populate the new `s3_obj_meta_t` field.
-4. Update `_Static_assert(sizeof(obj_header_t) == N)` to the new size.
-5. Old objects on disk won't parse anymore. This is fine for a homelab
-   pre-1.0 server; document it as a schema bump in the README.
+**A new parser** (XML config, JSON, header format, sidecar) gets a fuzz
+target in the 50,000-iteration run.
 
-## Phase history
+**A new syscall at runtime:** add it to `ALLOW[]` in `src/sandbox.c`,
+with argument filters where it makes sense, and run
+`make seccomp-profile`. Build the profile from the static Synology binary
+too; glibc versions differ (`open` vs `openat`, `stat` vs `newfstatat`).
 
-For when "wait, what was I doing in phase 5?" is the question:
+**A new CLI option:** add it to `--help` and the README's command-line
+reference. If it matters on a NAS, also add a `fs3.conf` key in
+`packaging/synology/scripts/start-stop-status`, plus its whitelist entry
+in `ui/index.cgi` (the SPK does not yet pass the newer options; see the
+roadmap).
 
-- **Phase 0** — HTTP server skeleton: epoll, llhttp, per-conn state
-  machine, write response back. No store, no S3 protocol.
-- **Phase 1** — Filesystem store: bucket and object CRUD on disk with
-  atomic-rename discipline. Tests in C.
-- **Phase 2** — S3 protocol: PUT/GET/HEAD/DELETE/list of objects,
-  XML responses. AWS CLI works without auth.
-- **Phase 3** — SigV4 header mode: canonical request, string-to-sign,
-  signing key. AWS test vectors. End-to-end with botocore.
-- **Phase 4** — Body-hash verification: streaming SHA-256 of the body,
-  compare against `x-amz-content-sha256`. Closes the "client can lie
-  about body" hole.
-- **Phase 5** — Streaming chunked SigV4: `aws-chunked` decoder with
-  per-chunk signature chaining, integrated with the existing PUT
-  writer path. AWS CLI's default-mode uploads now work.
-- **Phase 6** — Skipped/folded into 5.
-- **Phase 7** — Multipart upload: initiate / upload-part / complete /
-  abort. On-disk staging under `mpu/`. Multipart ETag carried through
-  to GET via schema-2 `part_count` field. 16 MB AWS CLI round-trip.
-- **Phase 8** — Service-level listing (`ListAllMyBuckets`),
-  in-bucket listing of in-flight uploads (`ListMultipartUploads`
-  with prefix filter), and periodic GC of abandoned multipart
-  staging dirs (60s sweep, 24h TTL, both flag-configurable).
-- **Phase 9** — HTTP Range requests (`Range: bytes=A-B/A-/-N`,
-  206 Partial Content / 416 Range Not Satisfiable), bulk object
-  delete (`POST /<bucket>?delete` with `<Delete>` XML body, including
-  Quiet mode), and bucket subresource stubs (`?location`,
-  `?versioning`).
-- **Phase 10** — Server-side object copy (`PUT` with
-  `x-amz-copy-source`), and `?acl` stub for both bucket and object
-  level (GET returns static FULL_CONTROL ACL, PUT discards body).
-- **Phase 11** — `GET /_health` health endpoint,
-  `--credentials-file` (one `ak:sk` per line, `#` comments),
-  and `--min-free-bytes` disk quota (reject uploads when the volume's
-  free space drops below the threshold).
-- **Phase 12** — NAS-readiness Tier 1+2 (see
-  `docs/synology-readiness/`): ENOSPC/EDQUOT → 507 at every write
-  step; startup sweep of orphaned `tmp/` files; `--max-body-size`
-  (streamed-enforced 413), `--idle-timeout`, `--max-conns` default
-  512; SIGHUP credential reload (build-then-swap); `--metrics-port`
-  localhost admin listener with `/healthz` + Prometheus `/metrics`;
-  auth-exempt `/_health`; SPK watchdog with backoff. The current
-  state.
+## Gotchas
 
-## Decisions for next phase
+- `t_commit_races_bucket_delete` in `tests/test_store` (a tight
+  two-thread race on `ns_mu`) occasionally flakes under DEBUG. It is
+  known and reproduces on unmodified `main`. Rerun before chasing it.
+- `set -eu` scripts die when `grep -c` finds no match (exit status 1).
+  Append `|| true` to counting expressions.
+- Start a server in the background, then poll until it answers before
+  sending requests; the e2e scripts' `start()` helpers do this.
+- If `make test` output looks truncated, run the suites individually.
+  Each one is standalone.
+- On DSM (kernel 3.10, no `getrandom`), importing `awscrt` can print an
+  entropy warning to stdout and break test parsing. The signing helpers
+  set `sys.modules["awscrt"] = None` there. More NAS-specific fixes are
+  in the runbook's troubleshooting table.
 
-When picking up phase 11, in rough order of value:
+## History, briefly
 
-1. **`?lifecycle` / `?cors` stubs** — clients sometimes probe these
-   before operating on a bucket. Empty XML response, ~20 lines each.
-2. **Multi-range `Range:` support** — `bytes=A-B,C-D`. Returns
-   `multipart/byteranges` MIME body. Rarely needed by S3 clients.
-3. **Object copy with metadata replace** — honour
-   `x-amz-metadata-directive: REPLACE` to take the new request's
-   `Content-Type` instead of copying the source's. Currently always
-   copies the source content-type.
-4. **Copy source range** — `x-amz-copy-source-range: bytes=A-B` for
-   partial object copies (copy only a byte slice of the source).
+- **Phases 0–8:** epoll server, filesystem store, S3 protocol, SigV4
+  header, body hash and chunked modes, multipart, service listing, MPU GC.
+- **Phases 9–12:** Range, bulk delete, copy, ACL stubs, health, the
+  credentials file, disk-full handling, startup recovery, resource
+  bounds, metrics, the SPK watchdog, per-user isolation, the DSM tile.
+- **Gap closure:** strict routing and `authz`, schema 3, trailer SigV4
+  and checksums, presign, grants, CORS, lifecycle, website, native TLS,
+  versioning, policies, Object Lock, admin API, audit log.
+- **Round 2:** schema 4, part records and ETag checks, ListParts,
+  UploadPartCopy, metadata, ListObjectsV2, quotas, scrub, key hygiene,
+  seccomp, reflink, dedup, compression, SSE-C, layout 2 and fs3-lockd.
 
-Don't tackle erasure coding, distributed mode, or IAM. Those aren't
-"the next phase of fs3" — those would be a different project (and
-the answer to that project is rustfs, not fs3).
-
-## Synology / NAS deployment
-
-fs3 is packaged as a Synology SPK under `packaging/synology/` (build with
-`cd packaging/synology && ./build-spk.sh`; needs `make fs3-static`
-first). The package targets the DS1515+ (Intel Atom C2538 = avoton
-platform) and statically links libcrypto for DSM-version portability.
-
-Before trusting fs3 on a NAS with real data, read
-`docs/synology-readiness/CLAUDE.md` — it indexes one brief per gap
-between "demo that passes tests" and "production-grade on a NAS,"
-prioritized. The Tier-1 gaps (disk-full behavior, share permissions,
-TLS) are correctness/safety issues specific to the NAS context, not
-feature polish. That index also flags a present-tense config-injection
-bug (`fs3.conf` is sourced as shell) worth fixing regardless of which
-features get built.
-
-Note: the briefs were written against a phase-8-era snapshot; phases
-9–11 (Range, bulk delete, copy, ACL stubs, `/healthz`,
-`--credentials-file`, `--min-free-bytes`) have since landed, so check
-each brief's "current state" claims against the code before acting.
+The design plans for the last two rounds lived outside the repo. The
+code and this file are the reference now.

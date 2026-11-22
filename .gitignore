@@ -76,10 +76,11 @@ tests/test_ssec
 # Python bytecode from test helpers
 __pycache__/
 
-# Session-restore tarballs and build artifacts
+# Tarballs and build artifacts
 fs3-*.tar.gz
 fs3-static
 packaging/synology/*.spk
 fs3-tls
 fs3-tls-static
 fs3-lockd
+fs3-dedup-estimate

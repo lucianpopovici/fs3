@@ -15,8 +15,12 @@
  * partial state. Crashes during PUT leave the temp file behind for
  * later GC; the live tree is never corrupted.
  *
- * Concurrency: not thread-safe yet. Phase 2.x will add a per-bucket
- * RWLock around the (eventual) index. For now, single-threaded use.
+ * Concurrency: called from the event loop and from iopool workers.
+ * Every multi-step mutation of one key holds that key's stripe lock
+ * (256 stripes on the object hash); namespace changes (bucket
+ * create/delete, MPU directories) take ns_mu. Lock order: a stripe lock
+ * before ns_mu, never two stripe locks. Committed object files are never
+ * modified in place, so readers need no lock.
  */
 #ifndef FS3_STORE_H
 #define FS3_STORE_H
@@ -479,10 +483,10 @@ s3_err_t store_mpu_abort(s3_store_t *s, s3_str_t bucket, s3_str_t key,
 
 /* ---- List ----
  *
- * Phase 2.1 implementation walks the filesystem; OK for homelab scale
- * (~tens of thousands of objects per bucket). Phase 2.2 replaces this
- * with an LMDB-backed index for O(log N) range scans. The interface
- * stays the same. */
+ * Walks the filesystem: the lister loads and sorts the bucket's keys at
+ * begin time. Fine at homelab scale (tens of thousands of objects per
+ * bucket); a bucket with millions of keys would want an index, which
+ * fs3 deliberately doesn't keep (the files are the source of truth). */
 typedef struct {
     s3_str_t prefix;     /* may be empty */
     s3_str_t marker;     /* return keys lexicographically AFTER this; may be empty */

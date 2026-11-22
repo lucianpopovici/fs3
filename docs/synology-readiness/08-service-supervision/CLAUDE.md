@@ -17,9 +17,10 @@
 > "running" during backoff. The preferred DSM-native service model
 > still needs investigating against the DSM 7 developer guide + real
 > hardware (reboot autostart relies on `startable="yes"` — verify on
-> the DS1515+).
+> the DS1515+). Re-verified in the 2026-11-18 run (package 0.9.0-6):
+> `kill -9` of the child respawned it within 2 s.
 
-**Problem:** the SPK launches fs3 as a backgrounded process and records
+**Problem (original, before the watchdog):** the SPK launches fs3 as a backgrounded process and records
 its PID (`start-stop-status` in `packaging/synology/scripts/`). If fs3
 crashes, nothing restarts it — DSM just shows "stopped" until someone
 notices and clicks Run. There's no crash recovery and no

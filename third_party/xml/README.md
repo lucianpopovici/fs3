@@ -1,15 +1,15 @@
 # XML library — extended for fs3
 
-This is your XML library, with two correctness fixes and three additions.
-The original public API is preserved unchanged.
+The project author's XML library, vendored with two correctness fixes
+and three additions. The original public API is preserved unchanged.
 
 ## Files
 
 - `xml_parser.h` — public API. Existing names kept; new names added.
 - `xml_parser.c` — single implementation file.
-- `tests/test_xml.c` — 25 test cases covering original API, escaping,
+- `tests/test_xml.c` — test cases covering original API, escaping,
   buffer serializer, parser, security limits, and round-trips.
-- `tests/test_legacy.c` — verifies your original calling pattern still
+- `tests/test_legacy.c` — verifies the original calling pattern still
   works (direct `node->content = strdup(...)` assignments,
   void-style `add_child`/`add_attr` calls).
 - `tests/test_fuzz.c` — quick brute-force fuzzer; 50k random inputs
@@ -122,7 +122,7 @@ prevent stack overflow and memory exhaustion from malicious input.
 ## Building
 
 The library has no dependencies. Compile `xml_parser.c` alongside
-your other sources, with `-Ipath/to/xml_parser_dir` for the header.
+the other sources, with `-Ipath/to/xml_parser_dir` for the header.
 
 ```
 gcc -O2 -Wall -Iinclude -Ithird_party/xml \
@@ -144,14 +144,14 @@ gcc -O2 -g -fsanitize=address,undefined \
 
 ## Backwards compatibility
 
-Existing callers of your library work without modification:
+Existing callers of the library work without modification:
 
 - `XMLNode *n = create_node("foo")` — unchanged.
 - `n->content = strdup("text")` — still allowed; the field is public.
 - `add_child(parent, child)` — return value (now `int`) safely ignored.
 - `add_attr(node, "k", "v")` — same.
 - `serialize_node(stdout, root, 0)` — same. Output is now correctly
-  escaped; if your existing callers were emitting content with `<` or
+  escaped; if existing callers were emitting content with `<` or
   `&` they were producing broken XML before.
 - `find_node(root, "name")` — unchanged.
 - `free_tree(root)` — unchanged.

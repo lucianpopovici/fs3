@@ -20,8 +20,9 @@
  * still need to stream the GET body via sendfile. That's signalled by
  * c->get_reader being non-NULL.
  *
- * Phase 2 hook for SigV4: insert a verification step at the head of
- * cb_on_headers_complete, before route_dispatch_headers().
+ * Authentication (SigV4 header/presigned, via sigv4_verify_id) runs in
+ * cb_on_headers_complete before routing. Blocking store work (commit,
+ * copy, MPU complete) is handed to the iopool (CST_WAIT_JOB).
  */
 
 #include "conn.h"
@@ -615,7 +616,7 @@ static int cb_on_headers_complete(llhttp_t *p) {
         return 0;
     }
 
-    /* Phase 2 hook: SigV4 verification.
+    /* SigV4 verification.
      *
      * If a verifier is configured, check the signature now. On failure,
      * build the appropriate S3 error response and skip the route
