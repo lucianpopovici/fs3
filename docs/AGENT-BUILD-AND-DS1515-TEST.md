@@ -600,6 +600,9 @@ seconds.
 - `docs/AGENT-COMPAT-HYPERBACKUP-VEEAM.md`: recorded runs of Synology
   Hyper Backup and Veeam against fs3 (the GUI part of the compatibility
   matrix in `docs/compatibility.md`).
+- `docs/AGENT-SSE-EVENTS-BROWSER-DS1515-TEST.md`: SSE-S3 cost and key
+  file, webhooks under seccomp, and the tile's object browser (upload
+  limits of DSM's web server, share links behind the reverse proxy).
 
 ## 2. Troubleshooting
 

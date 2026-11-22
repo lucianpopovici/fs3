@@ -1217,6 +1217,10 @@ Next:
 - **Replication on hardware:** a DS1515+ run replicating to B2 or a second
   box, which also confirms the DSM CA bundle path
   (`docs/AGENT-REPLICATION-DS1515-TEST.md`).
+- **SSE-S3, webhooks and the object browser on hardware:** a DS1515+
+  run measuring encryption cost, webhook delivery under seccomp, and how
+  large an upload DSM's web server passes to the tile
+  (`docs/AGENT-SSE-EVENTS-BROWSER-DS1515-TEST.md`).
 - **Backup-tool matrix, GUI part:** recorded Hyper Backup and Veeam runs
   (`docs/AGENT-COMPAT-HYPERBACKUP-VEEAM.md`). The scripted part is done:
   `make compat`, results in `docs/compatibility.md`.
