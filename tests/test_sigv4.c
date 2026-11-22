@@ -271,6 +271,34 @@ static void t_verify_aws_s3_get_example(void) {
     sigv4_destroy(v);
 }
 
+/* The signer (used by the replication client) must produce exactly the
+ * botocore signature above for the same request. */
+static void t_sign_matches_botocore(void) {
+    static const sigv4_hdr_t H[] = {
+        { { "host", 4 },       { "examplebucket.s3.amazonaws.com", 30 } },
+        { { "range", 5 },      { "bytes=0-9", 9 } },
+        { { "x-amz-date", 10 }, { "20130524T000000Z", 16 } },
+    };
+    sigv4_sign_req_t r = { "GET", "/test.txt", NULL, H, 3,
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" };
+    char auth[512];
+    int rc = sigv4_sign(&r, "AKIAIOSFODNN7EXAMPLE", "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+                        "us-east-1", "20130524T000000Z", auth, sizeof(auth));
+    CHECK(rc == 0, "sigv4_sign succeeds");
+    CHECK(strcmp(auth, "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request, SignedHeaders=host;range;x-amz-date, Signature=5d66fb2d81386a1a76b0d6d11ff033d15eef06699e0706d32b211f38fde2462c") == 0,
+          "sigv4_sign reproduces the botocore signature");
+    if (rc == 0 && !strstr(auth, "5d66fb2d")) fprintf(stderr, "  got %s\n", auth);
+    char small[16];
+    CHECK(sigv4_sign(&r, "AKIAIOSFODNN7EXAMPLE", "x", "us-east-1", "20130524T000000Z",
+                     small, sizeof(small)) == -1, "sigv4_sign: small buffer refused");
+    CHECK(sigv4_sign(&r, "AK", "x", "us-east-1", "2013", auth, sizeof(auth)) == -1,
+          "sigv4_sign: malformed date refused");
+    char hex[65];
+    sigv4_sha256_hex("", 0, hex);
+    CHECK(strcmp(hex, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855") == 0,
+          "sha256 hex of empty input");
+}
+
 static void t_verify_wrong_signature(void) {
     sigv4_verifier_t *v = sigv4_create();
     sigv4_add_cred(v, "AKIAIOSFODNN7EXAMPLE",
@@ -759,6 +787,7 @@ int main(void) {
     t_canon_query_aws_example();
     t_signing_key_aws_iam_example();
     t_verify_aws_s3_get_example();
+    t_sign_matches_botocore();
     t_verify_wrong_signature();
     t_verify_unknown_access_key();
     t_verify_skewed_time();

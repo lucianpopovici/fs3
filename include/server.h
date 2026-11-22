@@ -99,6 +99,13 @@ typedef struct {
     int                    scrub_now;
     uint64_t               scrub_rate;            /* bytes/s, 0 = unthrottled */
     int                    scrub_fail_reads;
+
+    /* Bucket replication (repl.c). repl_workers 0 disables it. */
+    int                    repl_workers;
+    uint64_t               repl_rate;             /* bytes/s, 0 = unthrottled */
+    const char            *repl_ca_file;          /* NULL = system CA bundle */
+    uint64_t               repl_part_size;
+    int                    repl_timeout_s;
     int                    key_max_age_days;      /* default expiry of admin-created keys */
     int                    seccomp_mode;          /* sandbox_mode_t */
     int                    reflink_off;           /* --reflink off */

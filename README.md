@@ -92,12 +92,15 @@ On a Synology NAS, install the SPK instead
 | Web | CORS, static website hosting on a separate listener, block-public-access by default |
 | Encryption | SSE-C (AES-256-GCM, chunked), native TLS (optional build) |
 | Storage efficiency | Reflink fast paths, opt-in whole-object dedup, Btrfs transparent compression |
+| Replication | Asynchronous one-way bucket replication to any S3 endpoint (another fs3, Garage, MinIO, B2, AWS) with a durable queue, backfill and a self-healing scrub |
 | Operations | Quotas, admin API (Unix socket), Prometheus metrics, JSON audit log, auth-failure throttling, seccomp, Synology SPK with DSM tile |
 
 Not implemented (all answer `501 NotImplemented`, never silently
 ignored): object tagging and tag-based lifecycle filters, lifecycle
 transitions, website routing rules, ACLs beyond stubs,
-`GetObjectAttributes`, SSE-S3/SSE-KMS, STS, replication, browser POST
+`GetObjectAttributes`, SSE-S3/SSE-KMS, STS, the S3 replication API
+(`PutBucketReplication`; fs3 configures replication through its admin
+API instead, see [Bucket replication](#bucket-replication)), browser POST
 uploads.
 
 ---
@@ -460,8 +463,11 @@ uploads.
     while requests are queued;
   - what it reads is dropped from the page cache;
   - after a restart it resumes where it stopped.
-- Corruption is never repaired or deleted. It goes to `scrub/corrupt.log`,
-  the audit log and `fs3_scrub_corrupt_total`. With
+- Corruption is never deleted. It goes to `scrub/corrupt.log`, the audit
+  log and `fs3_scrub_corrupt_total`. If the bucket replicates, the current
+  object is fetched back from the replica and swapped in, but only when
+  those bytes verify against the local header (see
+  [Bucket replication](#bucket-replication)); otherwise it stays as found. With
   `--scrub-fail-reads`, a GET of a corrupt version answers 500 instead of
   returning bad bytes.
 - On a Btrfs volume with data checksums, DSM's own data scrubbing covers
@@ -663,6 +669,8 @@ TLS listeners can run together.
 | `PUT /v1/buckets/<b>/grants/<user>` `{"perms":"rw"}`, `DELETE` | grants |
 | `GET/PUT/DELETE /v1/buckets/<b>/quota`, `/v1/users/<u>/quota` | quotas |
 | `POST /v1/scrub`, `GET /v1/scrub` | start a scrub pass; progress and last result |
+| `GET/PUT/DELETE /v1/buckets/<b>/replication` | replication rule (the secret is never returned) |
+| `POST /v1/buckets/<b>/replication/sync`, `GET …/status` | backfill existing objects; queue, lag, counters, recent errors |
 
 - **Prefer the Unix socket** (`--admin-socket PATH`). It is mode 0600 and
   the peer uid is checked with `SO_PEERCRED`; every local user and
@@ -676,6 +684,82 @@ TLS listeners can run together.
 - Key changes rewrite the credentials file atomically and reload it like
   SIGHUP does.
 
+### Bucket replication
+
+A bucket's changes can be copied, asynchronously and one way, to a bucket
+on another S3 endpoint: a second fs3, Garage, MinIO, Backblaze B2, AWS
+S3. fs3 stays single-node; the replica is its off-site copy.
+
+```sh
+curl --unix-socket /path/admin.sock -X PUT http://x/v1/buckets/photos/replication \
+  --data '{"endpoint":"https://s3.eu-central-003.backblazeb2.com",
+           "region":"eu-central-003","bucket":"nas-photos",
+           "access_key":"…","secret_key":"…","deletes":false}'
+curl --unix-socket /path/admin.sock -X POST http://x/v1/buckets/photos/replication/sync
+curl --unix-socket /path/admin.sock http://x/v1/buckets/photos/replication/status
+```
+
+- **What is replicated:** the current state of each key. PUT, multipart
+  completion, CopyObject, deletes (including delete markers and lifecycle
+  expiry), content type, user metadata and the standard headers. Not
+  replicated: version history, Object Lock settings, bucket configuration
+  (policy, CORS, lifecycle). SSE-C objects are skipped and counted (fs3
+  doesn't have the key).
+- **Rule fields:** `endpoint` (`https://host[:port]`, no path), `bucket`,
+  `access_key`, `secret_key`, and optionally `region` (default
+  `us-east-1`), `prefix` (only keys under it), `addressing`
+  (`path`, the default, or `virtual`), `deletes` (default `true`; `false`
+  is the usual choice for a backup target), `storage_class`,
+  `verify_tls` (default `true`) and `allow_plain_http`.
+  - `http://` endpoints are accepted only for loopback and private
+    addresses, and only with `"allow_plain_http": true`.
+    `"verify_tls": false` is likewise limited to private addresses.
+  - https needs a TLS build (`fs3 --build-info` shows `tls=yes`; the
+    Synology package is one). Certificates are checked against the system
+    CA bundle plus `--repl-ca-file`, and the host name or IP must match.
+  - The rule is stored in `buckets/<b>/replication.json` (mode 0600). The
+    secret is never returned by the API, logged or audited. A `PUT` that
+    omits `secret_key` but keeps the same access key keeps the stored
+    secret.
+- **Durable queue:** every change appends a record to
+  `repl/<bucket-id>/queue` while the key's lock is held, so records for
+  one key are in commit order. Records are fdatasync'd in groups every
+  10 ms. A record only says which key changed: the worker uploads the
+  key's current local state, or deletes it remotely if it is gone, so a
+  duplicated record costs an upload and a lost one only delays. After an
+  unclean shutdown (no `clean` marker), a recovery scan re-queues every
+  object newer than the queue's high-water mark.
+- **Workers:** `--repl-workers` threads (default 2; 0 turns replication
+  off) take one bucket at a time. They coalesce repeated changes to a key
+  within a batch, so a burst of overwrites uploads once, and send over one
+  keep-alive connection. Uploads are throttled by `--repl-rate` (default
+  20 MiB/s across buckets). Objects larger than four `--repl-part-size`
+  parts (default 16 MiB) go as multipart uploads, with per-part retries.
+  Single-part objects carry `Content-MD5`, so the replica verifies them,
+  and every object carries `x-amz-meta-fs3-source-etag` so backfills and
+  the scrub can compare multipart objects.
+- **Errors:** 5xx, timeouts, network errors and rule-level 4xx (bad
+  credentials, missing remote bucket, clock skew, redirects) keep the
+  record and back off from 1 s, doubling up to 10 minutes. Other 4xx
+  (a remote quota, a policy denial) are permanent for that object: it is
+  logged, audited, kept in the status's error ring and skipped.
+- **Backfill:** `POST …/replication/sync` walks the bucket, `HEAD`s each
+  key on the replica and queues what is missing or different. A new rule
+  doesn't copy existing objects until you ask. An interrupted backfill
+  starts over at the next start.
+- **Self-healing scrub:** when the scrub finds a corrupt current object
+  in a replicated bucket, fs3 fetches the key from the replica, checks it
+  against the local header (payload CRC64, MD5 or a full-object
+  checksum), and swaps it in under the key's lock if the object wasn't
+  replaced meanwhile. A replica copy that doesn't verify is refused.
+  Outcomes go to `scrub/corrupt.log`, the audit log and
+  `fs3_scrub_repaired_total`. Object Lock buckets (layout 2), SSE-C and
+  compressed objects are reported but not repaired.
+- **Interactions:** lifecycle expirations are deletes and replicate
+  unless `deletes` is false. Locked versions are never deleted locally, so
+  never remotely. Quotas, dedup and reflink are unaffected (replication
+  reads logical bytes).
+
 ### Metrics and health
 
 `--metrics-port N` serves `/healthz` and Prometheus `/metrics` on
@@ -686,7 +770,8 @@ series:
 |---|---|
 | traffic | `fs3_requests_total`, `fs3_request_duration_seconds`, `fs3_bytes_in_total`, `fs3_bytes_out_total`, `fs3_errors_total{error}` |
 | capacity | `fs3_buckets_total`, `fs3_mpu_inflight`, `fs3_storage_used_bytes`, `fs3_storage_free_bytes`, `fs3_bucket_bytes`, `fs3_bucket_quota_bytes`, `fs3_quota_rejections_total` |
-| background | `fs3_lifecycle_{expired,aborted_mpu,runs}_total`, `fs3_scrub_{objects,bytes,unverifiable,corrupt}_total`, `fs3_scrub_last_success_timestamp` |
+| background | `fs3_lifecycle_{expired,aborted_mpu,runs}_total`, `fs3_scrub_{objects,bytes,unverifiable,corrupt,repaired}_total`, `fs3_scrub_last_success_timestamp` |
+| replication | `fs3_repl_queue_depth{bucket}`, `fs3_repl_lag_seconds{bucket}`, `fs3_repl_bytes_total{bucket}`, `fs3_repl_ops_total{bucket,op,result}`, `fs3_repl_errors_total{bucket}` |
 | storage efficiency | `fs3_reflink_clones_total`, `fs3_dedup_hits_total`, `fs3_dedup_pool_adds_total` |
 | keys | `fs3_keys_expiring_soon`, `fs3_keys_unused_90d` |
 
@@ -707,7 +792,8 @@ series:
 | Object Lock | `--max-retention-days`, `--lock-immutable`, `--lockd-socket` |
 | storage efficiency | `--reflink`, `--dedup`, `--dedup-min-size`, `--dedup-verify`, `--fs-compress` |
 | scrub | `--scrub-interval-days`, `--scrub-now`, `--scrub-rate`, `--scrub-fail-reads` |
-| operations | `--metrics-port`, `--admin-socket`, `--admin-token-file`, `--audit-log`, `--log-file`, `--log-max-size`, `--log-keep`, `--seccomp`, `--seccomp-list` |
+| replication | `--repl-workers`, `--repl-rate`, `--repl-ca-file`, `--repl-part-size`, `--repl-timeout` |
+| operations | `--metrics-port`, `--admin-socket`, `--admin-token-file`, `--audit-log`, `--log-file`, `--log-max-size`, `--log-keep`, `--seccomp`, `--seccomp-list`, `--build-info` |
 
 Size options accept K/M/G suffixes. SIGHUP re-reads credentials, TLS
 certificates and the audit log file.
@@ -717,7 +803,10 @@ certificates and the audit log file.
 ## Synology deployment
 
 Build the package with
-`make fs3-static fs3-lockd-static && cd packaging/synology && ./build-spk.sh`.
+`make fs3-tls-static fs3-lockd-static && cd packaging/synology && ./build-spk.sh`.
+The package ships the static **TLS** build (libssl and libcrypto linked
+in), so replication can reach HTTPS targets; `build-spk.sh` refuses a
+non-TLS binary unless `FS3_SPK_ALLOW_NO_TLS=1`.
 `docs/AGENT-BUILD-AND-DS1515-TEST.md` is the step-by-step build and test
 runbook for a DS1515+, including a recorded run.
 
@@ -732,24 +821,35 @@ runbook for a DS1515+, including a recorded run.
   administrators only. It checks your DSM session with DSM's
   `authenticate.cgi` and membership of the `administrators` group on every
   request; everyone else gets a 403 with nothing in it. It shows buckets
-  (objects, size, quota usage), manages credentials and edits the server
-  settings.
+  (objects, size, quota usage), manages credentials and replication rules,
+  and edits the server settings.
 - **Credentials:** add or replace keys, with an optional *User* field.
   Replacing a key's secret keeps its attributes (expiry, disabled,
   read-only). To rotate a key without losing access to your buckets, add
   the new key with the same user, then remove the old one. The first key
   turns authentication on and restarts fs3.
 - **Settings:** network, access, limits and quotas, background jobs,
-  storage efficiency, Object Lock, websites, logging and hardening, about
-  40 options in all. Every value is validated before anything is written,
+  storage efficiency, Object Lock, websites, replication, logging and
+  hardening, about 45 options in all. Every value is validated before anything is written,
   and port clashes, an absent `fs3-lockd` helper or `--seccomp=require` on
   a kernel without seccomp are refused. Saving writes `fs3.conf` (only
   non-default values, previous file kept as `fs3.conf.bak`) and restarts
   fs3 through the watchdog within a few seconds. If fs3 then fails to
   start, the tile shows the end of the log and a *Restore previous
   settings* button. Files fs3 needs for a feature (audit log, admin
-  socket, lock helper socket) always live in the package folder; the form
+  socket, lock helper socket, replication CA bundle) always live in the package folder; the form
   can't point fs3 at other paths.
+- **Replication:** the tile lists each replicating bucket with its
+  target, queue, failures, lag and last error, with *Sync* (backfill) and
+  *Remove* buttons, and has a form to add or replace a rule (endpoint,
+  region, target bucket, keys, prefix, addressing, whether deletes are
+  mirrored; the secret field is write-only and can be left empty to keep
+  the stored one). It talks to fs3 through the admin API socket, which is
+  now on by default. *Replication threads*, *Replication upload rate* and
+  *Replication timeout* are under Settings. For an endpoint with a private
+  CA, put the CA certificate (PEM) at
+  `/var/packages/fs3/var/repl-ca.pem`; it is passed as `--repl-ca-file`
+  at the next start.
 - **`fs3.conf`:** the keys, their types, defaults and the fs3 flags they
   map to are defined once, in `packaging/synology/lib/fs3-conf.sh`, which
   both the start script and the tile use. You can still edit the file
@@ -768,10 +868,10 @@ runbook for a DS1515+, including a recorded run.
 - An admin listener runs on `127.0.0.1:9101` (`FS3_METRICS_PORT`; 0
   disables it). To scrape it from elsewhere, use a reverse-proxy entry or
   an SSH tunnel.
-- **Not available through the package:** native TLS (the SPK ships the
-  non-TLS build; use the DSM reverse proxy). If you change the S3 port,
-  also update the DSM firewall rule, which still lists the install-time
-  port.
+- **Not configured by the package:** a native TLS listener. The binary
+  supports it, but incoming HTTPS is the DSM reverse proxy's job. If you
+  change the S3 port, also update the DSM firewall rule, which still
+  lists the install-time port.
 - **Data folder:** by default `/var/packages/fs3/var/data`. If you point
   it at a shared folder, grant the package user write permission in
   Control Panel → Shared Folder → Edit → Permissions. The package checks
@@ -883,9 +983,10 @@ make fs3-dedup-estimate            # or fs3-dedup-estimate-static for the NAS
 - **No kTLS on kernel 3.10.** Native TLS on the DS1515+ copies bodies
   through userspace instead of using sendfile, so expect higher CPU use
   than over plain HTTP behind the DSM proxy.
-- **Single node.** fs3 has no replication. Redundancy comes from RAID or
-  Btrfs underneath and from off-site backups. The plain-file layout makes
-  those backups easy, because any file-level backup tool works.
+- **Single node.** Redundancy comes from RAID or Btrfs underneath, from
+  [bucket replication](#bucket-replication) to another S3 endpoint, and
+  from off-site backups. The plain-file layout makes those backups easy,
+  because any file-level backup tool works.
 
 ---
 
@@ -904,6 +1005,7 @@ upgrading, and see `packaging/synology/CHANGELOG.md`.
 make                 # release build (-O2): fs3, fs3-lockd, fs3-dedup-estimate
 make DEBUG=1         # ASan + UBSan (switching needs `make clean`)
 make TLS=1           # fs3 with native TLS (or `make fs3-tls` for a separate binary)
+./fs3 --build-info   # tls=yes|no
 make fs3-static fs3-tls-static fs3-lockd-static fs3-dedup-estimate-static   # for the SPK
 make test            # all unit, fuzz and e2e suites
 make smoketest       # start briefly and probe with curl
@@ -937,12 +1039,13 @@ need `curl` and `openssl`.
 
 | kind | suites |
 |---|---|
-| C unit tests | `test_store`, `test_conn`, `test_sigv4`, `test_checksum`, `test_objmeta`, `test_policy`, `test_json`, `test_ssec`, `test_sandbox`, `test_credfile`, `test_xml`, `test_xml_legacy` |
+| C unit tests | `test_store`, `test_conn`, `test_sigv4`, `test_repl`, `test_checksum`, `test_objmeta`, `test_policy`, `test_json`, `test_ssec`, `test_sandbox`, `test_credfile`, `test_xml`, `test_xml_legacy` |
 | fuzzers (50,000 iterations each) | `test_xml_fuzz`, `test_chunk_fuzz`, `test_config_fuzz`, plus fuzz passes in the policy, JSON and credentials suites |
 | core e2e | `test_e2e`, `test_e2e_auth`, `test_e2e_mpu`, `test_e2e_parts`, `test_e2e_listing`, `test_e2e_metadata`, `test_e2e_phase9`–`12`, `test_e2e_subresources` |
 | access control | `test_e2e_isolation`, `test_e2e_policy`, `test_e2e_keys`, `test_e2e_presign`, `test_e2e_admin`, `test_e2e_audit` |
 | features | `test_e2e_checksum`, `test_e2e_versioning`, `test_e2e_objlock`, `test_e2e_immutable`, `test_e2e_lifecycle`, `test_e2e_cors`, `test_e2e_website`, `test_e2e_quota`, `test_e2e_scrub`, `test_e2e_ssec`, `test_e2e_tls`, `test_e2e_reflink` |
 | logging | `test_log` (rotation, concurrency, failure handling), `test_e2e_logs` |
+| replication | `test_repl` (journal records and rule parser, plus a 50,000-iteration fuzz), `test_sigv4` (outbound signer against the botocore vector), `test_e2e_s3client` (outbound client, plain and TLS), `test_e2e_repl` (two fs3 instances: arrival, coalescing, outage, backfill, permanent and rule-level errors, crash recovery, SSE-C, https, self-healing scrub) |
 | tools and packaging | `test_e2e_dedup_estimate`, `test_ui_cgi` (DSM tile: sign-in gate, credentials, settings), `test_spk_scripts` (start script, conf → flags, watchdog) |
 
 All suites run under both the release and the ASan/UBSan builds. The
@@ -969,6 +1072,8 @@ src/
   json.c          strict JSON parser and writer
   cors.c website.c lifecycle.c objlock.c scrub.c ssec.c
   admin.c         /v1 admin API
+  repl.c          bucket replication: journal, workers, backfill, self-healing
+  s3client.c      outbound S3 client (HTTP/1.1, optional TLS, SigV4 signing)
   audit.c         audit log, auth-failure throttling
   metrics.c       Prometheus metrics
   tls.c           native TLS (TLS=1 builds)
@@ -995,7 +1100,9 @@ feature added.
 Done: the gap-closure plan (versioning, Object Lock, policies, TLS,
 presign, CORS, lifecycle, website, admin API, audit) and round 2 (part
 records, ListParts, UploadPartCopy, metadata, quotas, scrub, key
-hygiene, seccomp, reflink, dedup, compression, SSE-C, immutable locks).
+hygiene, seccomp, reflink, dedup, compression, SSE-C, immutable locks),
+log rotation and bucket replication (with backfill and a self-healing
+scrub).
 
 Next:
 
@@ -1013,11 +1120,17 @@ Next:
   set `FS_COMPR_FL` on pool files, before cloning into `cas/`.
 - **Production soak:** long-running use on real data, plus a periodic
   restore drill from the plain object files.
+- **Replication on hardware:** a DS1515+ run replicating to B2 or a second
+  box, which also confirms the DSM CA bundle path
+  (`docs/AGENT-REPLICATION-DS1515-TEST.md`).
+- **Backup-tool compatibility matrix** (item 3 of
+  `docs/plan-logs-replication-compat.md`).
 - **An offline converter** from layout 1 to layout 2 for existing Object
   Lock buckets.
 - **Application-level zstd** for ext4 volumes, only if needed.
 - **A more visible seccomp state** in the DSM tile (the filter can't run
   on DSM's kernel).
 
-Out of scope by design: multi-node replication, content-addressed chunk
+Out of scope by design: multi-node clustering and two-way replication,
+content-addressed chunk
 storage, SSE-S3/KMS, STS, object tagging.

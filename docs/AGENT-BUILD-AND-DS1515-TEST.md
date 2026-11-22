@@ -276,20 +276,24 @@ mentions SIGSYS.
 ```sh
 make fs3-lockd-static            # ships inside the SPK (not started by it)
 cd packaging/synology
-FS3_SPK_VERSION=0.9.0-1 ./build-spk.sh ../../fs3-static
+FS3_SPK_VERSION=0.9.0-1 ./build-spk.sh ../../fs3-tls-static
 ```
 
 - Bump `FS3_SPK_VERSION` above the version installed on the NAS, so
   Package Center treats this as an upgrade.
-- The SPK runs `fs3-static` as `bin/fs3`. It ships neither the TLS
-  binary nor any TLS setup: TLS in production is DSM's reverse proxy.
+- The SPK runs **`fs3-tls-static`** as `bin/fs3` (since the replication
+  work: outbound HTTPS to replication targets needs libssl).
+  `build-spk.sh` checks `bin/fs3 --build-info` for `tls=yes` and refuses
+  a non-TLS binary unless `FS3_SPK_ALLOW_NO_TLS=1`. Incoming HTTPS in
+  production is still DSM's reverse proxy; the package doesn't configure
+  a TLS listener.
 
 **Check:**
 - `fs3-<version>.spk` exists.
 - `tar tf fs3-*.spk` lists bare names (`INFO`, `package.tgz`, …), not
   `./INFO`; DSM 7.1 rejects the `./` form with error 263.
 - `tar xOf fs3-*.spk package.tgz | tar tz` contains `bin/fs3`,
-  `bin/fs3-lockd` and `ui/`.
+  `bin/fs3-lockd`, `lib/fs3-conf.sh` and `ui/`.
 
 ---
 

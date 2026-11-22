@@ -42,6 +42,13 @@ int      scrub_metrics(scrub_t *sc, char *out, size_t cap);
 /* Before iopool_destroy: ask a running pass to stop at the next file
  * (its cursor is saved; the next start resumes). */
 void     scrub_stop(scrub_t *sc);
+/* Self-healing (replication): called for a corrupt current object. The
+ * callback fetches a copy and hands it to store_repair_object. Returns 1
+ * repaired, 0 not applicable (no replication rule), -1 refused (reason
+ * in why). Runs on the scrub's worker thread. */
+typedef int (*scrub_repair_fn)(void *user, const char *bucket, const char *key, uint64_t ino,
+                               uint64_t size, char *why, size_t whycap);
+void     scrub_set_repair(scrub_t *sc, scrub_repair_fn fn, void *user);
 void     scrub_destroy(scrub_t *sc);
 
 #endif

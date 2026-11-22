@@ -6,6 +6,7 @@
 #include "sandbox.h"
 #include "store.h"
 #include "audit.h"
+#include "tls.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -103,12 +104,20 @@ static void usage(const char *argv0) {
         "      --scrub-now            start a scrub pass right after startup\n"
         "      --scrub-rate N         scrub read rate in bytes/s (default 20M; 0 = unthrottled)\n"
         "      --scrub-fail-reads     GET of a version the scrub found corrupt → 500\n"
+        "      --repl-workers N       bucket replication threads (default 2; 0 = replication off)\n"
+        "      --repl-rate N          replication upload rate in bytes/s across buckets\n"
+        "                             (default 20M; 0 = unthrottled)\n"
+        "      --repl-ca-file PATH    extra CA bundle (PEM) for replication endpoints\n"
+        "      --repl-part-size N     multipart part size for replication (default 16M, min 5M;\n"
+        "                             objects over 4 parts' worth are sent as multipart)\n"
+        "      --repl-timeout N       replication network timeout in seconds (default 30)\n"
         "      --default-bucket-quota N  byte limit for buckets without their own quota (0 = none)\n"
         "      --default-user-quota N    byte limit per user, over the buckets they own (0 = none)\n"
         "      --mpu-min-part-size N  minimum size of every multipart part but the last\n"
         "                             (default 5M, as S3; 0 = none)\n"
         "      --audit-log <file>     append one JSON line per request + admin change\n"
         "                             (no query strings / signatures); SIGHUP reopens\n"
+        "      --build-info           print build features (tls=yes|no) and exit\n"
         "      --log-file <file>      write the server log here instead of stderr (mode 0640)\n"
         "      --log-max-size <N>     rotate the log file and the audit log at N bytes\n"
         "                             (K/M/G suffix; default 10M; 0 = never)\n"
@@ -416,6 +425,7 @@ enum {
     OPT_TLS_MAX_PER_IP,
     OPT_AUDIT_LOG,
     OPT_LOG_FILE,
+    OPT_BUILD_INFO,
     OPT_LOG_MAX_SIZE,
     OPT_LOG_KEEP,
     OPT_AUTH_FAIL_LIMIT,
@@ -436,6 +446,11 @@ enum {
     OPT_SCRUB_RATE,
     OPT_SCRUB_FAIL_READS,
     OPT_DEFAULT_USER_QUOTA,
+    OPT_REPL_WORKERS,
+    OPT_REPL_RATE,
+    OPT_REPL_CA_FILE,
+    OPT_REPL_PART_SIZE,
+    OPT_REPL_TIMEOUT,
 };
 
 #ifndef FS3_MAIN_TESTING
@@ -518,6 +533,9 @@ int main(int argc, char **argv) {
     const char *lockd_socket = NULL;
     uint64_t dedup_min = 1024 * 1024;
     uint64_t scrub_rate = 20ULL * 1024 * 1024;           /* 20 MiB/s */
+    int repl_workers = 2, repl_timeout = 30;
+    uint64_t repl_rate = 20ULL * 1024 * 1024, repl_part_size = 16ULL * 1024 * 1024;
+    const char *repl_ca_file = NULL;
     int tls_port = 0, require_tls = 0, require_signed_payload = 0, tls_max_per_ip = 32;
     const char *tls_addr = NULL, *tls_cert = NULL, *tls_key = NULL;
     char trusted_proxies[1024] = "";
@@ -565,6 +583,7 @@ int main(int argc, char **argv) {
         { "tls-max-per-ip",   required_argument, NULL, OPT_TLS_MAX_PER_IP },
         { "audit-log",        required_argument, NULL, OPT_AUDIT_LOG },
         { "log-file",         required_argument, NULL, OPT_LOG_FILE },
+        { "build-info",       no_argument,       NULL, OPT_BUILD_INFO },
         { "log-max-size",     required_argument, NULL, OPT_LOG_MAX_SIZE },
         { "log-keep",         required_argument, NULL, OPT_LOG_KEEP },
         { "auth-fail-limit",  required_argument, NULL, OPT_AUTH_FAIL_LIMIT },
@@ -583,6 +602,11 @@ int main(int argc, char **argv) {
         { "seccomp-list",     no_argument,       NULL, OPT_SECCOMP_LIST },
         { "scrub-now",        no_argument,       NULL, OPT_SCRUB_NOW },
         { "scrub-rate",       required_argument, NULL, OPT_SCRUB_RATE },
+        { "repl-workers",     required_argument, NULL, OPT_REPL_WORKERS },
+        { "repl-rate",        required_argument, NULL, OPT_REPL_RATE },
+        { "repl-ca-file",     required_argument, NULL, OPT_REPL_CA_FILE },
+        { "repl-part-size",   required_argument, NULL, OPT_REPL_PART_SIZE },
+        { "repl-timeout",     required_argument, NULL, OPT_REPL_TIMEOUT },
         { "scrub-fail-reads", no_argument,       NULL, OPT_SCRUB_FAIL_READS },
         { "default-user-quota",   required_argument, NULL, OPT_DEFAULT_USER_QUOTA },
         { "require-signed-payload", no_argument, NULL, OPT_REQUIRE_SIGNED_PAYLOAD },
@@ -778,6 +802,10 @@ int main(int argc, char **argv) {
             case OPT_TLS_ADDR: tls_addr = optarg; break;
             case OPT_AUDIT_LOG: audit_log = optarg; break;
             case OPT_LOG_FILE: log_file = optarg; break;
+            case OPT_BUILD_INFO:
+                /* Machine-readable build features (used by build-spk.sh). */
+                printf("tls=%s\n", tls_available() ? "yes" : "no");
+                return 0;
             case OPT_LOG_MAX_SIZE:
                 log_max_size = strcmp(optarg, "0") == 0 ? 0 : parse_size(optarg);
                 if (strcmp(optarg, "0") && (log_max_size == 0 || log_max_size < 4096)) {
@@ -857,6 +885,41 @@ int main(int argc, char **argv) {
                 }
                 break;
             case OPT_SCRUB_FAIL_READS: scrub_fail_reads = 1; break;
+            case OPT_REPL_WORKERS: {
+                char *end;
+                long v = strtol(optarg, &end, 10);
+                if (*end || v < 0 || v > 16) { fprintf(stderr, "--repl-workers: 0..16\n"); return 2; }
+                repl_workers = (int)v;
+                break;
+            }
+            case OPT_REPL_TIMEOUT: {
+                char *end;
+                long v = strtol(optarg, &end, 10);
+                if (*end || v < 1 || v > 3600) { fprintf(stderr, "--repl-timeout: 1..3600\n"); return 2; }
+                repl_timeout = (int)v;
+                break;
+            }
+            case OPT_REPL_RATE:
+                repl_rate = strcmp(optarg, "0") == 0 ? 0 : parse_size(optarg);
+                if (strcmp(optarg, "0") && repl_rate == 0) {
+                    fprintf(stderr, "--repl-rate: invalid size '%s'\n", optarg);
+                    return 2;
+                }
+                break;
+            case OPT_REPL_PART_SIZE:
+                repl_part_size = parse_size(optarg);
+                if (repl_part_size < 5ULL * 1024 * 1024 || repl_part_size > 5ULL * 1024 * 1024 * 1024) {
+                    fprintf(stderr, "--repl-part-size: 5M..5G\n");
+                    return 2;
+                }
+                break;
+            case OPT_REPL_CA_FILE:
+                if (access(optarg, R_OK) < 0) {
+                    fprintf(stderr, "--repl-ca-file: cannot read %s: %s\n", optarg, strerror(errno));
+                    return 2;
+                }
+                repl_ca_file = optarg;
+                break;
             case OPT_SCRUB_RATE:
                 scrub_rate = strcmp(optarg, "0") == 0 ? 0 : parse_size(optarg);
                 if (strcmp(optarg, "0") && scrub_rate == 0) {
@@ -1015,6 +1078,11 @@ int main(int argc, char **argv) {
         .scrub_interval_days = scrub_interval_days,
         .scrub_now = scrub_now,
         .scrub_rate = scrub_rate,
+        .repl_workers = repl_workers,
+        .repl_rate = repl_rate,
+        .repl_ca_file = repl_ca_file,
+        .repl_part_size = repl_part_size,
+        .repl_timeout_s = repl_timeout,
         .scrub_fail_reads = scrub_fail_reads,
         .key_max_age_days = key_max_age_days,
         .seccomp_mode = seccomp_mode,

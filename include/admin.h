@@ -14,6 +14,9 @@
  *   PUT    /v1/buckets/<b>/owner {"owner":"u"}
  *   PUT    /v1/buckets/<b>/grants/<u> {"perms":"rw"}
  *   DELETE /v1/buckets/<b>/grants/<u>
+ *   GET|PUT|DELETE /v1/buckets/<b>/replication   rule (secret never returned)
+ *   POST   /v1/buckets/<b>/replication/sync      backfill existing objects
+ *   GET    /v1/buckets/<b>/replication/status    queue, lag, errors
  *
  * TCP requests need "Authorization: Bearer <token>" (--admin-token-file,
  * compared in constant time, failures back off exponentially), a
@@ -31,6 +34,7 @@
 
 struct s3_store;
 struct scrub;
+struct repl;
 struct sigv4_verifier;
 
 typedef struct {
@@ -40,6 +44,7 @@ typedef struct {
     int            (*reload)(void *user);   /* 0 = ok */
     void            *reload_user;
     struct scrub    *scrub;        /* POST/GET /v1/scrub (item 3) */
+    struct repl     *repl;         /* /v1/buckets/<b>/replication */
     const struct sigv4_verifier *auth;   /* live keys: last-used times (item 4) */
     int              key_max_age_days;   /* default expiry of new keys, 0 = none */
 } admin_cfg_t;

@@ -165,6 +165,8 @@ struct s3_store {
     char    *locks_dir;      /* ROOT/locks — object lock sidecars (item 10) */
     store_version_guard_fn vguard;   /* object-lock veto (item 10) */
     void    *vguard_user;
+    store_change_fn change_fn;      /* replication journal (repl.c) */
+    void    *change_user;
     uint64_t min_free_bytes; /* 0 = no quota check */
     /* Namespace lock. Commits run on iopool worker threads while the
      * event loop keeps serving other requests, so the short steps that
@@ -213,6 +215,16 @@ struct s3_store {
     struct store_cfg_ref *cfg_head;
     size_t           cfg_count;
 };
+
+static void notify_change(s3_store_t *s, s3_str_t bucket, s3_str_t key, int op, uint64_t mtime_ms) {
+    if (s->change_fn) s->change_fn(s->change_user, bucket, key, op, mtime_ms);
+}
+
+static uint64_t now_ms_wall(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)(ts.tv_nsec / 1000000);
+}
 
 static char *xstrdup_join(const char *a, const char *b) {
     size_t la = strlen(a), lb = strlen(b);
@@ -1987,6 +1999,8 @@ s3_err_t store_put_commit(s3_writer_t *w, s3_obj_meta_t *meta_out) {
                  (int64_t)q_o1 - (int64_t)q_o0);
         writer_release_quota(w);
     }
+    notify_change(w->store, bucket, (s3_str_t){ w->key_dup, w->hdr.key_len },
+                  STORE_CHANGE_PUT, w->hdr.mtime_ms);
     pthread_mutex_unlock(km);
     /* tmp_path is gone; clear so writer_free doesn't unlink the live file. */
     w->tmp_path[0] = '\0';
@@ -3602,6 +3616,7 @@ s3_err_t store_mpu_complete2(s3_store_t *s, s3_str_t bucket, s3_str_t key,
         snprintf(bn, sizeof(bn), S3_STR_FMT, S3_STR_ARG(bucket));
         q_charge(s, bn, (int64_t)q_b1 - (int64_t)q_b0 - (int64_t)q_parts,
                  (int64_t)q_o1 - (int64_t)q_o0);
+        notify_change(s, bucket, key, STORE_CHANGE_PUT, hdr.mtime_ms);
     }
     pthread_mutex_unlock(km);
     if (e != S3_OK) goto out;
@@ -4056,6 +4071,7 @@ s3_err_t store_expire_if_unchanged(s3_store_t *s, s3_str_t bucket,
     store_delete_result_t res;
     memset(&res, 0, sizeof(res));
     s3_err_t e = delete_locked(s, bucket, key, hex, NULL, mtime_ms, &res);
+    if (e == S3_OK) notify_change(s, bucket, key, STORE_CHANGE_DELETE, now_ms_wall());
     pthread_mutex_unlock(km);
     return e;
 }
@@ -4069,6 +4085,12 @@ int store_valid_bucket_name(s3_str_t name) { return valid_bucket_name(name); }
 static __thread int g_guard_bypass;
 
 void store_set_guard_bypass(int bypass) { g_guard_bypass = bypass; }
+
+void store_set_change_hook(s3_store_t *s, store_change_fn fn, void *user) {
+    if (!s) return;
+    s->change_fn = fn;
+    s->change_user = user;
+}
 
 void store_set_version_guard(s3_store_t *s, store_version_guard_fn fn, void *user) {
     if (!s) return;
@@ -4668,6 +4690,7 @@ s3_err_t store_delete_ex(s3_store_t *s, s3_str_t bucket, s3_str_t key,
     g_guard_bypass = bypass;
     s3_err_t e = delete_locked(s, bucket, key, hex, vid, 0, res);
     g_guard_bypass = 0;
+    if (e == S3_OK) notify_change(s, bucket, key, STORE_CHANGE_DELETE, now_ms_wall());
     pthread_mutex_unlock(km);
     return e;
 }
@@ -6165,4 +6188,94 @@ int store_version_file(s3_store_t *s, s3_str_t bucket, s3_str_t key, const uint8
     }
     closedir(d);
     return rc;
+}
+
+/* ===================================================================== */
+/* Self-healing scrub: replace a corrupt current object's payload         */
+/* ===================================================================== */
+
+s3_err_t store_repair_object(s3_store_t *s, s3_str_t bucket, s3_str_t key, uint64_t ino,
+                             int src_fd, uint64_t len, char *why, size_t whycap) {
+#define WHY(...) do { snprintf(why, whycap, __VA_ARGS__); } while (0)
+    why[0] = '\0';
+    if (!s || !valid_bucket_name(bucket) || !valid_key(key)) { WHY("bad name"); return S3_ERR_INVALID_ARGUMENT; }
+    if (bucket_layout(s, bucket) == 2) { WHY("object-lock bucket (layout 2) is not repaired"); return S3_ERR_INVALID_REQUEST; }
+    char hex[65], path[4096], tmp[4200];
+    hash_bucket_key(bucket, key, hex);
+    if (obj_path(s, bucket, hex, path, sizeof(path)) < 0) { WHY("path"); return S3_ERR_INTERNAL; }
+    int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0) { WHY("object is gone"); return S3_ERR_NO_SUCH_KEY; }
+    struct stat st;
+    s3_obj_meta_t m;
+    if (fstat(fd, &st) < 0 || (uint64_t)st.st_ino != ino) { close(fd); WHY("object changed"); return S3_ERR_INVALID_REQUEST; }
+    if (read_header(fd, NULL, &m) != S3_OK) { close(fd); WHY("header unreadable"); return S3_ERR_INTERNAL; }
+    if (m.flags & (S3_OBJF_SSEC | S3_OBJF_ZSTD | S3_OBJF_DELETE_MARKER)) {
+        close(fd); WHY("transformed payload"); return S3_ERR_INVALID_REQUEST;
+    }
+    if (m.size != len || (m.stored_size && m.stored_size != len)) {
+        close(fd); WHY("size differs (%llu, replica %llu)", (unsigned long long)m.size, (unsigned long long)len);
+        return S3_ERR_INVALID_REQUEST;
+    }
+
+    /* Header (with version id, metadata, checksums) from the local file,
+     * payload from the replica, in tmp/ like any writer. */
+    if (snprintf(tmp, sizeof(tmp), "%s/repair.XXXXXX", s->tmp_dir) >= (int)sizeof(tmp)) { close(fd); return S3_ERR_INTERNAL; }
+    int tfd = mkstemp(tmp);
+    if (tfd < 0) { close(fd); WHY("temp file: %s", strerror(errno)); return map_io_err(errno); }
+    char *buf = malloc(1 << 16);
+    int ok = buf != NULL;
+    for (uint64_t off = 0; ok && off < m.header_size;) {
+        size_t want = m.header_size - off < (1u << 16) ? (size_t)(m.header_size - off) : (1u << 16);
+        ssize_t n = pread(fd, buf, want, (off_t)off);
+        ok = n > 0 && xwrite(tfd, buf, (size_t)n) == n;
+        off += n > 0 ? (uint64_t)n : 0;
+    }
+    close(fd);
+    for (uint64_t off = 0; ok && off < len;) {
+        size_t want = len - off < (1u << 16) ? (size_t)(len - off) : (1u << 16);
+        ssize_t n = pread(src_fd, buf, want, (off_t)off);
+        ok = n > 0 && xwrite(tfd, buf, (size_t)n) == n;
+        off += n > 0 ? (uint64_t)n : 0;
+    }
+    free(buf);
+    if (ok) ok = fchmod(tfd, st.st_mode & 07777) == 0 && xfsync(tfd) == 0;
+    close(tfd);
+    if (!ok) { unlink(tmp); WHY("writing the repaired copy failed"); return S3_ERR_INTERNAL; }
+
+    /* The replica's bytes must verify against the LOCAL header. */
+    store_scrub_result_t vr;
+    store_scrub_file(s, tmp, STORE_SCRUB_OBJECT, NULL, NULL, NULL, &vr);
+    if (vr.verdict != SCRUB_OK) {
+        unlink(tmp);
+        WHY(vr.verdict == SCRUB_UNVERIFIABLE ? "nothing to verify the replica copy against"
+                                              : "replica copy does not verify (%s)", vr.reason);
+        return S3_ERR_BAD_DIGEST;
+    }
+
+    char dir[4096];
+    obj_dir(s, bucket, hex, dir, sizeof(dir));
+    pthread_mutex_t *km = key_lock(s, hex);
+    pthread_mutex_lock(km);
+    struct stat now;
+    s3_err_t e = S3_OK;
+    if (lstat(path, &now) < 0 || (uint64_t)now.st_ino != ino) {
+        e = S3_ERR_INVALID_REQUEST;
+        WHY("object changed during the repair");
+    } else {
+        uint64_t b0 = 0, o0 = 0, b1 = 0, o1 = 0;
+        key_usage(s, bucket, hex, &b0, &o0);
+        if (rename(tmp, path) < 0) { e = map_io_err(errno); WHY("rename: %s", strerror(errno)); }
+        else {
+            tmp[0] = '\0';
+            key_usage(s, bucket, hex, &b1, &o1);
+            char bn[64];
+            snprintf(bn, sizeof(bn), S3_STR_FMT, S3_STR_ARG(bucket));
+            q_charge(s, bn, (int64_t)b1 - (int64_t)b0, (int64_t)o1 - (int64_t)o0);
+        }
+    }
+    pthread_mutex_unlock(km);
+    if (tmp[0]) unlink(tmp);
+    if (e == S3_OK) fsync_dir(dir);
+    return e;
+#undef WHY
 }

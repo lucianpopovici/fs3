@@ -124,7 +124,8 @@ static const sb_call_t ALLOW[] = {
     /* network (listeners already bound) */
     C(accept4), C(recvfrom), C(sendto), C(recvmsg), C(sendmsg), C(shutdown),
     C(setsockopt), C(getsockopt), C(getpeername), C(getsockname),
-    C(connect),                         /* fs3-lockd's Unix socket (item 9) */
+    C(connect),                         /* fs3-lockd's Unix socket; replication */
+    C(sendmmsg),                        /* glibc resolver (replication endpoints) */
 #ifdef __NR_accept
     C(accept),
 #endif

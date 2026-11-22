@@ -248,7 +248,8 @@ kill "$HUPPID" 2>/dev/null || true; HUPPID=
 # 4. Live bucket stats via a real fs3 admin listener
 # ===================================================================
 mkdir -p "$DATA"
-${FS3_WRAP:-} "$ROOT/fs3" -p "$PORT" -d "$DATA" --metrics-port "$MPORT" >"$LOG" 2>&1 &
+${FS3_WRAP:-} "$ROOT/fs3" -p "$PORT" -d "$DATA" --metrics-port "$MPORT" \
+    --admin-socket "$VAR/admin.sock" >"$LOG" 2>&1 &
 SP=$!
 sleep 0.4
 kill -0 "$SP" 2>/dev/null || { echo "fs3 did not start" >&2; cat "$LOG" >&2; exit 1; }
@@ -272,6 +273,44 @@ check_has "live page shows running"     "$page" ">running</span>"
 check_has "live page shows bucket row"  "$page" "<code>cgibuk</code>"
 check_has "live page shows object count" "$page" "<td>1</td>"
 check_has "live page shows size"        "$page" "5 B"
+
+# Replication through the admin API socket.
+TOKEN=$(cat "$TOK_FILE")
+check_has "replication: empty state"    "$page" "No bucket replicates yet"
+check_has "replication: rule form"      "$page" "Replicate a bucket"
+RSEC=tileReplSecret0123456789
+rform() { printf 'action=setrepl&tok=%s&rb=cgibuk&rep=%s&rbk=target-bkt&rak=AKTILE&rsk=%s&rpfx=docs%%2F&rplain=1%s' \
+              "$TOKEN" "$1" "$RSEC" "${2:-}"; }
+out=$(cgi_post "$(rform 'http%3A%2F%2F127.0.0.1%3A1')")
+check_has "replication: rule saved"     "$out" "m=repl_set"
+page=$(cgi_get "m=repl_set")
+check_has "replication: row shown"      "$page" "<code>http://127.0.0.1:1/target-bkt</code>"
+check_has "replication: sync button"    "$page" 'value="syncrepl"'
+check_lacks "replication: secret never rendered" "$page" "$RSEC"
+check_eq "replication: deletes off by default" \
+    "$(curl -s --unix-socket "$VAR/admin.sock" http://x/v1/buckets/cgibuk/replication | grep -c '"deletes":false' || true)" "1"
+check_eq "replication: prefix decoded" \
+    "$(curl -s --unix-socket "$VAR/admin.sock" http://x/v1/buckets/cgibuk/replication | grep -c '"prefix":"docs/"' || true)" "1"
+out=$(cgi_post "$(rform 'http%3A%2F%2F8.8.8.8')")
+check_has "replication: public plain http refused by fs3" "$out" "m=e_repl_rule"
+out=$(cgi_post "$(rform 'https%3A%2F%2Fh%22%2C%22x%22%3A%221')")
+check_has "replication: JSON injection refused" "$out" "m=e_repl_in"
+out=$(cgi_post "$(rform 'ftp%3A%2F%2Fh')")
+check_has "replication: bad scheme refused" "$out" "m=e_repl_in"
+out=$(cgi_post "action=setrepl&tok=wrong&rb=cgibuk&rep=x&rbk=y&rak=z")
+check_has "replication: CSRF enforced"  "$out" "m=e_csrf"
+out=$(cgi_post "action=syncrepl&tok=$TOKEN&rb=cgibuk")
+check_has "replication: sync started"   "$out" "m=repl_sync"
+out=$(cgi_post "action=delrepl&tok=$TOKEN&rb=cgibuk")
+check_has "replication: rule removed"   "$out" "m=repl_removed"
+out=$(cgi_post "action=delrepl&tok=$TOKEN&rb=cgibuk")
+check_has "replication: removing again → no rule" "$out" "m=e_repl_bucket"
+out=$(cgi_post "action=delrepl&tok=$TOKEN&rb=..%2Fx")
+check_has "replication: bad bucket name" "$out" "m=e_repl_in"
+mv "$VAR/admin.sock" "$VAR/admin.sock.off"
+out=$(cgi_post "action=syncrepl&tok=$TOKEN&rb=cgibuk")
+check_has "replication: socket missing reported" "$out" "m=e_repl_sock"
+mv "$VAR/admin.sock.off" "$VAR/admin.sock"
 
 kill "$SP" 2>/dev/null; wait "$SP" 2>/dev/null || true; SP=
 rm -f "$VAR/fs3.pid" "$VAR/fs3.child.pid"
@@ -314,7 +353,7 @@ check_lacks "no restore button without backup" "$page" "restorecfg"
 
 form() {  # the form at the current defaults, then overrides "K=V"...
     local b="action=savecfg&tok=$TOKEN&FS3_PORT=9000&FS3_BIND=127.0.0.1&FS3_TRUSTED_PROXY=127.0.0.1"
-    b="$b&FS3_METRICS_PORT=9101&FS3_DEDUP=off&FS3_FS_COMPRESS=off&FS3_REFLINK=auto&FS3_SECCOMP=enforce"
+    b="$b&FS3_METRICS_PORT=9101&FS3_DEDUP=off&FS3_FS_COMPRESS=off&FS3_REFLINK=auto&FS3_SECCOMP=enforce&FS3_ADMIN_SOCKET=1"
     for o in "$@"; do b="$b&$o"; done
     printf '%s' "$b"
 }

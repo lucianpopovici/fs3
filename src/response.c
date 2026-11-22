@@ -333,7 +333,13 @@ int rsp_build_s3_error(conn_t *c, s3_err_t err, s3_str_t resource,
         return -1;
     }
 
-    if ((size_t)n + blen <= CONN_WBUF_SZ) {
+    /* HEAD: same head, no body (RFC 9110 §9.3.2). A body here would be
+     * parsed as the start of the next response on a keep-alive
+     * connection. */
+    if (s3_str_eq_lit(c->req.method, "HEAD")) {
+        free(body);
+        c->wlen = (size_t)n;
+    } else if ((size_t)n + blen <= CONN_WBUF_SZ) {
         memcpy(c->wbuf + n, body, blen);
         free(body);
         c->wlen = (size_t)n + blen;

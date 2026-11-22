@@ -511,7 +511,22 @@ oom:
  * per spec); values come from c->req.headers and are trimmed +
  * collapsed. The trailing blank line is part of the canonical headers
  * section. */
-static int build_canonical_headers(const conn_t *c, s3_str_t signed_headers,
+/* The parts of a request that SigV4 signs. The verifier fills it from a
+ * conn_t; the outbound client (sigv4_sign, used by s3client.c) from its
+ * own request, so both share one canonicalisation. */
+typedef struct {
+    s3_str_t             method, path, query;
+    const conn_header_t *headers;
+    size_t               n_headers;
+} req_view_t;
+
+static req_view_t view_of(const conn_t *c) {
+    req_view_t v = { c->req.method, c->req.path, c->req.query,
+                     c->req.headers, c->req.n_headers };
+    return v;
+}
+
+static int build_canonical_headers(const req_view_t *c, s3_str_t signed_headers,
                                    char *out, size_t cap) {
     size_t o = 0;
     size_t i = 0;
@@ -527,9 +542,9 @@ static int build_canonical_headers(const conn_t *c, s3_str_t signed_headers,
         /* Find header value */
         s3_str_t hname = { name, name_n };
         const s3_str_t *hv = NULL;
-        for (size_t h = 0; h < c->req.n_headers; h++) {
-            if (s3_str_eq(c->req.headers[h].k, hname)) {
-                hv = &c->req.headers[h].v;
+        for (size_t h = 0; h < c->n_headers; h++) {
+            if (s3_str_eq(c->headers[h].k, hname)) {
+                hv = &c->headers[h].v;
                 break;
             }
         }
@@ -572,27 +587,27 @@ static int copy_signed_headers(s3_str_t signed_headers, char *out, size_t cap) {
 
 /* Build the full canonical request into `out`. Returns bytes written
  * or -1 on overflow. */
-static int build_canonical_request(const conn_t *c, s3_str_t signed_headers,
+static int build_canonical_request(const req_view_t *c, s3_str_t signed_headers,
                                    s3_str_t body_hash, const char *q_exclude,
                                    char *out, size_t cap) {
     size_t o = 0;
     int n;
 
     /* Method */
-    if (o + c->req.method.n + 1 > cap) return -1;
-    memcpy(out + o, c->req.method.p, c->req.method.n);
-    o += c->req.method.n;
+    if (o + c->method.n + 1 > cap) return -1;
+    memcpy(out + o, c->method.p, c->method.n);
+    o += c->method.n;
     out[o++] = '\n';
 
     /* Canonical URI */
-    n = canon_uri_s3(c->req.path, out + o, cap - o);
+    n = canon_uri_s3(c->path, out + o, cap - o);
     if (n < 0) return -1;
     o += (size_t)n;
     if (o + 1 > cap) return -1;
     out[o++] = '\n';
 
     /* Canonical query string */
-    n = build_canonical_query(c->req.query, q_exclude, out + o, cap - o);
+    n = build_canonical_query(c->query, q_exclude, out + o, cap - o);
     if (n < 0) return -1;
     o += (size_t)n;
     if (o + 1 > cap) return -1;
@@ -982,7 +997,8 @@ static s3_err_t verify_params(const sigv4_verifier_t *v, const conn_t *c,
 
     char *cr_buf = malloc(CR_BUF_SZ);
     if (!cr_buf) return S3_ERR_INTERNAL;
-    int cr_n = build_canonical_request(c, p->ap.signed_headers, p->body_hash,
+    req_view_t rv = view_of(c);
+    int cr_n = build_canonical_request(&rv, p->ap.signed_headers, p->body_hash,
                                        p->is_presigned ? "X-Amz-Signature" : NULL,
                                        cr_buf, CR_BUF_SZ);
     if (cr_n < 0) { free(cr_buf); return S3_ERR_ACCESS_DENIED; }
@@ -1560,6 +1576,74 @@ void sigv4_chunk_free(sigv4_chunk_decoder_t *d) {
 }
 
 /* ===================================================================== */
+/* Signing outbound requests                                             */
+/* ===================================================================== */
+
+_Static_assert(sizeof(sigv4_hdr_t) == sizeof(conn_header_t),
+               "sigv4_hdr_t must match conn_header_t");
+
+void sigv4_sha256_hex(const void *data, size_t n, char out[65]) {
+    uint8_t h[32];
+    sha256(data, n, h);
+    hex_encode(h, 32, out);
+    out[64] = '\0';
+}
+
+int sigv4_sign(const sigv4_sign_req_t *r, const char *access_key, const char *secret,
+               const char *region, const char *amz_date, char *out, size_t cap) {
+    if (!r || !r->method || !r->path || !access_key || !secret || !region || !amz_date
+        || !r->payload_hash || strlen(amz_date) != 16 || r->n_headers == 0)
+        return -1;
+    /* SignedHeaders: the header names, in the (sorted) order given. */
+    char sh[1024];
+    size_t sho = 0;
+    for (size_t i = 0; i < r->n_headers; i++) {
+        size_t kn = r->headers[i].k.n;
+        if (sho + kn + 2 > sizeof(sh)) return -1;
+        if (i) sh[sho++] = ';';
+        memcpy(sh + sho, r->headers[i].k.p, kn);
+        sho += kn;
+    }
+    req_view_t rv = {
+        { r->method, strlen(r->method) }, { r->path, strlen(r->path) },
+        { r->query ? r->query : "", r->query ? strlen(r->query) : 0 },
+        (const conn_header_t *)r->headers, r->n_headers };
+    s3_str_t shs = { sh, sho };
+    s3_str_t bh = { r->payload_hash, strlen(r->payload_hash) };
+
+    char *cr_buf = malloc(CR_BUF_SZ);
+    if (!cr_buf) return -1;
+    int cr_n = build_canonical_request(&rv, shs, bh, NULL, cr_buf, CR_BUF_SZ);
+    if (cr_n < 0) { free(cr_buf); return -1; }
+    uint8_t cr_hash[32];
+    sha256(cr_buf, (size_t)cr_n, cr_hash);
+    free(cr_buf);
+
+    char scope[128];
+    int sn = snprintf(scope, sizeof(scope), "%.8s/%s/s3/aws4_request", amz_date, region);
+    if (sn < 0 || (size_t)sn >= sizeof(scope)) return -1;
+    s3_str_t ad = { amz_date, 16 }, sc = { scope, (size_t)sn };
+    char sts[STS_BUF_SZ];
+    int sts_n = build_string_to_sign(ad, sc, cr_hash, sts, sizeof(sts));
+    if (sts_n < 0) return -1;
+
+    s3_str_t d = { amz_date, 8 }, rg = { region, strlen(region) }, sv = { "s3", 2 };
+    uint8_t k_signing[32], mac[32];
+    derive_signing_key((const uint8_t *)secret, strlen(secret), d, rg, sv, k_signing);
+    hmac_sha256(k_signing, 32, sts, (size_t)sts_n, mac);
+    OPENSSL_cleanse(k_signing, sizeof(k_signing));
+    char sig[65];
+    hex_encode(mac, 32, sig);
+    sig[64] = '\0';
+    OPENSSL_cleanse(mac, sizeof(mac));
+
+    int n = snprintf(out, cap, "AWS4-HMAC-SHA256 Credential=%s/%s, SignedHeaders=%.*s, Signature=%s",
+                     access_key, scope, (int)sho, sh, sig);
+    return (n < 0 || (size_t)n >= cap) ? -1 : 0;
+}
+
+
+/* ===================================================================== */
 /* Test hooks (only enabled when SIGV4_TESTING is defined)                */
 /* ===================================================================== */
 #ifdef SIGV4_TESTING
@@ -1591,7 +1675,8 @@ int sigv4_test_canonical_request_from_conn(
     const char *body_hash_lit, char *out, size_t cap) {
     s3_str_t sh = { signed_headers_lit, strlen(signed_headers_lit) };
     s3_str_t bh = { body_hash_lit, strlen(body_hash_lit) };
-    return build_canonical_request(c, sh, bh, NULL, out, cap);
+    req_view_t rv = view_of(c);
+    return build_canonical_request(&rv, sh, bh, NULL, out, cap);
 }
 
 int sigv4_test_canon_query(const char *q, size_t q_n, char *out, size_t cap) {

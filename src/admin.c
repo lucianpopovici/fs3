@@ -5,6 +5,7 @@
 #include "json.h"
 #include "log.h"
 #include "scrub.h"
+#include "repl.h"
 #include "sigv4.h"
 #include "store.h"
 
@@ -668,6 +669,7 @@ static char *bucket_json(admin_ctx_t *a, const char *name, int detail,
             has_sidecar(a, b, "website.xml") ? "true" : "false",
             has_sidecar(a, b, "policy.json") ? "true" : "false");
     }
+    repl_bucket_summary(a->cfg.repl, name, out, cap - 2, o);
     if (*o + 2 < cap) out[(*o)++] = '}';
     out[*o] = '\0';
     return out;
@@ -734,6 +736,18 @@ static char *bucket_route(admin_ctx_t *a, const areq_t *rq, const char *rest,
         return respond(200, "OK", "{\"ok\":true}\n", rn);
     }
     if (!strcmp(sub, "quota")) return quota_route(a, rq, b, NULL, rn);
+    if (!strcmp(sub, "replication") || !strncmp(sub, "replication/", 12)) {
+        int st = 500;
+        char *body = repl_admin(a->cfg.repl, rq->method, name, sub[11] ? sub + 12 : "",
+                                rq->body, rq->body_n, &st);
+        if (!body) return err_json(500, "Internal Server Error", "out of memory", rn);
+        const char *reason = st == 200 ? "OK" : st == 202 ? "Accepted" : st == 400 ? "Bad Request"
+                           : st == 404 ? "Not Found" : st == 405 ? "Method Not Allowed"
+                           : st == 409 ? "Conflict" : st == 501 ? "Not Implemented" : "Internal Server Error";
+        char *resp = respond(st, reason, body, rn);
+        free(body);
+        return resp;
+    }
     if (!strncmp(sub, "grants/", 7)) {
         const char *user = sub + 7;
         if (!s3_valid_ident_strict(user))

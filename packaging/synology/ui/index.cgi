@@ -35,6 +35,7 @@ LOG_FILE="${VAR_DIR}/fs3.log"
 START_LOG="${VAR_DIR}/fs3.start.log"
 TOK_FILE="${VAR_DIR}/.ui-csrf"
 CONF_LIB="${PKG_DIR}/lib/fs3-conf.sh"
+ADMIN_SOCK="${VAR_DIR}/admin.sock"
 
 SCRIPT_PATH="$(printf '%s' "${SCRIPT_NAME:-index.cgi}" | tr -d '\r\n ')"
 
@@ -186,6 +187,70 @@ valid_key() {  # $1=value $2=min $3=max — charset [A-Za-z0-9._-]
     [ "${#1}" -ge "$2" ] && [ "${#1}" -le "$3" ]
 }
 
+# $1=value $2=allowed characters (tr set) $3=min $4=max length.
+valid_chars() {
+    [ "${#1}" -ge "$3" ] && [ "${#1}" -le "$4" ] || return 1
+    [ -z "$(printf '%s' "$1" | tr -d "$2")" ]
+}
+
+# Call the fs3 admin API over its Unix socket (replication rules).
+# $1=method $2=path under /v1 $3=JSON body (optional). Sets API_CODE;
+# rc 2 when the socket or curl is missing or fs3 doesn't answer.
+API_CODE=""
+admin_api() {
+    API_CODE=""
+    [ -S "${ADMIN_SOCK}" ] || return 2
+    command -v curl >/dev/null 2>&1 || return 2
+    if [ -n "${3:-}" ]; then
+        API_CODE="$(printf '%s' "$3" | curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
+            --unix-socket "${ADMIN_SOCK}" -X "$1" -H 'Content-Type: application/json' \
+            --data-binary @- "http://localhost/v1$2" 2>/dev/null)"
+    else
+        API_CODE="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
+            --unix-socket "${ADMIN_SOCK}" -X "$1" "http://localhost/v1$2" 2>/dev/null)"
+    fi
+    case "${API_CODE}" in 2??) return 0 ;; 000|'') return 2 ;; *) return 1 ;; esac
+}
+
+# Bucket names as fs3 accepts them (the API checks them again).
+valid_bucket() { valid_chars "$1" 'a-z0-9.-' 3 63; }
+
+# Replication form -> JSON. Every value is restricted to characters that
+# need no JSON escaping, so the document can be assembled with printf.
+set_replication() {
+    valid_bucket "${F_RB}" || redirect e_repl_in
+    ep="$(url_decode "${F_REP}")"
+    case "${ep}" in http://?*|https://?*) ;; *) redirect e_repl_in ;; esac
+    valid_chars "${ep}" 'A-Za-z0-9.:/-' 9 280 || redirect e_repl_in
+    reg="$(url_decode "${F_RREG}")"
+    valid_chars "${reg}" 'a-z0-9-' 0 63 || redirect e_repl_in
+    valid_bucket "${F_RBK}" || redirect e_repl_in
+    rak="$(url_decode "${F_RAK}")"
+    valid_chars "${rak}" 'A-Za-z0-9._/+=-' 1 128 || redirect e_repl_in
+    rsk="$(url_decode "${F_RSK}")"
+    valid_chars "${rsk}" 'A-Za-z0-9._/+=-' 0 256 || redirect e_repl_in
+    pfx="$(url_decode "${F_RPFX}")"
+    valid_chars "${pfx}" 'A-Za-z0-9._/-' 0 256 || redirect e_repl_in
+    addr=path; [ "${F_RADDR}" = "virtual" ] && addr=virtual
+    del=true;   [ "${F_RDEL}" = "1" ] || del=false
+    plain=false; [ "${F_RPLAIN}" = "1" ] && plain=true
+    json="{\"endpoint\":\"${ep}\",\"bucket\":\"${F_RBK}\",\"access_key\":\"${rak}\""
+    [ -n "${rsk}" ] && json="${json},\"secret_key\":\"${rsk}\""
+    [ -n "${reg}" ] && json="${json},\"region\":\"${reg}\""
+    json="${json},\"prefix\":\"${pfx}\",\"addressing\":\"${addr}\",\"deletes\":${del},\"allow_plain_http\":${plain}}"
+    admin_api PUT "/buckets/${F_RB}/replication" "${json}"
+    case $? in
+        0) redirect repl_set ;;
+        2) redirect e_repl_sock ;;
+    esac
+    case "${API_CODE}" in
+        400) redirect e_repl_rule ;;
+        404) redirect e_repl_bucket ;;
+        501) redirect e_repl_off ;;
+    esac
+    redirect e_repl_api
+}
+
 seccomp_supported() { grep -q '^Seccomp:' /proc/self/status 2>/dev/null; }
 
 # ---- POST -----------------------------------------------------------------
@@ -266,6 +331,8 @@ handle_post() {
     body="$(dd bs=1 count="${CONTENT_LENGTH}" 2>/dev/null)"
 
     F_ACTION=""; F_AK=""; F_SK=""; F_USER=""; F_TOK=""
+    F_RB=""; F_REP=""; F_RREG=""; F_RBK=""; F_RAK=""; F_RSK=""; F_RPFX=""
+    F_RADDR=""; F_RDEL=""; F_RPLAIN=""
     oldifs="${IFS}"; IFS='&'
     for pair in ${body}; do
         k="${pair%%=*}"; v="${pair#*=}"
@@ -275,6 +342,16 @@ handle_post() {
             sk)     F_SK="${v}" ;;
             user)   F_USER="${v}" ;;
             tok)    F_TOK="${v}" ;;
+            rb)     F_RB="${v}" ;;
+            rep)    F_REP="${v}" ;;
+            rreg)   F_RREG="${v}" ;;
+            rbk)    F_RBK="${v}" ;;
+            rak)    F_RAK="${v}" ;;
+            rsk)    F_RSK="${v}" ;;
+            rpfx)   F_RPFX="${v}" ;;
+            raddr)  F_RADDR="${v}" ;;
+            rdel)   F_RDEL="${v}" ;;
+            rplain) F_RPLAIN="${v}" ;;
         esac
     done
     IFS="${oldifs}"
@@ -361,6 +438,21 @@ handle_post() {
     restorecfg)
         restore_settings
         ;;
+    setrepl)
+        set_replication
+        ;;
+    delrepl|syncrepl)
+        valid_bucket "${F_RB}" || redirect e_repl_in
+        if [ "${F_ACTION}" = "delrepl" ]; then
+            admin_api DELETE "/buckets/${F_RB}/replication"; rc=$?; ok=repl_removed
+        else
+            admin_api POST "/buckets/${F_RB}/replication/sync"; rc=$?; ok=repl_sync
+        fi
+        [ "${rc}" -eq 0 ] && redirect "${ok}"
+        [ "${rc}" -eq 2 ] && redirect e_repl_sock
+        [ "${API_CODE}" = "404" ] && redirect e_repl_bucket
+        redirect e_repl_api
+        ;;
     restart)
         restart_fs3 && redirect restarted
         redirect e_notrunning
@@ -413,6 +505,15 @@ case "${QUERY_STRING}" in
     *m=cfg_restored_restarted*) MSG="Previous settings restored. fs3 is restarting with them." ;;
     *m=cfg_restored*) MSG="Previous settings restored. They take effect when the package next starts." ;;
     *m=restarted*) MSG="fs3 is restarting." ;;
+    *m=repl_set*) MSG="Replication rule saved. Changes from now on are copied to the target; use <b>Sync</b> to copy existing objects too." ;;
+    *m=repl_removed*) MSG="Replication rule removed; its queue was dropped." ;;
+    *m=repl_sync*) MSG="Backfill started: objects missing or different on the target are being queued." ;;
+    *m=e_repl_in*) MSG="Error: invalid replication field. Endpoint is <code>https://host[:port]</code>; bucket names use a&ndash;z 0&ndash;9 . -; keys use A&ndash;Z a&ndash;z 0&ndash;9 . _ / + = -; the prefix uses A&ndash;Z a&ndash;z 0&ndash;9 . _ / -. Nothing was saved." ;;
+    *m=e_repl_rule*) MSG="Error: fs3 refused the replication rule. Plain <code>http://</code> targets must be on a private network address with <i>Allow plain HTTP</i> ticked, a new rule needs the secret key, and virtual-host addressing can't be used with a dotted bucket name over https. Nothing was saved." ;;
+    *m=e_repl_bucket*) MSG="Error: no such bucket here, or it has no replication rule." ;;
+    *m=e_repl_off*) MSG="Error: replication is turned off (<i>Replication threads</i> is 0 under Settings)." ;;
+    *m=e_repl_sock*) MSG="Error: could not reach fs3's admin API socket. Turn on <i>Admin API socket</i> under Settings and make sure the package is running." ;;
+    *m=e_repl_api*) MSG="Error: fs3 could not apply the change (see fs3.log)." ;;
     *m=e_cfg.*)
         k="${QUERY_STRING#*m=e_cfg.}"; k="${k%%&*}"
         if fs3_conf_is_key "${k}"; then
@@ -519,6 +620,68 @@ else
         BUCKETS_HTML="<p class=\"muted\">Bucket statistics need the admin listener; set the admin listener port under Settings.</p>"
     else
         BUCKETS_HTML="<p class=\"muted\">Bucket statistics are unavailable (could not reach the admin listener on 127.0.0.1:$(html_escape "${FS3_METRICS_PORT}")).</p>"
+    fi
+fi
+
+# Replication: rules and their state from the admin listener
+# ("<bucket> <queue> <failed> <lag> <target> <last error...>"), managed
+# through the admin API socket.
+REPL_HTML=""
+if [ "${RUNNING}" != "running" ]; then
+    REPL_HTML="<p class=\"muted\">Replication can be managed while the package is running.</p>"
+elif [ "${FS3_REPL_WORKERS}" = "0" ]; then
+    REPL_HTML="<p class=\"muted\">Replication is turned off (<i>Replication threads</i> is 0 under Settings).</p>"
+else
+    REPL_ROWS=""
+    if RTXT="$(fetch_admin /replication)" && [ -n "${RTXT}" ]; then
+        REPL_ROWS="$(printf '%s\n' "${RTXT}" | while read -r rb rq rf rl rt rerr; do
+            [ -n "${rb}" ] || continue
+            valid_bucket "${rb}" || continue
+            hb="$(html_escape "${rb}")"
+            he="$(html_escape "${rerr}")"; [ "${rerr}" = "-" ] && he="&mdash;"
+            printf '<tr><td><code>%s</code></td><td><code>%s</code></td><td>%s</td><td>%s</td><td>%s s</td><td class="muted">%s</td><td>' \
+                "${hb}" "$(html_escape "${rt}")" "$(html_escape "${rq}")" "$(html_escape "${rf}")" \
+                "$(html_escape "${rl}")" "${he}"
+            if [ -n "${TOKEN}" ]; then
+                printf '<form method="post" class="inline"><input type="hidden" name="action" value="syncrepl"><input type="hidden" name="tok" value="%s"><input type="hidden" name="rb" value="%s"><button type="submit">Sync</button></form> ' "${TOKEN}" "${hb}"
+                printf '<form method="post" class="inline" onsubmit="return confirm('"'"'Stop replicating %s?'"'"');"><input type="hidden" name="action" value="delrepl"><input type="hidden" name="tok" value="%s"><input type="hidden" name="rb" value="%s"><button type="submit">Remove</button></form>' "${hb}" "${TOKEN}" "${hb}"
+            fi
+            printf '</td></tr>\n'
+        done)"
+    fi
+    if [ -n "${REPL_ROWS}" ]; then
+        REPL_HTML="<table><tr><th>Bucket</th><th>Target</th><th>Queued</th><th>Failed</th><th>Lag</th><th>Last error</th><th></th></tr>
+${REPL_ROWS}</table>"
+    else
+        REPL_HTML="<p class=\"muted\">No bucket replicates yet.</p>"
+    fi
+    if [ "${FS3_ADMIN_SOCKET}" != "1" ]; then
+        REPL_HTML="${REPL_HTML}
+<p class=\"muted\">To add or change rules here, turn on <i>Admin API socket</i> under Settings.</p>"
+    elif [ -n "${TOKEN}" ]; then
+        REPL_HTML="${REPL_HTML}
+<h4>Replicate a bucket</h4>
+<p class=\"muted\">Copies every change of a bucket here to a bucket on another S3 endpoint
+(Backblaze B2, AWS, MinIO, another fs3). Saving a rule for a bucket that already has one
+replaces it; leave the secret empty to keep the stored one. A CA certificate for a private
+endpoint goes in <code>$(html_escape "${VAR_DIR}")/repl-ca.pem</code> (read at start).</p>
+<form method=\"post\" autocomplete=\"off\">
+<input type=\"hidden\" name=\"action\" value=\"setrepl\">
+<input type=\"hidden\" name=\"tok\" value=\"${TOKEN}\">
+<table class=\"cfg\">
+<tr><td>Bucket here</td><td><input name=\"rb\" size=\"24\" required></td></tr>
+<tr><td>Target endpoint</td><td><input name=\"rep\" size=\"44\" placeholder=\"https://s3.eu-central-003.backblazeb2.com\" required></td></tr>
+<tr><td>Region</td><td><input name=\"rreg\" size=\"20\" placeholder=\"us-east-1\"></td></tr>
+<tr><td>Target bucket</td><td><input name=\"rbk\" size=\"24\" required></td></tr>
+<tr><td>Access key</td><td><input name=\"rak\" size=\"32\" required></td></tr>
+<tr><td>Secret key</td><td><input name=\"rsk\" type=\"password\" size=\"32\"></td></tr>
+<tr><td>Only keys starting with</td><td><input name=\"rpfx\" size=\"24\"></td></tr>
+<tr><td>Addressing</td><td><select name=\"raddr\"><option value=\"path\">path-style</option><option value=\"virtual\">virtual-host</option></select></td></tr>
+<tr><td></td><td><label><input type=\"checkbox\" name=\"rdel\" value=\"1\"> Also delete on the target</label>
+<label><input type=\"checkbox\" name=\"rplain\" value=\"1\"> Allow plain HTTP (private network only)</label></td></tr>
+</table>
+<button type=\"submit\">Save rule</button>
+</form>"
     fi
 fi
 
@@ -743,6 +906,8 @@ Data folder: <code>${H_DATA}</code></p>
 ${BINDLINE}
 <h3>Buckets</h3>
 ${BUCKETS_HTML}
+<h3>Replication</h3>
+${REPL_HTML}
 <h3>Credentials</h3>
 <p>${AUTHLINE}</p>
 ${CREDS_HTML}
