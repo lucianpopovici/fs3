@@ -1,7 +1,9 @@
 # Plan: log rotation, bucket replication, backup-tool compatibility
 
 Status: items 1 (log rotation) and 2 (replication) **implemented**;
-item 3 is roadmap. Each item is sized for its own branch and PR. Still
+item 3's scripted part is **implemented** (`make compat`,
+`docs/compatibility.md`); its recorded Hyper Backup and Veeam runs are
+open (`docs/AGENT-COMPAT-HYPERBACKUP-VEEAM.md`). Each item is sized for its own branch and PR. Still
 open: section 1.5 (the tile sign-in check on hardware) and the phase-d
 hardware run for replication (DS1515+ replicating to B2 or a second box).
 
@@ -25,7 +27,7 @@ Where the implementation of item 2 departs from the plan below:
 |---|---|---|---|
 | 1 | Log rotation (+ verify the tile sign-in on hardware) | S | Unbounded logs eventually fill the volume; readiness brief 09 |
 | 2 | Asynchronous bucket replication (**implemented**) | L | The one capability Garage and MinIO have that fs3 lacks; enables self-healing scrub |
-| 3 | Compatibility matrix with real backup tools | M | Most homelab S3 traffic is backups; finds the bugs users would hit |
+| 3 | Compatibility matrix with real backup tools (scripted part **implemented**) | M | Most homelab S3 traffic is backups; finds the bugs users would hit |
 
 House rules as always (`CLAUDE.md`): release and ASan/UBSan green, every
 new parser fuzzed, every sidecar written tmp → fsync → rename →

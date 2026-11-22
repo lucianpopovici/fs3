@@ -593,6 +593,14 @@ seconds.
 
 ---
 
+### D10. Related runbooks
+
+- `docs/AGENT-REPLICATION-DS1515-TEST.md`: bucket replication on this
+  NAS (cloud and LAN targets, CA bundle, DNS under seccomp).
+- `docs/AGENT-COMPAT-HYPERBACKUP-VEEAM.md`: recorded runs of Synology
+  Hyper Backup and Veeam against fs3 (the GUI part of the compatibility
+  matrix in `docs/compatibility.md`).
+
 ## 2. Troubleshooting
 
 | symptom | cause / fix |

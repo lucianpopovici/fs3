@@ -92,6 +92,7 @@ On a Synology NAS, install the SPK instead
 | Web | CORS, static website hosting on a separate listener, block-public-access by default |
 | Encryption | SSE-C (AES-256-GCM, chunked), native TLS (optional build) |
 | Storage efficiency | Reflink fast paths, opt-in whole-object dedup, Btrfs transparent compression |
+| Backup tools | restic, rclone, Kopia, Duplicati and AWS CLI v2 tested end to end (plain, TLS, versioning, Object Lock, crash mid-backup): [docs/compatibility.md](docs/compatibility.md) |
 | Replication | Asynchronous one-way bucket replication to any S3 endpoint (another fs3, Garage, MinIO, B2, AWS) with a durable queue, backfill and a self-healing scrub |
 | Operations | Quotas, admin API (Unix socket), Prometheus metrics, JSON audit log, auth-failure throttling, seccomp, Synology SPK with DSM tile |
 
@@ -1046,6 +1047,8 @@ need `curl` and `openssl`.
 | features | `test_e2e_checksum`, `test_e2e_versioning`, `test_e2e_objlock`, `test_e2e_immutable`, `test_e2e_lifecycle`, `test_e2e_cors`, `test_e2e_website`, `test_e2e_quota`, `test_e2e_scrub`, `test_e2e_ssec`, `test_e2e_tls`, `test_e2e_reflink` |
 | logging | `test_log` (rotation, concurrency, failure handling), `test_e2e_logs` |
 | replication | `test_repl` (journal records and rule parser, plus a 50,000-iteration fuzz), `test_sigv4` (outbound signer against the botocore vector), `test_e2e_s3client` (outbound client, plain and TLS), `test_e2e_repl` (two fs3 instances: arrival, coalescing, outage, backfill, permanent and rule-level errors, crash recovery, SSE-C, https, self-healing scrub) |
+| keep-alive | `test_e2e_keepalive` (a request sent while a large response is still going out, pipelining, split requests, an early error mid-body) |
+| backup tools (`make compat`, not in `make test`) | `tests/compat/`: restic, rclone, Kopia, Duplicati, AWS CLI v2 × plain / TLS / versioning / Object Lock / crash; see [docs/compatibility.md](docs/compatibility.md) |
 | tools and packaging | `test_e2e_dedup_estimate`, `test_ui_cgi` (DSM tile: sign-in gate, credentials, settings), `test_spk_scripts` (start script, conf → flags, watchdog) |
 
 All suites run under both the release and the ASan/UBSan builds. The
@@ -1123,8 +1126,9 @@ Next:
 - **Replication on hardware:** a DS1515+ run replicating to B2 or a second
   box, which also confirms the DSM CA bundle path
   (`docs/AGENT-REPLICATION-DS1515-TEST.md`).
-- **Backup-tool compatibility matrix** (item 3 of
-  `docs/plan-logs-replication-compat.md`).
+- **Backup-tool matrix, GUI part:** recorded Hyper Backup and Veeam runs
+  (`docs/AGENT-COMPAT-HYPERBACKUP-VEEAM.md`). The scripted part is done:
+  `make compat`, results in `docs/compatibility.md`.
 - **An offline converter** from layout 1 to layout 2 for existing Object
   Lock buckets.
 - **Application-level zstd** for ext4 volumes, only if needed.

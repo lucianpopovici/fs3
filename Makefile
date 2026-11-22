@@ -167,6 +167,8 @@ test: check-test-deps $(TEST_BINS) fs3 fs3-lockd fs3-dedup-estimate
 	@./tests/test_e2e_listing.sh
 	@echo "=== test_e2e_quota (round 2: bucket/user quotas) ==="
 	@./tests/test_e2e_quota.sh
+	@echo "=== test_e2e_keepalive (keep-alive and pipelining at the socket level) ==="
+	@./tests/test_e2e_keepalive.sh
 	@echo "=== test_e2e_s3client (outbound S3 client for replication) ==="
 	@./tests/test_e2e_s3client.sh
 	@echo "=== test_e2e_repl (bucket replication between two fs3 instances) ==="
@@ -366,3 +368,10 @@ fs3-dedup-estimate: src/dedup_estimate.c
 
 fs3-dedup-estimate-static: src/dedup_estimate.c
 	$(CC) $(CFLAGS) -static src/dedup_estimate.c -o fs3-dedup-estimate
+
+# Backup-tool compatibility matrix (restic, rclone, Kopia, Duplicati,
+# AWS CLI v2). Not part of `make test`: slow and needs the tools
+# (tests/compat/install-tools.sh). Results: docs/compatibility.md.
+compat: fs3-tls
+	@./tests/compat/run.sh
+.PHONY: compat
