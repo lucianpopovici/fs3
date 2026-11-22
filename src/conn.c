@@ -128,6 +128,13 @@ int conn_wants_write(const conn_t *c) {
     return 0;
 }
 
+/* Writing a response with rbuf already full of the next request: stop
+ * asking for EPOLLIN until the response is done (level-triggered would spin). */
+int conn_rbuf_full_parked(const conn_t *c) {
+    return c->state == CST_WRITE_RESPONSE && c->rlen >= sizeof(c->rbuf)
+           && llhttp_get_errno(&c->parser) == HPE_PAUSED;
+}
+
 int conn_hup_can_close(const conn_t *c) {
     /* If we're CST_WRITE_RESPONSE we'll send what we have first; if rbuf
      * still has bytes the parser will consume them. A read that yielded at
@@ -1037,6 +1044,14 @@ static int tls_step(conn_t *c) {
     return tls_handshake(c);
 }
 
+/* Response in progress and llhttp paused (end of the message, normally):
+ * new bytes belong to the next request. A response built at headers time
+ * while the body is still arriving leaves the parser running instead, and
+ * those body bytes must keep draining through it. */
+static int parked_paused(const conn_t *c) {
+    return c->state == CST_WRITE_RESPONSE && llhttp_get_errno(&c->parser) == HPE_PAUSED;
+}
+
 int conn_on_readable(conn_t *c) {
     size_t budget = CONN_READ_BUDGET;
     c->read_yielded = 0;
@@ -1047,6 +1062,25 @@ int conn_on_readable(conn_t *c) {
     if (c->ssl && c->tls_want_write == 0 && c->state == CST_WRITE_RESPONSE
         && conn_wants_write(c) && conn_on_writable(c) < 0)
         return -1;
+    if (parked_paused(c)) {
+        /* The previous response is still going out and llhttp is paused
+         * at the end of that message. Feeding it now would return
+         * HPE_PAUSED with the *old* pause position and silently swallow
+         * the next request (a client that sends its next request as soon
+         * as it has the body then waits for the idle timeout). Buffer
+         * what arrives; conn_on_writable parses it once the response is
+         * done. reset_conn_events drops EPOLLIN while rbuf is full. */
+        while (c->rlen < sizeof(c->rbuf)) {
+            ssize_t n = conn_io_read(c, c->rbuf + c->rlen, sizeof(c->rbuf) - c->rlen);
+            if (n > 0) { c->rlen += (size_t)n; continue; }
+            if (n == 0) { c->eof_seen = 1; return 0; }
+            if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
+            if (errno == EINTR) continue;
+            LOG_W("read fd=%d: %s", c->fd, strerror(errno));
+            return -1;
+        }
+        return 0;
+    }
     for (;;) {
         if (c->rlen >= sizeof(c->rbuf)) {
             /* Buffer full. If we're still parsing headers it means the
