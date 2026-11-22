@@ -446,6 +446,8 @@ typedef struct {
     const char *mem; size_t mem_len;
     /* response */
     int out_fd; uint64_t max_bytes; int head;
+    /* Plain HTTP request (webhooks): target is path?query, no signing. */
+    const char *raw_target;
 } req_t;
 
 static void parse_xml_tag(const char *xml, const char *tag, char *out, size_t cap) {
@@ -541,6 +543,7 @@ static int do_request_once(s3c_t *c, const req_t *r, s3c_resp_t *resp, int *stal
         if (*bucket) snprintf(path, sizeof(path), "/%s%s%s", bucket, r->key ? "/" : "", ekey);
         else snprintf(path, sizeof(path), "/");
     }
+    if (r->raw_target) snprintf(path, sizeof(path), "%s", r->raw_target);
     if (port != defport) {
         size_t hn = strlen(host);
         snprintf(host + hn, sizeof(host) - hn, ":%d", port);
@@ -554,15 +557,19 @@ static int do_request_once(s3c_t *c, const req_t *r, s3c_resp_t *resp, int *stal
     amz_now(amz);
     uint64_t blen = r->mem ? r->mem_len : (r->fd >= 0 ? r->len : 0);
     int has_body = !strcmp(r->method, "PUT") || !strcmp(r->method, "POST");
-    if (c->ep.https || !has_body) {
+    if (r->raw_target) {
+        phash[0] = 0;
+    } else if (c->ep.https || !has_body) {
         snprintf(phash, sizeof(phash), "%s", has_body ? "UNSIGNED-PAYLOAD"
                  : "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
     } else if (payload_sha256(c, r, phash) < 0) { free(h); return -1; }
 #define ADDH(N, ...) do { snprintf(h[nh].name, sizeof(h[nh].name), "%s", N); \
                           snprintf(h[nh].value, sizeof(h[nh].value), __VA_ARGS__); nh++; } while (0)
     ADDH("host", "%s", host);
-    ADDH("x-amz-date", "%s", amz);
-    ADDH("x-amz-content-sha256", "%s", phash);
+    if (!r->raw_target) {
+        ADDH("x-amz-date", "%s", amz);
+        ADDH("x-amz-content-sha256", "%s", phash);
+    }
     if (has_body) {
         ADDH("content-length", "%llu", (unsigned long long)blen);
         if (r->content_type) ADDH("content-type", "%s", r->content_type);
@@ -577,6 +584,8 @@ static int do_request_once(s3c_t *c, const req_t *r, s3c_resp_t *resp, int *stal
     }
 #undef ADDH
     qsort(h, nh, sizeof(hdr_t), hdr_cmp);
+    char auth[1024] = "";
+    if (r->raw_target) goto build_head;
     sigv4_hdr_t *sh = calloc(nh, sizeof(*sh));
     if (!sh) { free(h); set_err(c, "out of memory"); return -1; }
     for (size_t i = 0; i < nh; i++) {
@@ -584,11 +593,11 @@ static int do_request_once(s3c_t *c, const req_t *r, s3c_resp_t *resp, int *stal
         sh[i].v = (s3_str_t){ h[i].value, strlen(h[i].value) };
     }
     sigv4_sign_req_t sr = { r->method, path, r->query, sh, nh, phash };
-    char auth[1024];
     int srv = sigv4_sign(&sr, c->ep.access_key, c->ep.secret_key, c->ep.region, amz, auth, sizeof(auth));
     free(sh);
     if (srv < 0) { free(h); set_err(c, "signing failed"); return -1; }
 
+build_head:;
     /* Request head. */
     size_t cap = 8192 + nh * 1100;
     char *head = malloc(cap);
@@ -597,7 +606,9 @@ static int do_request_once(s3c_t *c, const req_t *r, s3c_resp_t *resp, int *stal
                                 r->query && *r->query ? "?" : "", r->query ? r->query : "");
     for (size_t i = 0; i < nh && o < cap; i++)
         o += (size_t)snprintf(head + o, cap - o, "%s: %s\r\n", h[i].name, h[i].value);
-    if (o < cap) o += (size_t)snprintf(head + o, cap - o, "authorization: %s\r\nuser-agent: fs3-replication\r\n\r\n", auth);
+    if (o < cap && auth[0]) o += (size_t)snprintf(head + o, cap - o, "authorization: %s\r\n", auth);
+    if (o < cap) o += (size_t)snprintf(head + o, cap - o, "user-agent: %s\r\n\r\n",
+                                       r->raw_target ? "fs3-notify" : "fs3-replication");
     free(h);
     if (o >= cap) { free(head); set_err(c, "request head too large"); return -1; }
     int wrc = write_all(c, head, o);
@@ -789,6 +800,20 @@ int s3c_mpu_complete(s3c_t *c, const char *bucket, const char *key, const char *
     int rc = do_request(c, &r, resp);
     free(xml);
     return rc;
+}
+
+int s3c_post_raw(s3c_t *c, const char *target, const char *content_type,
+                 const s3c_hdr_t *hdrs, size_t n_hdrs, const char *body, size_t len,
+                 s3c_resp_t *resp) {
+    if (!target || target[0] != '/') { set_err(c, "bad target"); return -1; }
+    for (const char *p = target; *p; p++)
+        if ((unsigned char)*p <= 0x20 || (unsigned char)*p >= 0x7f) { set_err(c, "bad target"); return -1; }
+    req_t r = req_init("POST", NULL, NULL);
+    r.raw_target = target;
+    r.content_type = content_type;
+    r.extra = hdrs; r.n_extra = n_hdrs;
+    r.mem = body ? body : ""; r.mem_len = body ? len : 0;
+    return do_request(c, &r, resp);
 }
 
 int s3c_mpu_abort(s3c_t *c, const char *bucket, const char *key, const char *upload_id,

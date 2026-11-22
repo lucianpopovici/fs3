@@ -488,8 +488,11 @@ static int rb_append(repl_t *r, rb_t *b, int op, const char *key, size_t kn, uin
 }
 
 /* The store's change hook: runs under the key's stripe lock. */
-static void on_change(void *user, s3_str_t bucket, s3_str_t key, int op, uint64_t mtime_ms) {
+static void on_change(void *user, const store_change_t *ev) {
     repl_t *r = user;
+    s3_str_t bucket = ev->bucket, key = ev->key;
+    int op = ev->op;
+    uint64_t mtime_ms = ev->mtime_ms;
     if (!__atomic_load_n(&r->n_rules, __ATOMIC_RELAXED)) return;
     char id[33];
     pthread_mutex_lock(&r->mu);
@@ -607,7 +610,7 @@ repl_t *repl_create(const repl_cfg_t *cfg) {
         }
         store_buckets_free(bl, nb);
     }
-    store_set_change_hook(cfg->store, on_change, r);
+    store_add_change_hook(cfg->store, on_change, r);
     return r;
 }
 
@@ -632,7 +635,7 @@ int repl_start(repl_t *r) {
 
 void repl_destroy(repl_t *r) {
     if (!r) return;
-    store_set_change_hook(r->cfg.store, NULL, NULL);
+    store_remove_change_hook(r->cfg.store, r);
     pthread_mutex_lock(&r->mu);
     __atomic_store_n(&r->stop, 1, __ATOMIC_RELAXED);
     pthread_cond_broadcast(&r->work_cv);

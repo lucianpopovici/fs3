@@ -713,16 +713,42 @@ s3_err_t store_delete_ex(s3_store_t *s, s3_str_t bucket, s3_str_t key,
 /* Veto hook for permanently removing a version (item 10). Return S3_OK to
  * allow. Called with the key's stripe lock held: must not call back into
  * mutating store functions. */
-/* Replication (repl.c): called after every change to a key's current
- * state — PUT/copy/multipart commit, delete (including delete markers,
- * version deletes and lifecycle expiry) — while the key's stripe lock is
- * held, so calls for one key arrive in commit order. The callback must
- * not block on I/O beyond an append and must take only leaf locks. */
+/* Change listeners (replication, event notifications): called after
+ * every change to a key's current state — PUT/copy/multipart commit,
+ * delete (including delete markers, version deletes and lifecycle
+ * expiry) — while the key's stripe lock is held, so calls for one key
+ * arrive in commit order. A listener must not block on I/O beyond an
+ * append and must take only leaf locks. */
 #define STORE_CHANGE_PUT    1
 #define STORE_CHANGE_DELETE 2
-typedef void (*store_change_fn)(void *user, s3_str_t bucket, s3_str_t key, int op,
-                                uint64_t mtime_ms);
-void     store_set_change_hook(s3_store_t *s, store_change_fn fn, void *user);
+
+/* What produced the change (for event names). */
+enum {
+    STORE_ORIGIN_PUT = 0,           /* PutObject */
+    STORE_ORIGIN_COPY,              /* CopyObject */
+    STORE_ORIGIN_MPU,               /* CompleteMultipartUpload */
+    STORE_ORIGIN_DELETE,            /* DeleteObject(s) */
+    STORE_ORIGIN_LIFECYCLE,         /* lifecycle expiration */
+};
+
+typedef struct {
+    s3_str_t       bucket, key;
+    int            op;              /* STORE_CHANGE_* */
+    int            origin;          /* STORE_ORIGIN_* */
+    uint64_t       mtime_ms;
+    uint64_t       size;            /* PUT: object size */
+    const uint8_t *etag;            /* PUT: 16 raw bytes */
+    unsigned       part_count;      /* PUT: >0 for multipart ETags */
+    char           version_id[33];  /* "" when unversioned */
+    int            delete_marker;   /* DELETE: a marker was created */
+} store_change_t;
+
+typedef void (*store_change_fn)(void *user, const store_change_t *ev);
+/* Up to four listeners; fn NULL removes the listener registered with `user`. */
+void     store_add_change_hook(s3_store_t *s, store_change_fn fn, void *user);
+void     store_remove_change_hook(s3_store_t *s, void *user);
+/* Tag a writer's commit (default STORE_ORIGIN_PUT). */
+void     store_put_set_origin(s3_writer_t *w, int origin);
 
 typedef s3_err_t (*store_version_guard_fn)(void *user, s3_str_t bucket,
                                            s3_str_t key, const s3_obj_meta_t *m,

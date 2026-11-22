@@ -88,4 +88,10 @@ int s3c_mpu_abort(s3c_t *c, const char *bucket, const char *key, const char *upl
 /* Test seam: fixed signing time (unix seconds), 0 = real clock. */
 void s3c_set_clock(int64_t fixed_now);
 
+/* Unsigned HTTP POST to target ("/path?query", already encoded) on the
+ * endpoint (webhooks). Same return convention as the S3 calls. */
+int    s3c_post_raw(s3c_t *c, const char *target, const char *content_type,
+                    const s3c_hdr_t *hdrs, size_t n_hdrs, const char *body, size_t len,
+                    s3c_resp_t *resp);
+
 #endif

@@ -251,6 +251,159 @@ set_replication() {
     redirect e_repl_api
 }
 
+# ---- Object browser ---------------------------------------------------
+#
+# The tile never touches object data itself: it asks fs3's admin API
+# (Unix socket) for a listing and for presigned URLs made with a key of
+# the bucket's owner (or the admin user), then streams through curl
+# against fs3 on 127.0.0.1. Keys travel URI-encoded everywhere
+# ([A-Za-z0-9._~/-] and %XX), so no key ever needs shell quoting, JSON
+# escaping or decoding except for display.
+
+# Raw (still encoded) value of a query-string parameter.
+qs_get() {
+    printf '%s' "&${QUERY_STRING}" | tr '&' '\n' | sed -n "s/^$1=//p" | head -n 1
+}
+
+# A URI-encoded key or prefix: $1=value $2=min length.
+valid_enc() {
+    valid_chars "$1" 'A-Za-z0-9%._~/-' "$2" 3072 || return 1
+    # every % starts a hex pair
+    [ -z "$(printf '%s' "$1" | sed -e 's/%[0-9A-Fa-f][0-9A-Fa-f]//g' | tr -d 'A-Za-z0-9._~/-')" ]
+}
+
+# Decode a URI-encoded key for display (bytes as-is, control characters
+# dropped), HTML-escaped.
+enc_html() {
+    printf '%s' "$1" | LC_ALL=C awk '
+        BEGIN { hex = "0123456789abcdef" }
+        { s = $0; out = ""
+          while ((i = index(s, "%")) > 0) {
+              out = out substr(s, 1, i - 1)
+              h = tolower(substr(s, i + 1, 2))
+              hi = index(hex, substr(h, 1, 1)); lo = index(hex, substr(h, 2, 1))
+              out = out sprintf("%c", (hi - 1) * 16 + lo - 1); s = substr(s, i + 3)
+          }
+          printf "%s", out s }' | LC_ALL=C tr -d '\000-\037\177' \
+        | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g'
+}
+
+# Print a presigned URL. $1=method $2=bucket $3=encoded key
+# $4=host[:port] $5=scheme $6=expires (s). rc 2: socket unreachable;
+# rc 1: refused (API_CODE / API_ERR say why).
+API_ERR=""
+presign_url() {
+    API_ERR=""; API_CODE=""
+    [ -S "${ADMIN_SOCK}" ] && command -v curl >/dev/null 2>&1 || return 2
+    _r="$(printf '{"key_enc":"%s","method":"%s","host":"%s","scheme":"%s","expires":%s}' \
+            "$3" "$1" "$4" "$5" "$6" \
+          | curl -s -w '\n%{http_code}' --max-time 5 --unix-socket "${ADMIN_SOCK}" -X POST \
+                 -H 'Content-Type: application/json' --data-binary @- \
+                 "http://localhost/v1/buckets/$2/presign" 2>/dev/null)"
+    API_CODE="$(printf '%s' "${_r}" | tail -n 1)"
+    case "${API_CODE}" in 200) ;; 000|'') return 2 ;;
+        *) API_ERR="$(printf '%s' "${_r}" | head -n 1 | sed -n 's/.*"error":"\([^"]*\)".*/\1/p')"; return 1 ;;
+    esac
+    printf '%s' "${_r}" | head -n 1 | sed -n 's/.*"url":"\([^"]*\)".*/\1/p'
+}
+
+LOCAL_HOST="127.0.0.1:${FS3_PORT}"
+
+# 303 back to the browser view with a fixed message code.
+redirect_browse() {  # $1=code $2=bucket $3=encoded prefix
+    printf 'Status: 303 See Other\r\nLocation: %s?v=browse&b=%s&p=%s&m=%s\r\n' "${SCRIPT_PATH}" "$2" "$3" "$1"
+    printf 'Content-type: text/plain\r\n\r\n%s\n' "$1"
+    exit 0
+}
+
+text_reply() {  # $1=status line $2=fixed code
+    printf 'Status: %s\r\nContent-type: text/plain\r\nCache-Control: no-store\r\n\r\n%s\n' "$1" "$2"
+    exit 0
+}
+
+# POST ?a=upload&b=<bucket>&k=<encoded key>, body = the file (sent by the
+# page's script with X-Fs3-Token). Streamed straight into fs3: nothing
+# is buffered here.
+handle_upload() {
+    if [ -n "${HTTP_ORIGIN}" ] && [ "${HTTP_ORIGIN}" != "null" ]; then
+        o="${HTTP_ORIGIN#*://}"; o="${o%%/*}"
+        [ "${o}" = "${HTTP_HOST}" ] || text_reply "403 Forbidden" e_csrf
+    fi
+    [ -n "${HTTP_X_FS3_TOKEN}" ] && [ -s "${TOK_FILE}" ] \
+        && [ "${HTTP_X_FS3_TOKEN}" = "$(cat "${TOK_FILE}" 2>/dev/null)" ] \
+        || text_reply "403 Forbidden" e_csrf
+    ub="$(qs_get b)"; uk="$(qs_get k)"
+    valid_bucket "${ub}" && valid_enc "${uk}" 1 || text_reply "400 Bad Request" e_req
+    case "${CONTENT_LENGTH}" in ''|*[!0-9]*) text_reply "411 Length Required" e_req ;; esac
+    [ "${#CONTENT_LENGTH}" -le 10 ] && [ "${CONTENT_LENGTH}" -le 5368709120 ] \
+        || text_reply "413 Payload Too Large" e_toolarge
+    url="$(presign_url PUT "${ub}" "${uk}" "${LOCAL_HOST}" http 3600)"
+    case $? in 0) ;; 2) text_reply "503 Service Unavailable" e_sock ;; *) text_reply "409 Conflict" e_nokey ;; esac
+    code="$(curl -s -o /dev/null -w '%{http_code}' -H "Content-Length: ${CONTENT_LENGTH}" \
+                 -H 'Transfer-Encoding:' -H 'Expect:' -T - "${url}" 2>/dev/null)"
+    case "${code}" in
+        200) text_reply "200 OK" ok ;;
+        413) text_reply "413 Payload Too Large" e_toolarge ;;
+        403) text_reply "403 Forbidden" e_denied ;;
+        507|503) text_reply "507 Insufficient Storage" e_full ;;
+    esac
+    text_reply "502 Bad Gateway" e_put
+}
+
+# GET ?v=get&b=<bucket>&k=<encoded key>: stream the object.
+handle_download() {
+    db="$(qs_get b)"; dk="$(qs_get k)"
+    valid_bucket "${db}" && valid_enc "${dk}" 1 || plain_page "400 Bad Request" "Malformed request."
+    hurl="$(presign_url HEAD "${db}" "${dk}" "${LOCAL_HOST}" http 300)" \
+        || plain_page "503 Service Unavailable" "Could not get a download link from fs3 (is the admin API socket on and the bucket owner's key enabled?)."
+    hdr="$(curl -s -I --max-time 10 "${hurl}" 2>/dev/null | tr -d '\r')"
+    st="$(printf '%s\n' "${hdr}" | head -n 1 | awk '{ print $2 }')"
+    [ "${st}" = "200" ] || plain_page "404 Not Found" "No such object, or it cannot be read here (an SSE-C object needs its customer key)."
+    len="$(printf '%s\n' "${hdr}" | sed -n 's/^[Cc]ontent-[Ll]ength: *\([0-9][0-9]*\)$/\1/p' | head -n 1)"
+    gurl="$(presign_url GET "${db}" "${dk}" "${LOCAL_HOST}" http 300)" || plain_page "503 Service Unavailable" "Could not get a download link from fs3."
+    fname="${dk##*/}"; [ -n "${fname}" ] || fname=download
+    printf 'Content-Type: application/octet-stream\r\nCache-Control: no-store\r\n'
+    printf 'X-Content-Type-Options: nosniff\r\n'
+    printf "Content-Disposition: attachment; filename=\"download\"; filename*=UTF-8''%s\r\n" "${fname}"
+    [ -n "${len}" ] && printf 'Content-Length: %s\r\n' "${len}"
+    printf '\r\n'
+    exec curl -s "${gurl}"
+}
+
+# Host clients use for share links: the public host name when set
+# (behind the DSM reverse proxy, https on 443), otherwise this page's
+# host on the S3 port when fs3 listens on the LAN. Empty: no share links.
+share_base() {
+    if [ -n "${FS3_PUBLIC_HOST}" ]; then
+        printf 'https %s' "${FS3_PUBLIC_HOST}"
+    elif [ "${FS3_BIND}" = "0.0.0.0" ]; then
+        h="${HTTP_HOST}"
+        case "${h}" in \[*\]*) h="${h%%]*}]" ;; *:*) h="${h%%:*}" ;; esac
+        valid_chars "${h}" 'A-Za-z0-9.:[]-' 1 253 && printf 'http %s:%s' "${h}" "${FS3_PORT}"
+    fi
+}
+
+# Share-link page (the URL is shown once, not stored anywhere).
+share_page() {  # $1=bucket $2=encoded key $3=expires $4=encoded prefix
+    set -- "$1" "$2" "$3" "$4" $(share_base)
+    [ -n "${6:-}" ] || redirect_browse e_noshare "$1" "$4"
+    url="$(presign_url GET "$1" "$2" "$6" "$5" "$3")"
+    case $? in 0) ;; 2) redirect_browse e_sock "$1" "$4" ;; *)
+        [ "${API_CODE}" = "400" ] && redirect_browse e_expires "$1" "$4"
+        redirect_browse e_nokey "$1" "$4" ;; esac
+    case "$3" in 3600) d="1 hour" ;; 86400) d="1 day" ;; *) d="7 days" ;; esac
+    printf 'Content-type: text/html\r\nCache-Control: no-store\r\n\r\n'
+    printf '<!doctype html><html><head><meta charset="utf-8"><title>fs3 share link</title></head>'
+    printf '<body style="font-family: system-ui, sans-serif; max-width: 760px; margin: 40px auto; color: #264653;">'
+    printf '<h1>Share link</h1><p>Anyone with this link can download <code>%s/%s</code> for %s. ' \
+        "$(html_escape "$1")" "$(enc_html "$2")" "${d}"
+    printf 'It cannot be revoked early except by disabling the key it was signed with.</p>'
+    printf '<p><input readonly style="width:100%%;font-family:monospace" value="%s" onclick="this.select()"></p>' "$(html_escape "${url}")"
+    printf '<p><a href="%s?v=browse&amp;b=%s&amp;p=%s">Back to the bucket</a></p></body></html>\n' \
+        "$(html_escape "${SCRIPT_PATH}")" "$1" "$4"
+    exit 0
+}
+
 seccomp_supported() { grep -q '^Seccomp:' /proc/self/status 2>/dev/null; }
 
 # ---- POST -----------------------------------------------------------------
@@ -333,6 +486,7 @@ handle_post() {
     F_ACTION=""; F_AK=""; F_SK=""; F_USER=""; F_TOK=""
     F_RB=""; F_REP=""; F_RREG=""; F_RBK=""; F_RAK=""; F_RSK=""; F_RPFX=""
     F_RADDR=""; F_RDEL=""; F_RPLAIN=""
+    F_OB=""; F_OK=""; F_OP=""; F_EXP=""
     oldifs="${IFS}"; IFS='&'
     for pair in ${body}; do
         k="${pair%%=*}"; v="${pair#*=}"
@@ -352,6 +506,10 @@ handle_post() {
             raddr)  F_RADDR="${v}" ;;
             rdel)   F_RDEL="${v}" ;;
             rplain) F_RPLAIN="${v}" ;;
+            ob)     F_OB="${v}" ;;
+            ok)     F_OK="${v}" ;;
+            op)     F_OP="${v}" ;;
+            exp)    F_EXP="${v}" ;;
         esac
     done
     IFS="${oldifs}"
@@ -453,6 +611,19 @@ handle_post() {
         [ "${API_CODE}" = "404" ] && redirect e_repl_bucket
         redirect e_repl_api
         ;;
+    objdel|share)
+        valid_bucket "${F_OB}" && valid_enc "${F_OK}" 1 || redirect e_req
+        valid_enc "${F_OP}" 0 || F_OP=""
+        if [ "${F_ACTION}" = "share" ]; then
+            case "${F_EXP}" in 3600|86400|604800) ;; *) redirect_browse e_req "${F_OB}" "${F_OP}" ;; esac
+            share_page "${F_OB}" "${F_OK}" "${F_EXP}" "${F_OP}"
+        fi
+        url="$(presign_url DELETE "${F_OB}" "${F_OK}" "${LOCAL_HOST}" http 300)"
+        case $? in 0) ;; 2) redirect_browse e_sock "${F_OB}" "${F_OP}" ;; *) redirect_browse e_nokey "${F_OB}" "${F_OP}" ;; esac
+        code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 30 -X DELETE "${url}" 2>/dev/null)"
+        case "${code}" in 204|200) redirect_browse obj_deleted "${F_OB}" "${F_OP}" ;; esac
+        redirect_browse e_del "${F_OB}" "${F_OP}"
+        ;;
     restart)
         restart_fs3 && redirect restarted
         redirect e_notrunning
@@ -464,8 +635,10 @@ handle_post() {
 }
 
 if [ "${REQUEST_METHOD}" = "POST" ]; then
+    case "&${QUERY_STRING}" in *"&a=upload&"*) handle_upload ;; esac
     handle_post
 fi
+case "&${QUERY_STRING}" in *"&v=get&"*) handle_download ;; esac
 
 # ---- GET: render the page -------------------------------------------
 
@@ -480,6 +653,152 @@ if [ -w "${VAR_DIR}" ] || [ -w "${TOK_FILE}" ] 2>/dev/null; then
     fi
     TOKEN="$(cat "${TOK_FILE}" 2>/dev/null)"
 fi
+
+# ---- GET ?v=browse: the object browser -----------------------------------
+browse_page() {
+    BB="$(qs_get b)"; BP="$(qs_get p)"; BA="$(qs_get after)"
+    valid_bucket "${BB}" || plain_page "400 Bad Request" "Malformed request."
+    valid_enc "${BP}" 0 || BP=""
+    valid_enc "${BA}" 0 || BA=""
+    HS="$(html_escape "${SCRIPT_PATH}")"
+    BMSG=""
+    case "${QUERY_STRING}" in
+        *m=obj_deleted*) BMSG="Object deleted." ;;
+        *m=e_sock*) BMSG="Error: could not reach fs3's admin API socket. Turn on <i>Admin API socket</i> under Settings and make sure the package is running." ;;
+        *m=e_nokey*) BMSG="Error: fs3 has no usable key to sign with. The bucket's owner (or the admin user) needs an enabled key; uploads and deletes need one that isn't read-only." ;;
+        *m=e_noshare*) BMSG="Error: share links need a public host name (<i>Public host for share links</i> under Settings) while fs3 listens only on 127.0.0.1." ;;
+        *m=e_expires*) BMSG="Error: that expiry is longer than <i>Longest presigned URL</i> under Settings allows." ;;
+        *m=e_del*) BMSG="Error: fs3 refused the delete (Object Lock, a bucket policy, or the object is gone)." ;;
+        *m=e_req*) BMSG="Error: malformed request." ;;
+    esac
+    BCLS="notice"; case "${QUERY_STRING}" in *m=e_*) BCLS="notice err" ;; esac
+
+    LIST=""; LERR=""
+    if [ ! -S "${ADMIN_SOCK}" ] || ! command -v curl >/dev/null 2>&1; then
+        LERR="The object browser needs the admin API socket (turn on <i>Admin API socket</i> under Settings) and a running package."
+    else
+        LIST="$(curl -s -f --max-time 20 --unix-socket "${ADMIN_SOCK}" \
+            "http://localhost/v1/buckets/${BB}/objects?format=tsv&max=200&prefix=${BP}&after=${BA}" 2>/dev/null)" \
+            || LERR="Could not list the bucket (does it exist, and is fs3 running?)."
+    fi
+
+    # Breadcrumbs: bucket / each prefix segment.
+    CRUMBS="<a href=\"${HS}?v=browse&amp;b=${BB}\"><code>${BB}</code></a>"
+    acc=""; rest="${BP}"
+    while [ -n "${rest}" ]; do
+        seg="${rest%%/*}"; acc="${acc}${seg}/"
+        case "${rest}" in */*) rest="${rest#*/}" ;; *) rest="" ;; esac
+        CRUMBS="${CRUMBS} / <a href=\"${HS}?v=browse&amp;b=${BB}&amp;p=${acc}\">$(enc_html "${seg}")</a>"
+    done
+
+    ROWS=""; MORE=""
+    if [ -n "${LIST}" ]; then
+        ROWS="$(printf '%s\n' "${LIST}" | while IFS='	' read -r t a b c d; do
+            case "${t}" in
+            P)  valid_enc "${a}" 1 || continue
+                printf '<tr><td>&#128193; <a href="%s?v=browse&amp;b=%s&amp;p=%s">%s</a></td><td></td><td></td><td></td></tr>\n' \
+                    "${HS}" "${BB}" "${a}" "$(enc_html "${a#"${BP}"}")" ;;
+            O)  valid_enc "${d}" 1 || continue
+                case "${a}${b}" in *[!0-9]*) continue ;; esac
+                when="$(printf '%s' "${b}" | awk '{ s = int($1 / 1000); d = int(s / 86400); r = s - d * 86400
+                    z = d + 719468; era = int(z / 146097); doe = z - era * 146097
+                    yoe = int((doe - int(doe / 1460) + int(doe / 36524) - int(doe / 146096)) / 365)
+                    y = yoe + era * 400; doy = doe - (365 * yoe + int(yoe / 4) - int(yoe / 100))
+                    mp = int((5 * doy + 2) / 153); dd = doy - int((153 * mp + 2) / 5) + 1
+                    m = mp < 10 ? mp + 3 : mp - 9; if (m <= 2) y++
+                    printf "%04d-%02d-%02d %02d:%02d UTC", y, m, dd, int(r / 3600), int(r % 3600 / 60) }')"
+                size="$(printf '%s' "${a}" | awk '{ b = $1 + 0
+                    if (b < 1024) printf "%d B", b; else if (b < 1048576) printf "%.1f KiB", b / 1024
+                    else if (b < 1073741824) printf "%.1f MiB", b / 1048576; else printf "%.2f GiB", b / 1073741824 }')"
+                name="$(enc_html "${d#"${BP}"}")"
+                printf '<tr><td><a href="%s?v=get&amp;b=%s&amp;k=%s">%s</a></td><td>%s</td><td>%s</td><td>' \
+                    "${HS}" "${BB}" "${d}" "${name}" "${size}" "${when}"
+                if [ -n "${TOKEN}" ]; then
+                    printf '<form method="post" class="inline"><input type="hidden" name="action" value="share"><input type="hidden" name="tok" value="%s"><input type="hidden" name="ob" value="%s"><input type="hidden" name="ok" value="%s"><input type="hidden" name="op" value="%s"><select name="exp"><option value="3600">1 h</option><option value="86400">1 day</option><option value="604800">7 days</option></select> <button type="submit">Share</button></form> ' \
+                        "${TOKEN}" "${BB}" "${d}" "${BP}"
+                    printf '<form method="post" class="inline" onsubmit="return confirm('"'"'Delete this object?'"'"');"><input type="hidden" name="action" value="objdel"><input type="hidden" name="tok" value="%s"><input type="hidden" name="ob" value="%s"><input type="hidden" name="ok" value="%s"><input type="hidden" name="op" value="%s"><button type="submit">Delete</button></form>' \
+                        "${TOKEN}" "${BB}" "${d}" "${BP}"
+                fi
+                printf '</td></tr>\n' ;;
+            esac
+        done)"
+        nxt="$(printf '%s\n' "${LIST}" | awk -F'\t' '$1 == "T" && $2 == "1" { print $3; exit }')"
+        if [ -n "${nxt}" ] && valid_enc "${nxt}" 1; then
+            MORE="<p><a href=\"${HS}?v=browse&amp;b=${BB}&amp;p=${BP}&amp;after=${nxt}\">Next page &rarr;</a></p>"
+        fi
+    fi
+    if [ -n "${LERR}" ]; then TABLE="<p class=\"notice err\">${LERR}</p>"
+    elif [ -n "${ROWS}" ]; then TABLE="<table><tr><th>Name</th><th>Size</th><th>Modified</th><th></th></tr>
+${ROWS}</table>${MORE}"
+    else TABLE="<p class=\"muted\">Empty.</p>"; fi
+
+    UPLOAD=""
+    if [ -n "${TOKEN}" ] && [ -z "${LERR}" ]; then
+        UPLOAD="<h3>Upload</h3>
+<p class=\"muted\">Files go into <code>${BB}/$(enc_html "${BP}")</code> under the bucket owner's key, streamed through DSM to fs3 (up to 5 GiB each). DSM's web server may cap request sizes lower.</p>
+<p><input type=\"file\" id=\"files\" multiple> <button type=\"button\" id=\"up\">Upload</button> <span id=\"upst\" class=\"muted\"></span></p>
+<script>
+(function () {
+  var tok = '${TOKEN}', b = '${BB}', p = '${BP}', url = location.pathname;
+  function enc(s) {
+    return encodeURIComponent(s).replace(/%2F/g, '/').replace(/[!'()*]/g, function (c) {
+      return '%' + c.charCodeAt(0).toString(16).toUpperCase(); });
+  }
+  var msgs = { e_csrf: 'the page expired; reload it', e_toolarge: 'file too large',
+    e_sock: 'admin API socket unreachable', e_nokey: 'no usable key for this bucket',
+    e_denied: 'access denied', e_full: 'not enough space', e_put: 'fs3 refused the upload', e_req: 'invalid name' };
+  document.getElementById('up').onclick = function () {
+    var files = Array.prototype.slice.call(document.getElementById('files').files), st = document.getElementById('upst');
+    if (!files.length) return;
+    (function next(i) {
+      if (i >= files.length) { st.textContent = 'Done.'; location.reload(); return; }
+      var f = files[i], x = new XMLHttpRequest();
+      x.open('POST', url + '?a=upload&b=' + b + '&k=' + p + enc(f.name));
+      x.setRequestHeader('X-Fs3-Token', tok);
+      x.upload.onprogress = function (e) {
+        if (e.lengthComputable) st.textContent = f.name + ': ' + Math.floor(100 * e.loaded / e.total) + '%';
+      };
+      x.onload = function () {
+        var c = (x.responseText || '').trim();
+        if (c === 'ok') next(i + 1);
+        else st.textContent = f.name + ': ' + (msgs[c] || ('error ' + x.status));
+      };
+      x.onerror = function () { st.textContent = f.name + ': network error'; };
+      x.send(f);
+    })(0);
+  };
+})();
+</script>"
+    fi
+
+    printf 'Content-type: text/html\r\nCache-Control: no-store\r\n\r\n'
+    cat <<HTML
+<!doctype html>
+<html><head><meta charset="utf-8"><title>fs3: ${BB}</title>
+<style>
+  body { font-family: -apple-system, system-ui, sans-serif; max-width: 900px;
+         margin: 40px auto; color: #264653; line-height: 1.5; padding: 0 16px; }
+  h1 { font-size: 22px; }
+  code { background: #f0f0f0; padding: 1px 5px; border-radius: 4px; }
+  .muted { color: #6b7b82; font-size: 14px; }
+  .notice { background: #e9f5f3; border-left: 4px solid #2a9d8f; padding: 8px 12px; border-radius: 4px; }
+  .notice.err { background: #fdf0ec; border-left-color: #e76f51; }
+  table { border-collapse: collapse; margin: 8px 0; width: 100%; }
+  th, td { text-align: left; padding: 4px 14px 4px 0; font-size: 14px; border-bottom: 1px solid #eee; }
+  td form, form.inline { display: inline; margin: 0; }
+  a { color: #1d6f66; }
+</style></head><body>
+<p><a href="${HS}">&larr; fs3</a></p>
+<h1>${CRUMBS}</h1>
+$( [ -n "${BMSG}" ] && printf '<p class="%s">%s</p>' "${BCLS}" "${BMSG}" )
+${TABLE}
+${UPLOAD}
+<p class="muted">Signed in as $(html_escape "${UI_USER}").</p>
+</body></html>
+HTML
+    exit 0
+}
+case "&${QUERY_STRING}" in *"&v=browse&"*|*"&v=browse") browse_page ;; esac
 
 H_PORT="$(html_escape "${FS3_PORT}")"
 H_DATA="$(html_escape "${FS3_DATA}")"
@@ -576,7 +895,9 @@ fi
 BUCKETS_HTML=""
 if BUCKETS_TXT="$(fetch_admin /buckets)"; then
     if [ -n "${BUCKETS_TXT}" ]; then
-        ROWS="$(printf '%s\n' "${BUCKETS_TXT}" | sort | awk '
+        BROWSE=0; [ "${FS3_ADMIN_SOCKET}" = "1" ] && [ -S "${ADMIN_SOCK}" ] && BROWSE=1
+        ROWS="$(printf '%s\n' "${BUCKETS_TXT}" | sort | awk -v browse="${BROWSE}" \
+                -v script="$(html_escape "${SCRIPT_PATH}")" '
             NF >= 3 {
                 name = $1
                 gsub(/&/, "\\&amp;", name)
@@ -594,7 +915,10 @@ if BUCKETS_TXT="$(fetch_admin /buckets)"; then
                     else                     qs = sprintf("%.2f GiB", q / 1073741824)
                     qs = sprintf("%d%% of %s", int(qu * 100 / q), qs)
                 } else qs = "&mdash;"
-                printf "<tr><td><code>%s</code></td><td>%s</td><td>%s</td><td>%s</td></tr>\n", name, $2, hs, qs
+                if (browse && $1 ~ /^[a-z0-9.-]+$/)
+                    cell = sprintf("<a href=\"%s?v=browse&amp;b=%s\"><code>%s</code></a>", script, $1, name)
+                else cell = sprintf("<code>%s</code>", name)
+                printf "<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>\n", cell, $2, hs, qs
                 nb++; tobj += $2; tb += b
                 if      (tb < 1024)       ts = sprintf("%d B", tb)
                 else if (tb < 1048576)    ts = sprintf("%.1f KiB", tb / 1024)

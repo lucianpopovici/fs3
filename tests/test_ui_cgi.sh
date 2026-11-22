@@ -10,6 +10,7 @@
 #   5. live bucket stats through a real fs3 admin listener
 #   6. DSM sign-in / administrators gate
 #   7. settings form: rendering, validation, conf writes, restart, restore
+#   8. object browser: listing, streamed upload/download, share links, delete
 #
 set -eu
 
@@ -311,6 +312,111 @@ mv "$VAR/admin.sock" "$VAR/admin.sock.off"
 out=$(cgi_post "action=syncrepl&tok=$TOKEN&rb=cgibuk")
 check_has "replication: socket missing reported" "$out" "m=e_repl_sock"
 mv "$VAR/admin.sock.off" "$VAR/admin.sock"
+
+kill "$SP" 2>/dev/null; wait "$SP" 2>/dev/null || true; SP=
+
+# ===================================================================
+# 5. Object browser (signed: fs3 with a key for the bucket owner)
+# ===================================================================
+OAK=AKIATILEOWNER001; OSK=tileOwnerSecret01234567890123456789012
+rm -f "$VAR/admin.sock"
+${FS3_WRAP:-} "$ROOT/fs3" -p "$PORT" -d "$DATA" --metrics-port "$MPORT" \
+    --auth "$OAK:$OSK" --require-auth --admin-socket "$VAR/admin.sock" >>"$LOG" 2>&1 &
+SP=$!
+for _ in $(seq 50); do [ -S "$VAR/admin.sock" ] && break; sleep 0.1; done
+echo "$SP" > "$VAR/fs3.pid"; echo "$SP" > "$VAR/fs3.child.pid"
+curl -s --unix-socket "$VAR/admin.sock" -X PUT -d "{\"owner\":\"$OAK\"}" http://x/v1/buckets/cgibuk/owner >/dev/null
+cgi_upload() {  # $1=query $2=file [$3=token]
+    cgi_env REQUEST_METHOD=POST QUERY_STRING="$1" CONTENT_LENGTH="$(wc -c < "$2" | tr -d ' ')" \
+        HTTP_X_FS3_TOKEN="${3-$TOKEN}" sh "$CGI" < "$2"
+}
+printf 'hello <tile>' > "$VAR/up1"
+head -c 3000000 /dev/urandom > "$VAR/up2"
+out=$(cgi_upload "a=upload&b=cgibuk&k=docs/a%20%3Cb%3E.txt" "$VAR/up1")
+check_has "browser: upload ok"            "$out" "ok"
+out=$(cgi_upload "a=upload&b=cgibuk&k=docs/big.bin" "$VAR/up2")
+check_has "browser: 3 MB upload ok"       "$out" "ok"
+out=$(cgi_upload "a=upload&b=cgibuk&k=x" "$VAR/up1" WRONG)
+check_has "browser: upload needs the token" "$out" "e_csrf"
+out=$(cgi_upload "a=upload&b=cgibuk&k=x" "$VAR/up1" "")
+check_has "browser: upload without token refused" "$out" "e_csrf"
+out=$(cgi_env REQUEST_METHOD=POST QUERY_STRING="a=upload&b=cgibuk&k=x" CONTENT_LENGTH=12 \
+      HTTP_X_FS3_TOKEN="$TOKEN" HTTP_ORIGIN=http://evil.example sh "$CGI" < "$VAR/up1")
+check_has "browser: cross-origin upload refused" "$out" "e_csrf"
+out=$(cgi_upload "a=upload&b=cgibuk&k=bad%2" "$VAR/up1")
+check_has "browser: malformed key refused" "$out" "e_req"
+out=$(cgi_upload "a=upload&b=cgibuk&k=a'b" "$VAR/up1")
+check_has "browser: quote in key refused" "$out" "e_req"
+out=$(cgi_upload "a=upload&b=..&k=x" "$VAR/up1")
+check_has "browser: bad bucket refused"   "$out" "e_req"
+check_eq "browser: stored through fs3" \
+    "$(curl -s --unix-socket "$VAR/admin.sock" "http://x/v1/buckets/cgibuk/objects?prefix=docs/&format=tsv" | grep -c '^O' || true)" 2
+
+page=$(cgi_get)
+check_has "browser: bucket links to the browser" "$page" "?v=browse&amp;b=cgibuk"
+page=$(cgi_get "v=browse&b=cgibuk")
+check_has "browser: folder row"           "$page" "p=docs/\">docs/</a>"
+check_has "browser: root object row"      "$page" "v=get&amp;b=cgibuk&amp;k=obj\">obj</a>"
+check_has "browser: upload widget"        "$page" 'id="files"'
+check_has "browser: token in the page"    "$page" "$TOKEN"
+page=$(cgi_get "v=browse&b=cgibuk&p=docs/")
+check_has "browser: name escaped"         "$page" "a &lt;b&gt;.txt"
+check_lacks "browser: no raw markup"      "$page" "a <b>.txt"
+check_has "browser: size"                 "$page" "2.9 MiB"
+check_has "browser: breadcrumbs"          "$page" "p=docs/\">docs</a>"
+check_has "browser: share form"           "$page" 'value="share"'
+page=$(cgi_get "v=browse&b=..%2Fetc")
+check_has "browser: bad bucket → 400"     "$page" "Status: 400"
+page=$(cgi_get "v=browse&b=cgibuk&p=%3Cscript%3E")
+check_lacks "browser: prefix never reflected raw" "$page" "<script>alert"
+
+dl=$(cgi_get "v=get&b=cgibuk&k=docs/a%20%3Cb%3E.txt")
+check_has "browser: download disposition" "$dl" "filename*=UTF-8''a%20%3Cb%3E.txt"
+check_has "browser: download length"      "$dl" "Content-Length: 12"
+check_has "browser: download body"        "$dl" "hello <tile>"
+check_eq "browser: big download intact" \
+    "$(cgi_get "v=get&b=cgibuk&k=docs/big.bin" | tail -c 3000000 | md5sum | cut -d' ' -f1)" \
+    "$(md5sum < "$VAR/up2" | cut -d' ' -f1)"
+dl=$(cgi_get "v=get&b=cgibuk&k=nope")
+check_has "browser: missing object → 404" "$dl" "Status: 404"
+
+out=$(cgi_post "action=share&tok=$TOKEN&ob=cgibuk&ok=docs/big.bin&op=docs/&exp=3600")
+check_has "browser: share page"           "$out" "Share link"
+url=$(printf '%s' "$out" | sed -n 's/.*value="\([^"]*\)".*/\1/p' | sed 's/&amp;/\&/g')
+check_has "browser: share link host"      "$url" "http://nas.local:$PORT/cgibuk/docs/big.bin?X-Amz-Algorithm="
+check_eq "browser: share link works" \
+    "$(curl -s -H "Host: nas.local:$PORT" "http://127.0.0.1:$PORT${url#http://nas.local:$PORT}" | md5sum | cut -d' ' -f1)" \
+    "$(md5sum < "$VAR/up2" | cut -d' ' -f1)"
+out=$(cgi_post "action=share&tok=$TOKEN&ob=cgibuk&ok=docs/big.bin&op=docs/&exp=99")
+check_has "browser: bad expiry refused"   "$out" "m=e_req"
+out=$(cgi_post "action=share&tok=wrong&ob=cgibuk&ok=docs/big.bin&exp=3600")
+check_has "browser: share needs CSRF"     "$out" "m=e_csrf"
+check_eq "browser: presigns audited in the log" \
+    "$(grep -c 'admin: presign GET bucket cgibuk key docs/big.bin' "$LOG" || true)" 2
+
+out=$(cgi_post "action=objdel&tok=$TOKEN&ob=cgibuk&ok=docs/big.bin&op=docs/")
+check_has "browser: deleted"              "$out" "m=obj_deleted"
+check_has "browser: back in the folder"   "$out" "v=browse&b=cgibuk&p=docs/"
+check_eq "browser: gone" \
+    "$(curl -s --unix-socket "$VAR/admin.sock" "http://x/v1/buckets/cgibuk/objects?prefix=docs/&format=tsv" | grep -c 'big.bin' || true)" 0
+out=$(cgi_post "action=objdel&tok=wrong&ob=cgibuk&ok=docs/x")
+check_has "browser: delete needs CSRF"    "$out" "m=e_csrf"
+
+# No usable key: the owner's only key disabled → the browser says so.
+curl -s --unix-socket "$VAR/admin.sock" -X PUT -d '{"owner":"nobody"}' http://x/v1/buckets/cgibuk/owner >/dev/null
+out=$(cgi_post "action=objdel&tok=$TOKEN&ob=cgibuk&ok=obj&op=")
+check_has "browser: no usable key reported" "$out" "m=e_nokey"
+check_has "browser: no-key message" "$(cgi_get "v=browse&b=cgibuk&m=e_nokey")" "no usable key"
+
+# Bound to 127.0.0.1 without a public host: share links refused.
+sed -i 's/^FS3_BIND=.*/FS3_BIND=127.0.0.1/' "$CONF"
+out=$(cgi_post "action=share&tok=$TOKEN&ob=cgibuk&ok=obj&op=&exp=3600")
+check_has "browser: share needs a public host" "$out" "m=e_noshare"
+printf 'FS3_PUBLIC_HOST=s3.example.com\n' >> "$CONF"
+curl -s --unix-socket "$VAR/admin.sock" -X PUT -d "{\"owner\":\"$OAK\"}" http://x/v1/buckets/cgibuk/owner >/dev/null
+out=$(cgi_post "action=share&tok=$TOKEN&ob=cgibuk&ok=obj&op=&exp=86400")
+check_has "browser: public-host share link" "$out" "https://s3.example.com/cgibuk/obj?X-Amz-"
+sed -i -e 's/^FS3_BIND=.*/FS3_BIND=0.0.0.0/' -e '/^FS3_PUBLIC_HOST=/d' "$CONF"
 
 kill "$SP" 2>/dev/null; wait "$SP" 2>/dev/null || true; SP=
 rm -f "$VAR/fs3.pid" "$VAR/fs3.child.pid"

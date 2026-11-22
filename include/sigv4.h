@@ -158,6 +158,22 @@ typedef struct {
 int sigv4_sign(const sigv4_sign_req_t *r, const char *access_key, const char *secret,
                const char *region, const char *amz_date, char *out, size_t cap);
 
+/* Mint a presigned URL query (SignedHeaders=host, UNSIGNED-PAYLOAD,
+ * region us-east-1) with a key of `user` (first usable: enabled, not
+ * expiring before the URL, writable if need_write, not an admin under
+ * --no-presign-admin), else, with allow_admin, of any admin. `path` is
+ * the canonical URI-encoded path ("/bkt/my%20key"); `host` exactly the
+ * Host the client will send. Writes the query string (no '?') and the
+ * chosen access key. 0 or a SIGV4_PRESIGN_* code. */
+typedef struct {
+    const char *method, *host, *path, *user;
+    int64_t     expires;
+    int         need_write, allow_admin;
+} sigv4_presign_req_t;
+enum { SIGV4_PRESIGN_BAD = -1, SIGV4_PRESIGN_NO_KEY = -2, SIGV4_PRESIGN_TOO_LONG = -3 };
+int sigv4_presign(const sigv4_verifier_t *v, const sigv4_presign_req_t *r,
+                  char *query_out, size_t cap, char *ak_out, size_t akcap);
+
 /* Lowercase hex SHA-256 of `n` bytes (65 bytes incl. NUL). */
 void sigv4_sha256_hex(const void *data, size_t n, char out[65]);
 

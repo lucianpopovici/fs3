@@ -118,6 +118,8 @@ static void usage(const char *argv0) {
         "      --repl-part-size N     multipart part size for replication (default 16M, min 5M;\n"
         "                             objects over 4 parts' worth are sent as multipart)\n"
         "      --repl-timeout N       replication network timeout in seconds (default 30)\n"
+        "      --notify on|off        bucket event notifications (webhooks; default on)\n"
+        "      --notify-timeout N     webhook network timeout in seconds (default 10)\n"
         "      --default-bucket-quota N  byte limit for buckets without their own quota (0 = none)\n"
         "      --default-user-quota N    byte limit per user, over the buckets they own (0 = none)\n"
         "      --mpu-min-part-size N  minimum size of every multipart part but the last\n"
@@ -468,6 +470,8 @@ enum {
     OPT_REPL_PART_SIZE,
     OPT_REPL_TIMEOUT,
     OPT_SSE_KEY_FILE,
+    OPT_NOTIFY,
+    OPT_NOTIFY_TIMEOUT,
 };
 
 #ifndef FS3_MAIN_TESTING
@@ -551,6 +555,7 @@ int main(int argc, char **argv) {
     uint64_t dedup_min = 1024 * 1024;
     uint64_t scrub_rate = 20ULL * 1024 * 1024;           /* 20 MiB/s */
     int repl_workers = 2, repl_timeout = 30;
+    int notify_on = 1, notify_timeout = 10;
     uint64_t repl_rate = 20ULL * 1024 * 1024, repl_part_size = 16ULL * 1024 * 1024;
     const char *repl_ca_file = NULL;
     int tls_port = 0, require_tls = 0, require_signed_payload = 0, tls_max_per_ip = 32;
@@ -625,6 +630,8 @@ int main(int argc, char **argv) {
         { "repl-part-size",   required_argument, NULL, OPT_REPL_PART_SIZE },
         { "repl-timeout",     required_argument, NULL, OPT_REPL_TIMEOUT },
         { "sse-key-file",     required_argument, NULL, OPT_SSE_KEY_FILE },
+        { "notify",           required_argument, NULL, OPT_NOTIFY },
+        { "notify-timeout",   required_argument, NULL, OPT_NOTIFY_TIMEOUT },
         { "scrub-fail-reads", no_argument,       NULL, OPT_SCRUB_FAIL_READS },
         { "default-user-quota",   required_argument, NULL, OPT_DEFAULT_USER_QUOTA },
         { "require-signed-payload", no_argument, NULL, OPT_REQUIRE_SIGNED_PAYLOAD },
@@ -919,6 +926,18 @@ int main(int argc, char **argv) {
                 g_sse_key_file = optarg;
                 break;
             }
+            case OPT_NOTIFY:
+                if (!strcmp(optarg, "on")) notify_on = 1;
+                else if (!strcmp(optarg, "off")) notify_on = 0;
+                else { fprintf(stderr, "--notify: on|off\n"); return 2; }
+                break;
+            case OPT_NOTIFY_TIMEOUT: {
+                char *end;
+                long v = strtol(optarg, &end, 10);
+                if (*end || v < 1 || v > 300) { fprintf(stderr, "--notify-timeout: 1..300\n"); return 2; }
+                notify_timeout = (int)v;
+                break;
+            }
             case OPT_REPL_TIMEOUT: {
                 char *end;
                 long v = strtol(optarg, &end, 10);
@@ -1110,6 +1129,8 @@ int main(int argc, char **argv) {
         .repl_ca_file = repl_ca_file,
         .repl_part_size = repl_part_size,
         .repl_timeout_s = repl_timeout,
+        .notify_enabled = notify_on,
+        .notify_timeout_s = notify_timeout,
         .scrub_fail_reads = scrub_fail_reads,
         .key_max_age_days = key_max_age_days,
         .seccomp_mode = seccomp_mode,

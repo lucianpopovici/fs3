@@ -2044,6 +2044,7 @@ static int handle_object_copy(conn_t *c, s3_str_t dst_bucket, s3_str_t dst_key) 
         po.size_hint = src_meta.size;
         po.ssec_key = c->ssec_on ? c->ssec_key : c->sse_s3_on ? c->sse_s3_key : NULL;
         if (e == S3_OK) e = store_put_begin_opts(c->store, dst_bucket, dst_key, &po, &writer);
+        if (e == S3_OK) store_put_set_origin(writer, STORE_ORIGIN_COPY);
         echo_sse_s3(c);
     }
     free(tlv);

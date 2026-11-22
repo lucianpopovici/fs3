@@ -25,6 +25,7 @@ FS3_PORT|port|9000|net|S3 port|Port of the S3 endpoint. Point the DSM reverse-pr
 FS3_BIND|enum:127.0.0.1/0.0.0.0|127.0.0.1|net|Listen address|127.0.0.1: reachable only through the DSM reverse proxy, which adds HTTPS (recommended). 0.0.0.0: plain HTTP on the LAN; credentials and data travel unencrypted.
 FS3_TRUSTED_PROXY|iplist|127.0.0.1|net|Trusted proxies|Proxies whose X-Forwarded-For/-Proto headers fs3 believes, comma-separated. Keep 127.0.0.1 behind the DSM reverse proxy, or throttling and IP conditions in bucket policies see every client as the NAS itself.
 FS3_METRICS_PORT|port0|9101|net|Admin listener port|Local-only /healthz and Prometheus /metrics (127.0.0.1). This page reads bucket statistics from it. 0 disables it.
+FS3_PUBLIC_HOST|host||net|Public host for share links|Host name clients use to reach fs3 through the DSM reverse proxy (https on 443). The object browser signs share links for it; empty: links use this page's host and the S3 port, and only when fs3 listens on the LAN. Not passed to fs3.
 FS3_ADMIN|user||access|Admin user|fs3 user who can see and manage every bucket. Empty: none.
 FS3_LEGACY_OWNER|user||access|Owner of older buckets|Receives buckets created before per-user isolation or with authentication off. Empty: the first user in the credentials list.
 FS3_AUTH_FAIL_LIMIT|int:0:100000|20|access|Failed sign-ins before throttling|Per client address and minute; that address then gets 503 SlowDown for a growing period. 0 disables throttling.
