@@ -211,6 +211,8 @@ test: check-test-deps $(TEST_BINS) fs3 fs3-lockd fs3-dedup-estimate
 	@./tests/test_e2e_presign.sh
 	@echo "=== test_ui_cgi (DSM tile admin console) ==="
 	@./tests/test_ui_cgi.sh
+	@echo "=== test_spk_scripts (package start script and watchdog) ==="
+	@./tests/test_spk_scripts.sh
 
 FUZZ_CFG_OBJS := src/cors.o src/lifecycle.o src/website.o src/store_fs.o src/ssec.o src/checksum.o src/log.o $(XML_OBJS)
 tests/test_config_fuzz: tests/test_config_fuzz.c tests/fuzz_targets.h $(FUZZ_CFG_OBJS)

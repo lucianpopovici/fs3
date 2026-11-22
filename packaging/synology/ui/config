@@ -6,7 +6,7 @@
       "desc": "S3-compatible object storage endpoint",
       "icon": "images/fs3_{0}.png",
       "url": "/webman/3rdparty/fs3/index.cgi",
-      "allUsers": true,
+      "allUsers": false,
       "grantPrivilege": "local"
     }
   }

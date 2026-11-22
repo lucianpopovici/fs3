@@ -19,52 +19,30 @@ LOG_FILE="${VAR_DIR}/fs3.log"
 CONF_FILE="${VAR_DIR}/fs3.conf"
 CRED_FILE="${VAR_DIR}/credentials"
 
-# Defaults; overridden by ${CONF_FILE} written from the install wizard.
-# Bind localhost by default: TLS is provided by putting DSM's reverse
-# proxy in front (see README), so fs3 itself should not be the public
-# face. Set FS3_BIND=0.0.0.0 in fs3.conf for direct plaintext LAN access.
-FS3_PORT="9000"
-FS3_BIND="127.0.0.1"
-FS3_DATA="${VAR_DIR}/data"
-FS3_REQUIRE_AUTH="0"
-FS3_ACCESS_KEY=""
-FS3_SECRET_KEY=""
-# Per-user bucket isolation (auth only). FS3_ADMIN names a user who can
-# see and manage every bucket. FS3_LEGACY_OWNER receives buckets that have
-# no owner (created before isolation existed, or with auth off); empty
-# means the first user in the credentials file, so a single-user install
-# keeps its buckets across the upgrade.
-FS3_ADMIN=""
-FS3_LEGACY_OWNER=""
-FS3_GC_INTERVAL="60"
-FS3_GC_MAX_AGE="86400"
-# Admin listener (always 127.0.0.1): /healthz + Prometheus /metrics.
-# Scrape remotely via a DSM reverse-proxy entry or an SSH tunnel.
-# Set to 0 to disable.
-FS3_METRICS_PORT="9101"
+RESTART_FILE="${VAR_DIR}/fs3.restart"  # presence = "respawn now, no backoff"
+CONF_LIB="${PKG_DIR}/lib/fs3-conf.sh"
 
-# Load saved configuration. The file is parsed line-by-line and NEVER
-# sourced: conf values come from install-wizard input, and sourcing
-# would let a crafted value (e.g. a key containing `"; reboot; "`)
-# execute as shell. Unknown keys are ignored. A single pair of
-# surrounding double quotes is stripped for compatibility with confs
-# written by older (sourced-format) versions of this package.
+# The conf schema (keys, types, defaults, flag mapping) is shared with
+# the DSM tile's settings form: lib/fs3-conf.sh. fs3.conf is parsed
+# line-by-line there and NEVER sourced: its values come from the install
+# wizard and the settings form, and sourcing would let a crafted value
+# (e.g. `"; reboot; "`) execute as shell. Unknown keys are ignored and
+# invalid values fall back to the default with a line in the log.
+#
+# Defaults worth knowing: fs3 binds 127.0.0.1 (TLS comes from DSM's
+# reverse proxy in front, see README) and trusts X-Forwarded-For from
+# that proxy (FS3_TRUSTED_PROXY=127.0.0.1), so throttling and policy IP
+# conditions see real clients.
+if [ ! -f "${CONF_LIB}" ]; then
+    echo "fs3: missing ${CONF_LIB}; reinstall the package" >> "${LOG_FILE}"
+    [ -n "${SYNOPKG_TEMP_LOGFILE}" ] && echo "fs3: missing ${CONF_LIB}; reinstall the package" > "${SYNOPKG_TEMP_LOGFILE}"
+    exit 1
+fi
+. "${CONF_LIB}"
+
 load_conf() {
-    [ -f "${CONF_FILE}" ] || return 0
-    while IFS= read -r line || [ -n "${line}" ]; do
-        case "${line}" in ''|'#'*) continue ;; esac
-        key="${line%%=*}"
-        val="${line#*=}"
-        case "${val}" in
-            '"'*'"') val="${val#\"}"; val="${val%\"}" ;;
-        esac
-        case "${key}" in
-            FS3_PORT|FS3_BIND|FS3_DATA|FS3_REQUIRE_AUTH|FS3_ACCESS_KEY|\
-            FS3_SECRET_KEY|FS3_GC_INTERVAL|FS3_GC_MAX_AGE|FS3_METRICS_PORT|\
-            FS3_ADMIN|FS3_LEGACY_OWNER)
-                eval "${key}=\${val}" ;;
-        esac
-    done < "${CONF_FILE}"
+    fs3_conf_defaults "${VAR_DIR}"
+    fs3_conf_load "${CONF_FILE}" 2>> "${LOG_FILE}"
 }
 
 # Abort a start with a message the user can actually find: the package
@@ -90,10 +68,46 @@ preflight_data_dir() {
     rm -f "${probe}"
 }
 
+# Print fs3's arguments, one per line, from the current conf. Returns 1
+# (with a message on stderr) when authentication is on but there is no
+# credentials file.
+build_args() {
+    fs3_conf_args "${VAR_DIR}"
+    if [ "${FS3_REQUIRE_AUTH}" = "1" ]; then
+        # Credentials live in a 0600 file, passed via --credentials-file
+        # so the secret never appears on the command line (visible in ps).
+        # Migrate from an old-format conf that still carries the keys.
+        if [ ! -f "${CRED_FILE}" ] && [ -n "${FS3_ACCESS_KEY}" ]; then
+            ( umask 077
+              printf '%s:%s\n' "${FS3_ACCESS_KEY}" "${FS3_SECRET_KEY}" > "${CRED_FILE}" )
+        fi
+        if [ ! -f "${CRED_FILE}" ]; then
+            echo "authentication is enabled (FS3_REQUIRE_AUTH=1) but ${CRED_FILE} does not exist. Create it with one access_key:secret_key per line, or set FS3_REQUIRE_AUTH=0 in ${CONF_FILE}." >&2
+            return 1
+        fi
+        chmod 600 "${CRED_FILE}" 2>/dev/null
+        printf '%s\n' --credentials-file "${CRED_FILE}" --require-auth
+
+        # Identity of the first credential: its :user field, else the key.
+        legacy="${FS3_LEGACY_OWNER}"
+        if [ -z "${legacy}" ]; then
+            legacy=$(grep -v '^[[:space:]]*#' "${CRED_FILE}" \
+                | awk -F: 'NF >= 2 { gsub(/[[:space:]]+$/, ""); \
+                                     print (NF >= 3 ? $3 : $1); exit }')
+        fi
+        [ -n "${legacy}" ] && printf '%s\n' --legacy-owner "${legacy}"
+        [ -n "${FS3_ADMIN}" ] && printf '%s\n' --admin "${FS3_ADMIN}"
+    fi
+    return 0
+}
+
 # Watchdog: run fs3 in the foreground and respawn it if it exits without
-# being asked to stop (STOP_FILE). Restart backoff doubles 1s → 60s so a
-# crash-loop (bad config, port taken) idles instead of cooking a core; a
-# run that survives 60s is considered healthy and resets the backoff.
+# being asked to stop (STOP_FILE). The conf is re-read before every
+# (re)start, so the DSM tile applies new settings by writing the conf,
+# creating RESTART_FILE and stopping the fs3 child: the watchdog then
+# respawns it at once with the new arguments. Unrequested exits back off
+# 1s → 60s so a crash-loop (bad config, port taken) idles instead of
+# cooking a core; a run that survives 60s resets the backoff.
 #
 # This is the FALLBACK supervision model: the watchdog itself is not
 # supervised, so a killed watchdog means no auto-restart until the next
@@ -103,13 +117,30 @@ preflight_data_dir() {
 watchdog() {
     backoff=1
     while [ ! -f "${STOP_FILE}" ]; do
+        load_conf
         started=$(date +%s)
-        "${BIN}" "$@" &
-        echo $! > "${CHILD_PID_FILE}"
-        wait $!
-        rc=$?
-        rm -f "${CHILD_PID_FILE}"
+        if args="$(build_args 2>> "${LOG_FILE}")"; then
+            set --
+            while IFS= read -r a; do
+                set -- "$@" "${a}"
+            done <<ARGS_EOF
+${args}
+ARGS_EOF
+            rm -f "${RESTART_FILE}"
+            "${BIN}" "$@" &
+            echo $! > "${CHILD_PID_FILE}"
+            wait $!
+            rc=$?
+            rm -f "${CHILD_PID_FILE}"
+        else
+            rc=1
+        fi
         [ -f "${STOP_FILE}" ] && break
+        if [ -f "${RESTART_FILE}" ]; then
+            echo "fs3 restarting to apply new settings" >> "${LOG_FILE}"
+            backoff=1
+            continue
+        fi
         echo "fs3 exited unexpectedly (rc=${rc}); restarting in ${backoff}s" \
             >> "${LOG_FILE}"
         sleep "${backoff}"
@@ -128,45 +159,15 @@ start_daemon() {
     mkdir -p "${VAR_DIR}"
     preflight_data_dir
 
-    set -- -a "${FS3_BIND}" -p "${FS3_PORT}" -d "${FS3_DATA}" \
-           --mpu-gc-interval "${FS3_GC_INTERVAL}" \
-           --mpu-gc-max-age "${FS3_GC_MAX_AGE}"
-    if [ "${FS3_METRICS_PORT}" != "0" ] && [ -n "${FS3_METRICS_PORT}" ]; then
-        set -- "$@" --metrics-port "${FS3_METRICS_PORT}"
-    fi
-
-    if [ "${FS3_REQUIRE_AUTH}" = "1" ]; then
-        # Credentials live in a 0600 file, passed via --credentials-file
-        # so the secret never appears on the command line (visible in ps).
-        # Migrate from an old-format conf that still carries the keys.
-        if [ ! -f "${CRED_FILE}" ] && [ -n "${FS3_ACCESS_KEY}" ]; then
-            umask 077
-            printf '%s:%s\n' "${FS3_ACCESS_KEY}" "${FS3_SECRET_KEY}" > "${CRED_FILE}"
-        fi
-        if [ ! -f "${CRED_FILE}" ]; then
-            fail_start "authentication is enabled (FS3_REQUIRE_AUTH=1) but ${CRED_FILE} does not exist. Create it with one access_key:secret_key per line, or set FS3_REQUIRE_AUTH=0 in ${CONF_FILE}."
-        fi
-        chmod 600 "${CRED_FILE}" 2>/dev/null
-        set -- "$@" --credentials-file "${CRED_FILE}" --require-auth
-
-        # Identity of the first credential: its :user field, else the key.
-        if [ -z "${FS3_LEGACY_OWNER}" ]; then
-            FS3_LEGACY_OWNER=$(grep -v '^[[:space:]]*#' "${CRED_FILE}" \
-                | awk -F: 'NF >= 2 { gsub(/[[:space:]]+$/, ""); \
-                                     print (NF >= 3 ? $3 : $1); exit }')
-        fi
-        if [ -n "${FS3_LEGACY_OWNER}" ]; then
-            set -- "$@" --legacy-owner "${FS3_LEGACY_OWNER}"
-        fi
-        if [ -n "${FS3_ADMIN}" ]; then
-            set -- "$@" --admin "${FS3_ADMIN}"
-        fi
+    # Fail the start with a readable message instead of crash-looping.
+    if ! msg="$(build_args 2>&1 >/dev/null)"; then
+        fail_start "${msg}"
     fi
 
     # Launch the watchdog; it records fs3's own PID in CHILD_PID_FILE.
     # fs3 logs to stderr; redirect to file.
-    rm -f "${STOP_FILE}"
-    watchdog "$@" >> "${LOG_FILE}" 2>&1 &
+    rm -f "${STOP_FILE}" "${RESTART_FILE}"
+    watchdog >> "${LOG_FILE}" 2>&1 &
     echo $! > "${PID_FILE}"
 }
 

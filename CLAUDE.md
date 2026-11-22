@@ -62,7 +62,7 @@ The module list is in README, "Source layout". Feature → code → tests:
 | seccomp | `src/sandbox.c` (`ALLOW[]`), `tests/tools/seccomp_profile.sh` | `test_sandbox`, every e2e suite (a SIGSYS is reported) |
 | credentials file | `parse_and_add_cred`, `load_credentials_file` in `src/main.c` | `test_credfile` (seam: `FS3_MAIN_TESTING`) |
 | dedup estimator | `src/dedup_estimate.c` (standalone; mirrors the header format, keep in sync) | `test_e2e_dedup_estimate.sh` |
-| Synology package and tile | `packaging/synology/` | `test_ui_cgi.sh` |
+| Synology package and tile | `packaging/synology/`; conf schema in `lib/fs3-conf.sh` (shared by `scripts/start-stop-status` and `ui/index.cgi`) | `test_ui_cgi.sh`, `test_spk_scripts.sh` |
 
 ## Rules the code depends on
 
@@ -188,10 +188,17 @@ with argument filters where it makes sense, and run
 too; glibc versions differ (`open` vs `openat`, `stat` vs `newfstatat`).
 
 **A new CLI option:** add it to `--help` and the README's command-line
-reference. If it matters on a NAS, also add a `fs3.conf` key in
-`packaging/synology/scripts/start-stop-status`, plus its whitelist entry
-in `ui/index.cgi` (the SPK does not yet pass the newer options; see the
-roadmap).
+reference. If it matters on a NAS, add one line to the schema in
+`packaging/synology/lib/fs3-conf.sh` (key, type, default = fs3's default,
+section, label, help) and its flag mapping in `fs3_conf_args`. The tile's
+settings form and the start script pick it up from there. Never map a
+conf value to a file path: features that need a file use a fixed name in
+the package folder. Extend `tests/test_spk_scripts.sh`.
+
+**The DSM tile** (`ui/index.cgi`) gates every request on DSM sign-in plus
+the `administrators` group before anything else runs. Keep new output
+and actions behind that gate, behind the CSRF token for POSTs, and use
+fixed message codes (never reflect input).
 
 ## Gotchas
 
