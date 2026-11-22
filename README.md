@@ -717,7 +717,10 @@ certificates and the audit log file.
 ## Synology deployment
 
 Build the package with
-`make fs3-static fs3-lockd-static && cd packaging/synology && ./build-spk.sh`.
+`make fs3-tls-static fs3-lockd-static && cd packaging/synology && ./build-spk.sh`.
+The package ships the static **TLS** build (libssl and libcrypto linked
+in), so replication can reach HTTPS targets; `build-spk.sh` refuses a
+non-TLS binary unless `FS3_SPK_ALLOW_NO_TLS=1`.
 `docs/AGENT-BUILD-AND-DS1515-TEST.md` is the step-by-step build and test
 runbook for a DS1515+, including a recorded run.
 
@@ -768,10 +771,10 @@ runbook for a DS1515+, including a recorded run.
 - An admin listener runs on `127.0.0.1:9101` (`FS3_METRICS_PORT`; 0
   disables it). To scrape it from elsewhere, use a reverse-proxy entry or
   an SSH tunnel.
-- **Not available through the package:** native TLS (the SPK ships the
-  non-TLS build; use the DSM reverse proxy). If you change the S3 port,
-  also update the DSM firewall rule, which still lists the install-time
-  port.
+- **Not configured by the package:** a native TLS listener. The binary
+  supports it, but incoming HTTPS is the DSM reverse proxy's job. If you
+  change the S3 port, also update the DSM firewall rule, which still
+  lists the install-time port.
 - **Data folder:** by default `/var/packages/fs3/var/data`. If you point
   it at a shared folder, grant the package user write permission in
   Control Panel → Shared Folder → Edit → Permissions. The package checks
@@ -904,6 +907,7 @@ upgrading, and see `packaging/synology/CHANGELOG.md`.
 make                 # release build (-O2): fs3, fs3-lockd, fs3-dedup-estimate
 make DEBUG=1         # ASan + UBSan (switching needs `make clean`)
 make TLS=1           # fs3 with native TLS (or `make fs3-tls` for a separate binary)
+./fs3 --build-info   # tls=yes|no
 make fs3-static fs3-tls-static fs3-lockd-static fs3-dedup-estimate-static   # for the SPK
 make test            # all unit, fuzz and e2e suites
 make smoketest       # start briefly and probe with curl

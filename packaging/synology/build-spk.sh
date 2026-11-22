@@ -1,8 +1,11 @@
 #!/bin/sh
 # build-spk.sh — assemble a Synology .spk for fs3.
 #
-# Prereqs: a statically-linked (libcrypto) fs3 binary at ../../fs3-static,
-# or pass the binary path as $1. Produces fs3-<version>.spk in this dir.
+# Prereqs: the static TLS build of fs3 at ../../fs3-tls-static (libssl and
+# libcrypto linked in: `make fs3-tls-static`), or pass the binary path as
+# $1. The package ships the TLS build so replication can reach HTTPS
+# targets (B2, AWS, another NAS behind HTTPS) and native TLS is available.
+# Produces fs3-<version>.spk in this dir.
 #
 # Run from packaging/synology/:   ./build-spk.sh [path-to-fs3-binary]
 set -eu
@@ -11,12 +14,21 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 PROJ_ROOT="$(cd "${HERE}/../.." && pwd)"
 
 VERSION="${FS3_SPK_VERSION:-0.8.0-1}"
-BIN="${1:-${PROJ_ROOT}/fs3-static}"
+BIN="${1:-${PROJ_ROOT}/fs3-tls-static}"
 
 if [ ! -f "${BIN}" ]; then
     echo "error: fs3 binary not found at ${BIN}" >&2
-    echo "build it first with: make fs3-static" >&2
+    echo "build it first with: make fs3-tls-static" >&2
     exit 1
+fi
+# Refuse a non-TLS binary by default: replication to HTTPS targets would
+# silently fail. FS3_SPK_ALLOW_NO_TLS=1 builds one anyway.
+if ! "${BIN}" --build-info 2>/dev/null | grep -qx 'tls=yes'; then
+    if [ "${FS3_SPK_ALLOW_NO_TLS:-0}" != "1" ]; then
+        echo "error: ${BIN} is not a TLS build (make fs3-tls-static)," >&2
+        echo "       or set FS3_SPK_ALLOW_NO_TLS=1 to package it anyway" >&2
+        exit 1
+    fi
 fi
 
 BUILD="$(mktemp -d)"

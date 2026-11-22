@@ -2,6 +2,13 @@
 
 ## Unreleased (round 2)
 
+- The package now ships the **TLS build** of fs3 (`fs3-tls-static`:
+  libssl + libcrypto linked statically), needed for replication to HTTPS
+  targets. The binary is larger; behaviour is unchanged unless TLS
+  features are used. `build-spk.sh` refuses a non-TLS binary
+  (`fs3 --build-info` must print `tls=yes`) unless
+  `FS3_SPK_ALLOW_NO_TLS=1`.
+
 - **Log rotation.** fs3 now writes `fs3.log` itself (`--log-file`) and
   rotates it and the audit log by size: 10M, 5 files kept by default,
   adjustable in the tile (*Rotate logs at*, *Rotated logs kept*). If a

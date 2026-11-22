@@ -6,6 +6,7 @@
 #include "sandbox.h"
 #include "store.h"
 #include "audit.h"
+#include "tls.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -109,6 +110,7 @@ static void usage(const char *argv0) {
         "                             (default 5M, as S3; 0 = none)\n"
         "      --audit-log <file>     append one JSON line per request + admin change\n"
         "                             (no query strings / signatures); SIGHUP reopens\n"
+        "      --build-info           print build features (tls=yes|no) and exit\n"
         "      --log-file <file>      write the server log here instead of stderr (mode 0640)\n"
         "      --log-max-size <N>     rotate the log file and the audit log at N bytes\n"
         "                             (K/M/G suffix; default 10M; 0 = never)\n"
@@ -416,6 +418,7 @@ enum {
     OPT_TLS_MAX_PER_IP,
     OPT_AUDIT_LOG,
     OPT_LOG_FILE,
+    OPT_BUILD_INFO,
     OPT_LOG_MAX_SIZE,
     OPT_LOG_KEEP,
     OPT_AUTH_FAIL_LIMIT,
@@ -565,6 +568,7 @@ int main(int argc, char **argv) {
         { "tls-max-per-ip",   required_argument, NULL, OPT_TLS_MAX_PER_IP },
         { "audit-log",        required_argument, NULL, OPT_AUDIT_LOG },
         { "log-file",         required_argument, NULL, OPT_LOG_FILE },
+        { "build-info",       no_argument,       NULL, OPT_BUILD_INFO },
         { "log-max-size",     required_argument, NULL, OPT_LOG_MAX_SIZE },
         { "log-keep",         required_argument, NULL, OPT_LOG_KEEP },
         { "auth-fail-limit",  required_argument, NULL, OPT_AUTH_FAIL_LIMIT },
@@ -778,6 +782,10 @@ int main(int argc, char **argv) {
             case OPT_TLS_ADDR: tls_addr = optarg; break;
             case OPT_AUDIT_LOG: audit_log = optarg; break;
             case OPT_LOG_FILE: log_file = optarg; break;
+            case OPT_BUILD_INFO:
+                /* Machine-readable build features (used by build-spk.sh). */
+                printf("tls=%s\n", tls_available() ? "yes" : "no");
+                return 0;
             case OPT_LOG_MAX_SIZE:
                 log_max_size = strcmp(optarg, "0") == 0 ? 0 : parse_size(optarg);
                 if (strcmp(optarg, "0") && (log_max_size == 0 || log_max_size < 4096)) {
