@@ -214,7 +214,7 @@ docker run --rm -it -v "$PWD":/src -w /src debian:stretch bash -euxc '
   make -j"$(nproc)" && make install_sw
   cd /src && make clean
   export C_INCLUDE_PATH=/opt/ossl/include LIBRARY_PATH=/opt/ossl/lib
-  make -j"$(nproc)" fs3-static fs3-tls-static fs3-lockd-static
+  make -j"$(nproc)" fs3-static fs3-tls-static fs3-lockd-static fs3-dedup-estimate-static
 '
 ```
 
@@ -231,6 +231,7 @@ Artifacts:
 | `fs3-static` | main server, libcrypto static, glibc dynamic (old) |
 | `fs3-tls-static` | native TLS variant (SSE-C needs TLS), libssl + libcrypto static |
 | `fs3-lockd` (from `make fs3-lockd-static`) | fully static root helper for `--lock-immutable` |
+| `fs3-dedup-estimate` (from `make fs3-dedup-estimate-static`) | optional, read-only block-dedup estimator; not in the SPK, copy it to the NAS by hand (added after the 2026-11-18 run) |
 
 ### B3. Verify the artifacts before copying them anywhere
 
