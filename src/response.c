@@ -120,6 +120,8 @@ static const err_entry_t ERR_TABLE[] = {
     { S3_ERR_NO_SUCH_LIFECYCLE,          404, "NoSuchLifecycleConfiguration", "The lifecycle configuration does not exist." },
     { S3_ERR_NO_SUCH_WEBSITE,            404, "NoSuchWebsiteConfiguration", "The specified bucket does not have a website configuration." },
     { S3_ERR_NO_SUCH_POLICY,             404, "NoSuchBucketPolicy",       "The bucket policy does not exist." },
+    { S3_ERR_NO_SUCH_ENCRYPTION,         404, "ServerSideEncryptionConfigurationNotFoundError", "The server side encryption configuration was not found." },
+    { S3_ERR_SSE_NOT_CONFIGURED,         400, "InvalidRequest", "Server-side encryption with fs3-managed keys is not configured on this server (--sse-key-file)." },
     { S3_ERR_NO_SUCH_OBJECT_LOCK,        404, "ObjectLockConfigurationNotFoundError", "Object Lock configuration does not exist for this bucket." },
     { S3_ERR_NO_SUCH_VERSION,            404, "NoSuchVersion",            "The specified version does not exist." },
     { S3_ERR_POLICY_DENIED,              403, "AccessDenied",             "Access denied by bucket policy." },

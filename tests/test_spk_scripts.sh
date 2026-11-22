@@ -81,6 +81,8 @@ lacks_arg "no dedup by default"  --dedup
 has_arg "admin socket on by default" --admin-socket "$VAR/admin.sock"
 lacks_arg "default replication threads not passed" --repl-workers
 lacks_arg "no CA bundle without repl-ca.pem" --repl-ca-file
+lacks_arg "no SSE key file by default" --sse-key-file
+check_eq "no SSE key file created by default" "$([ -e "$VAR/sse.keys" ] && echo yes || echo no)" "no"
 lacks_arg "no auth without credentials" --require-auth
 sss status && st=0 || st=$?
 check_eq "status running" "$st" "0"
@@ -102,6 +104,7 @@ FS3_REPL_WORKERS=4
 FS3_REPL_RATE=5M
 FS3_REPL_TIMEOUT=60
 FS3_ADMIN_SOCKET=0
+FS3_SSE_S3=1
 EOF
 mkdir -p "$VAR/my data"
 : > "$VAR/repl-ca.pem"
@@ -125,6 +128,12 @@ has_arg "replication rate"       --repl-rate 5M
 has_arg "replication timeout"    --repl-timeout 60
 has_arg "fixed CA bundle file"   --repl-ca-file "$VAR/repl-ca.pem"
 lacks_arg "admin socket can be turned off" --admin-socket
+has_arg "SSE key file passed"    --sse-key-file "$VAR/sse.keys"
+check_eq "SSE key file mode 600" "$(stat -c %a "$VAR/sse.keys")" "600"
+check_eq "SSE key file holds one valid key" \
+    "$(grep -cE '^k1 [0-9a-f]{64}$' "$VAR/sse.keys")" "1"
+check_eq "SSE key creation logged" "$(grep -c 'created a new SSE-S3 key file' "$VAR/fs3.start.log" || true)" "1"
+SSE_BEFORE=$(cat "$VAR/sse.keys")
 check_eq "restart request consumed" "$([ -f "$VAR/fs3.restart" ] && echo yes || echo no)" "no"
 check_eq "restart logged, no backoff" "$(grep -c 'restarting to apply new settings' "$VAR/fs3.start.log" || true)" "1"
 
@@ -146,6 +155,10 @@ lacks_arg "invalid enum → default" --dedup
 lacks_arg "unknown key ignored"  --allow-public-write
 check_eq "invalid value logged" "$(grep -c 'ignoring invalid value for FS3_PORT' "$VAR/fs3.start.log" || true)" "1"
 check_eq "conf never executed" "$([ -e "$T/pwned" ] && echo yes || echo no)" "no"
+# SSE-S3 off again (FS3_SSE_S3 not set): the existing key file is still
+# passed, unchanged, so sealed objects stay readable.
+has_arg "SSE key file kept after the setting is turned off" --sse-key-file "$VAR/sse.keys"
+check_eq "SSE key file not regenerated" "$(cat "$VAR/sse.keys")" "$SSE_BEFORE"
 
 # 4. An unexpected exit is respawned (after the 1 s backoff) and logged;
 #    an oversized fs3.start.log is trimmed at the respawn.

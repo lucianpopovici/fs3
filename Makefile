@@ -41,7 +41,7 @@ INCLUDES   := -Iinclude -I$(LLHTTP_DIR)/include -I$(XML_DIR)
 # Server objects
 SRV_SRCS := src/main.c src/server.c src/conn.c src/log.c src/store_fs.c \
             src/route.c src/response.c src/sigv4.c src/metrics.c \
-            src/iopool.c src/action.c src/checksum.c src/query.c src/cors.c src/lifecycle.c src/website.c src/json.c src/admin.c src/policy.c src/objlock.c src/tls.c src/audit.c src/objmeta.c src/scrub.c src/sandbox.c src/ssec.c src/lockc.c src/s3client.c src/repl.c
+            src/iopool.c src/action.c src/checksum.c src/query.c src/cors.c src/lifecycle.c src/website.c src/json.c src/admin.c src/policy.c src/objlock.c src/tls.c src/audit.c src/objmeta.c src/scrub.c src/sandbox.c src/ssec.c src/lockc.c src/s3client.c src/repl.c src/ssekeys.c
 SRV_OBJS := $(SRV_SRCS:.c=.o)
 
 LLHTTP_OBJS := $(LLHTTP_DIR)/src/api.o $(LLHTTP_DIR)/src/http.o \
@@ -107,7 +107,7 @@ $(XML_DIR)/%.o: $(XML_DIR)/%.c
 
 # ----- Tests --------------------------------------------------------
 
-TEST_BINS := tests/test_repl tests/test_log tests/test_ssec tests/test_sandbox tests/test_objmeta tests/test_policy tests/test_json tests/test_config_fuzz tests/test_chunk_fuzz tests/test_checksum tests/test_store tests/test_conn tests/test_xml tests/test_xml_legacy tests/test_xml_fuzz tests/test_sigv4 tests/test_credfile
+TEST_BINS := tests/test_ssekeys tests/test_repl tests/test_log tests/test_ssec tests/test_sandbox tests/test_objmeta tests/test_policy tests/test_json tests/test_config_fuzz tests/test_chunk_fuzz tests/test_checksum tests/test_store tests/test_conn tests/test_xml tests/test_xml_legacy tests/test_xml_fuzz tests/test_sigv4 tests/test_credfile
 
 # Fail fast, with the install line, if a test dependency is missing —
 # otherwise e.g. a missing awscrt shows up as checksum "server bugs".
@@ -131,6 +131,8 @@ test: check-test-deps $(TEST_BINS) fs3 fs3-lockd fs3-dedup-estimate
 	@./tests/test_ssec 50000
 	@echo "=== test_sandbox (seccomp filter) ==="
 	@./tests/test_sandbox
+	@echo "=== test_ssekeys (SSE-S3 key file + marker TLV, 50000 fuzz iterations) ==="
+	@./tests/test_ssekeys 50000
 	@echo "=== test_repl (replication journal + rule parser, 50000 fuzz iterations) ==="
 	@./tests/test_repl 50000
 	@echo "=== test_log (rotated log files) ==="
@@ -167,6 +169,8 @@ test: check-test-deps $(TEST_BINS) fs3 fs3-lockd fs3-dedup-estimate
 	@./tests/test_e2e_listing.sh
 	@echo "=== test_e2e_quota (round 2: bucket/user quotas) ==="
 	@./tests/test_e2e_quota.sh
+	@echo "=== test_e2e_sse_s3 (server-side encryption with fs3-managed keys) ==="
+	@./tests/test_e2e_sse_s3.sh
 	@echo "=== test_e2e_keepalive (keep-alive and pipelining at the socket level) ==="
 	@./tests/test_e2e_keepalive.sh
 	@echo "=== test_e2e_s3client (outbound S3 client for replication) ==="
@@ -226,7 +230,7 @@ test: check-test-deps $(TEST_BINS) fs3 fs3-lockd fs3-dedup-estimate
 	@echo "=== test_spk_scripts (package start script and watchdog) ==="
 	@./tests/test_spk_scripts.sh
 
-FUZZ_CFG_OBJS := src/cors.o src/lifecycle.o src/website.o src/store_fs.o src/ssec.o src/checksum.o src/log.o $(XML_OBJS)
+FUZZ_CFG_OBJS := src/cors.o src/lifecycle.o src/website.o src/store_fs.o src/ssec.o src/ssekeys.o src/checksum.o src/log.o $(XML_OBJS)
 tests/test_config_fuzz: tests/test_config_fuzz.c tests/fuzz_targets.h $(FUZZ_CFG_OBJS)
 	$(CC) $(CFLAGS) $(INCLUDES) -Itests tests/test_config_fuzz.c $(FUZZ_CFG_OBJS) \
 	    $(LDFLAGS) -o $@
@@ -245,8 +249,11 @@ tests/test_chunk_fuzz: tests/test_chunk_fuzz.c src/sigv4.o src/query.o src/log.o
 tests/test_ssec: tests/test_ssec.c src/ssec.o
 	$(CC) $(CFLAGS) $(INCLUDES) tests/test_ssec.c src/ssec.o $(LDFLAGS) -o $@
 
+tests/test_ssekeys: tests/test_ssekeys.c src/ssekeys.o
+	$(CC) $(CFLAGS) $(INCLUDES) tests/test_ssekeys.c src/ssekeys.o $(LDFLAGS) -o $@
+
 REPL_TEST_OBJS := src/repl.o src/s3client.o src/sigv4.o src/query.o src/json.o src/objmeta.o \
-                  src/tls.o src/store_fs.o src/ssec.o src/checksum.o src/log.o
+                  src/tls.o src/store_fs.o src/ssec.o src/ssekeys.o src/checksum.o src/log.o
 tests/test_repl: tests/test_repl.c $(REPL_TEST_OBJS)
 	$(CC) $(CFLAGS) $(INCLUDES) tests/test_repl.c $(REPL_TEST_OBJS) $(LDFLAGS) -lpthread -o $@
 
@@ -263,9 +270,9 @@ tests/test_checksum: tests/test_checksum.c src/checksum.o
 	$(CC) $(CFLAGS) $(INCLUDES) tests/test_checksum.c src/checksum.o \
 	    $(LDFLAGS) -o $@
 
-tests/test_store: tests/test_store.c src/store_fs.o src/ssec.o src/log.o src/checksum.o
+tests/test_store: tests/test_store.c src/store_fs.o src/ssec.o src/ssekeys.o src/log.o src/checksum.o
 	$(CC) $(CFLAGS) $(INCLUDES) tests/test_store.c \
-	    src/store_fs.o src/ssec.o src/log.o src/checksum.o $(LDFLAGS) -o $@
+	    src/store_fs.o src/ssec.o src/ssekeys.o src/log.o src/checksum.o $(LDFLAGS) -o $@
 
 # Everything but main.o/server.o: conn.c pulls in routing, the store,
 # SigV4, responses and metrics.

@@ -44,6 +44,8 @@ typedef enum {
     S3_ERR_NO_SUCH_WEBSITE,
     S3_ERR_NO_SUCH_POLICY,
     S3_ERR_NO_SUCH_OBJECT_LOCK,
+    S3_ERR_NO_SUCH_ENCRYPTION,          /* GET ?encryption with none set */
+    S3_ERR_SSE_NOT_CONFIGURED,          /* SSE-S3 requested without --sse-key-file */
     S3_ERR_MALFORMED_POLICY,
     S3_ERR_NO_SUCH_VERSION,
     S3_ERR_POLICY_DENIED,               /* explicit Deny in a bucket policy */

@@ -74,6 +74,23 @@ preflight_data_dir() {
 # credentials file.
 build_args() {
     fs3_conf_args "${VAR_DIR}"
+    # SSE-S3 keys: created once when the setting is on, then always
+    # passed while the file exists (objects sealed with them must stay
+    # readable even if the setting is turned off again).
+    SSE_FILE="${VAR_DIR}/sse.keys"
+    if [ "${FS3_SSE_S3}" = "1" ] && [ ! -s "${SSE_FILE}" ]; then
+        key=$(od -An -tx1 -N32 /dev/urandom 2>/dev/null | tr -d ' \n')
+        if [ "${#key}" -ne 64 ]; then
+            echo "cannot generate an SSE-S3 key (od /dev/urandom failed)" >&2
+            return 1
+        fi
+        ( umask 077; printf '# fs3 SSE-S3 keys: BACK THIS FILE UP. First line = key for new objects.\nk1 %s\n' "${key}" > "${SSE_FILE}" )
+        echo "created a new SSE-S3 key file ${SSE_FILE}: back it up apart from the data" >&2
+    fi
+    if [ -s "${SSE_FILE}" ]; then
+        chmod 600 "${SSE_FILE}" 2>/dev/null
+        printf '%s\n' --sse-key-file "${SSE_FILE}"
+    fi
     if [ "${FS3_REQUIRE_AUTH}" = "1" ]; then
         # Credentials live in a 0600 file, passed via --credentials-file
         # so the secret never appears on the command line (visible in ps).

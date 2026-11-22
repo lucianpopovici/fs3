@@ -61,6 +61,7 @@ FS3_WEB_ROOT_DOMAIN|host||web|Website root domain|Sites at <bucket>.<domain>. Em
 FS3_REPL_WORKERS|int:0:16|2|repl|Replication threads|Buckets with a replication rule are copied to their target by this many threads. 0 turns replication off (rules are kept but nothing is sent).
 FS3_REPL_RATE|size|20M|repl|Replication upload rate (per second)|Shared by all buckets. 0 = unthrottled.
 FS3_REPL_TIMEOUT|int:1:3600|30|repl|Replication timeout (seconds)|Per network operation; a slower target counts as unreachable and is retried with backoff.
+FS3_SSE_S3|bool|0|storage|Server-side encryption keys (SSE-S3)|Creates sse.keys in the package folder on the next start. Objects are then encrypted on disk when a client asks for it (x-amz-server-side-encryption: AES256) or the bucket has default encryption. BACK UP sse.keys apart from the data: without it, encrypted objects cannot be read. Turning this off later keeps using the existing file.
 FS3_AUDIT_LOG|bool|0|ops|Audit log|One JSON line per request and admin change in audit.jsonl in the package folder. Rotated like the server log.
 FS3_LOG_MAX_SIZE|size|10M|ops|Rotate logs at|fs3.log and audit.jsonl are rotated when they reach this size (K, M, G suffixes). 0 never rotates.
 FS3_LOG_KEEP|int:1:50|5|ops|Rotated logs kept|fs3.log.1 … fs3.log.N (and the same for the audit log).

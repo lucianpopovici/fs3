@@ -90,3 +90,4 @@ fs3-lockd
 fs3-dedup-estimate
 tests/compat/last-run.txt
 tests/compat/logs/
+tests/test_ssekeys

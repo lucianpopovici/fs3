@@ -3,6 +3,7 @@
 #include "log.h"
 #include "server.h"
 #include "sigv4.h"
+#include "ssekeys.h"
 #include "sandbox.h"
 #include "store.h"
 #include "audit.h"
@@ -100,10 +101,16 @@ static void usage(const char *argv0) {
         "      --fs-compress off|auto|all  Btrfs transparent compression of objects (default off)\n"
         "      --lock-immutable       make COMPLIANCE / legal-hold versions FS_IMMUTABLE_FL via\n"
         "                             fs3-lockd (--lockd-socket PATH); refuses to start without it\n"
+        );
+    fprintf(stderr,
         "      --scrub-interval-days N  integrity scrub every N days (default 30; 0 = only on demand)\n"
         "      --scrub-now            start a scrub pass right after startup\n"
         "      --scrub-rate N         scrub read rate in bytes/s (default 20M; 0 = unthrottled)\n"
         "      --scrub-fail-reads     GET of a version the scrub found corrupt → 500\n"
+        "      --sse-key-file PATH    keys for SSE-S3 (x-amz-server-side-encryption: AES256 and\n"
+        "                             bucket default encryption): lines \"<id> <64 hex>\", the\n"
+        "                             first one seals new objects; mode 0600; SIGHUP re-reads it.\n"
+        "                             Losing this file loses every SSE-S3 object: back it up\n"
         "      --repl-workers N       bucket replication threads (default 2; 0 = replication off)\n"
         "      --repl-rate N          replication upload rate in bytes/s across buckets\n"
         "                             (default 20M; 0 = unthrottled)\n"
@@ -297,6 +304,8 @@ typedef struct {
 static int do_reload(void *user);
 static void keys_state_flush(const sigv4_verifier_t *v);
 
+static const char *g_sse_key_file;     /* --sse-key-file, re-read on SIGHUP */
+
 static void reload_tick(void *user) {
     reload_ctx_t *r = user;
     static time_t last_flush;
@@ -308,6 +317,13 @@ static void reload_tick(void *user) {
     if (!g_reload) return;
     g_reload = 0;
     if (r->cred_file) (void)do_reload(user);
+    if (g_sse_key_file) {
+        char err[256];
+        if (ssekeys_load(g_sse_key_file, err, sizeof(err)) < 0)
+            LOG_E("SIGHUP: SSE key file not reloaded (keeping the old keys): %s", err);
+        else
+            LOG_I("SIGHUP: SSE key file reloaded (%d key(s))", ssekeys_count());
+    }
 #ifndef FS3_MAIN_TESTING
     server_tls_reload(g_server);
     audit_reopen();             /* external log rotation */
@@ -451,6 +467,7 @@ enum {
     OPT_REPL_CA_FILE,
     OPT_REPL_PART_SIZE,
     OPT_REPL_TIMEOUT,
+    OPT_SSE_KEY_FILE,
 };
 
 #ifndef FS3_MAIN_TESTING
@@ -607,6 +624,7 @@ int main(int argc, char **argv) {
         { "repl-ca-file",     required_argument, NULL, OPT_REPL_CA_FILE },
         { "repl-part-size",   required_argument, NULL, OPT_REPL_PART_SIZE },
         { "repl-timeout",     required_argument, NULL, OPT_REPL_TIMEOUT },
+        { "sse-key-file",     required_argument, NULL, OPT_SSE_KEY_FILE },
         { "scrub-fail-reads", no_argument,       NULL, OPT_SCRUB_FAIL_READS },
         { "default-user-quota",   required_argument, NULL, OPT_DEFAULT_USER_QUOTA },
         { "require-signed-payload", no_argument, NULL, OPT_REQUIRE_SIGNED_PAYLOAD },
@@ -890,6 +908,15 @@ int main(int argc, char **argv) {
                 long v = strtol(optarg, &end, 10);
                 if (*end || v < 0 || v > 16) { fprintf(stderr, "--repl-workers: 0..16\n"); return 2; }
                 repl_workers = (int)v;
+                break;
+            }
+            case OPT_SSE_KEY_FILE: {
+                char err[256];
+                if (ssekeys_load(optarg, err, sizeof(err)) < 0) {
+                    fprintf(stderr, "--sse-key-file: %s\n", err);
+                    return 2;
+                }
+                g_sse_key_file = optarg;
                 break;
             }
             case OPT_REPL_TIMEOUT: {

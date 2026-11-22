@@ -66,6 +66,7 @@ enum {
     S3_TLV_PART_TABLE     = 4,
     S3_TLV_SSEC           = 5,
     S3_TLV_ZSTD_SEEK      = 6,
+    S3_TLV_SSE_S3         = 7,   /* [u8 ver=1][u8 idlen][key id]: sealed with an fs3 key (ssekeys.h) */
 };
 
 typedef struct {
@@ -469,6 +470,10 @@ s3_err_t store_mpu_complete2(s3_store_t *s, s3_str_t bucket, s3_str_t key,
                              char etag_out[40], s3_obj_meta_t *meta_out);
 
 /* The checksum algorithm/type an upload was created with (0 = none). */
+/* The upload's stored TLV records (metadata, SSE parameters); *tlv is
+ * malloc'd (NULL when there are none). */
+s3_err_t store_mpu_upload_tlv(s3_store_t *s, s3_str_t bucket, const char *upload_id,
+                              uint8_t **tlv, size_t *tlv_n);
 s3_err_t store_mpu_checksum_info(s3_store_t *s, s3_str_t bucket,
                                  const char *upload_id,
                                  uint8_t *algo, uint8_t *type);

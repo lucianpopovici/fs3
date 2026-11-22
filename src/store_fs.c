@@ -41,6 +41,7 @@
 #include "store.h"
 #include "checksum.h"
 #include "ssec.h"
+#include "ssekeys.h"
 #include "log.h"
 
 #include <dirent.h>
@@ -1565,6 +1566,7 @@ struct s3_writer {
     uint32_t    ssec_part;
     uint64_t    ssec_idx;
     uint8_t    *ssec_buf;           /* SSEC_SEG plaintext + SSEC_TAG */
+    int         md5_plain;          /* SSE-S3: the ETag is the plaintext MD5, as on AWS */
     size_t      ssec_len;
     uint64_t    stored_written;     /* on-disk payload bytes */
 
@@ -1673,6 +1675,8 @@ s3_err_t store_put_begin_opts(s3_store_t *s, s3_str_t bucket, s3_str_t key,
         s3_err_t se = ssec_info_new(opts->ssec_key, &ssec_si) < 0 ? S3_ERR_INTERNAL
                     : writer_ssec_on(w, opts->ssec_key, &ssec_si, 0);
         if (se != S3_OK) { writer_free(w); return se; }
+        char sid[SSEKEYS_ID_MAX + 1];
+        w->md5_plain = ssekeys_tlv_find(opts->tlv, opts->tlv_len, sid) == 1;
     }
     /* Quota: room for one more object before any byte is written. */
     if (q_reserve(s, (snprintf(w->q_bucket, sizeof(w->q_bucket), S3_STR_FMT,
@@ -1790,7 +1794,7 @@ s3_err_t store_put_begin_opts(s3_store_t *s, s3_str_t bucket, s3_str_t key,
 
 /* On-disk payload bytes: written, and hashed for the ETag and payload CRC. */
 static s3_err_t writer_emit(s3_writer_t *w, const void *buf, size_t n) {
-    if (EVP_DigestUpdate(w->md5_ctx, buf, n) != 1) return S3_ERR_INTERNAL;
+    if (!w->md5_plain && EVP_DigestUpdate(w->md5_ctx, buf, n) != 1) return S3_ERR_INTERNAL;
     if (w->pcrc.algo) cksum_update(&w->pcrc, buf, n);
     const char *p = buf;
     size_t left = n;
@@ -1822,6 +1826,7 @@ static s3_err_t writer_feed(s3_writer_t *w, const void *buf, size_t n) {
         if (e == S3_OK) w->data_written += n;
         return e;
     }
+    if (w->md5_plain && EVP_DigestUpdate(w->md5_ctx, buf, n) != 1) return S3_ERR_INTERNAL;
     const uint8_t *p = buf;
     while (n) {
         if (w->ssec_len == SSEC_SEG) {
@@ -3065,6 +3070,8 @@ s3_err_t store_mpu_part_begin_ssec(s3_store_t *s, s3_str_t bucket, s3_str_t key,
         free(k2); free(c2);
         ssec_info_t si;
         int r = ssec_tlv_find(mt, mtn, &si);
+        char sid[SSEKEYS_ID_MAX + 1];
+        w->md5_plain = ssekeys_tlv_find(mt, mtn, sid) == 1;
         free(mt);
         s3_err_t se = S3_OK;
         if (r < 0) se = S3_ERR_INTERNAL;
@@ -3270,6 +3277,17 @@ s3_err_t store_mpu_complete(s3_store_t *s, s3_str_t bucket, s3_str_t key,
                             char etag_out[40], s3_obj_meta_t *meta_out) {
     return store_mpu_complete2(s, bucket, key, upload_id, parts, n_parts,
                                NULL, 0, etag_out, meta_out);
+}
+
+s3_err_t store_mpu_upload_tlv(s3_store_t *s, s3_str_t bucket, const char *upload_id,
+                              uint8_t **tlv, size_t *tlv_n) {
+    *tlv = NULL; *tlv_n = 0;
+    if (!s || !upload_id) return S3_ERR_INVALID_ARGUMENT;
+    if (!valid_bucket_name(bucket)) return S3_ERR_INVALID_BUCKET_NAME;
+    char *k = NULL, *ct = NULL;
+    s3_err_t e = mpu_read_meta2(s, bucket, upload_id, &k, NULL, &ct, NULL, NULL, tlv, tlv_n);
+    free(k); free(ct);
+    return e;
 }
 
 s3_err_t store_mpu_checksum_info(s3_store_t *s, s3_str_t bucket,
