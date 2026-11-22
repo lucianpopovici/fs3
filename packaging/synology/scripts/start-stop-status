@@ -99,7 +99,7 @@ preflight_data_dir() {
 # supervised, so a killed watchdog means no auto-restart until the next
 # DSM start. DSM-native service supervision is the preferred answer once
 # verified on real hardware — see
-# docs/synology-readiness/08-service-supervision.
+# docs/synology-readiness/08-service-supervision/CLAUDE.md.
 watchdog() {
     backoff=1
     while [ ! -f "${STOP_FILE}" ]; do

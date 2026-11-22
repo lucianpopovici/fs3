@@ -37,7 +37,7 @@
 
 typedef enum {
     CST_READ_HEADERS,    /* feeding bytes to llhttp; headers not yet complete */
-    CST_AUTH,            /* headers complete; auth check (Phase 0: no-op) */
+    CST_AUTH,            /* reserved; auth runs inside on_headers_complete */
     CST_READ_BODY,       /* body bytes streaming through on_body */
     CST_WAIT_JOB,        /* request complete; blocking store work (commit,
                           * copy) is running on the iopool. No socket

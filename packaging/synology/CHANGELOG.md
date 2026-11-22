@@ -2,6 +2,15 @@
 
 ## Unreleased (round 2)
 
+- New read-only tool `fs3-dedup-estimate` (`make fs3-dedup-estimate[-static]`)
+  that measures how much block-level dedup would save on an existing data
+  root. Not shipped in the SPK yet; copy the static binary to the NAS to
+  run it.
+- Known limitation: `fs3.conf` only exposes the basic keys (bind, port,
+  data, auth, legacy owner, admin, metrics port, MPU GC). The newer
+  options (trusted proxy, audit log, admin socket, scrub, quotas, dedup,
+  compression, lock helper, TLS) can't be set through the package yet.
+
 - Multipart: part records + ETag verification at Complete (InvalidPart,
   InvalidPartOrder, EntityTooSmall below `--mpu-min-part-size`, default
   5 MiB), ListParts, UploadPartCopy; `x-amz-copy-source-if-*` honoured.
@@ -40,7 +49,9 @@
   `/var/packages/fs3/target/bin/fs3-lockd --root <data dir> --socket
   /var/packages/fs3/var/lockd.sock --journal /var/packages/fs3/var/lockd.journal`),
   then add `--lock-immutable --lockd-socket /var/packages/fs3/var/lockd.sock`
-  to the service flags. Without it the status stays "API-level WORM".
+  to the fs3 command line. `fs3.conf` has no key for these yet, so that
+  means editing `scripts/start-stop-status`, and a package upgrade
+  overwrites the edit. Without it the status stays "API-level WORM".
 - Audit log lines carry the S3 error code (`"error":"…"`).
 - Fix: a request refused before `100 Continue` now closes the connection
   (botocore stalled 60 s on the next request).
