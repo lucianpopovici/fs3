@@ -58,7 +58,9 @@ FS3_MAX_RETENTION_DAYS|int:1:36500|3650|lock|Longest Object Lock retention (days
 FS3_LOCK_IMMUTABLE|bool|0|lock|Immutable COMPLIANCE versions (fs3-lockd)|Needs the fs3-lockd helper running as root (see the package notes). fs3 refuses to start without it, so this can only be turned on while the helper's socket exists.
 FS3_WEB_PORT|port0|0|web|Website port|Serves buckets with a website configuration anonymously (GET/HEAD) on this port, on the listen address above. Needs public buckets allowed. 0 disables.
 FS3_WEB_ROOT_DOMAIN|host||web|Website root domain|Sites at <bucket>.<domain>. Empty: the Host header must equal the bucket name (custom domains through the reverse proxy).
-FS3_AUDIT_LOG|bool|0|ops|Audit log|One JSON line per request and admin change in audit.jsonl in the package folder. Not rotated yet; watch its size.
+FS3_AUDIT_LOG|bool|0|ops|Audit log|One JSON line per request and admin change in audit.jsonl in the package folder. Rotated like the server log.
+FS3_LOG_MAX_SIZE|size|10M|ops|Rotate logs at|fs3.log and audit.jsonl are rotated when they reach this size (K, M, G suffixes). 0 never rotates.
+FS3_LOG_KEEP|int:1:50|5|ops|Rotated logs kept|fs3.log.1 … fs3.log.N (and the same for the audit log).
 FS3_ADMIN_SOCKET|bool|0|ops|Admin API socket|Serves the /v1 admin API on admin.sock in the package folder (mode 0600, package user only).
 FS3_SECCOMP|enum:enforce/log/require/off|enforce|ops|System call filter (seccomp)|DSM 7.1's kernel has no seccomp filter support, so on a DS1515+ enforce only logs a warning; require would keep fs3 from starting there.
 FS3_VERBOSE|bool|0|ops|Debug logging|Much more output in fs3.log.
@@ -250,7 +252,8 @@ fs3_conf_get() {
 fs3_conf_args() {
     _vd="$1"
     printf '%s\n' -a "${FS3_BIND}" -p "${FS3_PORT}" -d "${FS3_DATA}" \
-        --mpu-gc-interval "${FS3_GC_INTERVAL}" --mpu-gc-max-age "${FS3_GC_MAX_AGE}"
+        --mpu-gc-interval "${FS3_GC_INTERVAL}" --mpu-gc-max-age "${FS3_GC_MAX_AGE}" \
+        --log-file "${_vd}/fs3.log"
     [ "${FS3_METRICS_PORT}" != "0" ] && printf '%s\n' --metrics-port "${FS3_METRICS_PORT}"
 
     if [ -n "${FS3_TRUSTED_PROXY}" ]; then
@@ -283,7 +286,9 @@ fs3_conf_args() {
         FS3_DEDUP_MIN_SIZE:--dedup-min-size \
         FS3_FS_COMPRESS:--fs-compress \
         FS3_MAX_RETENTION_DAYS:--max-retention-days \
-        FS3_SECCOMP:--seccomp
+        FS3_SECCOMP:--seccomp \
+        FS3_LOG_MAX_SIZE:--log-max-size \
+        FS3_LOG_KEEP:--log-keep
     do
         _k="${_pair%%:*}"; _f="${_pair#*:}"
         _cur="$(fs3_conf_get "${_k}")"

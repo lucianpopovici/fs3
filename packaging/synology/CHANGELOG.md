@@ -2,6 +2,17 @@
 
 ## Unreleased (round 2)
 
+- **Log rotation.** fs3 now writes `fs3.log` itself (`--log-file`) and
+  rotates it and the audit log by size: 10M, 5 files kept by default,
+  adjustable in the tile (*Rotate logs at*, *Rotated logs kept*). If a
+  rotation fails, fs3 keeps logging to the current file. The package
+  script, the watchdog and fs3's stderr now go to a separate, self-trimming
+  `fs3.start.log`. Behaviour change for the audit log outside the
+  package too: it now rotates at 10M by default (`--log-max-size 0` keeps
+  the old never-rotate behaviour).
+- Log lines can no longer contain a newline: one embedded in a message is
+  replaced by a space, so client-supplied strings can't forge log lines.
+
 - New read-only tool `fs3-dedup-estimate` (`make fs3-dedup-estimate[-static]`)
   that measures how much block-level dedup would save on an existing data
   root. Not shipped in the SPK yet; copy the static binary to the NAS to

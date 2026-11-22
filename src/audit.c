@@ -13,31 +13,30 @@
 #include <string.h>
 #include <unistd.h>
 
-static int   g_fd = -1;
-static char *g_path;
+/* The audit log is a logfile_t (log.h): one write() per line under its
+ * mutex, rotated by size with the --log-max-size / --log-keep settings,
+ * re-opened on SIGHUP. Mode 0600: it names users and paths. */
+static logfile_t *g_audit;
 
 int audit_open(const char *path) {
-    int fd = open(path, O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC, 0600);
-    if (fd < 0) return -1;
-    if (g_fd >= 0) close(g_fd);
-    g_fd = fd;
-    if (g_path != path) { free(g_path); g_path = strdup(path); }
+    logfile_t *lf = logfile_open(path, 0600, log_rotation_max(), log_rotation_keep());
+    if (!lf) return -1;
+    logfile_close(g_audit);
+    g_audit = lf;
     return 0;
 }
 
 void audit_reopen(void) {
-    if (g_path && audit_open(g_path) < 0) LOG_W("audit log: cannot reopen %s", g_path);
+    if (g_audit && logfile_reopen(g_audit) < 0) LOG_W("audit log: cannot reopen");
 }
 
 void audit_close(void) {
-    if (g_fd >= 0) close(g_fd);
-    g_fd = -1;
-    free(g_path);
-    g_path = NULL;
+    logfile_close(g_audit);
+    g_audit = NULL;
 }
 
 static void emit(const char *line, size_t n) {
-    if (g_fd >= 0) (void)!write(g_fd, line, n);     /* one write(): atomic append */
+    if (g_audit) logfile_write(g_audit, line, n);
 }
 
 static void now_iso(char out[64]) {
@@ -52,7 +51,7 @@ static void now_iso(char out[64]) {
 
 void audit_request(const conn_t *c, int status, uint64_t bytes_in,
                    uint64_t bytes_out, double dur_s) {
-    if (g_fd < 0) return;
+    if (!g_audit) return;
     char line[3000], ts[64], path[1100], method[16];
     now_iso(ts);
     size_t pn = c->req.path.n < sizeof(path) - 1 ? c->req.path.n : sizeof(path) - 1;
@@ -94,7 +93,7 @@ void audit_request(const conn_t *c, int status, uint64_t bytes_in,
 }
 
 void audit_event(const char *who, const char *what) {
-    if (g_fd < 0) return;
+    if (!g_audit) return;
     char line[1200], ts[64];
     now_iso(ts);
     size_t o = 0;
