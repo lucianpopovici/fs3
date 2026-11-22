@@ -107,7 +107,7 @@ $(XML_DIR)/%.o: $(XML_DIR)/%.c
 
 # ----- Tests --------------------------------------------------------
 
-TEST_BINS := tests/test_ssec tests/test_sandbox tests/test_objmeta tests/test_policy tests/test_json tests/test_config_fuzz tests/test_chunk_fuzz tests/test_checksum tests/test_store tests/test_conn tests/test_xml tests/test_xml_legacy tests/test_xml_fuzz tests/test_sigv4 tests/test_credfile
+TEST_BINS := tests/test_log tests/test_ssec tests/test_sandbox tests/test_objmeta tests/test_policy tests/test_json tests/test_config_fuzz tests/test_chunk_fuzz tests/test_checksum tests/test_store tests/test_conn tests/test_xml tests/test_xml_legacy tests/test_xml_fuzz tests/test_sigv4 tests/test_credfile
 
 # Fail fast, with the install line, if a test dependency is missing —
 # otherwise e.g. a missing awscrt shows up as checksum "server bugs".
@@ -131,6 +131,8 @@ test: check-test-deps $(TEST_BINS) fs3 fs3-lockd fs3-dedup-estimate
 	@./tests/test_ssec 50000
 	@echo "=== test_sandbox (seccomp filter) ==="
 	@./tests/test_sandbox
+	@echo "=== test_log (rotated log files) ==="
+	@./tests/test_log
 	@echo "=== test_objmeta (+50000 fuzz iterations) ==="
 	@./tests/test_objmeta 50000
 	@echo "=== test_checksum ==="
@@ -163,6 +165,8 @@ test: check-test-deps $(TEST_BINS) fs3 fs3-lockd fs3-dedup-estimate
 	@./tests/test_e2e_listing.sh
 	@echo "=== test_e2e_quota (round 2: bucket/user quotas) ==="
 	@./tests/test_e2e_quota.sh
+	@echo "=== test_e2e_logs (log file rotation) ==="
+	@./tests/test_e2e_logs.sh
 	@echo "=== test_e2e_dedup_estimate (fs3-dedup-estimate) ==="
 	@./tests/test_e2e_dedup_estimate.sh
 	@echo "=== test_e2e_scrub (round 2: integrity scrub) ==="
@@ -232,6 +236,9 @@ tests/test_chunk_fuzz: tests/test_chunk_fuzz.c src/sigv4.o src/query.o src/log.o
 
 tests/test_ssec: tests/test_ssec.c src/ssec.o
 	$(CC) $(CFLAGS) $(INCLUDES) tests/test_ssec.c src/ssec.o $(LDFLAGS) -o $@
+
+tests/test_log: tests/test_log.c src/log.o
+	$(CC) $(CFLAGS) $(INCLUDES) tests/test_log.c src/log.o $(LDFLAGS) -lpthread -o $@
 
 tests/test_sandbox: tests/test_sandbox.c src/sandbox.o src/log.o
 	$(CC) $(CFLAGS) $(INCLUDES) tests/test_sandbox.c src/sandbox.o src/log.o $(LDFLAGS) -lpthread -o $@

@@ -15,7 +15,8 @@ BIN="${PKG_DIR}/bin/fs3"
 PID_FILE="${VAR_DIR}/fs3.pid"          # the watchdog's PID
 CHILD_PID_FILE="${VAR_DIR}/fs3.child.pid"  # the fs3 process itself
 STOP_FILE="${VAR_DIR}/fs3.stop"        # presence = "don't respawn"
-LOG_FILE="${VAR_DIR}/fs3.log"
+LOG_FILE="${VAR_DIR}/fs3.log"         # fs3's own log; fs3 rotates it (--log-file)
+START_LOG="${VAR_DIR}/fs3.start.log"  # this script, the watchdog and fs3's stderr
 CONF_FILE="${VAR_DIR}/fs3.conf"
 CRED_FILE="${VAR_DIR}/credentials"
 
@@ -34,7 +35,7 @@ CONF_LIB="${PKG_DIR}/lib/fs3-conf.sh"
 # that proxy (FS3_TRUSTED_PROXY=127.0.0.1), so throttling and policy IP
 # conditions see real clients.
 if [ ! -f "${CONF_LIB}" ]; then
-    echo "fs3: missing ${CONF_LIB}; reinstall the package" >> "${LOG_FILE}"
+    echo "fs3: missing ${CONF_LIB}; reinstall the package" >> "${START_LOG}"
     [ -n "${SYNOPKG_TEMP_LOGFILE}" ] && echo "fs3: missing ${CONF_LIB}; reinstall the package" > "${SYNOPKG_TEMP_LOGFILE}"
     exit 1
 fi
@@ -42,13 +43,13 @@ fi
 
 load_conf() {
     fs3_conf_defaults "${VAR_DIR}"
-    fs3_conf_load "${CONF_FILE}" 2>> "${LOG_FILE}"
+    fs3_conf_load "${CONF_FILE}" 2>> "${START_LOG}"
 }
 
 # Abort a start with a message the user can actually find: the package
 # log, and the DSM UI via SYNOPKG_TEMP_LOGFILE.
 fail_start() {
-    echo "fs3: $1" >> "${LOG_FILE}"
+    echo "fs3: $1" >> "${START_LOG}"
     if [ -n "${SYNOPKG_TEMP_LOGFILE}" ]; then
         echo "$1" > "${SYNOPKG_TEMP_LOGFILE}"
     fi
@@ -114,12 +115,26 @@ build_args() {
 # DSM start. DSM-native service supervision is the preferred answer once
 # verified on real hardware — see
 # docs/synology-readiness/08-service-supervision/CLAUDE.md.
+# fs3 writes and rotates fs3.log itself. fs3.start.log only collects
+# startup failures, crash output and this script's messages, so it stays
+# small; trim it to its last 128 KiB when it passes 256 KiB.
+trim_start_log() {
+    [ -f "${START_LOG}" ] || return 0
+    sz=$(wc -c < "${START_LOG}" 2>/dev/null || echo 0)
+    if [ "${sz}" -gt 262144 ]; then
+        tail -c 131072 "${START_LOG}" > "${START_LOG}.tmp" 2>/dev/null \
+            && cat "${START_LOG}.tmp" > "${START_LOG}"
+        rm -f "${START_LOG}.tmp"
+    fi
+}
+
 watchdog() {
     backoff=1
     while [ ! -f "${STOP_FILE}" ]; do
+        trim_start_log
         load_conf
         started=$(date +%s)
-        if args="$(build_args 2>> "${LOG_FILE}")"; then
+        if args="$(build_args 2>> "${START_LOG}")"; then
             set --
             while IFS= read -r a; do
                 set -- "$@" "${a}"
@@ -137,12 +152,12 @@ ARGS_EOF
         fi
         [ -f "${STOP_FILE}" ] && break
         if [ -f "${RESTART_FILE}" ]; then
-            echo "fs3 restarting to apply new settings" >> "${LOG_FILE}"
+            echo "fs3 restarting to apply new settings" >> "${START_LOG}"
             backoff=1
             continue
         fi
         echo "fs3 exited unexpectedly (rc=${rc}); restarting in ${backoff}s" \
-            >> "${LOG_FILE}"
+            >> "${START_LOG}"
         sleep "${backoff}"
         now=$(date +%s)
         if [ $((now - started)) -ge 60 ]; then
@@ -167,7 +182,7 @@ start_daemon() {
     # Launch the watchdog; it records fs3's own PID in CHILD_PID_FILE.
     # fs3 logs to stderr; redirect to file.
     rm -f "${STOP_FILE}" "${RESTART_FILE}"
-    watchdog >> "${LOG_FILE}" 2>&1 &
+    watchdog >> "${START_LOG}" 2>&1 &
     echo $! > "${PID_FILE}"
 }
 

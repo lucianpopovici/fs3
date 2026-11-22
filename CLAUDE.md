@@ -59,6 +59,7 @@ The module list is in README, "Source layout". Feature → code → tests:
 | native TLS | `src/tls.c`, `conn_io_*` in `src/conn.c` | `test_e2e_tls.sh` |
 | admin API | `src/admin.c` | `test_e2e_admin.sh` |
 | audit log, throttling | `src/audit.c` | `test_e2e_audit.sh` |
+| logging, rotated log files | `src/log.c` (`log_msg`, `logfile_t`: one `write()` per line, size rotation, SIGHUP reopen) | `test_log`, `test_e2e_logs.sh` |
 | seccomp | `src/sandbox.c` (`ALLOW[]`), `tests/tools/seccomp_profile.sh` | `test_sandbox`, every e2e suite (a SIGSYS is reported) |
 | credentials file | `parse_and_add_cred`, `load_credentials_file` in `src/main.c` | `test_credfile` (seam: `FS3_MAIN_TESTING`) |
 | dedup estimator | `src/dedup_estimate.c` (standalone; mirrors the header format, keep in sync) | `test_e2e_dedup_estimate.sh` |

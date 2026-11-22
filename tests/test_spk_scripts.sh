@@ -75,6 +75,8 @@ has_arg "default port"           -p 9000
 has_arg "default data folder"    -d "$VAR/data"
 has_arg "trusted proxy on by default" --trusted-proxy 127.0.0.1
 has_arg "admin listener"         --metrics-port 9101
+has_arg "fs3 writes its own rotated log" --log-file "$VAR/fs3.log"
+lacks_arg "default rotation not passed" --log-max-size
 lacks_arg "no dedup by default"  --dedup
 lacks_arg "no auth without credentials" --require-auth
 sss status && st=0 || st=$?
@@ -91,6 +93,8 @@ FS3_TRUSTED_PROXY=127.0.0.1,10.0.0.2
 FS3_MAX_BODY_SIZE=1G
 FS3_ALLOW_PUBLIC=1
 FS3_SECCOMP=log
+FS3_LOG_MAX_SIZE=2M
+FS3_LOG_KEEP=7
 EOF
 mkdir -p "$VAR/my data"
 mark
@@ -106,8 +110,10 @@ has_arg "second trusted proxy"   --trusted-proxy 10.0.0.2
 has_arg "body size"              --max-body-size 1G
 has_arg "public allowed"         --allow-public
 has_arg "seccomp mode"           --seccomp log
+has_arg "log rotation size"      --log-max-size 2M
+has_arg "log rotation count"     --log-keep 7
 check_eq "restart request consumed" "$([ -f "$VAR/fs3.restart" ] && echo yes || echo no)" "no"
-check_eq "restart logged, no backoff" "$(grep -c 'restarting to apply new settings' "$VAR/fs3.log" || true)" "1"
+check_eq "restart logged, no backoff" "$(grep -c 'restarting to apply new settings' "$VAR/fs3.start.log" || true)" "1"
 
 # 3. Hand-edited invalid values fall back to the default and are logged;
 #    nothing in the conf is executed.
@@ -125,14 +131,18 @@ wait_args "$T/mark" || echo "no respawn" >&2
 has_arg "invalid port → default" -p 9000
 lacks_arg "invalid enum → default" --dedup
 lacks_arg "unknown key ignored"  --allow-public-write
-check_eq "invalid value logged" "$(grep -c 'ignoring invalid value for FS3_PORT' "$VAR/fs3.log" || true)" "1"
+check_eq "invalid value logged" "$(grep -c 'ignoring invalid value for FS3_PORT' "$VAR/fs3.start.log" || true)" "1"
 check_eq "conf never executed" "$([ -e "$T/pwned" ] && echo yes || echo no)" "no"
 
-# 4. An unexpected exit is respawned (after the 1 s backoff) and logged.
+# 4. An unexpected exit is respawned (after the 1 s backoff) and logged;
+#    an oversized fs3.start.log is trimmed at the respawn.
+head -c 600000 /dev/zero | tr '\0' 'x' >> "$VAR/fs3.start.log"
 mark
 kill "$(cat "$VAR/fs3.child.pid")"
 wait_args "$T/mark" || echo "no respawn after crash" >&2
-check_eq "unexpected exit logged" "$(grep -c 'exited unexpectedly' "$VAR/fs3.log" || true)" "1"
+check_eq "unexpected exit logged" "$(grep -c 'exited unexpectedly' "$VAR/fs3.start.log" || true)" "1"
+check_eq "start log trimmed" "$([ "$(wc -c < "$VAR/fs3.start.log")" -le 262144 ] && echo yes || echo no)" "yes"
+check_eq "nothing but the stub writes fs3.log" "$([ -e "$VAR/fs3.log" ] && echo yes || echo no)" "no"
 
 # 5. Authentication.
 sss stop

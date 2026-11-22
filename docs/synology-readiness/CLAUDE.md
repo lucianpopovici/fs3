@@ -23,6 +23,7 @@ briefs if you need the original reasoning.
 | 06 startup recovery | temp files, half-written sidecars and duplicate version links cleaned at `store_open` |
 | 07 metrics and health | localhost admin listener with `/healthz` and Prometheus `/metrics`; S3-port `/_health` without auth |
 | 11 desktop console | DSM tile: bucket stats (objects, size, quota), credential management and a settings form for every NAS-relevant option (schema in `packaging/synology/lib/fs3-conf.sh`), behind DSM sign-in + administrators group, CSRF token and Origin check |
+| 09 log rotation | fs3 writes and rotates `fs3.log` and the audit log by size (`--log-file`, `--log-max-size`, `--log-keep`, tile settings); script and watchdog output goes to a self-trimming `fs3.start.log` |
 | 12 DSM identity binding | per-user buckets (`ak:sk[:user]`, owner + random bucket id), admins, legacy owner; the planned management socket became the `/v1` admin API (`--admin-socket`) |
 
 Two present-tense packaging bugs were also fixed along the way: `fs3.conf`
@@ -35,7 +36,6 @@ the existing conf and credentials instead of resetting
 | Brief | State |
 |---|---|
 | [08-service-supervision](08-service-supervision/CLAUDE.md) | Fallback in place and hardware-verified: the SPK watchdog restarts fs3 with exponential backoff. DSM-native supervision (preferred, because the watchdog itself is unsupervised) is still uninvestigated. |
-| [09-log-rotation](09-log-rotation/CLAUDE.md) | Open. `fs3.log` still grows without bound. The audit log reopens on SIGHUP, but nothing rotates the package log. |
 | [10-package-signing](10-package-signing/CLAUDE.md) | Open. The SPK is unsigned, so DSM asks to lower the trust level. Mostly unavoidable without a Synology developer certificate. |
 
 ## Not yet briefed

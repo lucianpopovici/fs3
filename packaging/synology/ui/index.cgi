@@ -32,6 +32,7 @@ PID_FILE="${VAR_DIR}/fs3.pid"
 CHILD_PID_FILE="${VAR_DIR}/fs3.child.pid"
 RESTART_FILE="${VAR_DIR}/fs3.restart"
 LOG_FILE="${VAR_DIR}/fs3.log"
+START_LOG="${VAR_DIR}/fs3.start.log"
 TOK_FILE="${VAR_DIR}/.ui-csrf"
 CONF_LIB="${PKG_DIR}/lib/fs3-conf.sh"
 
@@ -452,13 +453,21 @@ certificate, so traffic on the network is encrypted. To expose plain HTTP on
 the LAN instead, change the listen address under Settings.</p>"
 fi
 
-# Restarting or crash-looping: show the end of the log.
+# Restarting or crash-looping: show the end of both logs (startup
+# failures land in fs3.start.log, everything after in fs3.log).
+log_tail_html() {  # $1 = file
+    [ -r "$1" ] || return 0
+    printf '<p class="muted">Last lines of <code>%s</code>:</p>\n<pre>%s</pre>\n' \
+        "$(html_escape "$1")" \
+        "$(tail -n 8 "$1" 2>/dev/null | tr -d '\r' \
+           | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g')"
+}
 LOGTAIL_HTML=""
-if [ "${RUNNING}" = "restarting" ] && [ -r "${LOG_FILE}" ]; then
+if [ "${RUNNING}" = "restarting" ]; then
     LOGTAIL_HTML="<p class=\"notice err\">fs3 is not running at the moment (restarting,
-or failing to start). Last lines of <code>$(html_escape "${LOG_FILE}")</code>:</p>
-<pre>$(tail -n 8 "${LOG_FILE}" 2>/dev/null | tr -d '\r' \
-    | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g')</pre>"
+or failing to start).</p>
+$(log_tail_html "${START_LOG}")
+$(log_tail_html "${LOG_FILE}")"
 fi
 
 # Bucket stats from the admin listener: "<name> <objects> <bytes> [<quota> <quota-used>]"

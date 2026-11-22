@@ -109,6 +109,11 @@ static void usage(const char *argv0) {
         "                             (default 5M, as S3; 0 = none)\n"
         "      --audit-log <file>     append one JSON line per request + admin change\n"
         "                             (no query strings / signatures); SIGHUP reopens\n"
+        "      --log-file <file>      write the server log here instead of stderr (mode 0640)\n"
+        "      --log-max-size <N>     rotate the log file and the audit log at N bytes\n"
+        "                             (K/M/G suffix; default 10M; 0 = never)\n"
+        "      --log-keep <num>       rotated files kept: <file>.1 .. <file>.<num>\n"
+        "                             (default 5, max 50); SIGHUP reopens both files\n"
         "      --auth-fail-limit N    auth failures per client IP per minute before\n"
         "                             503 SlowDown backoff (default 20; 0 = off)\n"
         "      --tls-max-per-ip N     concurrent TLS connections per client IP (default 32);\n"
@@ -296,7 +301,8 @@ static void reload_tick(void *user) {
     if (r->cred_file) (void)do_reload(user);
 #ifndef FS3_MAIN_TESTING
     server_tls_reload(g_server);
-    audit_reopen();             /* log rotation */
+    audit_reopen();             /* external log rotation */
+    log_reopen();
 #endif
 }
 
@@ -409,6 +415,9 @@ enum {
     OPT_REQUIRE_SIGNED_PAYLOAD,
     OPT_TLS_MAX_PER_IP,
     OPT_AUDIT_LOG,
+    OPT_LOG_FILE,
+    OPT_LOG_MAX_SIZE,
+    OPT_LOG_KEEP,
     OPT_AUTH_FAIL_LIMIT,
     OPT_MPU_MIN_PART_SIZE,
     OPT_DEFAULT_BUCKET_QUOTA,
@@ -495,6 +504,9 @@ int main(int argc, char **argv) {
     int allow_public_write = 0;
     int max_retention_days = 3650;
     const char *audit_log = NULL;
+    const char *log_file = NULL;
+    uint64_t log_max_size = LOG_DEFAULT_MAX_SIZE;
+    int log_keep = LOG_DEFAULT_KEEP;
     int auth_fail_limit = 20;
     uint64_t mpu_min_part = 5ULL * 1024 * 1024;   /* S3's minimum */
     uint64_t def_bucket_quota = 0, def_user_quota = 0;   /* 0 = unlimited */
@@ -552,6 +564,9 @@ int main(int argc, char **argv) {
         { "require-tls",      no_argument,       NULL, OPT_REQUIRE_TLS },
         { "tls-max-per-ip",   required_argument, NULL, OPT_TLS_MAX_PER_IP },
         { "audit-log",        required_argument, NULL, OPT_AUDIT_LOG },
+        { "log-file",         required_argument, NULL, OPT_LOG_FILE },
+        { "log-max-size",     required_argument, NULL, OPT_LOG_MAX_SIZE },
+        { "log-keep",         required_argument, NULL, OPT_LOG_KEEP },
         { "auth-fail-limit",  required_argument, NULL, OPT_AUTH_FAIL_LIMIT },
         { "mpu-min-part-size", required_argument, NULL, OPT_MPU_MIN_PART_SIZE },
         { "default-bucket-quota", required_argument, NULL, OPT_DEFAULT_BUCKET_QUOTA },
@@ -762,6 +777,24 @@ int main(int argc, char **argv) {
                 break;
             case OPT_TLS_ADDR: tls_addr = optarg; break;
             case OPT_AUDIT_LOG: audit_log = optarg; break;
+            case OPT_LOG_FILE: log_file = optarg; break;
+            case OPT_LOG_MAX_SIZE:
+                log_max_size = strcmp(optarg, "0") == 0 ? 0 : parse_size(optarg);
+                if (strcmp(optarg, "0") && (log_max_size == 0 || log_max_size < 4096)) {
+                    fprintf(stderr, "--log-max-size: invalid size '%s' (0, or at least 4K)\n", optarg);
+                    return 2;
+                }
+                break;
+            case OPT_LOG_KEEP: {
+                char *end = NULL;
+                long k = strtol(optarg, &end, 10);
+                if (!end || *end || k < 1 || k > LOG_MAX_KEEP) {
+                    fprintf(stderr, "--log-keep: must be 1..%d\n", LOG_MAX_KEEP);
+                    return 2;
+                }
+                log_keep = (int)k;
+                break;
+            }
             case OPT_MPU_MIN_PART_SIZE:
                 mpu_min_part = strcmp(optarg, "0") == 0 ? 0 : parse_size(optarg);
                 if (strcmp(optarg, "0") && mpu_min_part == 0) {
@@ -885,6 +918,12 @@ int main(int argc, char **argv) {
     }
     if (auth) sigv4_set_presign_policy(auth, presign_max_expires, no_presign_admin);
     throttle_set_limit(auth_fail_limit);
+    log_set_rotation(log_max_size, log_keep);
+    if (log_file && log_set_file(log_file) < 0) {
+        fprintf(stderr, "--log-file %s: cannot open: %s\n", log_file, strerror(errno));
+        sigv4_destroy(auth);
+        return 2;
+    }
     if (audit_log && audit_open(audit_log) < 0) {
         fprintf(stderr, "--audit-log %s: cannot open: %s\n", audit_log, strerror(errno));
         sigv4_destroy(auth);

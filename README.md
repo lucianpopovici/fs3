@@ -588,15 +588,28 @@ TLS listeners can run together.
 - SSE-C objects are never deduplicated, compressed or served on the
   website listener. The scrub verifies their ciphertext without the key.
 
-### Audit log and throttling
+### Logs, audit log and throttling
+
+- **Server log:** stderr by default. `--log-file <file>` writes it to a
+  file instead (mode 0640).
+  - Each line is formatted in full and written with one `write()`, so lines
+    from worker threads never interleave or tear. A newline inside a
+    message (for example from a client-supplied string) is replaced by a
+    space, so it can't forge another log line.
+- **Rotation** applies to both the log file and the audit log:
+  - when a file reaches `--log-max-size` (default 10M; 0 = never), it
+    becomes `<file>.1`, older ones shift up, and `--log-keep` of them are
+    kept (default 5, max 50);
+  - if a rotation fails (disk full, permissions), fs3 keeps writing to the
+    current file and retries at most once a minute;
+  - SIGHUP re-opens both files, so external rotation tools still work.
 
 - `--audit-log <file>` appends one JSON line per request (time, client,
   user, access key, S3 action, path, status, bytes, duration, and
   presigned/TLS/website/SSE-C flags) and one per admin-API change.
   - Query strings and key material are never logged, so presigned
     signatures stay out of it.
-  - The file is created with mode 0600, and SIGHUP reopens it for
-    rotation.
+  - The file is created with mode 0600 and rotated as above.
 - `--auth-fail-limit N` (default 20): after N failed authentications from
   one client address within a minute, that address gets `503 SlowDown`
   for an exponentially growing period (2 s up to 5 min).
@@ -694,7 +707,7 @@ series:
 | Object Lock | `--max-retention-days`, `--lock-immutable`, `--lockd-socket` |
 | storage efficiency | `--reflink`, `--dedup`, `--dedup-min-size`, `--dedup-verify`, `--fs-compress` |
 | scrub | `--scrub-interval-days`, `--scrub-now`, `--scrub-rate`, `--scrub-fail-reads` |
-| operations | `--metrics-port`, `--admin-socket`, `--admin-token-file`, `--audit-log`, `--seccomp`, `--seccomp-list` |
+| operations | `--metrics-port`, `--admin-socket`, `--admin-token-file`, `--audit-log`, `--log-file`, `--log-max-size`, `--log-keep`, `--seccomp`, `--seccomp-list` |
 
 Size options accept K/M/G suffixes. SIGHUP re-reads credentials, TLS
 certificates and the audit log file.
@@ -741,8 +754,14 @@ runbook for a DS1515+, including a recorded run.
   map to are defined once, in `packaging/synology/lib/fs3-conf.sh`, which
   both the start script and the tile use. You can still edit the file
   over SSH: unknown keys are ignored, and an invalid value falls back to
-  its default with a line in `fs3.log`. The data folder (`FS3_DATA`) is
+  its default with a line in `fs3.start.log`. The data folder (`FS3_DATA`) is
   not editable in the tile, since moving it means moving the data.
+- **Logs:** fs3 writes and rotates `fs3.log` itself (*Rotate logs at* and
+  *Rotated logs kept* in the tile; 10M × 5 by default), and the audit log
+  the same way. `fs3.start.log` holds only the package script's
+  messages, startup failures and crash output, and is trimmed to its
+  last 128 KiB when it passes 256 KiB. The tile shows the end of both
+  while fs3 is restarting or failing to start.
 - `FS3_LEGACY_OWNER` (default: the first user in the credentials file)
   receives buckets that predate per-user isolation. `FS3_ADMIN=<user>`
   names an admin.
@@ -923,6 +942,7 @@ need `curl` and `openssl`.
 | core e2e | `test_e2e`, `test_e2e_auth`, `test_e2e_mpu`, `test_e2e_parts`, `test_e2e_listing`, `test_e2e_metadata`, `test_e2e_phase9`–`12`, `test_e2e_subresources` |
 | access control | `test_e2e_isolation`, `test_e2e_policy`, `test_e2e_keys`, `test_e2e_presign`, `test_e2e_admin`, `test_e2e_audit` |
 | features | `test_e2e_checksum`, `test_e2e_versioning`, `test_e2e_objlock`, `test_e2e_immutable`, `test_e2e_lifecycle`, `test_e2e_cors`, `test_e2e_website`, `test_e2e_quota`, `test_e2e_scrub`, `test_e2e_ssec`, `test_e2e_tls`, `test_e2e_reflink` |
+| logging | `test_log` (rotation, concurrency, failure handling), `test_e2e_logs` |
 | tools and packaging | `test_e2e_dedup_estimate`, `test_ui_cgi` (DSM tile: sign-in gate, credentials, settings), `test_spk_scripts` (start script, conf → flags, watchdog) |
 
 All suites run under both the release and the ASan/UBSan builds. The
